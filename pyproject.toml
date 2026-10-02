@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tg-signer"
+name = "tg-signer-plus"
 dynamic = ["version"]
 description = "Automated Telegram tasks (check-ins, sending messages, keyboard clicks, AI replies, etc.); monitoring, forwarding, and auto-replying to private, group, and channel messages."
 authors = [
@@ -51,7 +51,7 @@ Homepage = "https://github.com/amchii/tg-signer"
 Repository = "https://github.com/amchii/tg-signer"
 
 [project.scripts]
-tg-signer = "tg_signer.__main__:signer"
+tg-signer-plus = "tg_signer.__main__:signer"
 
 [tool.setuptools]
 include-package-data = true
