@@ -175,6 +175,9 @@ class BaseConfigBlock:
     def refresh_options(self) -> None:
         options = list_task_names(self.kind, state.workdir)
         self.select.options = options
+        # 只有一个配置时默认选中（会触发 load_current 自动加载）
+        if len(options) == 1 and not self.select.value:
+            self.select.value = options[0]
         self.select.update()
 
     def load_current(self) -> None:
@@ -564,7 +567,10 @@ class TaskRunnerBlock:
 
     def _on_type_change(self) -> None:
         self.task_select.options = self._get_task_names()
-        if self.task_select.options:
+        # 只有一个任务时默认选中，否则清空选择
+        if len(self.task_select.options) == 1:
+            self.task_select.value = self.task_select.options[0]
+        else:
             self.task_select.value = None
         self.task_select.update()
 
@@ -1039,6 +1045,37 @@ def _build_dashboard(container) -> None:
             for refresh in refreshers:
                 refresh()
 
+        # ---- 预构建"数据查看"对话框（用户信息 / 签到记录 / 日志） ----
+        with ui.dialog() as users_dialog, ui.card().classes("w-full max-w-4xl"):
+            ui.label("用户信息").classes("text-lg font-semibold")
+            ui.label("查看当前已登录账户信息 (users/*/me.json)。").classes(
+                "text-gray-600"
+            )
+            refreshers.append(user_info_block())
+            with ui.row().classes("w-full justify-end"):
+                ui.button("关闭", on_click=users_dialog.close).props("outline")
+
+        with ui.dialog() as records_dialog, ui.card().classes("w-full max-w-4xl"):
+            ui.label("签到记录").classes("text-lg font-semibold")
+            ui.label("签到记录（优先读取 SQLite，兼容旧 sign_record.json）").classes(
+                "text-gray-600"
+            )
+            refresh_records = SignRecordBlock()
+            refreshers.append(refresh_records)
+            with ui.row().classes("w-full justify-end"):
+                ui.button("关闭", on_click=records_dialog.close).props("outline")
+
+        with ui.dialog() as logs_dialog, ui.card().classes("w-full max-w-4xl"):
+            ui.label("日志").classes("text-lg font-semibold")
+            ui.label("查看日志文件的最新行。").classes("text-gray-600")
+            refreshers.append(log_block())
+            with ui.row().classes("w-full justify-end"):
+                ui.button("关闭", on_click=logs_dialog.close).props("outline")
+
+        def goto_records(task_name: str) -> None:
+            refresh_records.filter_input.set_value(task_name)
+            records_dialog.open()
+
         def open_settings() -> None:
             with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
                 ui.label("设置").classes("text-lg font-semibold")
@@ -1059,22 +1096,51 @@ def _build_dashboard(container) -> None:
                     )
             dialog.open()
 
-        settings_btn.on_click(open_settings)
+        with settings_btn:
+            menu = ui.menu().props("no-parent-event")
+            ui.menu_item("设置", on_click=open_settings)
+            ui.menu_item("用户信息", on_click=users_dialog.open)
+            ui.menu_item("签到记录", on_click=records_dialog.open)
+            ui.menu_item("日志", on_click=logs_dialog.open)
+        # 悬停齿轮按钮即展开菜单（点击外部或菜单项后关闭）
+        settings_btn.on("mouseenter", handler=menu.open)
 
         with ui.tabs().classes("w-full") as tabs:
-            tab_configs = ui.tab("配置管理")
-            tab_run = ui.tab("执行任务")
-            tab_users = ui.tab("用户信息")
-            tab_records = ui.tab("签到记录")
-            tab_logs = ui.tab("日志")
-            tab_random = ui.tab("随机发言")
+            tab_run = ui.tab("run", "执行任务")
+            tab_random = ui.tab("random", "随机发言")
+            tab_configs = ui.tab("configs", "配置管理")
 
-        def goto_records(task_name: str) -> None:
-            tabs.value = tab_records
-            tabs.update()
-            refresh_records.filter_input.set_value(task_name)
+        valid_tabs = {"run", "random", "configs"}
 
-        with ui.tab_panels(tabs, value=tab_configs).classes("w-full"):
+        def _tab_name(value) -> str:
+            if isinstance(value, str):
+                return value
+            return str(getattr(value, "name", "") or "")
+
+        saved_tab = app.storage.user.get("tg_signer_tab")
+        if saved_tab not in valid_tabs:
+            saved_tab = "run"
+
+        def _on_tab_change(e) -> None:
+            name = _tab_name(e.value)
+            if name in valid_tabs:
+                try:
+                    app.storage.user["tg_signer_tab"] = name
+                except Exception:
+                    pass
+
+        tabs.on_value_change(_on_tab_change)
+
+        with ui.tab_panels(tabs, value=saved_tab).classes("w-full"):
+            with ui.tab_panel(tab_run):
+                refreshers.append(TaskRunnerBlock())
+
+            with ui.tab_panel(tab_random):
+                ui.label(
+                    "多账号随机发言：选择账号与目标群组，按固定间隔从内置语库随机发送消息。"
+                ).classes("text-gray-600")
+                refreshers.append(random_chat_block(state.workdir))
+
             with ui.tab_panel(tab_configs):
                 ui.label(
                     "管理 signer 和 monitor 的配置文件，支持查看、编辑和删除。"
@@ -1089,32 +1155,6 @@ def _build_dashboard(container) -> None:
                         )
                     with ui.tab_panel(tab_monitor):
                         refreshers.append(MonitorBlock(MONITOR_TEMPLATE))
-
-            with ui.tab_panel(tab_run):
-                refreshers.append(TaskRunnerBlock())
-
-            with ui.tab_panel(tab_users):
-                ui.label("查看当前已登录账户信息 (users/*/me.json)。").classes(
-                    "text-gray-600"
-                )
-                refreshers.append(user_info_block())
-
-            with ui.tab_panel(tab_records):
-                ui.label(
-                    "签到记录（优先读取 SQLite，兼容旧 sign_record.json）"
-                ).classes("text-gray-600")
-                refresh_records = SignRecordBlock()
-                refreshers.append(refresh_records)
-
-            with ui.tab_panel(tab_logs):
-                ui.label("查看日志文件的最新行。").classes("text-gray-600")
-                refreshers.append(log_block())
-
-            with ui.tab_panel(tab_random):
-                ui.label(
-                    "多账号随机发言：选择账号与目标群组，按固定间隔从内置语库随机发送消息。"
-                ).classes("text-gray-600")
-                refreshers.append(random_chat_block(state.workdir))
 
         refresh_all()
 

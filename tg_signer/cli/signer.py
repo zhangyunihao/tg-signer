@@ -259,7 +259,7 @@ def list_sign_records(obj, task_name: str | None, limit: int, user_id: str | Non
 @click.option(
     "--num-of-dialogs",
     "-n",
-    default=50,
+    default=200,
     show_default=True,
     type=int,
     help="未指定 --from-folder 时获取最近N个对话",
@@ -283,7 +283,7 @@ def logout(obj):
 @click.option(
     "--num-of-dialogs",
     "-n",
-    default=50,
+    default=200,
     show_default=True,
     type=int,
     help="未指定 --from-folder 时获取最近N个对话",
@@ -308,7 +308,7 @@ def run(obj, task_names, num_of_dialogs, folder):
     "--num-of-dialogs",
     "-n",
     "num_of_dialogs",
-    default=50,
+    default=200,
     show_default=True,
     type=int,
     help="未指定 --from-folder 时获取最近N个对话",
@@ -575,7 +575,7 @@ def list_schedule_messages(obj, chat_id):
 @click.option(
     "--num-of-dialogs",
     "-n",
-    default=50,
+    default=200,
     show_default=True,
     type=int,
     help="未指定 --from-folder 时获取最近N个对话",
