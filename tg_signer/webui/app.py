@@ -1,5 +1,11 @@
 import json
 import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict
 
@@ -23,6 +29,7 @@ from tg_signer.webui.data import (
     save_config,
 )
 from tg_signer.webui.interactive import InteractiveSignerConfig
+from tg_signer.webui.random_chat import random_chat_block
 from tg_signer.webui.schema_utils import clean_schema
 
 SIGNER_TEMPLATE: Dict[str, object] = {
@@ -67,6 +74,7 @@ MONITOR_TEMPLATE: Dict[str, object] = {
 
 AUTH_CODE_ENV = "TG_SIGNER_GUI_AUTHCODE"
 AUTH_STORAGE_KEY = "tg_signer_gui_auth_code"
+SOURCE_ROOT = Path(__file__).resolve().parents[2]
 
 
 class UIState:
@@ -291,6 +299,487 @@ class SignerBlock(BaseConfigBlock):
 class MonitorBlock(BaseConfigBlock):
     def __init__(self, template: Dict[str, object]):
         super().__init__("monitor", template)
+
+
+TASK_HISTORY_FILE = "webui_task_history.json"
+TASK_HISTORY_LIMIT = 100
+
+
+def _task_history_path() -> Path:
+    return get_workdir(state.workdir) / TASK_HISTORY_FILE
+
+
+def load_task_history() -> list[dict]:
+    path = _task_history_path()
+    if not path.is_file():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_task_history(items: list[dict]) -> None:
+    path = _task_history_path()
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(items[-TASK_HISTORY_LIMIT:], fp, ensure_ascii=False, indent=2)
+
+
+def append_task_history(record: dict) -> None:
+    items = load_task_history()
+    items.append(record)
+    save_task_history(items)
+
+
+def update_task_history(record: dict) -> None:
+    """按记录 id 更新已存在的历史条目并持久化。"""
+    items = load_task_history()
+    for i, item in enumerate(items):
+        if item.get("id") == record.get("id"):
+            items[i] = record
+            break
+    save_task_history(items)
+
+
+class TaskRunnerBlock:
+    """执行任务面板：从 WebUI 直接运行签到/自动化/监控任务"""
+
+    TASK_TYPES = [
+        "签到 (run-once)",
+        "签到 (run 定时)",
+        "自动化 (automation run)",
+        "监控 (monitor run)",
+    ]
+
+    def __init__(self) -> None:
+        # record_id -> {"record": dict, "procs": [...], "queue": Queue, "start_ts": float}
+        self.runs: dict[str, dict] = {}
+        self.output_lines: list[str] = []
+
+        with ui.card().classes("w-full shadow-md"):
+            ui.label("执行任务").classes("text-lg font-semibold")
+            ui.label(
+                "点击「新增任务」在弹窗中选择任务类型、任务与账号；运行中的任务可在下方历史列表中停止。"
+            ).classes("text-sm text-gray-500")
+
+            with ui.row().classes("gap-2 items-center"):
+                ui.button("新增任务", icon="add", color="primary", on_click=self.open_dialog)
+                ui.button("清空输出", on_click=self.clear_log).props("outline")
+
+            self.status_label = ui.label("空闲").classes("text-sm text-gray-500")
+
+            # ---- 任务历史 ----
+            ui.separator().classes("my-2")
+            with ui.row().classes("w-full items-center justify-between"):
+                ui.label("任务历史").classes("text-md font-semibold")
+                ui.button("清空历史", on_click=self.clear_history).props(
+                    "outline dense"
+                )
+            ui.label(
+                "记录通过本页面手动执行过的任务（含类型、账号、状态与结果），保存在工作目录下。"
+            ).classes("text-sm text-gray-500")
+            self.history_summary = ui.label("").classes("text-sm text-gray-600")
+            self.history_table = ui.table(
+                columns=[
+                    {
+                        "name": "time",
+                        "label": "开始时间",
+                        "field": "time",
+                        "align": "left",
+                    },
+                    {
+                        "name": "type",
+                        "label": "任务类型",
+                        "field": "type",
+                        "align": "left",
+                    },
+                    {
+                        "name": "task",
+                        "label": "任务名",
+                        "field": "task",
+                        "align": "left",
+                    },
+                    {
+                        "name": "accounts",
+                        "label": "账号",
+                        "field": "accounts",
+                        "align": "left",
+                    },
+                    {
+                        "name": "status",
+                        "label": "状态",
+                        "field": "status",
+                        "align": "left",
+                    },
+                    {
+                        "name": "result",
+                        "label": "结果",
+                        "field": "result",
+                        "align": "left",
+                    },
+                    {
+                        "name": "actions",
+                        "label": "操作",
+                        "field": "actions",
+                        "align": "left",
+                    },
+                ],
+                rows=[],
+            ).classes("w-full").props("flat dense")
+            # 状态列渲染为彩色徽章：已完成=绿、失败=红、运行中=蓝、其他=灰
+            self.history_table.add_slot(
+                "body-cell-status",
+                '<q-td :props="props">'
+                '<q-badge :color="props.row.status === \'已完成\' ? \'positive\' : '
+                "props.row.status === '失败' ? 'negative' : "
+                "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
+                "{{ props.row.status }}</q-badge></q-td>",
+            )
+            # 操作列：仅运行中的任务显示「停止」按钮，点击后回传整行数据
+            self.history_table.add_slot(
+                "body-cell-actions",
+                '<q-td :props="props">'
+                '<q-btn v-if="props.row.status === \'运行中\'" flat dense color="negative" '
+                'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
+                "</q-td>",
+            )
+            self.history_table.on("stopTask", self._on_stop_event)
+
+            self.log_area = ui.scroll_area().classes(
+                "w-full bg-gray-50 rounded-lg border border-gray-200"
+            )
+            self.log_area.style("max-height: 420px")
+            with self.log_area:
+                self.log_list = (
+                    ui.column()
+                    .classes("w-full gap-0 p-3 font-mono text-sm")
+                    .style("white-space: pre;")
+                )
+
+            self._timer = ui.timer(0.3, self._poll_output)
+            self._timer.deactivate()
+
+        # ---- 新增任务弹窗 ----
+        with ui.dialog() as self.dialog, ui.card().classes("w-full max-w-2xl"):
+            ui.label("新增任务").classes("text-lg font-semibold")
+            with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+                self.type_select = ui.select(
+                    label="任务类型",
+                    options=self.TASK_TYPES,
+                    value=self.TASK_TYPES[0],
+                    on_change=self._on_type_change,
+                ).classes("min-w-[240px]")
+
+                self.task_select = ui.select(
+                    label="选择任务",
+                    options=[],
+                    with_input=True,
+                ).classes("min-w-[200px]")
+
+                self.account_select = ui.select(
+                    label="选择账号（可多选）",
+                    options=[],
+                    multiple=True,
+                ).classes("min-w-[240px]").props("use-chips")
+            ui.label(
+                "账号来自 *.session 文件；多选时每个账号各启动一个进程。"
+            ).classes("text-xs text-gray-500")
+            with ui.row().classes("gap-2 justify-end w-full"):
+                ui.button("取消", on_click=self.dialog.close).props("outline")
+                ui.button("执行", color="primary", on_click=self.start_task)
+
+    def _get_task_names(self) -> list[str]:
+        task_type = self.type_select.value or ""
+        workdir = state.workdir
+        if "签到" in task_type:
+            return list_task_names("signer", workdir)
+        elif "自动化" in task_type:
+            root = get_workdir(workdir) / "automations"
+            if not root.is_dir():
+                return []
+            return sorted(p.name for p in root.iterdir() if p.is_dir())
+        elif "监控" in task_type:
+            return list_task_names("monitor", workdir)
+        return []
+
+    def _get_account_names(self) -> list[str]:
+        """账号来自 session 文件（与 CLI 默认 session_dir='.' 一致），另附加 TG_ACCOUNT 环境变量。"""
+        names = sorted(p.stem for p in Path(".").glob("*.session"))
+        env_account = os.environ.get("TG_ACCOUNT")
+        if env_account and env_account not in names:
+            names.append(env_account)
+        return names
+
+    def _refresh_accounts(self) -> None:
+        options = self._get_account_names()
+        self.account_select.options = options
+        if self.account_select.value:
+            self.account_select.value = [
+                v for v in self.account_select.value if v in options
+            ]
+        self.account_select.update()
+
+    def _refresh_history_table(self) -> None:
+        items = load_task_history()
+        counts: dict[str, int] = {}
+        for r in items:
+            status = r.get("status", "未知")
+            counts[status] = counts.get(status, 0) + 1
+        summary = f"共 {len(items)} 条"
+        for status in ("运行中", "已完成", "失败", "已停止"):
+            if status in counts:
+                summary += f" | {status}: {counts[status]}"
+        self.history_summary.text = summary
+        self.history_summary.update()
+        rows = [
+            {
+                "id": r.get("id", ""),
+                "time": r.get("start_time", ""),
+                "type": r.get("task_type", ""),
+                "task": r.get("task_name", ""),
+                "accounts": r.get("accounts", ""),
+                "status": r.get("status", ""),
+                "result": r.get("result", ""),
+            }
+            for r in reversed(items)
+        ]
+        self.history_table.rows = rows
+        self.history_table.update()
+
+    def clear_history(self) -> None:
+        save_task_history([])
+        self._refresh_history_table()
+        ui.notify("已清空任务历史", type="positive")
+
+    def open_dialog(self) -> None:
+        self._on_type_change()
+        self._refresh_accounts()
+        # 默认全选发现的账号
+        if not self.account_select.value and self.account_select.options:
+            self.account_select.value = list(self.account_select.options)
+            self.account_select.update()
+        self.dialog.open()
+
+    def _on_type_change(self) -> None:
+        self.task_select.options = self._get_task_names()
+        if self.task_select.options:
+            self.task_select.value = None
+        self.task_select.update()
+
+    def _build_args(self, account: str) -> list[str]:
+        task_type = self.type_select.value
+        task_name = self.task_select.value
+        workdir = str(state.workdir)
+        # 根命令选项（-w/-a）必须位于子命令之前
+        if "run-once" in task_type:
+            return ["-w", workdir, "-a", account, "run-once", task_name]
+        elif "run 定时" in task_type:
+            return ["-w", workdir, "-a", account, "run", task_name]
+        elif "自动化" in task_type:
+            return ["-w", workdir, "-a", account, "automation", "run", task_name]
+        elif "监控" in task_type:
+            return ["-w", workdir, "-a", account, "monitor", "run", task_name]
+        return []
+
+    def start_task(self) -> None:
+        task_name = self.task_select.value
+        if not task_name:
+            ui.notify("请先选择任务", type="warning")
+            return
+        accounts = [a for a in (self.account_select.value or []) if a]
+        if not accounts:
+            ui.notify("请至少选择一个账号", type="warning")
+            return
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(SOURCE_ROOT)
+        record = {
+            "id": f"{time.time_ns()}",
+            "start_time": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+            "task_type": self.type_select.value or "",
+            "task_name": task_name,
+            "accounts": ", ".join(accounts),
+            "status": "运行中",
+            "result": "",
+        }
+        procs: list[dict] = []
+        run_queue: queue.Queue = queue.Queue()
+        for account in accounts:
+            args = self._build_args(account)
+            if not args:
+                ui.notify(f"无法构建命令: {account}", type="warning")
+                continue
+            cmd = [
+                sys.executable,
+                "-c",
+                "from tg_signer.cli import tg_signer; tg_signer()",
+            ] + args
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=env,
+                )
+            except Exception as exc:
+                notify_error(exc)
+                continue
+            reader = threading.Thread(
+                target=self._reader, args=(proc, task_name, account, run_queue), daemon=True
+            )
+            reader.start()
+            procs.append({"proc": proc, "reader": reader, "account": account})
+        if not procs:
+            ui.notify("未能启动任务", type="negative")
+            return
+        record["accounts"] = ", ".join(i["account"] for i in procs)
+        self.runs[record["id"]] = {
+            "record": record,
+            "procs": procs,
+            "queue": run_queue,
+            "start_ts": time.time(),
+        }
+        append_task_history(record)
+        self._refresh_history_table()
+        self._timer.activate()
+        self._update_status()
+        self.dialog.close()
+        ui.notify(f"已启动: {task_name}（{len(procs)} 个账号）", type="positive")
+
+    def _reader(
+        self, proc: subprocess.Popen, task_name: str, account: str, q: "queue.Queue"
+    ) -> None:
+        prefix = f"[{task_name}:{account}] "
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            q.put(prefix + line.rstrip("\r\n"))
+
+    def _on_stop_event(self, e) -> None:
+        row = e.args
+        if isinstance(row, dict) and row.get("id"):
+            self._stop_run(str(row["id"]))
+
+    def _stop_run(self, record_id: str) -> None:
+        run = self.runs.get(record_id)
+        if run is None:
+            return
+        for item in run["procs"]:
+            proc = item["proc"]
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+        self.runs.pop(record_id, None)
+        record = run["record"]
+        record["status"] = "已停止"
+        record["result"] = (
+            f"手动停止，耗时 {self._format_duration_ts(run['start_ts'])}"
+        )
+        update_task_history(record)
+        self._refresh_history_table()
+        self._update_status()
+        ui.notify(f"已停止: {record['task_name']}", type="positive")
+
+    def _update_running_row(self, record_id: str, result_text: str) -> None:
+        for row in self.history_table.rows:
+            if row.get("id") == record_id:
+                row["result"] = result_text
+                break
+        self.history_table.update()
+
+    def _finalize_run(self, record_id: str) -> None:
+        run = self.runs.pop(record_id)
+        rcs = ", ".join(str(i["proc"].returncode) for i in run["procs"])
+        ok = all(i["proc"].returncode == 0 for i in run["procs"])
+        record = run["record"]
+        record["status"] = "已完成" if ok else "失败"
+        record["result"] = (
+            f"返回码: {rcs}，耗时 {self._format_duration_ts(run['start_ts'])}"
+        )
+        update_task_history(record)
+        self._refresh_history_table()
+
+    @staticmethod
+    def _format_duration_ts(start_ts: float) -> str:
+        seconds = max(0, int(time.time() - start_ts))
+        if seconds >= 60:
+            return f"{seconds // 60}分{seconds % 60}秒"
+        return f"{seconds}秒"
+
+    def _update_status(self) -> None:
+        if not self.runs:
+            self.status_label.text = "空闲"
+        else:
+            parts = []
+            for run in self.runs.values():
+                rec = run["record"]
+                parts.append(
+                    f"{rec['task_name']}（{rec['accounts']}）已运行 "
+                    f"{self._format_duration_ts(run['start_ts'])}"
+                )
+            self.status_label.text = (
+                f"运行中 {len(self.runs)} 个任务: " + "; ".join(parts)
+            )
+        self.status_label.update()
+
+    def _poll_output(self) -> None:
+        for run in self.runs.values():
+            while not run["queue"].empty():
+                self.output_lines.append(run["queue"].get())
+        self.log_list.clear()
+        with self.log_list:
+            for line in self.output_lines[-200:]:
+                color = self._classify_line(line)
+                ui.label(line).classes(f"w-full {color}").style(
+                    "white-space: pre;"
+                )
+        self.log_list.update()
+
+        finished_ids: list[str] = []
+        for run_id, run in list(self.runs.items()):
+            if all(i["proc"].poll() is not None for i in run["procs"]):
+                if any(i["reader"].is_alive() for i in run["procs"]):
+                    continue
+                finished_ids.append(run_id)
+            else:
+                self._update_running_row(
+                    run_id,
+                    f"已运行 {self._format_duration_ts(run['start_ts'])}",
+                )
+        for run_id in finished_ids:
+            self._finalize_run(run_id)
+        self._update_status()
+        if not self.runs:
+            self._timer.deactivate()
+
+    def clear_log(self) -> None:
+        self.output_lines = []
+        self.log_list.clear()
+        self.log_list.update()
+
+    @staticmethod
+    def _classify_line(line: str) -> str:
+        upper = line.upper()
+        if "ERROR" in upper:
+            return "text-red-700"
+        if "WARN" in upper:
+            return "text-amber-700"
+        if "INFO" in upper:
+            return "text-blue-700"
+        return "text-gray-800"
+
+    def __call__(self, *args, **kwargs):
+        self._on_type_change()
+        self._refresh_accounts()
+        self._refresh_history_table()
+        self._update_status()
 
 
 def user_info_block() -> Callable[[], None]:
@@ -523,22 +1012,6 @@ def log_block() -> Callable[[], None]:
     return refresh
 
 
-def top_controls(on_refresh: Callable[[], None]) -> None:
-    with ui.card().classes("w-full"):
-        ui.label("基础设置").classes("text-lg font-semibold")
-        with ui.row().classes("items-end w-full"):
-            workdir_input = ui.input(
-                label="工作目录",
-                value=str(state.workdir),
-                placeholder=".signer",
-            ).classes("w-full")
-            ui.button(
-                "应用并刷新",
-                color="primary",
-                on_click=lambda: _apply_paths(workdir_input, on_refresh),
-            )
-
-
 def _apply_paths(workdir_input, on_refresh: Callable[[], None]) -> None:
     try:
         state.set_workdir(workdir_input.value or str(DEFAULT_WORKDIR))
@@ -551,9 +1024,14 @@ def _apply_paths(workdir_input, on_refresh: Callable[[], None]) -> None:
 
 def _build_dashboard(container) -> None:
     with container:
-        ui.label("TG Signer Web 控制台").classes(
-            "text-2xl font-semibold tracking-wide mb-2"
-        )
+        with ui.row().classes("w-full items-center justify-between mb-2"):
+            ui.label("TG Signer Web 控制台").classes(
+                "text-2xl font-semibold tracking-wide"
+            )
+            settings_btn = (
+                ui.button(icon="settings").props("flat round").tooltip("设置")
+            )
+
         refreshers: list[Callable[[], None]] = []
         refresh_records: "SignRecordBlock"
 
@@ -561,13 +1039,35 @@ def _build_dashboard(container) -> None:
             for refresh in refreshers:
                 refresh()
 
-        top_controls(refresh_all)
+        def open_settings() -> None:
+            with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
+                ui.label("设置").classes("text-lg font-semibold")
+                workdir_input = ui.input(
+                    label="工作目录",
+                    value=str(state.workdir),
+                    placeholder=".signer",
+                ).classes("w-full")
+                with ui.row().classes("w-full justify-end gap-2"):
+                    ui.button("取消", on_click=dialog.close).props("outline")
+                    ui.button(
+                        "应用并刷新",
+                        color="primary",
+                        on_click=lambda: (
+                            _apply_paths(workdir_input, refresh_all),
+                            dialog.close(),
+                        ),
+                    )
+            dialog.open()
+
+        settings_btn.on_click(open_settings)
 
         with ui.tabs().classes("w-full") as tabs:
             tab_configs = ui.tab("配置管理")
+            tab_run = ui.tab("执行任务")
             tab_users = ui.tab("用户信息")
             tab_records = ui.tab("签到记录")
             tab_logs = ui.tab("日志")
+            tab_random = ui.tab("随机发言")
 
         def goto_records(task_name: str) -> None:
             tabs.value = tab_records
@@ -590,6 +1090,9 @@ def _build_dashboard(container) -> None:
                     with ui.tab_panel(tab_monitor):
                         refreshers.append(MonitorBlock(MONITOR_TEMPLATE))
 
+            with ui.tab_panel(tab_run):
+                refreshers.append(TaskRunnerBlock())
+
             with ui.tab_panel(tab_users):
                 ui.label("查看当前已登录账户信息 (users/*/me.json)。").classes(
                     "text-gray-600"
@@ -606,6 +1109,12 @@ def _build_dashboard(container) -> None:
             with ui.tab_panel(tab_logs):
                 ui.label("查看日志文件的最新行。").classes("text-gray-600")
                 refreshers.append(log_block())
+
+            with ui.tab_panel(tab_random):
+                ui.label(
+                    "多账号随机发言：选择账号与目标群组，按固定间隔从内置语库随机发送消息。"
+                ).classes("text-gray-600")
+                refreshers.append(random_chat_block(state.workdir))
 
         refresh_all()
 
