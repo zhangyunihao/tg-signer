@@ -9,6 +9,9 @@ description = "Automated Telegram tasks (check-ins, sending messages, keyboard c
 authors = [
     { name = "Amchii", email = "finethankuandyou@gmail.com" }
 ]
+maintainers = [
+    { name = "zhangyunihao" }
+]
 license = "BSD-3-Clause"
 readme = "README.md"
 requires-python = ">=3.10"
