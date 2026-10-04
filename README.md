@@ -2,6 +2,38 @@
 
 [English](./README_EN.md)
 
+> 本项目为 [amchii/tg-signer](https://github.com/amchii/tg-signer) 的 fork，发布为 PyPI 包 `tg-signer-plus`，命令行入口为 `tg-signer-plus`，并新增 WebUI 随机发言等功能。
+
+### WebUI 用户指南（新增功能）
+
+安装并启动 WebUI：
+
+```sh
+pip install "tg-signer-plus[gui]"
+tg-signer-plus webgui  # 启动后访问 http://127.0.0.1:8080
+```
+
+页面包含「执行任务 / 随机发言 / 配置管理」三个标签页（刷新后自动回到上次选中的标签），右上角「菜单」按钮内有：工作目录 / 用户信息 / 签到记录 / 日志。
+
+#### 执行任务
+
+![执行任务](./assets/webui_run.png)
+
+- 选择任务类型（签到 / 定时 / 监控 / 自动化）与配置，勾选要执行的账号，点击「执行任务」
+- 输出区实时显示执行日志，可随时「停止」或「清空输出」
+- 「任务历史」记录最近的执行，点击行内「复制」会用该次参数回填新增任务弹窗，方便再次执行
+
+#### 随机发言
+
+![随机发言](./assets/webui_random.png)
+
+- 「新增任务」表单：选择账号（可多选）、目标群组（手动输入 chat_id / @username，或从最近聊天下拉选择，仅显示群组）、发送间隔、删除延迟、每账号发送条数
+- 点击「添加任务」创建并自动启动，支持多个任务并行运行
+- 每个账号独立计时：实际间隔 = 设定秒数 + 随机 0~3 秒，从内置 200 条语料库随机选句发送到目标群组
+- 删除延迟填 0 或留空则消息不删除；否则发送 N 秒后自动撤回，停止任务后剩余消息仍按延迟依次撤回
+- 每个任务支持「启动 / 停止 / 复制 / 删除」；任务配置持久化到 `.signer/random_chat_tasks.json`，刷新页面或重启服务后自动恢复
+- 底部共用日志区展示所有任务日志，每行带 `[#任务编号]` 前缀，发送与撤回记录显示群聊名称
+
 ### 功能
 
 - 每日定时和随机误差时间签到
@@ -10,6 +42,7 @@
 - 个人、群组、频道消息监控、转发与自动回复
 - 根据配置执行动作流
 - 自动化规则引擎（message/timer/startup 触发 + handler 链）
+- WebUI 随机发言（tg-signer-plus 新增）：多账号多任务并行、内置 200 条语料随机发送、每账号独立计时、可选定时自动撤回
 
   **...**
 
@@ -18,33 +51,35 @@
 需要Python3.10及以上
 
 ```sh
-pip install -U tg-signer
+pip install -U tg-signer-plus
 ```
 
 或者为了提升程序速度：
 
 ```sh
-pip install "tg-signer[speedup]"
+pip install "tg-signer-plus[speedup]"
 ```
 
 启用 YAML 配置支持：
 
 ```sh
-pip install "tg-signer[yaml]"
+pip install "tg-signer-plus[yaml]"
 ```
 #### WebUI
-tg-signer附带了一个WebUI，安装命令:
+tg-signer-plus附带了一个WebUI，安装命令:
 ```sh
-pip install "tg-signer[gui]"
+pip install "tg-signer-plus[gui]"
 ```
 
 ![webgui](./assets/webui.jpeg)
+
+> WebUI 使用说明见文档开头「WebUI 用户指南」章节。
 
 
 ### Docker
 
 #### GitHub Container Registry
-在 GitHub Container Registry 提供了两种预构建镜像：`ghcr.io/amchii/tg-signer:<tag>`（CLI）和 `ghcr.io/amchii/tg-signer:<tag>-webui`（CLI + WebUI）。
+在 GitHub Container Registry 提供了两种预构建镜像：`ghcr.io/amchii/tg-signer:<tag>`（CLI）和 `ghcr.io/amchii/tg-signer:<tag>-webui`（CLI + WebUI）。注意这些为上游镜像，本 fork（tg-signer-plus）未单独发布镜像，建议直接 `pip install tg-signer-plus` 使用。
 
 #### 本地
 如果需要自行构建镜像，本地 build 方式仍然保留，见 [docker](./docker) 目录下的 Dockerfile 和 [README](./docker/README.md) 。
@@ -52,7 +87,7 @@ pip install "tg-signer[gui]"
 ### 使用方法
 
 ```
-Usage: tg-signer [OPTIONS] COMMAND [ARGS]...
+Usage: tg-signer-plus [OPTIONS] COMMAND [ARGS]...
 
   使用<子命令> --help查看使用说明
 
@@ -110,45 +145,45 @@ Commands:
 例如:
 
 ```sh
-tg-signer run
-tg-signer run my_sign  # 不询问，直接运行'my_sign'任务
-tg-signer run-once my_sign  # 直接运行一次'my_sign'任务
-tg-signer list-folders  # 列出 Telegram 普通 Folder 的 ID、名称和显式对话数量
-tg-signer login --from-folder Sign  # 登录账号并从 Sign Folder 发现对话
-tg-signer run --from-folder Sign my_sign  # 从 Sign Folder 发现对话后运行任务
-tg-signer list-sign-records linuxdo -n 5  # 查看任务 linuxdo 最近 5 条签到记录
-tg-signer migrate-sign-records  # 将.signer/signs 下的签到记录迁移到 SQLite
-tg-signer send-text 8671234001 /test  # 向chat_id为'8671234001'的聊天发送'/test'文本
-tg-signer send-text @neo /test  # 向username为'@neo'的聊天发送'/test'文本
-tg-signer send-text --message-thread-id 1 -- -1003763902761 checkin  # 发送到群组话题(message_thread_id=1)
-tg-signer send-text -- -10006758812 浇水  # 对于负数需要使用POSIX风格，在短横线'-'前方加上'--'
-tg-signer send-text --delete-after 1 8671234001 /test  # 向chat_id为'8671234001'的聊天发送'/test'文本, 并在1秒后删除发送的消息
-tg-signer list-members --chat_id -1001680975844 --admin  # 列出频道的管理员
-tg-signer list-topics --chat_id -1003763902761 --limit 50  # 列出群组话题及message_thread_id
-tg-signer schedule-messages --crontab '0 0 * * *' --next-times 10 -- -1001680975844 你好  # 在未来10天的每天0点向'-1001680975844'发送消息
-tg-signer schedule-messages --crontab '0 0 * * *' --next-times 3 --message-thread-id 1 -- -1003763902761 你好  # 配置群组话题的定时消息
-tg-signer automation init my_auto  # 初始化自动化模板
-tg-signer automation run my_auto  # 运行自动化任务
-tg-signer monitor run  # 配置个人、群组、频道消息监控与自动回复
-tg-signer multi-run -a account_a -a account_b same_task  # 使用'same_task'的配置同时运行'account_a'和'account_b'两个账号
-tg-signer webgui --auth-code averycomplexcode  # 启动一个WebGUI
+tg-signer-plus run
+tg-signer-plus run my_sign  # 不询问，直接运行'my_sign'任务
+tg-signer-plus run-once my_sign  # 直接运行一次'my_sign'任务
+tg-signer-plus list-folders  # 列出 Telegram 普通 Folder 的 ID、名称和显式对话数量
+tg-signer-plus login --from-folder Sign  # 登录账号并从 Sign Folder 发现对话
+tg-signer-plus run --from-folder Sign my_sign  # 从 Sign Folder 发现对话后运行任务
+tg-signer-plus list-sign-records linuxdo -n 5  # 查看任务 linuxdo 最近 5 条签到记录
+tg-signer-plus migrate-sign-records  # 将.signer/signs 下的签到记录迁移到 SQLite
+tg-signer-plus send-text 8671234001 /test  # 向chat_id为'8671234001'的聊天发送'/test'文本
+tg-signer-plus send-text @neo /test  # 向username为'@neo'的聊天发送'/test'文本
+tg-signer-plus send-text --message-thread-id 1 -- -1003763902761 checkin  # 发送到群组话题(message_thread_id=1)
+tg-signer-plus send-text -- -10006758812 浇水  # 对于负数需要使用POSIX风格，在短横线'-'前方加上'--'
+tg-signer-plus send-text --delete-after 1 8671234001 /test  # 向chat_id为'8671234001'的聊天发送'/test'文本, 并在1秒后删除发送的消息
+tg-signer-plus list-members --chat_id -1001680975844 --admin  # 列出频道的管理员
+tg-signer-plus list-topics --chat_id -1003763902761 --limit 50  # 列出群组话题及message_thread_id
+tg-signer-plus schedule-messages --crontab '0 0 * * *' --next-times 10 -- -1001680975844 你好  # 在未来10天的每天0点向'-1001680975844'发送消息
+tg-signer-plus schedule-messages --crontab '0 0 * * *' --next-times 3 --message-thread-id 1 -- -1003763902761 你好  # 配置群组话题的定时消息
+tg-signer-plus automation init my_auto  # 初始化自动化模板
+tg-signer-plus automation run my_auto  # 运行自动化任务
+tg-signer-plus monitor run  # 配置个人、群组、频道消息监控与自动回复
+tg-signer-plus multi-run -a account_a -a account_b same_task  # 使用'same_task'的配置同时运行'account_a'和'account_b'两个账号
+tg-signer-plus webgui --auth-code averycomplexcode  # 启动一个WebGUI
 ```
 
 ### 自动化规则（automation）
 
-推荐使用 `tg-signer automation` 统一管理自动化规则（覆盖 monitor 能力）。
+推荐使用 `tg-signer-plus automation` 统一管理自动化规则（覆盖 monitor 能力）。
 
 ```sh
-tg-signer automation init my_auto
+tg-signer-plus automation init my_auto
 # 编辑 .signer/automations/my_auto/config.json
-tg-signer automation run my_auto
+tg-signer-plus automation run my_auto
 ```
 
 更多详细使用说明与示例见：`docs/automation_usage.md`
 
 ### 配置代理（如有需要）
 
-`tg-signer`不读取系统代理，可以使用环境变量 `TG_PROXY`或命令参数`--proxy`进行配置
+`tg-signer-plus`不读取系统代理，可以使用环境变量 `TG_PROXY`或命令参数`--proxy`进行配置
 
 例如：
 
@@ -159,7 +194,7 @@ export TG_PROXY=socks5://127.0.0.1:7890
 ### 登录
 
 ```sh
-tg-signer login
+tg-signer-plus login
 ```
 
 根据提示输入手机号码和验证码进行登录并获取最近的聊天列表，确保你想要签到的聊天在列表内。
@@ -169,10 +204,10 @@ tg-signer login
 如果目标对话不在最近列表中，可以在 Telegram 新建一个普通 Folder，手动把目标对话加入其中，然后按名称或 ID 加载：
 
 ```sh
-tg-signer list-folders
-tg-signer login --from-folder Sign
+tg-signer-plus list-folders
+tg-signer-plus login --from-folder Sign
 # 名称重复时使用 ID
-tg-signer login --from-folder 2
+tg-signer-plus login --from-folder 2
 ```
 
 `--from-folder` 表示“从 Folder 发现对话”，也适用于 `run`、`run-once`、`multi-run`、`automation run` 和 `monitor run`。指定后会加载 Folder 中所有手动加入或置顶的对话，`--num-of-dialogs` 不再生效。当前不支持按联系人、非联系人、机器人、群组或频道等动态规则生成成员的 Folder；请使用只包含手动添加对话的普通 Folder。
@@ -190,7 +225,7 @@ tg-signer login --from-folder 2
 ### 获取群组话题 ID
 
 ```sh
-tg-signer list-topics --chat_id -1003763902761
+tg-signer-plus list-topics --chat_id -1003763902761
 ```
 
 会输出该论坛群组可见话题的 `message_thread_id`、标题及状态，便于配置签到到指定话题。
@@ -198,20 +233,20 @@ tg-signer list-topics --chat_id -1003763902761
 ### 发送一次消息
 
 ```sh
-tg-signer send-text 8671234001 hello  # 向chat_id为'8671234001'的聊天发送'hello'文本
-tg-signer send-text @neo hello  # 向username为'@neo'的聊天发送'hello'文本
+tg-signer-plus send-text 8671234001 hello  # 向chat_id为'8671234001'的聊天发送'hello'文本
+tg-signer-plus send-text @neo hello  # 向username为'@neo'的聊天发送'hello'文本
 ```
 
 ### 运行签到任务
 
 ```sh
-tg-signer run
+tg-signer-plus run
 ```
 
 或预先执行任务名：
 
 ```sh
-tg-signer run linuxdo
+tg-signer-plus run linuxdo
 ```
 
 根据提示进行配置即可。
@@ -275,10 +310,10 @@ tg-signer run linuxdo
 ```
 
 ### 配置与运行监控
-说明：monitor 为 legacy 功能，推荐使用 `tg-signer automation` 统一管理自动化规则。
+说明：monitor 为 legacy 功能，推荐使用 `tg-signer-plus automation` 统一管理自动化规则。
 
 ```sh
-tg-signer monitor run my_monitor
+tg-signer-plus monitor run my_monitor
 ```
 
 根据提示进行配置。
