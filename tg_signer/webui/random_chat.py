@@ -13,10 +13,12 @@ from tg_signer.core import get_client
 from tg_signer.webui.data import load_user_infos
 from tg_signer.webui.phrases import PHRASES
 
-# 跨浏览器刷新仍可控制的运行中引擎：{workdir:task_id -> engine}
+# 跨浏览器刷新仍可控制的运行中引擎：{workdir|task_id -> engine}
 _GLOBAL_ENGINES: Dict[str, "RandomChatEngine"] = {}
-# 跨浏览器刷新保留的共用日志缓冲：{workdir -> [line, ...]}
+# 跨浏览器刷新保留的共用日志缓冲：{workdir -> [line, ...]}，页面通过定时器增量拉取
 _GLOBAL_LOGS: Dict[str, List[str]] = {}
+# 跨浏览器刷新可用的任务状态回调：{workdir|task_id -> set_status(bool)}
+_GLOBAL_STATUS_CBS: Dict[str, Callable[[bool], None]] = {}
 
 _TASKS_FILE = "random_chat_tasks.json"
 
@@ -101,7 +103,10 @@ def parse_chat_id(raw) -> Optional[Union[int, str]]:
 
 
 class RandomChatEngine:
-    """后台随机发言任务：每 interval 秒随机挑选一个账号发送一条随机语料"""
+    """后台随机发言任务：每个账号各自按间隔发送随机语料"""
+
+    # 连接阶段的超时秒数，避免代理异常时卡住无法停止
+    CONNECT_TIMEOUT = 30
 
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
@@ -136,40 +141,104 @@ class RandomChatEngine:
         return True
 
     async def stop(self) -> None:
+        """立即返回，不阻塞界面；发送循环可能在网络请求中卡住，由后台任务收尾"""
         if self._stop is not None:
             self._stop.set()
-        if self._task is not None:
-            try:
-                await self._task
-            except Exception:
-                pass
+        task = self._task
+        if task is None:
+            return
+        asyncio.create_task(self._finalize(task))
+
+    async def _finalize(self, task: asyncio.Task) -> None:
+        try:
+            await task
+        except Exception:
+            pass
+        if self._task is task:
             self._task = None
 
-    async def _delete_later(self, message, delay: int, log, account, text) -> None:
+    async def _delete_later(
+        self, message, delay, log, account, text, chat_label, undelivered
+    ) -> None:
         """消息发出 delay 秒后撤回"""
         try:
             await asyncio.sleep(delay)
-            chat = getattr(message, "chat", None)
-            title = getattr(chat, "title", None)
-            cid = getattr(chat, "id", "?")
-            target = f"{title} ({cid})" if title else str(cid)
             await message.delete()
-            log(f"{datetime.now():%H:%M:%S} [已删除] {account} -> {target}: {text}")
+            undelivered.discard(message.id)
+            log(f"{datetime.now():%H:%M:%S} [已删除] {account} -> {chat_label}: {text}")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log(f"{datetime.now():%H:%M:%S} [删除失败] {account}: {exc}")
 
+    async def _account_loop(
+        self, client, account, chat_id, interval, log, delete_after, total_count
+    ) -> None:
+        """单个账号的发送循环：每条间隔 interval + 随机 0~3 秒"""
+        pending_deletes: set = set()
+        undelivered: set = set()
+        sent = 0
+        try:
+            while not self._stop.is_set():
+                if total_count and sent >= total_count:
+                    break
+                text = random.choice(PHRASES)
+                try:
+                    message = await client.send_message(chat_id, text)
+                    sent += 1
+                    undelivered.add(message.id)
+                    done = f"{sent}/{total_count}" if total_count else str(sent)
+                    chat_title = getattr(getattr(message, "chat", None), "title", None)
+                    target = chat_title or str(chat_id)
+                    log(
+                        f"{datetime.now():%H:%M:%S} [成功] {account}({done}) -> {target}: {text}"
+                    )
+                    if delete_after:
+                        task = asyncio.create_task(
+                            self._delete_later(
+                                message,
+                                delete_after,
+                                log,
+                                account,
+                                text,
+                                target,
+                                undelivered,
+                            )
+                        )
+                        pending_deletes.add(task)
+                        task.add_done_callback(pending_deletes.discard)
+                except Exception as exc:
+                    log(f"{datetime.now():%H:%M:%S} [失败] {account}: {exc}")
+                try:
+                    await asyncio.wait_for(
+                        self._stop.wait(),
+                        timeout=interval + random.uniform(0, 3),
+                    )
+                except TimeoutError:
+                    pass
+        finally:
+            # 停止发送后，已发出的消息不立即撤回，仍按设定的删除延迟依次自动删除
+            if self._stop.is_set() and undelivered:
+                log(
+                    f"{datetime.now():%H:%M:%S} [停止] {account} 停止发送，"
+                    f"剩余 {len(undelivered)} 条将按 {delete_after}s 延迟自动删除"
+                )
+            if pending_deletes:
+                await asyncio.gather(*pending_deletes, return_exceptions=True)
+
     async def _loop(
         self, accounts, chat_id, interval, session_dir, log, delete_after, total_count
     ) -> None:
         clients = {}
-        pending_deletes: set = set()
-        sent_by_account: Dict[str, int] = {}
         for account in accounts:
+            if self._stop.is_set():
+                break
+            client = None
             try:
                 client = get_client(account, workdir=str(session_dir))
-                is_authorized = await client.connect()
+                is_authorized = await asyncio.wait_for(
+                    client.connect(), timeout=self.CONNECT_TIMEOUT
+                )
                 if not is_authorized:
                     log(f"「{account}」会话未授权，已跳过（请先用 CLI 登录该账号）")
                     try:
@@ -177,70 +246,49 @@ class RandomChatEngine:
                     except Exception:
                         pass
                     continue
-                me = await client.get_me()
+                if self._stop.is_set():
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    break
+                me = await asyncio.wait_for(
+                    client.get_me(), timeout=self.CONNECT_TIMEOUT
+                )
                 nickname = getattr(me, "first_name", "") or ""
                 clients[account] = client
-                sent_by_account[account] = 0
                 log(f"「{account}」已连接（{nickname}）")
+            except asyncio.TimeoutError:
+                log(f"「{account}」连接超时（网络或代理异常），已跳过")
+                if client is not None:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
             except Exception as exc:
                 log(f"「{account}」连接失败: {exc}")
         if not clients:
             log("没有可用账号，任务结束")
             return
-        log(f"开始随机发言：{len(clients)} 个账号 -> {chat_id}，每 {interval} 秒一条")
+        count_label = f"每账号 {total_count} 条" if total_count else "不限条数"
+        log(
+            f"开始随机发言：{len(clients)} 个账号 -> {chat_id}，"
+            f"每账号独立计时，间隔 {interval}~{interval + 3} 秒，{count_label}"
+        )
         try:
-            while not self._stop.is_set():
-                if total_count:
-                    remaining = [
-                        a for a, c in sent_by_account.items() if c < total_count
-                    ]
-                else:
-                    remaining = list(clients)
-                if not remaining:
-                    break
-                account = random.choice(remaining)
-                text = random.choice(PHRASES)
-                try:
-                    message = await clients[account].send_message(chat_id, text)
-                    sent_by_account[account] += 1
-                    done = (
-                        f"{sent_by_account[account]}/{total_count}"
-                        if total_count
-                        else str(sent_by_account[account])
+            await asyncio.gather(
+                *[
+                    self._account_loop(
+                        client, account, chat_id, interval, log, delete_after, total_count
                     )
-                    chat_title = getattr(getattr(message, "chat", None), "title", None)
-                    target = f"{chat_title} ({chat_id})" if chat_title else str(chat_id)
-                    log(
-                        f"{datetime.now():%H:%M:%S} [成功] {account}({done}) -> {target}: {text}"
-                    )
-                    if delete_after:
-                        task = asyncio.create_task(
-                            self._delete_later(
-                                message, delete_after, log, account, text
-                            )
-                        )
-                        pending_deletes.add(task)
-                        task.add_done_callback(pending_deletes.discard)
-                    if total_count and all(
-                        c >= total_count for c in sent_by_account.values()
-                    ):
-                        summary = ", ".join(
-                            f"{a}:{c}" for a, c in sorted(sent_by_account.items())
-                        )
-                        log(f"每个账号均已发满 {total_count} 条（{summary}），任务完成")
-                        break
-                except Exception as exc:
-                    log(f"{datetime.now():%H:%M:%S} [失败] {account}: {exc}")
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=interval)
-                except TimeoutError:
-                    pass
+                    for account, client in clients.items()
+                ]
+            )
+            if total_count:
+                summary = ", ".join(f"{a}:{total_count}" for a in sorted(clients))
+                log(f"每个账号均已发满 {total_count} 条（{summary}），任务完成")
         finally:
-            for task in pending_deletes:
-                task.cancel()
-            if pending_deletes:
-                await asyncio.gather(*pending_deletes, return_exceptions=True)
-            for account, client in clients.items():
+            for client in clients.values():
                 try:
                     await client.disconnect()
                 except Exception:
@@ -288,15 +336,10 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
 
     def make_log(name: str) -> Callable[[str], None]:
         def _log(msg: str) -> None:
-            line = f"[#{name}] {msg}"
             buf = _GLOBAL_LOGS.setdefault(wd_key, [])
-            buf.append(line)
+            buf.append(f"[#{name}] {msg}")
             if len(buf) > 300:
                 del buf[:-300]
-            try:
-                send_log.push(line)
-            except Exception:
-                pass
 
         return _log
 
@@ -326,6 +369,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             return
         tasks.pop(name, None)
         _GLOBAL_ENGINES.pop(engine_key(name), None)
+        _GLOBAL_STATUS_CBS.pop(engine_key(name), None)
         _persist()
         render_tasks()
 
@@ -362,7 +406,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 )
                 return
         def _on_finish(_n: str = name) -> None:
-            cb = tasks.get(_n, {}).get("_set_status")
+            cb = _GLOBAL_STATUS_CBS.get(engine_key(_n)) or tasks.get(_n, {}).get(
+                "_set_status"
+            )
             if cb is not None:
                 _apply_status(cb, False)
 
@@ -380,6 +426,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         if started:
             set_status(True)
             ui.notify(f"任务 #{name} 已启动", type="positive")
+        else:
+            ui.notify(f"任务 #{name} 正在运行或收尾中，请稍后再试", type="warning")
 
     async def stop_task(name: str, set_status: Callable[[bool], None]) -> None:
         engine = get_engine(name)
@@ -480,6 +528,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                         )
                         stop_btn.on_click(lambda n=name, s=set_status: stop_task(n, s))
                         tasks[name]["_set_status"] = set_status
+                        _GLOBAL_STATUS_CBS[engine_key(name)] = set_status
 
     with ui.card().classes("w-full shadow-md"):
         ui.label("随机发言").classes("text-lg font-semibold")
@@ -534,11 +583,39 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         ui.separator()
         ui.label("共用日志（所有任务）").classes("font-semibold")
         send_log = ui.log(max_lines=300).classes("w-full h-40")
-        for line in _GLOBAL_LOGS.get(wd_key, []):
+        log_buf = _GLOBAL_LOGS.setdefault(wd_key, [])
+        _seen = {"n": len(log_buf)}
+
+        for line in log_buf:
             try:
                 send_log.push(line)
             except Exception:
                 pass
+
+        client = ui.context.client
+
+        async def _poll_loop() -> None:
+            while True:
+                await asyncio.sleep(1.0)
+                if not client.has_socket_connection:
+                    return
+                if _seen["n"] > len(log_buf):
+                    _seen["n"] = len(log_buf)
+                new_lines = log_buf[_seen["n"]:]
+                if not new_lines:
+                    continue
+                _seen["n"] = len(log_buf)
+                try:
+                    with client:
+                        for line in new_lines:
+                            try:
+                                send_log.push(line)
+                            except Exception:
+                                pass
+                except Exception:
+                    return
+
+        asyncio.create_task(_poll_loop())
 
     refresh_options()
     render_tasks()

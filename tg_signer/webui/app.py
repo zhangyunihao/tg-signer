@@ -364,7 +364,7 @@ class TaskRunnerBlock:
         with ui.card().classes("w-full shadow-md"):
             ui.label("执行任务").classes("text-lg font-semibold")
             ui.label(
-                "点击「新增任务」在弹窗中选择任务类型、任务与账号；运行中的任务可在下方历史列表中停止。"
+                "点击「新增任务」在弹窗中选择任务类型、任务与账号；历史列表可「复制」任意历史任务的参数快速新建，运行中的任务可停止。"
             ).classes("text-sm text-gray-500")
 
             with ui.row().classes("gap-2 items-center"):
@@ -440,15 +440,18 @@ class TaskRunnerBlock:
                 "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
                 "{{ props.row.status }}</q-badge></q-td>",
             )
-            # 操作列：仅运行中的任务显示「停止」按钮，点击后回传整行数据
+            # 操作列：所有行显示「复制」（用该行参数打开新增弹窗），运行中的行额外显示「停止」
             self.history_table.add_slot(
                 "body-cell-actions",
                 '<q-td :props="props">'
+                '<q-btn flat dense color="primary" '
+                'label="复制" @click="$parent.$emit(\'duplicateTask\', props.row)" />'
                 '<q-btn v-if="props.row.status === \'运行中\'" flat dense color="negative" '
                 'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
                 "</q-td>",
             )
             self.history_table.on("stopTask", self._on_stop_event)
+            self.history_table.on("duplicateTask", self._on_duplicate_event)
 
             self.log_area = ui.scroll_area().classes(
                 "w-full bg-gray-50 rounded-lg border border-gray-200"
@@ -669,6 +672,30 @@ class TaskRunnerBlock:
         row = e.args
         if isinstance(row, dict) and row.get("id"):
             self._stop_run(str(row["id"]))
+
+    def _on_duplicate_event(self, e) -> None:
+        """用历史行的参数打开「新增任务」弹窗"""
+        row = e.args
+        if not isinstance(row, dict):
+            return
+        if row.get("type") in self.TASK_TYPES:
+            self.type_select.value = row["type"]
+            self.type_select.update()
+        self._on_type_change()
+        task = row.get("task") or ""
+        if task:
+            if task not in self.task_select.options:
+                self.task_select.options = list(self.task_select.options) + [task]
+            self.task_select.value = task
+            self.task_select.update()
+        accounts = [a.strip() for a in (row.get("accounts") or "").split(",") if a.strip()]
+        if accounts:
+            self._refresh_accounts()
+            valid = [a for a in accounts if a in (self.account_select.options or [])]
+            self.account_select.value = valid or accounts
+            self.account_select.update()
+        self.dialog.open()
+        ui.notify("已复制任务参数，可调整后点击「执行」", type="positive")
 
     def _stop_run(self, record_id: str) -> None:
         run = self.runs.get(record_id)
