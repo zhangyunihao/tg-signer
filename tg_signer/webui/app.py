@@ -29,6 +29,7 @@ from tg_signer.webui.data import (
     save_config,
 )
 from tg_signer.webui.interactive import InteractiveSignerConfig
+from tg_signer.webui.auto_leave import auto_leave_block
 from tg_signer.webui.random_chat import random_chat_block
 from tg_signer.webui.schema_utils import clean_schema
 
@@ -1133,9 +1134,10 @@ def _build_dashboard(container) -> None:
         with ui.tabs().classes("w-full").props("align=left") as tabs:
             tab_run = ui.tab("run", "执行任务")
             tab_random = ui.tab("random", "随机发言")
+            tab_leave = ui.tab("leave", "自动退群")
             tab_configs = ui.tab("configs", "配置管理")
 
-        valid_tabs = {"run", "random", "configs"}
+        valid_tabs = {"run", "random", "leave", "configs"}
 
         def _tab_name(value) -> str:
             if isinstance(value, str):
@@ -1165,6 +1167,12 @@ def _build_dashboard(container) -> None:
                     "多账号随机发言：选择账号与目标群组，按固定间隔从内置语库随机发送消息。"
                 ).classes("text-gray-600")
                 refreshers.append(random_chat_block(state.workdir))
+
+            with ui.tab_panel(tab_leave):
+                ui.label(
+                    "扫描账号对话，批量退出超过指定天数未更新的频道（可预览确认后再执行）。"
+                ).classes("text-gray-600")
+                refreshers.append(auto_leave_block(state.workdir))
 
             with ui.tab_panel(tab_configs):
                 ui.label(
