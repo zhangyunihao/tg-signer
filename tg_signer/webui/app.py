@@ -1061,9 +1061,8 @@ def _build_dashboard(container) -> None:
             ui.label("TG Signer Web 控制台").classes(
                 "text-2xl font-semibold tracking-wide"
             )
-            settings_btn = (
-                ui.button(icon="settings").props("flat round").tooltip("设置")
-            )
+            # 右上角菜单按钮（下拉项在对话框定义后填充）
+            header_btn = ui.button("菜单").props("flat dense")
 
         refreshers: list[Callable[[], None]] = []
         refresh_records: "SignRecordBlock"
@@ -1105,7 +1104,7 @@ def _build_dashboard(container) -> None:
 
         def open_settings() -> None:
             with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
-                ui.label("设置").classes("text-lg font-semibold")
+                ui.label("工作目录").classes("text-lg font-semibold")
                 workdir_input = ui.input(
                     label="工作目录",
                     value=str(state.workdir),
@@ -1123,16 +1122,15 @@ def _build_dashboard(container) -> None:
                     )
             dialog.open()
 
-        with settings_btn:
-            menu = ui.menu().props("no-parent-event")
-            ui.menu_item("设置", on_click=open_settings)
-            ui.menu_item("用户信息", on_click=users_dialog.open)
-            ui.menu_item("签到记录", on_click=records_dialog.open)
-            ui.menu_item("日志", on_click=logs_dialog.open)
-        # 悬停齿轮按钮即展开菜单（点击外部或菜单项后关闭）
-        settings_btn.on("mouseenter", handler=menu.open)
+        # 「菜单」按钮的下拉项（点击按钮展开）
+        with header_btn:
+            with ui.menu():
+                ui.menu_item("工作目录", on_click=open_settings)
+                ui.menu_item("用户信息", on_click=users_dialog.open)
+                ui.menu_item("签到记录", on_click=records_dialog.open)
+                ui.menu_item("日志", on_click=logs_dialog.open)
 
-        with ui.tabs().classes("w-full") as tabs:
+        with ui.tabs().classes("w-full").props("align=left") as tabs:
             tab_run = ui.tab("run", "执行任务")
             tab_random = ui.tab("random", "随机发言")
             tab_configs = ui.tab("configs", "配置管理")

@@ -219,10 +219,16 @@ class RandomChatEngine:
         finally:
             # 停止发送后，已发出的消息不立即撤回，仍按设定的删除延迟依次自动删除
             if self._stop.is_set() and undelivered:
-                log(
-                    f"{datetime.now():%H:%M:%S} [停止] {account} 停止发送，"
-                    f"剩余 {len(undelivered)} 条将按 {delete_after}s 延迟自动删除"
-                )
+                if delete_after:
+                    log(
+                        f"{datetime.now():%H:%M:%S} [停止] {account} 停止发送，"
+                        f"剩余 {len(undelivered)} 条将按 {delete_after}s 延迟自动删除"
+                    )
+                else:
+                    log(
+                        f"{datetime.now():%H:%M:%S} [停止] {account} 停止发送，"
+                        f"已发送的 {len(undelivered)} 条不删除"
+                    )
             if pending_deletes:
                 await asyncio.gather(*pending_deletes, return_exceptions=True)
 
@@ -456,7 +462,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             "accounts": accounts,
             "chat_id": chat_id,
             "interval": max(1, int(interval_input.value or 5)),
-            "delete_after": max(1, int(delete_input.value or 20)),
+            # 0 或留空 = 不删除
+            "delete_after": max(0, int(delete_input.value or 0)),
             "total_count": max(
                 0, int(total_input.value if total_input.value is not None else 50)
             ),
@@ -517,9 +524,12 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                             except Exception:
                                 pass
 
+                        del_label = (
+                            f"{cfg['delete_after']}s" if cfg["delete_after"] else "不删除"
+                        )
                         ui.label(
                             f"#{name} | {len(cfg['accounts'])} 账号 → {chat_display(cfg['chat_id'])} | 间隔 "
-                            f"{cfg['interval']}s | 删除延迟 {cfg['delete_after']}s | "
+                            f"{cfg['interval']}s | 删除延迟 {del_label} | "
                             f"每账号 {cfg['total_count'] or '不限'} 条"
                         ).classes("text-sm text-gray-500 flex-1 min-w-[280px]")
 
@@ -533,7 +543,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
     with ui.card().classes("w-full shadow-md"):
         ui.label("随机发言").classes("text-lg font-semibold")
         ui.label(
-            f"从内置 {len(PHRASES)} 条语库中随机选一句，由所选账号发送到目标群组，发送后在指定秒数自动删除。支持添加多个任务并行运行。"
+            f"从内置 {len(PHRASES)} 条语库中随机选一句，由所选账号发送到目标群组，发送后可在指定秒数自动删除（删除延迟填 0 或留空则不删除）。支持添加多个任务并行运行。"
         ).classes("text-sm text-gray-500")
 
         ui.label("新增任务").classes("font-semibold mt-1")
@@ -565,7 +575,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 label="发送间隔（秒）", value=5, min=1, max=3600, format="%d"
             ).classes("w-36")
             delete_input = ui.number(
-                label="删除延迟（秒）", value=20, min=1, max=86400, format="%d"
+                label="删除延迟（秒，0或空=不删除）", value=20, min=0, max=86400, format="%d"
             ).classes("w-36")
             total_input = ui.number(
                 label="每账号发送条数（0=不限）", value=50, min=0, max=1000000, format="%d"
