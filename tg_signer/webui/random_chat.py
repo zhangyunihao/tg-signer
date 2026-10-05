@@ -3,6 +3,7 @@
 import asyncio
 import json
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Union
@@ -10,7 +11,7 @@ from typing import Callable, Dict, List, Optional, Union
 from nicegui import ui
 
 from tg_signer.core import get_client
-from tg_signer.webui.data import load_user_infos
+from tg_signer.webui.data import load_disabled_accounts, load_user_infos
 from tg_signer.webui.phrases import PHRASES
 
 # 跨浏览器刷新仍可控制的运行中引擎：{workdir|task_id -> engine}
@@ -23,12 +24,15 @@ _GLOBAL_STATUS_CBS: Dict[str, Callable[[bool], None]] = {}
 _TASKS_FILE = "random_chat_tasks.json"
 
 
-def list_session_names(session_dir: Union[Path, str]) -> List[str]:
-    """列出会话目录下所有 .session 文件对应的账号名"""
+def list_session_names(
+    session_dir: Union[Path, str], workdir=None
+) -> List[str]:
+    """列出会话目录下所有 .session 文件对应的账号名（排除停用账户）"""
     base = Path(session_dir)
     if not base.is_dir():
         return []
-    return sorted(p.stem for p in base.glob("*.session"))
+    disabled = load_disabled_accounts(workdir)
+    return sorted(p.stem for p in base.glob("*.session") if p.stem not in disabled)
 
 
 def list_known_chats(workdir) -> Dict[str, str]:
@@ -64,6 +68,144 @@ def chat_titles(workdir) -> Dict[str, str]:
     return mapping
 
 
+async def update_account_chats(
+    account: str,
+    session_dir: Union[Path, str],
+    workdir,
+    log: Callable[[str], None],
+) -> int:
+    """连接 Telegram 拉取该账号最近对话并写入 users/<id>/latest_chats.json，返回对话数（失败返回 -1）"""
+    client = None
+    try:
+        client = get_client(account, workdir=str(session_dir))
+        ok = await asyncio.wait_for(client.connect(), 30)
+        if not ok:
+            log(f"[{account}] 会话未授权，跳过")
+            return -1
+        me = await asyncio.wait_for(client.get_me(), 30)
+        chats = []
+        async for dialog in client.get_dialogs(limit=200):
+            chats.append(dialog.chat)
+        latest = [
+            {
+                "id": c.id,
+                "title": c.title,
+                "type": str(c.type).replace("ChatType.", ""),
+                "username": c.username,
+                "first_name": c.first_name,
+                "last_name": c.last_name,
+            }
+            for c in chats
+        ]
+        user_dir = Path(workdir) / "users" / str(me.id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+        with open(user_dir / "latest_chats.json", "w", encoding="utf-8") as fp:
+            json.dump(latest, fp, indent=4, ensure_ascii=False)
+        me_file = user_dir / "me.json"
+        if not me_file.is_file():
+            me_file.write_text(str(me), encoding="utf-8")
+        log(f"[{account}] 已更新 {len(latest)} 个对话")
+        return len(latest)
+    except asyncio.TimeoutError:
+        log(f"[{account}] 连接超时（30s），跳过")
+        return -1
+    except Exception as exc:
+        log(f"[{account}] 更新失败: {exc}")
+        return -1
+    finally:
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+# 账户授权状态懒检测缓存：{"<session_dir>|<account>": bool}
+_AUTHZ_CACHE: Dict[str, bool] = {}
+_AUTHZ_PENDING: set = set()
+_AUTHZ_TASK: Dict[str, Optional[asyncio.Task]] = {"task": None}
+
+
+async def _check_account_authorized(account: str, session_dir: Path) -> Optional[bool]:
+    """连接一次判断会话授权状态。
+
+    返回 True（已授权）/ False（连接成功但确认无 auth_key）；
+    网络异常、超时、数据库占用等一律返回 None（不缓存，下次刷新重试）。
+    """
+    client = None
+    try:
+        client = get_client(account, workdir=str(session_dir))
+        ok = await asyncio.wait_for(client.connect(), 15)
+        return bool(ok)
+    except Exception:
+        return None
+    finally:
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            from tg_signer.core import _CLIENT_INSTANCES
+
+            _CLIENT_INSTANCES.pop(
+                str(Path(session_dir).joinpath(account).resolve()), None
+            )
+
+
+def authz_cached(session_dir: Path, account: str) -> Optional[bool]:
+    """返回缓存的授权状态：True/False 已知，None 未检测"""
+    return _AUTHZ_CACHE.get(f"{session_dir}|{account}")
+
+
+def build_account_options(session_dir: Path, names: List[str]) -> Dict[str, str]:
+    """把账号列表转成下拉选项。NiceGUI 字典选项格式为 {值: 显示名}，未授权的加 ⚠️ 标注"""
+    opts: Dict[str, str] = {}
+    for n in names:
+        cached = authz_cached(session_dir, n)
+        opts[n] = f"{n} ⚠️未授权" if cached is False else n
+    return opts
+
+
+def schedule_auth_checks(
+    session_dir: Path, names: List[str], on_done: Optional[Callable[[], None]] = None
+) -> None:
+    """后台逐个检测未缓存账户的授权状态，完成后回调 on_done 刷新标注"""
+    session_key = str(session_dir)
+    todo = [
+        n
+        for n in names
+        if f"{session_key}|{n}" not in _AUTHZ_CACHE
+        and f"{session_key}|{n}" not in _AUTHZ_PENDING
+    ]
+
+    async def _run() -> None:
+        try:
+            for n in todo:
+                key = f"{session_key}|{n}"
+                _AUTHZ_PENDING.add(key)
+                try:
+                    result = await _check_account_authorized(n, session_dir)
+                    # None = 检测失败（网络/占用等），不缓存，下次刷新会重试
+                    if result is not None:
+                        _AUTHZ_CACHE[key] = result
+                finally:
+                    _AUTHZ_PENDING.discard(key)
+        except Exception:
+            pass
+        finally:
+            if on_done is not None:
+                try:
+                    on_done()
+                except Exception:
+                    pass
+
+    if not todo:
+        if on_done is not None:
+            _AUTHZ_TASK["task"] = asyncio.create_task(_run())
+        return
+    _AUTHZ_TASK["task"] = asyncio.create_task(_run())
+
+
 def _store_path(workdir) -> Path:
     return Path(workdir) / _TASKS_FILE
 
@@ -96,6 +238,10 @@ def parse_chat_id(raw) -> Optional[Union[int, str]]:
     text = (raw or "").strip()
     if not text:
         return None
+    # 兼容最近聊天标签格式「名称 (id)」，直接提取 id
+    m = re.search(r"\((-?\d+)\)\s*$", text)
+    if m:
+        return int(m.group(1))
     try:
         return int(text)
     except ValueError:
@@ -111,10 +257,23 @@ class RandomChatEngine:
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
         self._stop: Optional[asyncio.Event] = None
+        # 运行进度：{account: 已发送条数}，供任务表格状态列展示
+        self.progress: Dict[str, int] = {}
+        self._total_accounts: int = 0
+        self._total_count: int = 0
 
     @property
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    def progress_text(self) -> Optional[str]:
+        """运行中返回带进度的状态文本（如 "运行中 (18/100)"），未运行返回 None"""
+        if not self.running:
+            return None
+        sent = sum(self.progress.values())
+        if self._total_count and self._total_accounts:
+            return f"运行中 ({sent}/{self._total_count * self._total_accounts})"
+        return f"运行中 (已发{sent}条)"
 
     async def start(
         self,
@@ -130,6 +289,9 @@ class RandomChatEngine:
         if self.running:
             log("任务已在运行中")
             return False
+        self.progress = {}
+        self._total_accounts = len(accounts)
+        self._total_count = total_count
         self._stop = asyncio.Event()
         self._task = asyncio.create_task(
             self._loop(
@@ -186,6 +348,7 @@ class RandomChatEngine:
                 try:
                     message = await client.send_message(chat_id, text)
                     sent += 1
+                    self.progress[account] = sent
                     undelivered.add(message.id)
                     done = f"{sent}/{total_count}" if total_count else str(sent)
                     chat_title = getattr(getattr(message, "chat", None), "title", None)
@@ -307,8 +470,21 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
     wd_key = str(Path(workdir).resolve())
     store = load_task_store(workdir)
     tasks: Dict[str, dict] = dict(store["tasks"])
+    # 修复历史 bug：账号值曾被写入「⚠️未授权」标签后缀，加载时统一清理
+    for cfg in tasks.values():
+        if isinstance(cfg.get("accounts"), list):
+            cleaned = [str(a).replace(" ⚠️未授权", "") for a in cfg["accounts"]]
+            if cleaned != cfg["accounts"]:
+                cfg["accounts"] = cleaned
+    store["tasks"] = {
+        name: {k: v for k, v in cfg.items() if not k.startswith("_")}
+        for name, cfg in tasks.items()
+    }
+    save_task_store(workdir, store)
     chat_options_map: Dict[str, str] = {}
     chat_title_map: Dict[str, str] = {}
+    # 当前渲染的任务表格引用，供轮询循环更新进度状态列
+    table_ref: Dict[str, object] = {"table": None}
 
     def _persist() -> None:
         clean = {}
@@ -349,10 +525,18 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
 
         return _log
 
+    def _set_account_options() -> None:
+        session_dir = Path(session_dir_input.value or ".")
+        names = list_session_names(session_dir, workdir)
+        account_select.options = build_account_options(session_dir, names)
+        account_select.update()
+
     def refresh_options() -> None:
         session_dir = Path(session_dir_input.value or ".")
-        account_select.options = list_session_names(session_dir)
-        account_select.update()
+        _set_account_options()
+        names = list_session_names(session_dir, workdir)
+        # 后台懒检测未授权账户，完成后刷新 ⚠️ 标注
+        schedule_auth_checks(session_dir, names, on_done=_set_account_options)
         chat_options_map.clear()
         chat_options_map.update(list_known_chats(workdir))
         chat_select.options = list(chat_options_map.keys())
@@ -362,12 +546,27 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
 
     def _on_chat_pick(e) -> None:
         value = e.value or ""
-        chat_input.value = chat_options_map.get(value, value)
+        resolved = chat_options_map.get(value, value)
+        chat_input.value = resolved
         chat_input.update()
+        # 调试：确认最近聊天选择事件是否触发及解析结果
+        try:
+            log_buf.append(
+                f"{datetime.now():%H:%M:%S} [调试] 最近聊天选择 value={value!r} "
+                f"解析={resolved!r} map大小={len(chat_options_map)}"
+            )
+        except Exception:
+            pass
 
     def task_running(name: str) -> bool:
         engine = get_engine(name)
         return engine is not None and engine.running
+
+    def _status_text(name: str) -> str:
+        engine = get_engine(name)
+        if engine is None or not engine.running:
+            return "未运行"
+        return engine.progress_text() or "运行中"
 
     def remove_task(name: str) -> None:
         if task_running(name):
@@ -396,7 +595,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             total_input,
         ):
             el.update()
-        ui.notify("已复制任务参数到新增表单，可修改后点击「添加任务」", type="positive")
+        ui.notify("已复制任务参数，可修改后点击「确定添加」", type="positive")
+        add_dlg.open()
 
     async def start_task(name: str, set_status: Callable[[bool], None]) -> None:
         cfg = tasks[name]
@@ -452,7 +652,13 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         if not accounts:
             ui.notify("请至少选择一个账号", type="warning")
             return
-        chat_id = parse_chat_id(chat_input.value)
+        chat_raw = (chat_input.value or "").strip()
+        if not chat_raw and chat_select.value:
+            # 目标群组框为空但最近聊天已选中：直接用下拉选中值（容错回填）
+            chat_raw = str(chat_select.value)
+            chat_input.value = chat_raw
+            chat_input.update()
+        chat_id = parse_chat_id(chat_raw)
         if chat_id is None:
             ui.notify("请填写目标群组 chat_id 或 @username", type="warning")
             return
@@ -472,73 +678,153 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         ensure_engine(name)
         _persist()
         render_tasks()
+        add_dlg.close()
         ui.notify(f"任务 #{name} 已添加，正在启动...", type="positive")
         asyncio.create_task(start_task(name, tasks[name]["_set_status"]))
 
     def render_tasks() -> None:
         task_list_container.clear()
+        table_ref["table"] = None
         with task_list_container:
             if not tasks:
-                ui.label("暂无任务，请在上方添加。").classes("text-sm text-gray-400")
+                ui.label("暂无任务，请点击「添加任务」创建。").classes(
+                    "text-sm text-gray-400"
+                )
                 return
-            for name in list(tasks):
+            columns = [
+                {"name": "name", "label": "任务", "field": "name", "align": "left"},
+                {
+                    "name": "accounts",
+                    "label": "账号",
+                    "field": "accounts",
+                    "align": "left",
+                },
+                {"name": "chat", "label": "群组", "field": "chat", "align": "left"},
+                {
+                    "name": "interval",
+                    "label": "间隔",
+                    "field": "interval",
+                    "align": "left",
+                },
+                {
+                    "name": "delete_after",
+                    "label": "删除延迟",
+                    "field": "delete_after",
+                    "align": "left",
+                },
+                {
+                    "name": "total",
+                    "label": "每账号条数",
+                    "field": "total",
+                    "align": "left",
+                },
+                {
+                    "name": "status",
+                    "label": "状态",
+                    "field": "status",
+                    "align": "left",
+                },
+                {
+                    "name": "actions",
+                    "label": "操作",
+                    "field": "actions",
+                    "align": "left",
+                },
+            ]
+            rows = []
+            for name in sorted(
+                tasks,
+                key=lambda n: int(n) if str(n).isdigit() else 0,
+                reverse=True,
+            ):
                 cfg = tasks[name]
-                is_running = task_running(name)
-                with ui.card().classes("w-full").props("flat bordered"):
-                    with ui.row().classes("w-full items-center gap-3 flex-wrap"):
-                        status_label = ui.label(
-                            "状态：运行中" if is_running else "状态：未运行"
-                        ).classes("text-sm text-gray-600")
-                        start_btn = ui.button("启动", color="primary")
-                        stop_btn = ui.button("停止", color="negative")
-                        if is_running:
-                            start_btn.disable()
-                        else:
-                            stop_btn.disable()
-                        ui.button(
-                            "复制",
-                            color="primary",
-                            on_click=lambda n=name: duplicate_task(n),
-                        ).props("outline")
-                        ui.button(
-                            "删除",
-                            color="negative",
-                            on_click=lambda n=name: remove_task(n),
-                        ).props("outline")
+                rows.append(
+                    {
+                        "name": str(name),
+                        "accounts": ", ".join(cfg["accounts"]),
+                        "chat": chat_display(cfg["chat_id"]),
+                        "interval": f"{cfg['interval']}s",
+                        "delete_after": (
+                            f"{cfg['delete_after']}s" if cfg["delete_after"] else "不删除"
+                        ),
+                        "total": str(cfg["total_count"]) if cfg["total_count"] else "不限",
+                        "status": _status_text(name),
+                    }
+                )
+            table = ui.table(
+                columns=columns,
+                rows=rows,
+                row_key="name",
+                pagination=5,
+            ).classes("w-full").props("flat dense")
+            table_ref["table"] = table
+            # 状态列渲染为彩色徽章：运行中=蓝、未运行=灰（状态文本可能带进度，用 startsWith 匹配）
+            table.add_slot(
+                "body-cell-status",
+                '<q-td :props="props">'
+                '<q-badge :color="props.row.status.startsWith(\'运行中\') ? \'info\' : \'grey-6\'">'
+                "{{ props.row.status }}</q-badge></q-td>",
+            )
+            # 操作列：未运行显示「启动」，运行中显示「停止」，另附「复制」「删除」
+            table.add_slot(
+                "body-cell-actions",
+                '<q-td :props="props">'
+                '<q-btn v-if="!props.row.status.startsWith(\'运行中\')" flat dense color="primary" '
+                'label="启动" @click="$parent.$emit(\'startTask\', props.row)" />'
+                '<q-btn v-if="props.row.status.startsWith(\'运行中\')" flat dense color="negative" '
+                'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
+                '<q-btn flat dense color="primary" '
+                'label="复制" @click="$parent.$emit(\'copyTask\', props.row)" />'
+                '<q-btn flat dense color="negative" '
+                'label="删除" @click="$parent.$emit(\'deleteTask\', props.row)" />'
+                "</q-td>",
+            )
 
-                        def set_status(
-                            running: bool,
-                            _s=status_label,
-                            _start=start_btn,
-                            _stop=stop_btn,
-                        ) -> None:
-                            _s.text = "状态：运行中" if running else "状态：未运行"
+            def make_set_status(n: str) -> Callable[[bool], None]:
+                def _set(running: bool) -> None:
+                    for r in table.rows:
+                        if r["name"] == str(n):
+                            r["status"] = "运行中" if running else "未运行"
                             try:
-                                _s.update()
-                                if running:
-                                    _start.disable()
-                                    _stop.enable()
-                                else:
-                                    _start.enable()
-                                    _stop.disable()
+                                table.update()
                             except Exception:
                                 pass
+                            break
 
-                        del_label = (
-                            f"{cfg['delete_after']}s" if cfg["delete_after"] else "不删除"
-                        )
-                        ui.label(
-                            f"#{name} | {len(cfg['accounts'])} 账号 → {chat_display(cfg['chat_id'])} | 间隔 "
-                            f"{cfg['interval']}s | 删除延迟 {del_label} | "
-                            f"每账号 {cfg['total_count'] or '不限'} 条"
-                        ).classes("text-sm text-gray-500 flex-1 min-w-[280px]")
+                return _set
 
-                        start_btn.on_click(
-                            lambda n=name, s=set_status: start_task(n, s)
-                        )
-                        stop_btn.on_click(lambda n=name, s=set_status: stop_task(n, s))
-                        tasks[name]["_set_status"] = set_status
-                        _GLOBAL_STATUS_CBS[engine_key(name)] = set_status
+            async def on_start_event(e) -> None:
+                row = e.args
+                if isinstance(row, dict):
+                    n = str(row.get("name") or "")
+                    if n in tasks:
+                        await start_task(n, make_set_status(n))
+
+            async def on_stop_event(e) -> None:
+                row = e.args
+                if isinstance(row, dict):
+                    n = str(row.get("name") or "")
+                    if n in tasks:
+                        await stop_task(n, make_set_status(n))
+
+            def on_copy_event(e) -> None:
+                row = e.args
+                if isinstance(row, dict) and row.get("name"):
+                    duplicate_task(str(row["name"]))
+
+            def on_delete_event(e) -> None:
+                row = e.args
+                if isinstance(row, dict) and row.get("name"):
+                    remove_task(str(row["name"]))
+
+            table.on("startTask", on_start_event)
+            table.on("stopTask", on_stop_event)
+            table.on("copyTask", on_copy_event)
+            table.on("deleteTask", on_delete_event)
+            for name in list(tasks):
+                set_status = make_set_status(str(name))
+                tasks[name]["_set_status"] = set_status
+                _GLOBAL_STATUS_CBS[engine_key(name)] = set_status
 
     with ui.card().classes("w-full shadow-md"):
         ui.label("随机发言").classes("text-lg font-semibold")
@@ -546,52 +832,27 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             f"从内置 {len(PHRASES)} 条语库中随机选一句，由所选账号发送到目标群组，发送后可在指定秒数自动删除（删除延迟填 0 或留空则不删除）。支持添加多个任务并行运行。"
         ).classes("text-sm text-gray-500")
 
-        ui.label("新增任务").classes("font-semibold mt-1")
-        with ui.row().classes("items-end w-full gap-3 flex-wrap"):
-            session_dir_input = ui.input(
-                label="会话目录（.session 所在目录）", value=default_session_dir
-            ).classes("w-56")
-            account_select = ui.select(
-                label="选择账号（可多选）",
-                options=[],
-                multiple=True,
-            ).classes("min-w-[260px]").props("use-chips")
-            ui.button("刷新账号/群组", on_click=lambda: refresh_options()).props(
+        # —— 任务列表（置顶） ——
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label("任务列表").classes("font-semibold")
+            ui.button("添加任务", icon="add", on_click=lambda: add_dlg.open()).props(
                 "outline"
             )
-
-        with ui.row().classes("items-end w-full gap-3 flex-wrap"):
-            chat_input = ui.input(
-                label="目标群组（chat_id 或 @username）",
-                placeholder="-1001234567890 或 @groupname",
-            ).classes("min-w-[320px]")
-            chat_select = ui.select(
-                label="或从最近聊天选择",
-                options=[],
-                with_input=True,
-                on_change=_on_chat_pick,
-            ).classes("min-w-[280px]")
-            interval_input = ui.number(
-                label="发送间隔（秒）", value=5, min=1, max=3600, format="%d"
-            ).classes("w-36")
-            delete_input = ui.number(
-                label="删除延迟（秒，0或空=不删除）", value=20, min=0, max=86400, format="%d"
-            ).classes("w-36")
-            total_input = ui.number(
-                label="每账号发送条数（0=不限）", value=50, min=0, max=1000000, format="%d"
-            ).classes("w-48")
-            ui.button("添加任务", color="primary", on_click=on_add_task)
-
-        ui.label(
-            "提示：发送过于频繁可能触发 Telegram 风控，建议间隔不小于 5 秒；同一账号不能同时用于多个运行中的任务。"
-        ).classes("text-xs text-amber-600")
-
-        ui.separator()
-        ui.label("任务列表").classes("font-semibold")
         task_list_container = ui.column().classes("w-full gap-2")
 
+        # —— 共用日志 ——
         ui.separator()
-        ui.label("共用日志（所有任务）").classes("font-semibold")
+
+        def clear_log() -> None:
+            log_buf.clear()
+            _seen["n"] = len(log_buf)
+            send_log.clear()
+
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label("共用日志（所有任务）").classes("font-semibold")
+            ui.button(icon="delete_outline", on_click=clear_log).props(
+                "flat round dense"
+            ).tooltip("清空日志")
         send_log = ui.log(max_lines=300).classes("w-full h-40")
         log_buf = _GLOBAL_LOGS.setdefault(wd_key, [])
         _seen = {"n": len(log_buf)}
@@ -609,6 +870,22 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 await asyncio.sleep(1.0)
                 if not client.has_socket_connection:
                     return
+                # 每秒刷新运行中任务的进度状态列（如 "运行中 (18/100)"）
+                table = table_ref["table"]
+                if table is not None:
+                    try:
+                        changed = False
+                        for r in table.rows:
+                            n = str(r.get("name") or "")
+                            if n in tasks:
+                                new_status = _status_text(n)
+                                if r.get("status") != new_status:
+                                    r["status"] = new_status
+                                    changed = True
+                        if changed:
+                            table.update()
+                    except Exception:
+                        pass
                 if _seen["n"] > len(log_buf):
                     _seen["n"] = len(log_buf)
                 new_lines = log_buf[_seen["n"]:]
@@ -626,6 +903,79 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                     return
 
         asyncio.create_task(_poll_loop())
+
+        # —— 添加任务弹窗 ——
+        with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl"):
+            ui.label("添加任务").classes("text-lg font-semibold")
+            with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+                session_dir_input = ui.input(
+                    label="会话目录（.session 所在目录）", value=default_session_dir
+                ).classes("w-56")
+                account_select = ui.select(
+                    label="选择账号（可多选）",
+                    options=[],
+                    multiple=True,
+                ).classes("min-w-[260px]").props("use-chips")
+                ui.button("刷新账号/群组", on_click=lambda: refresh_options()).props(
+                    "outline"
+                )
+
+                async def update_chats_from_tg() -> None:
+                    accounts = list(account_select.value or [])
+                    if not accounts:
+                        accounts = list_session_names(
+                            Path(session_dir_input.value or "."), workdir
+                        )
+                    if not accounts:
+                        ui.notify("没有可用账号", type="warning")
+                        return
+                    update_btn.disable()
+
+                    def _log(msg: str) -> None:
+                        log_buf.append(f"{datetime.now():%H:%M:%S} {msg}")
+
+                    try:
+                        _log(f"开始从 Telegram 更新 {len(accounts)} 个账号的群组列表...")
+                        for a in accounts:
+                            await update_account_chats(
+                                a, Path(session_dir_input.value or "."), workdir, _log
+                            )
+                        refresh_options()
+                        ui.notify("群组列表已从 Telegram 更新", type="positive")
+                    finally:
+                        update_btn.enable()
+
+                update_btn = ui.button(
+                    "从TG更新群组", on_click=update_chats_from_tg
+                ).props("outline")
+
+            with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+                chat_input = ui.input(
+                    label="目标群组（chat_id 或 @username）",
+                    placeholder="-1001234567890 或 @groupname",
+                ).classes("min-w-[320px]")
+                chat_select = ui.select(
+                    label="或从最近聊天选择",
+                    options=[],
+                    with_input=True,
+                    on_change=_on_chat_pick,
+                ).classes("min-w-[280px]")
+                interval_input = ui.number(
+                    label="发送间隔（秒）", value=5, min=1, max=3600, format="%d"
+                ).classes("w-36")
+                delete_input = ui.number(
+                    label="删除延迟（秒，0或空=不删除）", value=20, min=0, max=86400, format="%d"
+                ).classes("w-36")
+                total_input = ui.number(
+                    label="每账号发送条数（0=不限）", value=50, min=0, max=1000000, format="%d"
+                ).classes("w-48")
+
+            ui.label(
+                "提示：发送过于频繁可能触发 Telegram 风控，建议间隔不小于 5 秒；同一账号不能同时用于多个运行中的任务。"
+            ).classes("text-xs text-amber-600")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("取消", on_click=add_dlg.close).props("flat")
+                ui.button("确定添加", color="primary", on_click=on_add_task)
 
     refresh_options()
     render_tasks()

@@ -10,9 +10,16 @@ from nicegui import ui
 from pyrogram.errors import FloodWait, RPCError
 
 from tg_signer.core import get_client
-from tg_signer.webui.random_chat import list_session_names
+from tg_signer.webui.random_chat import (
+    build_account_options,
+    list_session_names,
+    schedule_auth_checks,
+)
 
 CONFIG_NAME = "auto_leave_config.json"
+
+# 扫描结果默认不勾选的关键字（频道名命中即排除，防止误退）
+UNSELECT_KEYWORDS = ("抽奖", "嫩妹社", "野寻")
 
 
 def _config_path(workdir) -> Path:
@@ -166,10 +173,18 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
 
     def refresh_options() -> None:
         session_dir = Path(session_dir_input.value or ".")
-        names = list_session_names(session_dir)
-        account_select.options = names
+        names = list_session_names(session_dir, workdir)
+        account_select.options = build_account_options(session_dir, names)
         if not account_select.value:
             account_select.value = [a for a in (cfg.get("accounts") or []) if a in names]
+        account_select.update()
+        # 后台懒检测未授权账户，完成后刷新 ⚠️ 标注
+        schedule_auth_checks(session_dir, names, on_done=refresh_marks)
+
+    def refresh_marks() -> None:
+        session_dir = Path(session_dir_input.value or ".")
+        names = list_session_names(session_dir, workdir)
+        account_select.options = build_account_options(session_dir, names)
         account_select.update()
 
     async def set_busy(busy: bool) -> None:
@@ -207,7 +222,22 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             if not rows_all:
                 log("未发现符合条件的对话")
             else:
-                log(f"共 {len(rows_all)} 个候选，勾选后点击「退出所选」")
+                # 默认全选，但名字含敏感关键字的频道不勾选（防误退抽奖/特定频道）
+                default_selected = [
+                    r
+                    for r in rows_all
+                    if not any(kw in str(r.get("title") or "") for kw in UNSELECT_KEYWORDS)
+                ]
+                result_table.selected = default_selected
+                result_table.update()
+                skipped = len(rows_all) - len(default_selected)
+                if skipped:
+                    log(
+                        f"共 {len(rows_all)} 个候选，含「抽奖」的 {skipped} 个已默认不勾选，"
+                        f"点击「退出所选」执行"
+                    )
+                else:
+                    log(f"共 {len(rows_all)} 个候选，已默认全选，点击「退出所选」执行")
         finally:
             await set_busy(False)
 
@@ -258,15 +288,24 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     if not ok:
                         log(f"[{account}] 会话未授权，跳过 {len(items)} 个")
                         continue
-                    log(f"[{account}] 开始退出 {len(items)} 个对话")
-                    done_keys = set()
-                    for row in items:
-                        success = await leave_one(
-                            client, row["chat_id"], row["title"], log
-                        )
-                        if success:
-                            done_keys.add(row["key"])
-                        await asyncio.sleep(1.5)  # 降低触发限流概率
+                    log(f"[{account}] 开始批量退出 {len(items)} 个对话（并发 8）")
+                    done_keys: set = set()
+                    done_lock = asyncio.Lock()
+                    sem = asyncio.Semaphore(8)
+
+                    async def _do_leave(row: Dict) -> None:
+                        async with sem:
+                            success = await leave_one(
+                                client, row["chat_id"], row["title"], log
+                            )
+                            if success:
+                                async with done_lock:
+                                    done_keys.add(row["key"])
+
+                    await asyncio.gather(*[_do_leave(row) for row in items])
+                    log(
+                        f"[{account}] 批量退出完成：成功 {len(done_keys)}/{len(items)}"
+                    )
                     if done_keys:
                         remain = [r for r in rows_all if r["key"] not in done_keys]
                         rows_all.clear()
@@ -288,10 +327,10 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             await set_busy(False)
 
     with ui.card().classes("w-full shadow-md"):
-        ui.label("自动退群").classes("text-lg font-semibold")
+        ui.label("批量退频道").classes("text-lg font-semibold")
         ui.label(
             "扫描所选账号的对话，列出超过指定天数没有新消息的频道（可选包含群组），"
-            "预览勾选后批量退出。自己是创建者的对话永远不会被退出。"
+            "默认全选后并发批量退出。自己是创建者的对话永远不会被退出。"
         ).classes("text-sm text-gray-500")
 
         with ui.row().classes("w-full items-end flex-nowrap"):
@@ -308,13 +347,15 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             skip_pinned = ui.checkbox(
                 "跳过置顶", value=bool(cfg.get("skip_pinned", True))
             )
-            scan_btn = ui.button("扫描预览", on_click=on_scan).props("outline")
             account_select = ui.select(
                 label="账号（可多选）",
                 options=[],
                 multiple=True,
                 with_input=True,
-            ).classes("min-w-64")
+            ).classes("min-w-64 flex-1")
+            scan_btn = ui.button("扫描预览", on_click=on_scan).props(
+                "outline"
+            ).classes("ml-auto")
 
         result_table = ui.table(
             columns=[

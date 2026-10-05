@@ -168,6 +168,77 @@ def load_user_infos(workdir: Optional[Path | str] = None) -> List[UserInfo]:
     return entries
 
 
+def _accounts_state_path(workdir: Optional[Path | str] = None) -> Path:
+    return get_workdir(workdir) / "webui_accounts.json"
+
+
+def load_disabled_accounts(workdir: Optional[Path | str] = None) -> set:
+    """读取被停用的账户名集合（webui_accounts.json）。"""
+    path = _accounts_state_path(workdir)
+    if not path.is_file():
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (json.JSONDecodeError, OSError):
+        return set()
+    disabled = data.get("disabled")
+    return set(disabled) if isinstance(disabled, list) else set()
+
+
+def set_account_enabled(
+    name: str, enabled: bool, workdir: Optional[Path | str] = None
+) -> None:
+    """启用/停用账户，停用名单持久化到 webui_accounts.json。"""
+    path = _accounts_state_path(workdir)
+    disabled = load_disabled_accounts(workdir)
+    if enabled:
+        disabled.discard(name)
+    else:
+        disabled.add(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump({"disabled": sorted(disabled)}, fp, ensure_ascii=False, indent=2)
+
+
+def account_login_names(
+    names: List[str],
+    workdir: Optional[Path | str] = None,
+    session_dir: Path | str = ".",
+) -> Dict[str, str]:
+    """读取每个账户 .session 内的 user_id，从 users/<id>/me.json 提取登录显示名。
+
+    返回 {账户名: 显示名}，只包含能解析出 user_id 且 me.json 存在的账户。
+    """
+    import sqlite3
+
+    base = Path(session_dir)
+    users_root = get_workdir(workdir) / "users"
+    mapping: Dict[str, str] = {}
+    for name in names:
+        session_file = base / f"{name}.session"
+        user_id = None
+        try:
+            con = sqlite3.connect(f"file:{session_file.as_posix()}?mode=ro", uri=True)
+            try:
+                row = con.execute("SELECT user_id FROM sessions LIMIT 1").fetchone()
+                user_id = row[0] if row else None
+            finally:
+                con.close()
+        except Exception:
+            continue
+        if user_id is None:
+            continue
+        me_file = users_root / str(user_id) / "me.json"
+        try:
+            first = me_file.read_text(encoding="utf-8").splitlines()[0].strip()
+        except Exception:
+            continue
+        if first:
+            mapping[name] = first
+    return mapping
+
+
 def _record_target(path: Path, signs_root: Path) -> Tuple[str, Optional[str]]:
     relative_parts = path.relative_to(signs_root).parts
     task = relative_parts[0]

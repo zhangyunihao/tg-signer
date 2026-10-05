@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import queue
@@ -18,16 +19,20 @@ from tg_signer.webui.data import (
     DEFAULT_WORKDIR,
     LOG_DIR,
     ConfigKind,
+    account_login_names,
     delete_config,
     get_workdir,
     list_log_files,
     list_task_names,
     load_config,
+    load_disabled_accounts,
     load_logs,
     load_sign_records,
     load_user_infos,
     save_config,
+    set_account_enabled,
 )
+from tg_signer.core import get_api_config, get_proxy
 from tg_signer.webui.interactive import InteractiveSignerConfig
 from tg_signer.webui.auto_leave import auto_leave_block
 from tg_signer.webui.random_chat import random_chat_block
@@ -431,6 +436,7 @@ class TaskRunnerBlock:
                     },
                 ],
                 rows=[],
+                pagination=5,
             ).classes("w-full").props("flat dense")
             # 状态列渲染为彩色徽章：已完成=绿、失败=红、运行中=蓝、其他=灰
             self.history_table.add_slot(
@@ -512,12 +518,13 @@ class TaskRunnerBlock:
         return []
 
     def _get_account_names(self) -> list[str]:
-        """账号来自 session 文件（与 CLI 默认 session_dir='.' 一致），另附加 TG_ACCOUNT 环境变量。"""
+        """账号来自 session 文件（与 CLI 默认 session_dir='.' 一致），另附加 TG_ACCOUNT 环境变量；排除停用账户。"""
         names = sorted(p.stem for p in Path(".").glob("*.session"))
         env_account = os.environ.get("TG_ACCOUNT")
         if env_account and env_account not in names:
             names.append(env_account)
-        return names
+        disabled = load_disabled_accounts(state.workdir)
+        return [n for n in names if n not in disabled]
 
     def _refresh_accounts(self) -> None:
         options = self._get_account_names()
@@ -540,6 +547,11 @@ class TaskRunnerBlock:
                 summary += f" | {status}: {counts[status]}"
         self.history_summary.text = summary
         self.history_summary.update()
+
+        def _id_key(r: dict) -> int:
+            v = str(r.get("id") or "")
+            return int(v) if v.isdigit() else 0
+
         rows = [
             {
                 "id": r.get("id", ""),
@@ -550,7 +562,7 @@ class TaskRunnerBlock:
                 "status": r.get("status", ""),
                 "result": r.get("result", ""),
             }
-            for r in reversed(items)
+            for r in sorted(items, key=_id_key, reverse=True)
         ]
         self.history_table.rows = rows
         self.history_table.update()
@@ -816,13 +828,304 @@ class TaskRunnerBlock:
         self._update_status()
 
 
+class AccountLoginSession:
+    """在页面上执行 tg-signer CLI 登录：连接 → 发送验证码 → 登录（可选两步验证密码）。
+
+    使用文件模式 Client（与 CLI 一致），登录成功后自动落盘 <账户名>.session。
+    """
+
+    def __init__(self, name: str, phone: str) -> None:
+        self.name = (name or "").strip()
+        self.phone = (phone or "").strip()
+        self.client = None
+        self.phone_code_hash = None
+        self.password_needed = False
+
+    def _check_basic(self) -> None:
+        if not self.name:
+            raise ValueError("请填写账户名")
+        if not self.phone:
+            raise ValueError("请填写手机号（国际格式，如 +8613800138000）")
+
+    @staticmethod
+    def _save_me(me) -> None:
+        data = {
+            "id": me.id,
+            "first_name": me.first_name,
+            "last_name": me.last_name,
+            "username": me.username,
+            "phone_number": me.phone_number,
+            "is_premium": getattr(me, "is_premium", None),
+        }
+        user_dir = get_workdir(state.workdir) / "users" / str(me.id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+        with open(user_dir / "me.json", "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+
+    async def start(self) -> str:
+        """连接并发送验证码；若会话已授权则直接完成登录。"""
+        self._check_basic()
+        from pyrogram import Client
+
+        api_id, api_hash = get_api_config()
+        self.client = Client(
+            self.name,
+            api_id=api_id,
+            api_hash=api_hash,
+            proxy=get_proxy(),
+            workdir=".",
+        )
+        authorized = await asyncio.wait_for(self.client.connect(), 60)
+        if authorized:
+            me = await asyncio.wait_for(self.client.get_me(), 30)
+            self._save_me(me)
+            await self.client.disconnect()
+            self.client = None
+            return f"该账户已登录：{me.first_name or me.id}"
+        sent = await asyncio.wait_for(
+            self.client.send_phone_number_code(self.phone), 60
+        )
+        self.phone_code_hash = sent.phone_code_hash
+        return "验证码已发送，请查看 Telegram 官方消息"
+
+    async def complete(self, code: str, password: str) -> str:
+        """提交验证码（及可选的两步验证密码）完成登录。"""
+        if self.client is None or self.phone_code_hash is None:
+            raise ValueError("请先发送验证码")
+        from pyrogram.errors import SessionPasswordNeeded
+
+        try:
+            if not self.password_needed:
+                code = (code or "").strip()
+                if not code:
+                    raise ValueError("请填写验证码")
+                await asyncio.wait_for(
+                    self.client.sign_in(self.phone, self.phone_code_hash, code), 60
+                )
+            else:
+                password = (password or "").strip()
+                if not password:
+                    raise ValueError("请填写两步验证密码")
+                await asyncio.wait_for(self.client.check_password(password), 60)
+        except SessionPasswordNeeded:
+            self.password_needed = True
+            raise ValueError("该账户开启了两步验证，请填写密码后再次点击登录")
+        me = await asyncio.wait_for(self.client.get_me(), 30)
+        self._save_me(me)
+        await self.client.disconnect()
+        self.client = None
+        # 清掉该账户可能残留的旧客户端缓存，避免后续任务使用过期会话
+        from tg_signer.core import _CLIENT_INSTANCES
+
+        _CLIENT_INSTANCES.pop(str(Path(".").joinpath(self.name).resolve()), None)
+        return str(me.first_name or me.id)
+
+    async def cancel(self) -> None:
+        if self.client is not None:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+            self.client = None
+        self.phone_code_hash = None
+        self.password_needed = False
+
+
 def user_info_block() -> Callable[[], None]:
     container = ui.column().classes("w-full gap-2")
 
+    # 增加账户弹窗（CLI 登录流程，只创建一次，refresh 清空 container 不影响它）
+    login_session: dict = {"session": None}
+
+    def _reset_login_dialog() -> None:
+        async def _cancel() -> None:
+            session = login_session.get("session")
+            if session is not None:
+                await session.cancel()
+            login_session["session"] = None
+
+        asyncio.ensure_future(_cancel())
+        add_name.value = ""
+        add_phone.value = ""
+        add_code.value = ""
+        add_password.value = ""
+        add_status.text = ""
+        add_status.classes(replace="text-sm text-gray-500")
+        step2.visible = False
+        add_password.visible = False
+        send_btn.enable()
+        login_btn.enable()
+
+    with ui.dialog() as add_dlg, ui.card().classes("w-[520px] max-w-full"):
+        ui.label("增加账户（TG 登录）").classes("text-lg font-semibold")
+        add_name = ui.input("账户名", placeholder="例如 my_account").classes("w-full")
+        add_phone = ui.input(
+            "手机号", placeholder="国际格式，如 +8613800138000"
+        ).classes("w-full")
+        add_status = ui.label("").classes("text-sm text-gray-500")
+
+        async def do_send_code() -> None:
+            add_status.classes(replace="text-sm text-orange-600")
+            add_status.text = "正在连接 Telegram 并发送验证码..."
+            add_status.update()
+            send_btn.disable()
+            try:
+                session = login_session.get("session")
+                if session is None:
+                    session = AccountLoginSession(add_name.value, add_phone.value)
+                    login_session["session"] = session
+                msg = await session.start()
+                add_status.classes(replace="text-sm text-positive")
+                add_status.text = msg
+                step2.visible = True
+            except Exception as exc:  # noqa: BLE001
+                add_status.classes(replace="text-sm text-negative")
+                add_status.text = f"发送失败：{exc}"
+                send_btn.enable()
+            add_status.update()
+
+        async def do_login() -> None:
+            session = login_session.get("session")
+            if session is None:
+                add_status.classes(replace="text-sm text-negative")
+                add_status.text = "请先发送验证码"
+                add_status.update()
+                return
+            login_btn.disable()
+            add_status.classes(replace="text-sm text-orange-600")
+            add_status.text = "正在登录..."
+            add_status.update()
+            try:
+                who = await session.complete(add_code.value, add_password.value)
+            except ValueError as exc:
+                add_status.classes(replace="text-sm text-negative")
+                add_status.text = str(exc)
+                if "两步验证" in str(exc):
+                    add_password.visible = True
+                    add_password.update()
+                login_btn.enable()
+                add_status.update()
+                return
+            except Exception as exc:  # noqa: BLE001
+                add_status.classes(replace="text-sm text-negative")
+                add_status.text = f"登录失败：{exc}"
+                login_btn.enable()
+                add_status.update()
+                return
+            ui.notify(f"账户登录成功：{who}", type="positive")
+            add_dlg.close()
+            _reset_login_dialog()
+            refresh()
+
+        with ui.row().classes("w-full gap-2"):
+            send_btn = ui.button("发送验证码", on_click=do_send_code).props("outline")
+            login_btn = ui.button("登录", color="primary", on_click=do_login)
+
+        with ui.column().classes("w-full") as step2:
+            step2.visible = False
+            add_code = ui.input("验证码", placeholder="Telegram 发送的验证码").classes(
+                "w-full"
+            )
+            add_password = ui.input(
+                "两步验证密码",
+                placeholder="仅开启了两步验证的账户需要填写",
+                password=True,
+            ).props("password-icon-toggle-password-visibility").classes("w-full")
+            add_password.visible = False
+
+    def toggle_account(name: str, enabled: bool) -> None:
+        set_account_enabled(name, enabled, state.workdir)
+        ui.notify(f"账户 {name} 已{'启用' if enabled else '停用'}", type="positive")
+
     def refresh() -> None:
         container.clear()
-        entries = load_user_infos(state.workdir)
+        disabled = load_disabled_accounts(state.workdir)
         with container:
+            # —— 账户管理 ——
+            with ui.card().classes("w-full shadow-sm"):
+                with ui.row().classes("w-full items-center justify-between"):
+                    ui.label("账户管理").classes("text-lg font-semibold")
+                    ui.button(
+                        "增加账户",
+                        icon="person_add",
+                        on_click=lambda: (_reset_login_dialog(), add_dlg.open()),
+                    ).props("outline")
+                names = sorted(p.stem for p in Path(".").glob("*.session"))
+                env_account = os.environ.get("TG_ACCOUNT")
+                if env_account and env_account not in names:
+                    names.append(env_account)
+                if not names:
+                    ui.label("未发现账户（当前目录无 *.session）").classes(
+                        "text-sm text-gray-500"
+                    )
+                else:
+                    display_names = account_login_names(names, workdir=state.workdir)
+
+                    def delete_account(name: str) -> None:
+                        with ui.dialog() as dlg, ui.card():
+                            ui.label(f"确认删除账户 {name}？").classes(
+                                "text-lg font-semibold"
+                            )
+                            ui.label(
+                                "将删除该账户的 .session / .session_string 文件，不可恢复！"
+                                "删除前请先停止使用该账户的任务。"
+                            ).classes("text-sm text-red-600")
+                            with ui.row().classes("w-full justify-end"):
+                                ui.button("取消", on_click=dlg.close).props("flat")
+
+                                def do_delete(n: str = name) -> None:
+                                    errs = []
+                                    for suffix in (".session", ".session_string"):
+                                        try:
+                                            Path(n + suffix).unlink(missing_ok=True)
+                                        except Exception as exc:
+                                            errs.append(str(exc))
+                                    dlg.close()
+                                    if errs:
+                                        ui.notify(
+                                            f"删除失败（文件可能被运行中的连接占用）: {errs[0]}",
+                                            type="negative",
+                                        )
+                                        return
+                                    from tg_signer.core import _CLIENT_INSTANCES
+
+                                    _CLIENT_INSTANCES.pop(
+                                        str(Path(".").joinpath(n).resolve()), None
+                                    )
+                                    ui.notify(f"账户 {n} 已删除", type="positive")
+                                    refresh()
+
+                                ui.button("确认删除", on_click=do_delete).props(
+                                    "color=negative"
+                                )
+                        dlg.open()
+
+                    with ui.grid(columns=3).classes("w-full gap-2"):
+                        for name in names:
+                            with ui.column().classes("border rounded p-2 gap-1"):
+                                with ui.row().classes("w-full items-center justify-between"):
+                                    ui.switch(
+                                        name,
+                                        value=name not in disabled,
+                                        on_change=lambda e, n=name: toggle_account(
+                                            n, e.value
+                                        ),
+                                    )
+                                    ui.button(
+                                        icon="delete",
+                                        on_click=lambda n=name: delete_account(n),
+                                    ).props("flat round dense color=negative").tooltip(
+                                        "删除账户"
+                                    )
+                                disp = display_names.get(name)
+                                if disp:
+                                    ui.label(disp).classes("text-xs text-gray-500")
+                ui.label(
+                    "停用的账户不会出现在执行任务/随机发言/批量退频道的账号下拉列表中"
+                ).classes("text-xs text-gray-500")
+
+            # —— 用户信息 ——
+            entries = load_user_infos(state.workdir)
             if not entries:
                 ui.label("未找到用户信息").classes("text-gray-500")
                 return
@@ -1058,12 +1361,10 @@ def _apply_paths(workdir_input, on_refresh: Callable[[], None]) -> None:
 
 def _build_dashboard(container) -> None:
     with container:
-        with ui.row().classes("w-full items-center justify-between mb-2"):
-            ui.label("TG Signer Web 控制台").classes(
-                "text-2xl font-semibold tracking-wide"
-            )
-            # 右上角菜单按钮（下拉项在对话框定义后填充）
-            header_btn = ui.button("菜单").props("flat dense")
+        # 右上角菜单按钮，绝对定位不占布局空间（下拉项在对话框定义后填充）
+        header_btn = ui.button(icon="more_vert").props("flat round dense").classes(
+            "absolute top-1 right-3 z-10"
+        )
 
         refreshers: list[Callable[[], None]] = []
         refresh_records: "SignRecordBlock"
@@ -1134,7 +1435,7 @@ def _build_dashboard(container) -> None:
         with ui.tabs().classes("w-full").props("align=left") as tabs:
             tab_run = ui.tab("run", "执行任务")
             tab_random = ui.tab("random", "随机发言")
-            tab_leave = ui.tab("leave", "自动退群")
+            tab_leave = ui.tab("leave", "批量退频道")
             tab_configs = ui.tab("configs", "配置管理")
 
         valid_tabs = {"run", "random", "leave", "configs"}
@@ -1170,7 +1471,7 @@ def _build_dashboard(container) -> None:
 
             with ui.tab_panel(tab_leave):
                 ui.label(
-                    "扫描账号对话，批量退出超过指定天数未更新的频道（可预览确认后再执行）。"
+                    "批量退出长期不更新的频道：扫描账号对话，预览确认后并发批量退出。"
                 ).classes("text-gray-600")
                 refreshers.append(auto_leave_block(state.workdir))
 
