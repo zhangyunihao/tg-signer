@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import sys
 from typing import Optional
 
 import click
@@ -175,6 +176,13 @@ def tg_signer(
     in_memory: bool,
 ):
     from tg_signer.logger import configure_logger
+
+    # Windows 控制台默认 GBK，打印含 emoji/特殊符号的聊天列表会直接崩溃，改为 UTF-8 并容错
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
     logger = configure_logger(log_level=log_level, log_dir=log_dir, log_file=log_file)
     ctx.ensure_object(dict)
