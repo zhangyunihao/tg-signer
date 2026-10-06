@@ -368,7 +368,7 @@ class TaskRunnerBlock:
         self.output_lines: list[str] = []
 
         with ui.card().classes("w-full shadow-md"):
-            ui.label("执行任务").classes("text-lg font-semibold")
+            ui.label("签到").classes("text-lg font-semibold")
             ui.label(
                 "点击「新增任务」在弹窗中选择任务类型、任务与账号；历史列表可「复制」任意历史任务的参数快速新建，运行中的任务可停止。"
             ).classes("text-sm text-gray-500")
@@ -643,6 +643,8 @@ class TaskRunnerBlock:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,
                     env=env,
                 )
@@ -1121,7 +1123,7 @@ def user_info_block() -> Callable[[], None]:
                                 if disp:
                                     ui.label(disp).classes("text-xs text-gray-500")
                 ui.label(
-                    "停用的账户不会出现在执行任务/随机发言/批量退频道的账号下拉列表中"
+                    "停用的账户不会出现在签到/随机发言/批量退频道的账号下拉列表中"
                 ).classes("text-xs text-gray-500")
 
             # —— 用户信息 ——
@@ -1433,7 +1435,7 @@ def _build_dashboard(container) -> None:
                 ui.menu_item("日志", on_click=logs_dialog.open)
 
         with ui.tabs().classes("w-full").props("align=left") as tabs:
-            tab_run = ui.tab("run", "执行任务")
+            tab_run = ui.tab("run", "签到")
             tab_random = ui.tab("random", "随机发言")
             tab_leave = ui.tab("leave", "批量退频道")
             tab_configs = ui.tab("configs", "配置管理")

@@ -257,6 +257,7 @@ class RandomChatEngine:
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
         self._stop: Optional[asyncio.Event] = None
+        self._stopping: bool = False
         # 运行进度：{account: 已发送条数}，供任务表格状态列展示
         self.progress: Dict[str, int] = {}
         self._total_accounts: int = 0
@@ -270,6 +271,8 @@ class RandomChatEngine:
         """运行中返回带进度的状态文本（如 "运行中 (18/100)"），未运行返回 None"""
         if not self.running:
             return None
+        if self._stopping:
+            return "停止中"
         sent = sum(self.progress.values())
         if self._total_count and self._total_accounts:
             return f"运行中 ({sent}/{self._total_count * self._total_accounts})"
@@ -290,6 +293,7 @@ class RandomChatEngine:
             log("任务已在运行中")
             return False
         self.progress = {}
+        self._stopping = False
         self._total_accounts = len(accounts)
         self._total_count = total_count
         self._stop = asyncio.Event()
@@ -304,6 +308,7 @@ class RandomChatEngine:
 
     async def stop(self) -> None:
         """立即返回，不阻塞界面；发送循环可能在网络请求中卡住，由后台任务收尾"""
+        self._stopping = True
         if self._stop is not None:
             self._stop.set()
         task = self._task
@@ -393,7 +398,17 @@ class RandomChatEngine:
                         f"已发送的 {len(undelivered)} 条不删除"
                     )
             if pending_deletes:
-                await asyncio.gather(*pending_deletes, return_exceptions=True)
+                # 等待延迟删除收尾，设上限避免网络异常时无限挂起
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending_deletes, return_exceptions=True),
+                        timeout=delete_after + 60,
+                    )
+                except asyncio.TimeoutError:
+                    log(
+                        f"{datetime.now():%H:%M:%S} [停止] {account} "
+                        f"删除收尾超时，未确认删除的消息保留在群里可手动处理"
+                    )
 
     async def _loop(
         self, accounts, chat_id, interval, session_dir, log, delete_after, total_count
@@ -637,9 +652,11 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
 
     async def stop_task(name: str, set_status: Callable[[bool], None]) -> None:
         engine = get_engine(name)
-        if engine is not None:
+        if engine is not None and engine.running:
+            # 停止后由状态定时器显示「停止中」，收尾完成经 on_finish 回调置为未运行
             await engine.stop()
-        set_status(False)
+        else:
+            set_status(False)
 
     def _apply_status(set_status: Callable[[bool], None], running: bool) -> None:
         try:

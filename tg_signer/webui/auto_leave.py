@@ -19,7 +19,7 @@ from tg_signer.webui.random_chat import (
 CONFIG_NAME = "auto_leave_config.json"
 
 # 扫描结果默认不勾选的关键字（频道名命中即排除，防止误退）
-UNSELECT_KEYWORDS = ("抽奖", "嫩妹社", "野寻")
+UNSELECT_KEYWORDS = ("抽奖", "嫩妹社", "野寻", "榜")
 
 
 def _config_path(workdir) -> Path:
@@ -233,8 +233,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 skipped = len(rows_all) - len(default_selected)
                 if skipped:
                     log(
-                        f"共 {len(rows_all)} 个候选，含「抽奖」的 {skipped} 个已默认不勾选，"
-                        f"点击「退出所选」执行"
+                        f"共 {len(rows_all)} 个候选，命中排除关键字（{'、'.join(UNSELECT_KEYWORDS)}）"
+                        f"的 {skipped} 个已默认不勾选，点击「退出所选」执行"
                     )
                 else:
                     log(f"共 {len(rows_all)} 个候选，已默认全选，点击「退出所选」执行")
