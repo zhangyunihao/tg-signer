@@ -47,8 +47,8 @@ yaml = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/amchii/tg-signer"
-Repository = "https://github.com/amchii/tg-signer"
+Homepage = "https://github.com/zhangyunihao/tg-signer"
+Repository = "https://github.com/zhangyunihao/tg-signer"
 
 [project.scripts]
 tg-signer-plus = "tg_signer.__main__:signer"
