@@ -172,49 +172,99 @@ def _accounts_state_path(workdir: Optional[Path | str] = None) -> Path:
     return get_workdir(workdir) / "webui_accounts.json"
 
 
-def load_disabled_accounts(workdir: Optional[Path | str] = None) -> set:
-    """读取被停用的账户名集合（webui_accounts.json）。"""
-    path = _accounts_state_path(workdir)
-    if not path.is_file():
-        return set()
+def _read_accounts_state(path: Path) -> Dict:
     try:
         with open(path, "r", encoding="utf-8") as fp:
             data = json.load(fp)
+        return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError):
-        return set()
-    disabled = data.get("disabled")
+        return {}
+
+
+def _write_accounts_state(path: Path, state: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(state, fp, ensure_ascii=False, indent=2)
+
+
+def load_disabled_accounts(workdir: Optional[Path | str] = None) -> set:
+    """读取被停用的账户名集合（webui_accounts.json）。"""
+    disabled = _read_accounts_state(_accounts_state_path(workdir)).get("disabled")
     return set(disabled) if isinstance(disabled, list) else set()
 
 
 def set_account_enabled(
     name: str, enabled: bool, workdir: Optional[Path | str] = None
 ) -> None:
-    """启用/停用账户，停用名单持久化到 webui_accounts.json。"""
+    """启用/停用账户，停用名单持久化到 webui_accounts.json（保留其他字段）。"""
     path = _accounts_state_path(workdir)
-    disabled = load_disabled_accounts(workdir)
+    state = _read_accounts_state(path)
+    disabled = set(state.get("disabled") or [])
     if enabled:
         disabled.discard(name)
     else:
         disabled.add(name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fp:
-        json.dump({"disabled": sorted(disabled)}, fp, ensure_ascii=False, indent=2)
+    state["disabled"] = sorted(disabled)
+    _write_accounts_state(path, state)
 
 
-def account_login_names(
+def rename_account_state(
+    old: str, new: str, workdir: Optional[Path | str] = None
+) -> None:
+    """账户重命名后，同步更新 webui_accounts.json 中的 disabled 与 order 记录。"""
+    path = _accounts_state_path(workdir)
+    state = _read_accounts_state(path)
+    for field in ("disabled", "order"):
+        values = state.get(field)
+        if isinstance(values, list) and old in values:
+            values[values.index(old)] = new
+            state[field] = values
+    _write_accounts_state(path, state)
+
+
+def load_account_order(workdir: Optional[Path | str] = None) -> List[str]:
+    """读取账户展示顺序（webui_accounts.json 的 order 字段）。"""
+    order = _read_accounts_state(_accounts_state_path(workdir)).get("order")
+    return list(order) if isinstance(order, list) else []
+
+
+def set_account_order(
+    order: List[str], workdir: Optional[Path | str] = None
+) -> None:
+    """保存账户展示顺序。"""
+    path = _accounts_state_path(workdir)
+    state = _read_accounts_state(path)
+    state["order"] = list(order)
+    _write_accounts_state(path, state)
+
+
+def apply_account_order(
+    names: List[str], workdir: Optional[Path | str] = None
+) -> List[str]:
+    """按已保存的顺序排列账户名，未登记的账户按字母序排在后面。"""
+    order = load_account_order(workdir)
+    names = list(names)
+    known = [n for n in order if n in names]
+    rest = sorted(n for n in names if n not in order)
+    return known + rest
+
+
+def account_identities(
     names: List[str],
     workdir: Optional[Path | str] = None,
     session_dir: Path | str = ".",
-) -> Dict[str, str]:
-    """读取每个账户 .session 内的 user_id，从 users/<id>/me.json 提取登录显示名。
+) -> Dict[str, Dict[str, object]]:
+    """读取每个账户 .session 内的 user_id，并从 users/<id>/me.json 提取 Telegram 身份。
 
-    返回 {账户名: 显示名}，只包含能解析出 user_id 且 me.json 存在的账户。
+    返回 {账户名: {"user_id": int, "name": str, "username": str}}，
+    只包含能解析出 user_id 且 me.json 存在的账户。
     """
+    import json as _json
     import sqlite3
 
     base = Path(session_dir)
     users_root = get_workdir(workdir) / "users"
-    mapping: Dict[str, str] = {}
+    mapping: Dict[str, Dict[str, object]] = {}
     for name in names:
         session_file = base / f"{name}.session"
         user_id = None
@@ -231,11 +281,19 @@ def account_login_names(
             continue
         me_file = users_root / str(user_id) / "me.json"
         try:
-            first = me_file.read_text(encoding="utf-8").splitlines()[0].strip()
+            data = _json.loads(me_file.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if first:
-            mapping[name] = first
+        if not isinstance(data, dict):
+            continue
+        name_full = (data.get("first_name") or "").strip()
+        if data.get("last_name"):
+            name_full = f"{name_full} {data['last_name']}".strip()
+        mapping[name] = {
+            "user_id": user_id,
+            "name": name_full,
+            "username": data.get("username") or "",
+        }
     return mapping
 
 

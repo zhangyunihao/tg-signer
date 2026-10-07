@@ -19,7 +19,8 @@ from tg_signer.webui.data import (
     DEFAULT_WORKDIR,
     LOG_DIR,
     ConfigKind,
-    account_login_names,
+    account_identities,
+    apply_account_order,
     delete_config,
     get_workdir,
     list_log_files,
@@ -30,7 +31,9 @@ from tg_signer.webui.data import (
     load_sign_records,
     load_user_infos,
     save_config,
+    rename_account_state,
     set_account_enabled,
+    set_account_order,
 )
 from tg_signer.core import get_api_config, get_proxy
 from tg_signer.webui.interactive import InteractiveSignerConfig
@@ -447,18 +450,21 @@ class TaskRunnerBlock:
                 "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
                 "{{ props.row.status }}</q-badge></q-td>",
             )
-            # 操作列：所有行显示「复制」（用该行参数打开新增弹窗），运行中的行额外显示「停止」
+            # 操作列：所有行显示「复制」「明细」（用该行参数打开新增弹窗/查看子任务明细），运行中的行额外显示「停止」
             self.history_table.add_slot(
                 "body-cell-actions",
                 '<q-td :props="props">'
                 '<q-btn flat dense color="primary" '
                 'label="复制" @click="$parent.$emit(\'duplicateTask\', props.row)" />'
+                '<q-btn flat dense color="grey-8" '
+                'label="明细" @click="$parent.$emit(\'detailTask\', props.row)" />'
                 '<q-btn v-if="props.row.status === \'运行中\'" flat dense color="negative" '
                 'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
                 "</q-td>",
             )
             self.history_table.on("stopTask", self._on_stop_event)
             self.history_table.on("duplicateTask", self._on_duplicate_event)
+            self.history_table.on("detailTask", self._on_detail_event)
 
             self.log_area = ui.scroll_area().classes(
                 "w-full bg-gray-50 rounded-lg border border-gray-200"
@@ -518,13 +524,16 @@ class TaskRunnerBlock:
         return []
 
     def _get_account_names(self) -> list[str]:
-        """账号来自 session 文件（与 CLI 默认 session_dir='.' 一致），另附加 TG_ACCOUNT 环境变量；排除停用账户。"""
+        """账号来自 session 文件（与 CLI 默认 session_dir='.' 一致），另附加 TG_ACCOUNT 环境变量；
+        排除停用账户，按账户管理中拖动的顺序排列。"""
         names = sorted(p.stem for p in Path(".").glob("*.session"))
         env_account = os.environ.get("TG_ACCOUNT")
         if env_account and env_account not in names:
             names.append(env_account)
         disabled = load_disabled_accounts(state.workdir)
-        return [n for n in names if n not in disabled]
+        return apply_account_order(
+            [n for n in names if n not in disabled], state.workdir
+        )
 
     def _refresh_accounts(self) -> None:
         options = self._get_account_names()
@@ -537,14 +546,12 @@ class TaskRunnerBlock:
 
     def _refresh_history_table(self) -> None:
         items = load_task_history()
-        counts: dict[str, int] = {}
+        counts: dict[str, int] = {s: 0 for s in ("运行中", "已完成", "失败", "已停止")}
         for r in items:
             status = r.get("status", "未知")
-            counts[status] = counts.get(status, 0) + 1
-        summary = f"共 {len(items)} 条"
-        for status in ("运行中", "已完成", "失败", "已停止"):
             if status in counts:
-                summary += f" | {status}: {counts[status]}"
+                counts[status] += 1
+        summary = f"总任务数 {len(items)} | 运行中 {counts['运行中']} | 已完成 {counts['已完成']} | 失败 {counts['失败']} | 已停止 {counts['已停止']}"
         self.history_summary.text = summary
         self.history_summary.update()
 
@@ -627,6 +634,8 @@ class TaskRunnerBlock:
         }
         procs: list[dict] = []
         run_queue: queue.Queue = queue.Queue()
+        chats_labels = self._chat_labels(task_name)
+        detail_rows: list[dict] = []
         for account in accounts:
             args = self._build_args(account)
             if not args:
@@ -637,6 +646,8 @@ class TaskRunnerBlock:
                 "-c",
                 "from tg_signer.cli import tg_signer; tg_signer()",
             ] + args
+            # 每账号进程独立统计聊天级进度：started=已开始的聊天数，failed=签到失败数
+            stats = {"started": 0, "failed": 0, "current_pos": None}
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -652,10 +663,12 @@ class TaskRunnerBlock:
                 notify_error(exc)
                 continue
             reader = threading.Thread(
-                target=self._reader, args=(proc, task_name, account, run_queue), daemon=True
+                target=self._reader,
+                args=(proc, task_name, account, run_queue, stats, chats_labels, detail_rows),
+                daemon=True,
             )
             reader.start()
-            procs.append({"proc": proc, "reader": reader, "account": account})
+            procs.append({"proc": proc, "reader": reader, "account": account, "stats": stats})
         if not procs:
             ui.notify("未能启动任务", type="negative")
             return
@@ -665,6 +678,8 @@ class TaskRunnerBlock:
             "procs": procs,
             "queue": run_queue,
             "start_ts": time.time(),
+            "total_chats": len(chats_labels) * len(procs),
+            "details": detail_rows,
         }
         append_task_history(record)
         self._refresh_history_table()
@@ -674,19 +689,120 @@ class TaskRunnerBlock:
         ui.notify(f"已启动: {task_name}（{len(procs)} 个账号）", type="positive")
 
     def _reader(
-        self, proc: subprocess.Popen, task_name: str, account: str, q: "queue.Queue"
+        self,
+        proc: subprocess.Popen,
+        task_name: str,
+        account: str,
+        q: "queue.Queue",
+        stats: dict,
+        chats_labels: list,
+        detail_rows: list,
     ) -> None:
         prefix = f"[{task_name}:{account}] "
         while True:
             line = proc.stdout.readline()
             if not line:
                 break
+            stripped = line.lstrip()
+            # CLI 日志带格式前缀（[INFO] [name] 时间 ... 账户「x」- 任务「y」: 开始执行: ...），用子串匹配
+            if "开始执行" in stripped:
+                # 上一轮聊天结束，视为成功
+                pos = stats["current_pos"]
+                if pos is not None and detail_rows[pos]["status"] == "进行中":
+                    detail_rows[pos]["status"] = "成功"
+                # 按配置中的聊天顺序轮转取标签
+                if chats_labels:
+                    label = chats_labels[stats["started"] % len(chats_labels)]
+                else:
+                    label = f"第{stats['started'] + 1}个聊天"
+                detail_rows.append({"account": account, "chat": label, "status": "进行中"})
+                stats["current_pos"] = len(detail_rows) - 1
+                stats["started"] += 1
+            elif "签到失败" in stripped:
+                stats["failed"] += 1
+                pos = stats["current_pos"]
+                if pos is not None and detail_rows[pos]["status"] == "进行中":
+                    detail_rows[pos]["status"] = "失败"
             q.put(prefix + line.rstrip("\r\n"))
+
+    def _chat_labels(self, task_name: str) -> list[str]:
+        """读取签到配置的聊天标签（名称+chat_id），读取失败返回空列表。"""
+        try:
+            entry = load_config("signer", task_name, workdir=state.workdir)
+            labels = []
+            for c in entry.payload.get("chats") or []:
+                name = str(c.get("name") or "").strip()
+                labels.append(f"{name}({c.get('chat_id')})" if name else str(c.get("chat_id")))
+            return labels
+        except Exception:
+            return []
+
+    def _format_progress(self, run: dict) -> str:
+        """根据各账号进程的日志统计生成进度文本。"""
+        total = run.get("total_chats") or 0
+        started = failed = completed = 0
+        for item in run["procs"]:
+            s = item["stats"]
+            started += s["started"]
+            failed += s["failed"]
+            # 存活进程当前必有 1 个聊天进行中，不计入已完成
+            alive = item["proc"].poll() is None
+            completed += max(0, s["started"] - (1 if alive else 0))
+        ok = max(0, completed - failed)
+        task_type = run["record"].get("task_type", "")
+        if total > 0 and "run-once" in task_type:
+            return f"进度 {ok}/{total} · 失败 {failed}"
+        if started > 0:
+            return f"已完成 {ok} 个聊天 · 失败 {failed}"
+        return ""
 
     def _on_stop_event(self, e) -> None:
         row = e.args
         if isinstance(row, dict) and row.get("id"):
             self._stop_run(str(row["id"]))
+
+    def _on_detail_event(self, e) -> None:
+        """查看某条任务记录的子任务（账号 × 聊天）成功/失败明细"""
+        row = e.args
+        if not isinstance(row, dict):
+            return
+        rid = str(row.get("id") or "")
+        details: list[dict] = []
+        if rid in self.runs:
+            details = list(self.runs[rid]["details"])
+        else:
+            for r in load_task_history():
+                if str(r.get("id")) == rid:
+                    details = list(r.get("details") or [])
+                    break
+        counts = {"成功": 0, "失败": 0, "进行中": 0, "中断": 0}
+        for d in details:
+            counts[d.get("status", "中断")] = counts.get(d.get("status", "中断"), 0) + 1
+        with ui.dialog() as dlg, ui.card().classes("w-full max-w-xl"):
+            ui.label(f"子任务明细 — {row.get('task', '')}").classes("text-lg font-semibold")
+            ui.label(
+                f"共 {len(details)} 个子任务 | 成功 {counts['成功']} · 失败 {counts['失败']}"
+                f" · 进行中 {counts['进行中']} · 中断 {counts['中断']}"
+            ).classes("text-sm text-gray-600")
+            with ui.scroll_area().classes("w-full max-h-96 border rounded-lg"):
+                if not details:
+                    ui.label("无子任务明细（旧记录或任务尚未开始执行聊天）").classes(
+                        "text-sm text-gray-500 p-3"
+                    )
+                for d in details:
+                    status = d.get("status", "")
+                    color = {
+                        "成功": "text-green-700",
+                        "失败": "text-red-700",
+                        "进行中": "text-blue-700",
+                    }.get(status, "text-gray-500")
+                    mark = {"成功": "✓", "失败": "✗", "进行中": "…"}.get(status, "−")
+                    ui.label(f"{mark} {d.get('account', '')} → {d.get('chat', '')}：{status}").classes(
+                        f"text-sm py-0.5 {color}"
+                    ).style("white-space: pre;")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("关闭", on_click=dlg.close).props("flat")
+        dlg.open()
 
     def _on_duplicate_event(self, e) -> None:
         """用历史行的参数打开「新增任务」弹窗"""
@@ -725,8 +841,10 @@ class TaskRunnerBlock:
                 except Exception:
                     proc.kill()
         self.runs.pop(record_id, None)
+        self._close_pending_details(run, "中断")
         record = run["record"]
         record["status"] = "已停止"
+        record["details"] = list(run["details"])
         record["result"] = (
             f"手动停止，耗时 {self._format_duration_ts(run['start_ts'])}"
         )
@@ -742,15 +860,33 @@ class TaskRunnerBlock:
                 break
         self.history_table.update()
 
+    def _close_pending_details(self, run: dict, default_status: str) -> None:
+        """进程结束后，把仍在「进行中」的子任务标记为最终状态。"""
+        for item in run["procs"]:
+            pos = item["stats"].get("current_pos")
+            rows = run["details"]
+            if pos is not None and pos < len(rows) and rows[pos]["status"] == "进行中":
+                if default_status == "自动":
+                    rc = item["proc"].returncode
+                    rows[pos]["status"] = "成功" if rc == 0 else "失败"
+                else:
+                    rows[pos]["status"] = default_status
+
     def _finalize_run(self, record_id: str) -> None:
         run = self.runs.pop(record_id)
         rcs = ", ".join(str(i["proc"].returncode) for i in run["procs"])
         ok = all(i["proc"].returncode == 0 for i in run["procs"])
+        self._close_pending_details(run, "自动")
         record = run["record"]
         record["status"] = "已完成" if ok else "失败"
-        record["result"] = (
-            f"返回码: {rcs}，耗时 {self._format_duration_ts(run['start_ts'])}"
-        )
+        record["details"] = list(run["details"])
+        progress = self._format_progress(run)
+        parts = []
+        if progress:
+            parts.append(progress)
+        parts.append(f"返回码: {rcs}")
+        parts.append(f"耗时 {self._format_duration_ts(run['start_ts'])}")
+        record["result"] = "，".join(parts)
         update_task_history(record)
         self._refresh_history_table()
 
@@ -797,9 +933,10 @@ class TaskRunnerBlock:
                     continue
                 finished_ids.append(run_id)
             else:
+                elapsed = f"已运行 {self._format_duration_ts(run['start_ts'])}"
+                progress = self._format_progress(run)
                 self._update_running_row(
-                    run_id,
-                    f"已运行 {self._format_duration_ts(run['start_ts'])}",
+                    run_id, f"{elapsed} · {progress}" if progress else elapsed
                 )
         for run_id in finished_ids:
             self._finalize_run(run_id)
@@ -933,8 +1070,42 @@ class AccountLoginSession:
         self.password_needed = False
 
 
+# 账户卡片拖动排序初始化脚本：以 [data-account] 卡片的父元素（账户网格）为 Sortable 容器。
+# 页面构建和每次打开用户信息弹窗时都会执行，_sortableInit 标记防止重复初始化。
+ACCOUNT_SORTABLE_INIT_JS = """
+(function() {
+    function init() {
+        if (!window.Sortable) { setTimeout(init, 400); return; }
+        var card = document.querySelector('[data-account]');
+        if (!card) return;
+        var el = card.parentElement;
+        if (!el || el._sortableInit) return;
+        el._sortableInit = true;
+        new Sortable(el, {
+            animation: 150,
+            draggable: '[data-account]',
+            onEnd: function() {
+                var order = Array.from(el.querySelectorAll('[data-account]'))
+                    .map(function(c) { return c.getAttribute('data-account'); })
+                    .filter(Boolean);
+                emitEvent('account_reordered', { order: order });
+            }
+        });
+        el.setAttribute('data-sortable-ready', '1');
+    }
+    init();
+})();
+"""
+
+
 def user_info_block() -> Callable[[], None]:
     container = ui.column().classes("w-full gap-2")
+
+    # 拖动排序依赖 SortableJS（CDN 加载失败时仅拖动不可用，其余功能不受影响）
+    ui.add_head_html(
+        '<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.6/Sortable.min.js">'
+        "</script>"
+    )
 
     # 增加账户弹窗（CLI 登录流程，只创建一次，refresh 清空 container 不影响它）
     login_session: dict = {"session": None}
@@ -1039,6 +1210,23 @@ def user_info_block() -> Callable[[], None]:
         set_account_enabled(name, enabled, state.workdir)
         ui.notify(f"账户 {name} 已{'启用' if enabled else '停用'}", type="positive")
 
+    async def on_account_reordered(e) -> None:
+        """拖动排序结束：校验并持久化新顺序。"""
+        order = e.args.get("order") if isinstance(e.args, dict) else e.args
+        if not isinstance(order, list):
+            return
+        current = [p.stem for p in Path(".").glob("*.session")]
+        env_account = os.environ.get("TG_ACCOUNT")
+        if env_account and env_account not in current:
+            current.append(env_account)
+        if set(order) != set(current):
+            return
+        set_account_order([str(n) for n in order], state.workdir)
+        ui.notify("账户顺序已保存", type="positive")
+        refresh()
+
+    ui.on("account_reordered", on_account_reordered)
+
     def refresh() -> None:
         container.clear()
         disabled = load_disabled_accounts(state.workdir)
@@ -1046,7 +1234,11 @@ def user_info_block() -> Callable[[], None]:
             # —— 账户管理 ——
             with ui.card().classes("w-full shadow-sm"):
                 with ui.row().classes("w-full items-center justify-between"):
-                    ui.label("账户管理").classes("text-lg font-semibold")
+                    with ui.row().classes("items-center gap-1"):
+                        ui.label("账户管理").classes("text-lg font-semibold")
+                        ui.icon("drag_indicator").classes("text-gray-400").tooltip(
+                            "拖动卡片可调整顺序，保存后各页面账号下拉也按此顺序显示"
+                        )
                     ui.button(
                         "增加账户",
                         icon="person_add",
@@ -1056,12 +1248,17 @@ def user_info_block() -> Callable[[], None]:
                 env_account = os.environ.get("TG_ACCOUNT")
                 if env_account and env_account not in names:
                     names.append(env_account)
+                names = apply_account_order(names, state.workdir)
                 if not names:
                     ui.label("未发现账户（当前目录无 *.session）").classes(
                         "text-sm text-gray-500"
                     )
                 else:
-                    display_names = account_login_names(names, workdir=state.workdir)
+                    identities = account_identities(names, workdir=state.workdir)
+                    # 同一 Telegram 账号可能有多份 session，聚合用于重复标注
+                    ids_by_uid: dict = {}
+                    for n, info in identities.items():
+                        ids_by_uid.setdefault(info["user_id"], []).append(n)
 
                     def delete_account(name: str) -> None:
                         with ui.dialog() as dlg, ui.card():
@@ -1102,9 +1299,72 @@ def user_info_block() -> Callable[[], None]:
                                 )
                         dlg.open()
 
-                    with ui.grid(columns=3).classes("w-full gap-2"):
+                    def rename_account(name: str) -> None:
+                        with ui.dialog() as dlg, ui.card().classes("w-[420px] max-w-full"):
+                            ui.label(f"重命名账户 {name}").classes("text-lg font-semibold")
+                            ui.label(
+                                "将重命名 .session / .session_string 文件，"
+                                "并同步更新顺序与停用记录。重命名前请先停止使用该账户的任务。"
+                            ).classes("text-sm text-gray-500")
+                            new_name = ui.input("新账户名", value=name).classes("w-full")
+                            err = ui.label("").classes("text-sm text-negative")
+
+                            def do_rename() -> None:
+                                target = new_name.value.strip()
+                                if not target or target == name:
+                                    err.text = "请输入与当前不同的新账户名"
+                                    err.update()
+                                    return
+                                if target in (".", "..") or any(
+                                    ch in target for ch in '/\\:*?"<>|'
+                                ):
+                                    err.text = "账户名包含非法字符"
+                                    err.update()
+                                    return
+                                if Path(target + ".session").exists() or Path(
+                                    target + ".session_string"
+                                ).exists():
+                                    err.text = f"账户 {target} 已存在"
+                                    err.update()
+                                    return
+                                errs = []
+                                for suffix in (".session", ".session_string"):
+                                    src = Path(name + suffix)
+                                    if src.exists():
+                                        try:
+                                            src.rename(Path(target + suffix))
+                                        except Exception as exc:
+                                            errs.append(str(exc))
+                                if errs:
+                                    err.text = (
+                                        f"重命名失败（文件可能被运行中的连接占用）: {errs[0]}"
+                                    )
+                                    err.update()
+                                    return
+                                rename_account_state(name, target, state.workdir)
+                                from tg_signer.core import _CLIENT_INSTANCES
+
+                                _CLIENT_INSTANCES.pop(
+                                    str(Path(".").joinpath(name).resolve()), None
+                                )
+                                dlg.close()
+                                ui.notify(
+                                    f"账户 {name} 已重命名为 {target}", type="positive"
+                                )
+                                refresh()
+
+                            with ui.row().classes("w-full justify-end"):
+                                ui.button("取消", on_click=dlg.close).props("flat")
+                                ui.button(
+                                    "确认重命名", on_click=do_rename
+                                ).props("color=primary")
+                        dlg.open()
+
+                    with ui.grid(columns=3).classes("w-full gap-2") as account_grid:
                         for name in names:
-                            with ui.column().classes("border rounded p-2 gap-1"):
+                            with ui.column().classes(
+                                "border rounded p-2 gap-1 cursor-move"
+                            ).props(f'data-account="{name}"'):
                                 with ui.row().classes("w-full items-center justify-between"):
                                     ui.switch(
                                         name,
@@ -1114,17 +1374,69 @@ def user_info_block() -> Callable[[], None]:
                                         ),
                                     )
                                     ui.button(
+                                        icon="edit",
+                                        on_click=lambda n=name: rename_account(n),
+                                    ).props("flat round dense").tooltip("重命名账户")
+                                    ui.button(
                                         icon="delete",
                                         on_click=lambda n=name: delete_account(n),
                                     ).props("flat round dense color=negative").tooltip(
                                         "删除账户"
                                     )
-                                disp = display_names.get(name)
-                                if disp:
-                                    ui.label(disp).classes("text-xs text-gray-500")
+                                info = identities.get(name)
+                                if info:
+                                    parts = []
+                                    if info["name"]:
+                                        parts.append(f"→ {info['name']}")
+                                    if info["username"]:
+                                        parts.append(f"@{info['username']}")
+                                    parts.append(f"ID {info['user_id']}")
+                                    text = " ".join(parts)
+                                    dups = [
+                                        n
+                                        for n in ids_by_uid.get(info["user_id"], [])
+                                        if n != name
+                                    ]
+                                    if dups:
+                                        text += f"（与 {'、'.join(dups)} 为同一账号）"
+                                    ui.label(text).classes("text-xs text-gray-500")
+                                else:
+                                    ui.label(
+                                        "→ 未获取到 Telegram 身份（未登录或缺少用户信息）"
+                                    ).classes("text-xs text-gray-400")
                 ui.label(
                     "停用的账户不会出现在签到/随机发言/批量退频道的账号下拉列表中"
                 ).classes("text-xs text-gray-500")
+
+                # 初始化拖动排序（SortableJS），拖完把新顺序发回服务端持久化
+                # 注意：不用 getElementById（NiceGUI 元素 id 不一定等于 DOM id），
+                # 直接以 [data-account] 卡片的父元素（账户网格）作为 Sortable 容器
+                ui.run_javascript(
+                    """
+                    (function() {
+                        function init() {
+                            if (!window.Sortable) { setTimeout(init, 400); return; }
+                            var card = document.querySelector('[data-account]');
+                            if (!card) return;
+                            var el = card.parentElement;
+                            if (!el || el._sortableInit) return;
+                            el._sortableInit = true;
+                            new Sortable(el, {
+                                animation: 150,
+                                draggable: '[data-account]',
+                                onEnd: function() {
+                                    var order = Array.from(el.querySelectorAll('[data-account]'))
+                                        .map(function(c) { return c.getAttribute('data-account'); })
+                                        .filter(Boolean);
+                                    emitEvent('account_reordered', { order: order });
+                                }
+                            });
+                            el.setAttribute('data-sortable-ready', '1');
+                        }
+                        init();
+                    })();
+                    """
+                )
 
             # —— 用户信息 ——
             entries = load_user_infos(state.workdir)

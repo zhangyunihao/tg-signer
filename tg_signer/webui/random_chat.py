@@ -11,7 +11,11 @@ from typing import Callable, Dict, List, Optional, Union
 from nicegui import ui
 
 from tg_signer.core import get_client
-from tg_signer.webui.data import load_disabled_accounts, load_user_infos
+from tg_signer.webui.data import (
+    apply_account_order,
+    load_disabled_accounts,
+    load_user_infos,
+)
 from tg_signer.webui.phrases import PHRASES
 
 # 跨浏览器刷新仍可控制的运行中引擎：{workdir|task_id -> engine}
@@ -27,12 +31,13 @@ _TASKS_FILE = "random_chat_tasks.json"
 def list_session_names(
     session_dir: Union[Path, str], workdir=None
 ) -> List[str]:
-    """列出会话目录下所有 .session 文件对应的账号名（排除停用账户）"""
+    """列出会话目录下所有 .session 文件对应的账号名（排除停用账户，按账户管理中拖动的顺序排列）"""
     base = Path(session_dir)
     if not base.is_dir():
         return []
     disabled = load_disabled_accounts(workdir)
-    return sorted(p.stem for p in base.glob("*.session") if p.stem not in disabled)
+    names = [p.stem for p in base.glob("*.session") if p.stem not in disabled]
+    return apply_account_order(names, workdir)
 
 
 def list_known_chats(workdir) -> Dict[str, str]:
