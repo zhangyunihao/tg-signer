@@ -7,10 +7,7 @@ name = "tg-signer-plus"
 dynamic = ["version"]
 description = "Automated Telegram tasks (check-ins, sending messages, keyboard clicks, AI replies, etc.); monitoring, forwarding, and auto-replying to private, group, and channel messages."
 authors = [
-    { name = "Amchii", email = "finethankuandyou@gmail.com" }
-]
-maintainers = [
-    { name = "zhangyunihao" }
+    { name = "zhangyunihao", email = "zhangyunihao@users.noreply.github.com" }
 ]
 license = "BSD-3-Clause"
 readme = "README.md"
