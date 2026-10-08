@@ -450,6 +450,14 @@ class TaskRunnerBlock:
                 "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
                 "{{ props.row.status }}</q-badge></q-td>",
             )
+            # 结果列：给文字一个固定 DOM id（runres-<任务id>），
+            # 运行中进度用 run_javascript 直接改写文本，避免整表重渲染吞掉按钮点击
+            self.history_table.add_slot(
+                "body-cell-result",
+                '<q-td :props="props">'
+                '<span :id="\'runres-\' + props.row.id">{{ props.row.result }}</span>'
+                "</q-td>",
+            )
             # 操作列：所有行显示「复制」「明细」（用该行参数打开新增弹窗/查看子任务明细），运行中的行额外显示「停止」
             self.history_table.add_slot(
                 "body-cell-actions",
@@ -758,12 +766,16 @@ class TaskRunnerBlock:
 
     def _on_stop_event(self, e) -> None:
         row = e.args
+        if isinstance(row, list) and row and isinstance(row[0], dict):
+            row = row[0]
         if isinstance(row, dict) and row.get("id"):
             self._stop_run(str(row["id"]))
 
     def _on_detail_event(self, e) -> None:
         """查看某条任务记录的子任务（账号 × 聊天）成功/失败明细"""
         row = e.args
+        if isinstance(row, list) and row and isinstance(row[0], dict):
+            row = row[0]
         if not isinstance(row, dict):
             return
         rid = str(row.get("id") or "")
@@ -778,28 +790,87 @@ class TaskRunnerBlock:
         counts = {"成功": 0, "失败": 0, "进行中": 0, "中断": 0}
         for d in details:
             counts[d.get("status", "中断")] = counts.get(d.get("status", "中断"), 0) + 1
+        accounts = sorted({d.get("account", "") for d in details if d.get("account")})
+        acc_stats = {
+            acc: {
+                "total": len([d for d in details if d.get("account", "") == acc]),
+                "failed": len(
+                    [
+                        d
+                        for d in details
+                        if d.get("account", "") == acc and d.get("status") == "失败"
+                    ]
+                ),
+            }
+            for acc in accounts
+        }
         with ui.dialog() as dlg, ui.card().classes("w-full max-w-xl"):
             ui.label(f"子任务明细 — {row.get('task', '')}").classes("text-lg font-semibold")
             ui.label(
                 f"共 {len(details)} 个子任务 | 成功 {counts['成功']} · 失败 {counts['失败']}"
                 f" · 进行中 {counts['进行中']} · 中断 {counts['中断']}"
             ).classes("text-sm text-gray-600")
+            # 分账号失败统计：点击可直接筛选该账号
+            if acc_stats:
+                with ui.row().classes("w-full gap-1 flex-wrap items-center"):
+                    ui.label("分账号：").classes("text-xs text-gray-500")
+
+                    def set_acc(acc: str) -> None:
+                        account_sel.value = acc
+                        account_sel.update()
+
+                    for acc in accounts:
+                        st = acc_stats[acc]
+                        ui.button(
+                            f"{acc}（失败 {st['failed']}/{st['total']}）",
+                            on_click=lambda a=acc: set_acc(a),
+                        ).props("flat dense size=sm color=grey-8")
+            with ui.row().classes("w-full gap-2 items-center"):
+                status_sel = ui.select(
+                    ["失败", "成功", "进行中", "中断", "全部"],
+                    value="失败",
+                    label="状态筛选",
+                    on_change=lambda: render(),
+                ).classes("min-w-[130px]")
+            # 账号筛选用 radio button（横向排列），点选即切换
+            account_sel = ui.radio(
+                ["全部账号"] + accounts,
+                value="全部账号",
+                on_change=lambda: render(),
+            ).props("inline dense").classes("w-full flex-wrap gap-x-4 gap-y-1 text-sm")
+            count_label = ui.label("").classes("text-sm text-gray-500")
             with ui.scroll_area().classes("w-full max-h-96 border rounded-lg"):
-                if not details:
-                    ui.label("无子任务明细（旧记录或任务尚未开始执行聊天）").classes(
-                        "text-sm text-gray-500 p-3"
-                    )
-                for d in details:
-                    status = d.get("status", "")
-                    color = {
-                        "成功": "text-green-700",
-                        "失败": "text-red-700",
-                        "进行中": "text-blue-700",
-                    }.get(status, "text-gray-500")
-                    mark = {"成功": "✓", "失败": "✗", "进行中": "…"}.get(status, "−")
-                    ui.label(f"{mark} {d.get('account', '')} → {d.get('chat', '')}：{status}").classes(
-                        f"text-sm py-0.5 {color}"
-                    ).style("white-space: pre;")
+                list_container = ui.column().classes("w-full gap-0 p-1")
+
+            def render() -> None:
+                st = status_sel.value
+                acc = account_sel.value
+                filtered = [
+                    d
+                    for d in details
+                    if (st == "全部" or d.get("status", "") == st)
+                    and (acc == "全部账号" or d.get("account", "") == acc)
+                ]
+                count_label.text = f"筛选后 {len(filtered)} 条"
+                count_label.update()
+                list_container.clear()
+                with list_container:
+                    if not filtered:
+                        ui.label("无匹配的子任务").classes("text-sm text-gray-500 p-2")
+                    for d in filtered:
+                        status = d.get("status", "")
+                        color = {
+                            "成功": "text-green-700",
+                            "失败": "text-red-700",
+                            "进行中": "text-blue-700",
+                        }.get(status, "text-gray-500")
+                        mark = {"成功": "✓", "失败": "✗", "进行中": "…"}.get(status, "−")
+                        ui.label(
+                            f"{mark} {d.get('account', '')} → {d.get('chat', '')}：{status}"
+                        ).classes(f"text-sm py-0.5 {color}").style("white-space: pre;")
+                list_container.update()
+
+            render()
             with ui.row().classes("w-full justify-end"):
                 ui.button("关闭", on_click=dlg.close).props("flat")
         dlg.open()
@@ -807,6 +878,8 @@ class TaskRunnerBlock:
     def _on_duplicate_event(self, e) -> None:
         """用历史行的参数打开「新增任务」弹窗"""
         row = e.args
+        if isinstance(row, list) and row and isinstance(row[0], dict):
+            row = row[0]
         if not isinstance(row, dict):
             return
         if row.get("type") in self.TASK_TYPES:
@@ -854,11 +927,19 @@ class TaskRunnerBlock:
         ui.notify(f"已停止: {record['task_name']}", type="positive")
 
     def _update_running_row(self, record_id: str, result_text: str) -> None:
+        # 只同步内存行数据；进度文本用 JS 直接改写单元格（固定 DOM id），
+        # 不调用 history_table.update()，避免每 0.3s 整表重渲染导致「明细/停止」点击丢失
         for row in self.history_table.rows:
             if row.get("id") == record_id:
                 row["result"] = result_text
                 break
-        self.history_table.update()
+        safe = (
+            result_text.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+        )
+        ui.run_javascript(
+            f"var el = document.getElementById('runres-{record_id}');"
+            f"if (el) el.textContent = '{safe}';"
+        )
 
     def _close_pending_details(self, run: dict, default_status: str) -> None:
         """进程结束后，把仍在「进行中」的子任务标记为最终状态。"""
