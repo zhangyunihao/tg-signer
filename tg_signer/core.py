@@ -1166,7 +1166,12 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         chat_ids = [c.chat_id for c in config.chats]
 
         async def sign_once():
-            for chat in config.chats:
+            # TG_SIGNER_SHUFFLE_CHATS=1 时随机打乱频道执行顺序（每个账号进程各自独立打乱）
+            chats = list(config.chats)
+            if os.environ.get("TG_SIGNER_SHUFFLE_CHATS") == "1":
+                random.shuffle(chats)
+                self.log("已随机打乱频道执行顺序")
+            for chat in chats:
                 route_key = None
                 try:
                     route_key = await self.resolve_chat_route_key(chat)

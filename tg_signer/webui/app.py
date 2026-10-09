@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import queue
+import random
 import subprocess
 import sys
 import threading
@@ -629,8 +630,12 @@ class TaskRunnerBlock:
         if not accounts:
             ui.notify("请至少选择一个账号", type="warning")
             return
+        # 多账号时打乱启动顺序，避免每次都按相同顺序发言
+        random.shuffle(accounts)
         env = os.environ.copy()
         env["PYTHONPATH"] = str(SOURCE_ROOT)
+        # 每个账号进程各自随机打乱频道执行顺序，避免所有账号按相同顺序发同一批频道
+        env["TG_SIGNER_SHUFFLE_CHATS"] = "1"
         record = {
             "id": f"{time.time_ns()}",
             "start_time": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
@@ -1318,7 +1323,7 @@ def user_info_block() -> Callable[[], None]:
                     with ui.row().classes("items-center gap-1"):
                         ui.label("账户管理").classes("text-lg font-semibold")
                         ui.icon("drag_indicator").classes("text-gray-400").tooltip(
-                            "拖动卡片可调整顺序，保存后各页面账号下拉也按此顺序显示"
+                            "用上下箭头（或拖动卡片）调整顺序，保存后各页面账号下拉也按此顺序显示"
                         )
                     ui.button(
                         "增加账户",
@@ -1441,8 +1446,19 @@ def user_info_block() -> Callable[[], None]:
                                 ).props("color=primary")
                         dlg.open()
 
+                    def move_account(name: str, delta: int) -> None:
+                        """上下箭头调整账户顺序：与相邻账户交换位置后持久化。"""
+                        idx = names.index(name)
+                        new_idx = idx + delta
+                        if new_idx < 0 or new_idx >= len(names):
+                            return
+                        lst = list(names)
+                        lst[idx], lst[new_idx] = lst[new_idx], lst[idx]
+                        set_account_order(lst, state.workdir)
+                        refresh()
+
                     with ui.grid(columns=3).classes("w-full gap-2") as account_grid:
-                        for name in names:
+                        for pos, name in enumerate(names):
                             with ui.column().classes(
                                 "border rounded p-2 gap-1 cursor-move"
                             ).props(f'data-account="{name}"'):
@@ -1454,6 +1470,20 @@ def user_info_block() -> Callable[[], None]:
                                             n, e.value
                                         ),
                                     )
+                                    up_btn = ui.button(
+                                        icon="keyboard_arrow_up",
+                                        on_click=lambda n=name: move_account(n, -1),
+                                    ).props("flat round dense")
+                                    up_btn.tooltip("上移")
+                                    if pos <= 0:
+                                        up_btn.props("disable")
+                                    down_btn = ui.button(
+                                        icon="keyboard_arrow_down",
+                                        on_click=lambda n=name: move_account(n, 1),
+                                    ).props("flat round dense")
+                                    down_btn.tooltip("下移")
+                                    if pos >= len(names) - 1:
+                                        down_btn.props("disable")
                                     ui.button(
                                         icon="edit",
                                         on_click=lambda n=name: rename_account(n),
