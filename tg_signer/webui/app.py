@@ -1917,7 +1917,7 @@ def _build_dashboard(container) -> None:
                             "application/zip",
                         )
                         ui.notify(
-                            "备份已导出（含配置和 session 文件），浏览器已开始下载",
+                            "备份已导出（不含 session 文件），浏览器已开始下载",
                             type="positive",
                         )
                     except Exception as exc:  # noqa: BLE001
@@ -1933,7 +1933,6 @@ def _build_dashboard(container) -> None:
                         return
                     ui.notify(
                         "导入完成：签到配置 {signer} 个、监控配置 {monitor} 个、"
-                        "session 文件 {session_files} 个、"
                         "数据文件 {signer_data_files} 个".format(**counts),
                         type="positive",
                     )
@@ -1954,10 +1953,9 @@ def _build_dashboard(container) -> None:
                     ui.label(
                         "选择此前「导出全部配置」生成的备份文件（.zip 或 .json）。"
                         "同名配置会被覆盖，账户状态同步恢复；"
-                        "ZIP 还会还原 session 文件（同名覆盖）、"
-                        "最近聊天缓存和批量退频道排除关键字配置。"
-                        "任务历史不随备份迁移。"
-                        "注意：session 文件包含账号登录凭据，请妥善保管备份。"
+                        "ZIP 还会还原最近聊天缓存和批量退频道排除关键字配置。"
+                        "任务历史不随备份迁移；备份不含 session 登录凭据，"
+                        "迁移账号需另行复制 .session 文件。"
                     ).classes("text-sm text-gray-600")
                     ui.upload(
                         label="选择备份文件",

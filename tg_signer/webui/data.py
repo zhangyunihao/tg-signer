@@ -373,10 +373,9 @@ def import_all_configs(
 
 
 def export_backup(workdir: Optional[Path | str] = None) -> bytes:
-    """导出完整备份 ZIP。
+    """导出备份 ZIP（不含 session 登录凭据，迁移账号需另行复制 session 文件）。
 
     - configs.json：签到/监控配置、随机发言任务、账户状态（导入时走合并逻辑）
-    - sessions/：全部 session 文件（含 session_string，账号登录凭据）
     - signer_data/：users 缓存（me.json / latest_chats.json）+ 批量退频道配置
     """
     import io
@@ -393,13 +392,6 @@ def export_backup(workdir: Optional[Path | str] = None) -> bytes:
 
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("configs.json", export_all_configs(workdir))
-        session_dir = Path(".")
-        for pattern in ("*.session", "*.session_string"):
-            for p in sorted(session_dir.glob(pattern)):
-                try:
-                    zf.write(p, f"sessions/{p.name}")
-                except OSError:
-                    continue
         # users 缓存（最近聊天列表、账户身份资料）
         users_dir = base / "users"
         if users_dir.is_dir():
@@ -449,16 +441,7 @@ def import_backup(raw: bytes, workdir: Optional[Path | str] = None) -> Dict[str,
         if "configs.json" in names:
             curated = import_all_configs(zf.read("configs.json"), workdir)
             counts.update({k: v for k, v in curated.items() if k in counts})
-        # 3) 还原 session 文件到运行目录
-        session_dir = Path(".")
-        for name in names:
-            if not name.startswith("sessions/"):
-                continue
-            fname = Path(name).name
-            if not fname or fname.startswith("."):
-                continue
-            (session_dir / fname).write_bytes(zf.read(name))
-            counts["session_files"] += 1
+        # 兼容旧备份：忽略 sessions/ 目录（不再还原 session 凭据）
     return counts
 
 
