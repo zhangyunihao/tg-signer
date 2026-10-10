@@ -160,95 +160,52 @@ class InteractiveSignerConfig:
                 "text-lg font-bold mb-4"
             )
 
-            # Quick Import Dialog
-            def show_import_dialog():
-                user_infos = load_user_infos(self.workdir)
-                if not user_infos:
-                    ui.notify("未找到用户信息", type="warning")
+            # Quick Import: 仿照随机发言，聚合全部账户的最近群组，内嵌下拉直接选择（无弹窗）
+            def build_group_options():
+                options = {}
+                for u in load_user_infos(self.workdir):
+                    for c in u.latest_chats or []:
+                        # 签到目标是群组，私聊/机器人等非群组聊天不列出
+                        chat_type = str(c.get("type") or "").lower()
+                        if not chat_type.endswith("group"):
+                            continue
+                        cid = c.get("id")
+                        if cid is None:
+                            continue
+                        title = c.get("title") or c.get("first_name") or "N/A"
+                        # ui.select 字典格式为 {值: 显示标签}
+                        options[(cid, title)] = f"{title} ({cid})"
+                return options
+
+            def on_group_pick(e: ValueChangeEventArguments):
+                selected = e.value
+                if not selected:
                     return
+                chat_id, title = selected
+                # Auto fill ID
+                id_input.value = chat_id
+                # Auto fill name if empty
+                if not name_input.value:
+                    name_input.value = title
 
-                with ui.dialog() as import_dialog, ui.card().classes("w-full max-w-lg"):
-                    ui.label("从最近聊天快速导入").classes("text-lg font-bold mb-4")
+            with ui.column().classes("w-full gap-2"):
+                id_input = ui.input(
+                    label="Chat ID / @username",
+                    value=str(d_chat_id) if d_chat_id else "",
+                    placeholder="整数ID 或 @username",
+                ).props("outlined")
 
-                    def on_chat_select(e: ValueChangeEventArguments):
-                        selected_chat = e.value
-                        if not selected_chat:
-                            return
-
-                        chat_id, label = selected_chat
-                        # Auto fill ID
-                        id_input.value = chat_id
-
-                        # Auto fill name if empty
-                        if not name_input.value:
-                            name_input.value = label
-
-                        import_dialog.close()
-
-                    def on_user_select(e):
-                        user_id = e.value
-                        chat_select.options = {}
-                        chat_select.value = None
-
-                        if not user_id:
-                            chat_select.disable()
-                            return
-
-                        target_user = next(
-                            (u for u in user_infos if u.user_id == user_id), None
-                        )
-                        if target_user and target_user.latest_chats:
-                            options = {}
-                            for c in target_user.latest_chats:
-                                label = c.get("title") or c.get("first_name") or "N/A"
-                                username = c.get("username")
-                                if username:
-                                    label += f" (@{username})"
-                                value = (c["id"], label)
-                                options[value] = label
-                            chat_select.options = options
-                            chat_select.enable()
-                        else:
-                            chat_select.disable()
-                            ui.notify("该用户无最近聊天记录", type="warning")
-
-                    with ui.column().classes("w-full gap-4"):
-                        user_options = {
-                            u.user_id: f"{u.user_id} ({u.data.get('first_name', '')})"
-                            for u in user_infos
-                        }
-                        ui.select(
-                            options=user_options,
-                            label="选择用户",
-                            on_change=on_user_select,
-                            with_input=True,
-                        ).classes("w-full")
-
-                        chat_select = ui.select(
-                            options={},
-                            label="选择聊天",
-                            on_change=on_chat_select,
-                            with_input=True,
-                        ).classes("w-full")
-                        chat_select.disable()
-
-                    ui.button("取消", on_click=import_dialog.close).props(
-                        "flat"
-                    ).classes("ml-auto mt-4")
-
-                import_dialog.open()
+                group_select = ui.select(
+                    options=build_group_options(),
+                    label="或从最近聊天选择",
+                    on_change=on_group_pick,
+                    with_input=True,
+                ).classes("w-full")
+                if not group_select.options:
+                    group_select.props('label="或从最近聊天选择（无记录）"')
+                    group_select.disable()
 
             with ui.grid(columns=2).classes("w-full gap-4 mb-4"):
-                id_input = (
-                    ui.input(
-                        label="Chat ID / @username",
-                        value=str(d_chat_id) if d_chat_id else "",
-                        placeholder="整数ID 或 @username (点击选择)",
-                    )
-                    .props("outlined")
-                    .on("click", show_import_dialog)
-                )
-
                 name_input = ui.input(label="备注名称 (可选)", value=d_name).props(
                     "outlined"
                 )
