@@ -326,68 +326,67 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         finally:
             await set_busy(False)
 
-    with ui.card().classes("w-full shadow-md"):
-        ui.label("批量退频道").classes("text-lg font-semibold")
-        ui.label(
-            "扫描所选账号的对话，列出超过指定天数没有新消息的频道（可选包含群组），"
-            "默认全选后并发批量退出。自己是创建者的对话永远不会被退出。"
-        ).classes("text-sm text-gray-500")
+    ui.label("批量退频道").classes("text-lg font-semibold")
+    ui.label(
+        "扫描所选账号的对话，列出超过指定天数没有新消息的频道（可选包含群组），"
+        "默认全选后并发批量退出。自己是创建者的对话永远不会被退出。"
+    ).classes("text-sm text-gray-500")
 
-        with ui.row().classes("w-full items-end flex-nowrap"):
-            session_dir_input = ui.input(
-                label="会话目录", value=cfg.get("session_dir") or default_session_dir
-            ).classes("w-40")
-            days_input = ui.number(
-                label="不更新天数阈值", value=cfg.get("days") or 7, min=1, step=1,
-                format="%.0f",
-            ).classes("w-36")
-            include_groups = ui.checkbox(
-                "包含群组", value=bool(cfg.get("include_groups"))
-            )
-            skip_pinned = ui.checkbox(
-                "跳过置顶", value=bool(cfg.get("skip_pinned", True))
-            )
-            account_select = ui.select(
-                label="账号（可多选）",
-                options=[],
-                multiple=True,
-                with_input=True,
-            ).classes("min-w-64 flex-1")
-            scan_btn = ui.button("扫描预览", on_click=on_scan).props(
-                "outline"
-            ).classes("ml-auto")
+    with ui.row().classes("w-full items-end flex-nowrap"):
+        session_dir_input = ui.input(
+            label="会话目录", value=cfg.get("session_dir") or default_session_dir
+        ).classes("w-40")
+        days_input = ui.number(
+            label="不更新天数阈值", value=cfg.get("days") or 7, min=1, step=1,
+            format="%.0f",
+        ).classes("w-36")
+        include_groups = ui.checkbox(
+            "包含群组", value=bool(cfg.get("include_groups"))
+        )
+        skip_pinned = ui.checkbox(
+            "跳过置顶", value=bool(cfg.get("skip_pinned", True))
+        )
+        account_select = ui.select(
+            label="账号（可多选）",
+            options=[],
+            multiple=True,
+            with_input=True,
+        ).classes("min-w-64 flex-1")
+        scan_btn = ui.button("扫描预览", on_click=on_scan).props(
+            "outline"
+        ).classes("ml-auto")
 
-        result_table = ui.table(
-            columns=[
-                {"name": "account", "label": "账号", "field": "account", "align": "left"},
-                {"name": "title", "label": "名称", "field": "title", "align": "left"},
-                {"name": "type", "label": "类型", "field": "type", "align": "left"},
-                {
-                    "name": "age_days",
-                    "label": "未更新(天)",
-                    "field": "age_days",
-                    "align": "left",
-                },
-                {"name": "chat_id", "label": "chat_id", "field": "chat_id", "align": "left"},
-            ],
-            rows=[],
-            row_key="key",
-            selection="multiple",
-        ).classes("w-full")
+    result_table = ui.table(
+        columns=[
+            {"name": "account", "label": "账号", "field": "account", "align": "left"},
+            {"name": "title", "label": "名称", "field": "title", "align": "left"},
+            {"name": "type", "label": "类型", "field": "type", "align": "left"},
+            {
+                "name": "age_days",
+                "label": "未更新(天)",
+                "field": "age_days",
+                "align": "left",
+            },
+            {"name": "chat_id", "label": "chat_id", "field": "chat_id", "align": "left"},
+        ],
+        rows=[],
+        row_key="key",
+        selection="multiple",
+    ).classes("w-full")
 
-        with ui.row().classes("w-full items-center"):
-            leave_btn = ui.button(
-                "退出所选", on_click=confirm_leave
-            ).props("color=negative outline")
-            ui.label("勾选表格左侧复选框后操作；扫描结果默认不执行任何退出").classes(
-                "text-xs text-gray-500"
-            )
+    with ui.row().classes("w-full items-center"):
+        leave_btn = ui.button(
+            "退出所选", on_click=confirm_leave
+        ).props("color=negative outline")
+        ui.label("勾选表格左侧复选框后操作；扫描结果默认不执行任何退出").classes(
+            "text-xs text-gray-500"
+        )
 
-        log_area = ui.log(max_lines=300).classes("w-full h-48 mt-2")
-        for line in log_lines:
-            log_area.push(line)
+    log_area = ui.log(max_lines=300).classes("w-full h-48 mt-2")
+    for line in log_lines:
+        log_area.push(line)
 
-        account_select.on("update:model-value", lambda: persist())
-        refresh_options()
+    account_select.on("update:model-value", lambda: persist())
+    refresh_options()
 
     return refresh_options

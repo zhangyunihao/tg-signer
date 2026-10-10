@@ -23,7 +23,11 @@ from tg_signer.webui.data import (
     account_identities,
     apply_account_order,
     delete_config,
+    export_all_configs,
+    export_backup,
     get_workdir,
+    import_all_configs,
+    import_backup,
     list_log_files,
     list_task_names,
     load_config,
@@ -122,48 +126,47 @@ class BaseConfigBlock:
         self.template = template
         self.title = "签到配置 (signer)" if kind == "signer" else "监控配置 (monitor)"
         self.root_dir, self.cfg_cls = CONFIG_META[kind]
-        with ui.card().classes("w-full shadow-md"):
-            ui.label(self.title).classes("text-lg font-semibold")
-            ui.label(f"目录: {self.root_dir}/<name>/config.json").classes(
-                "text-sm text-gray-500"
-            )
-            with ui.row().classes("items-end w-full gap-3"):
-                self.select = ui.select(
-                    label="选择配置",
-                    options=[],
-                    with_input=True,
-                    on_change=self.load_current,
-                ).classes("min-w-[240px]")
-                ui.button("重置", on_click=self.clear_selection).props("outline")
-                self.name_input = ui.input(
-                    label="保存为/新建名称",
-                    placeholder="my_task",
-                ).classes("min-w-[200px]")
-                ui.button("使用示例", on_click=self.fill_template)
-                self.setup_toolbar()
+        ui.label(self.title).classes("text-lg font-semibold")
+        ui.label(f"目录: {self.root_dir}/<name>/config.json").classes(
+            "text-sm text-gray-500"
+        )
+        with ui.row().classes("items-end w-full gap-3"):
+            self.select = ui.select(
+                label="选择配置",
+                options=[],
+                with_input=True,
+                on_change=self.load_current,
+            ).classes("min-w-[240px]")
+            ui.button("重置", on_click=self.clear_selection).props("outline")
+            self.name_input = ui.input(
+                label="保存为/新建名称",
+                placeholder="my_task",
+            ).classes("min-w-[200px]")
+            ui.button("使用示例", on_click=self.fill_template)
+            self.setup_toolbar()
 
-            # MonitorConfig schema causes json_editor to fail rendering due to "format": "uri" etc.
-            # We need to clean the schema before passing it to the editor.
-            schema = TypeAdapter(self.cfg_cls | None).json_schema()
-            if self.kind == "monitor":
-                schema = clean_schema(schema)
+        # MonitorConfig schema causes json_editor to fail rendering due to "format": "uri" etc.
+        # We need to clean the schema before passing it to the editor.
+        schema = TypeAdapter(self.cfg_cls | None).json_schema()
+        if self.kind == "monitor":
+            schema = clean_schema(schema)
 
-            def on_change(e):
-                self.editor.properties["content"] = e.content
+        def on_change(e):
+            self.editor.properties["content"] = e.content
 
-            self.editor = ui.json_editor(
-                {"content": {"json": None}},
-                schema=schema,
-                on_change=on_change,
-            )
-            self.selected_name: dict[str, str] = {"value": ""}
+        self.editor = ui.json_editor(
+            {"content": {"json": None}},
+            schema=schema,
+            on_change=on_change,
+        )
+        self.selected_name: dict[str, str] = {"value": ""}
 
-            with ui.row().classes("gap-2 items-center"):
-                ui.button("刷新列表", on_click=self.refresh_options)
-                ui.button("加载", on_click=self.load_current)
-                ui.button("保存", color="primary", on_click=self.save_current)
-                ui.button("删除", color="negative", on_click=self.delete_current)
-            self.setup_footer()
+        with ui.row().classes("gap-2 items-center"):
+            ui.button("刷新列表", on_click=self.refresh_options)
+            ui.button("加载", on_click=self.load_current)
+            ui.button("保存", color="primary", on_click=self.save_current)
+            ui.button("删除", color="negative", on_click=self.delete_current)
+        self.setup_footer()
 
     def clear_selection(self) -> None:
         self.select.value = None
@@ -371,123 +374,122 @@ class TaskRunnerBlock:
         self.runs: dict[str, dict] = {}
         self.output_lines: list[str] = []
 
-        with ui.card().classes("w-full shadow-md"):
-            ui.label("签到").classes("text-lg font-semibold")
-            ui.label(
-                "点击「新增任务」在弹窗中选择任务类型、任务与账号；历史列表可「复制」任意历史任务的参数快速新建，运行中的任务可停止。"
-            ).classes("text-sm text-gray-500")
+        ui.label("签到").classes("text-lg font-semibold")
+        ui.label(
+            "点击「新增任务」在弹窗中选择任务类型、任务与账号；历史列表可「复制」任意历史任务的参数快速新建，运行中的任务可停止。"
+        ).classes("text-sm text-gray-500")
 
-            with ui.row().classes("gap-2 items-center"):
-                ui.button("新增任务", icon="add", color="primary", on_click=self.open_dialog)
-                ui.button("清空输出", on_click=self.clear_log).props("outline")
+        with ui.row().classes("gap-2 items-center"):
+            ui.button("新增任务", icon="add", color="primary", on_click=self.open_dialog)
+            ui.button("清空输出", on_click=self.clear_log).props("outline")
 
-            self.status_label = ui.label("空闲").classes("text-sm text-gray-500")
+        self.status_label = ui.label("空闲").classes("text-sm text-gray-500")
 
-            # ---- 任务历史 ----
-            ui.separator().classes("my-2")
-            with ui.row().classes("w-full items-center justify-between"):
-                ui.label("任务历史").classes("text-md font-semibold")
-                ui.button("清空历史", on_click=self.clear_history).props(
-                    "outline dense"
-                )
-            ui.label(
-                "记录通过本页面手动执行过的任务（含类型、账号、状态与结果），保存在工作目录下。"
-            ).classes("text-sm text-gray-500")
-            self.history_summary = ui.label("").classes("text-sm text-gray-600")
-            self.history_table = ui.table(
-                columns=[
-                    {
-                        "name": "time",
-                        "label": "开始时间",
-                        "field": "time",
-                        "align": "left",
-                    },
-                    {
-                        "name": "type",
-                        "label": "任务类型",
-                        "field": "type",
-                        "align": "left",
-                    },
-                    {
-                        "name": "task",
-                        "label": "任务名",
-                        "field": "task",
-                        "align": "left",
-                    },
-                    {
-                        "name": "accounts",
-                        "label": "账号",
-                        "field": "accounts",
-                        "align": "left",
-                    },
-                    {
-                        "name": "status",
-                        "label": "状态",
-                        "field": "status",
-                        "align": "left",
-                    },
-                    {
-                        "name": "result",
-                        "label": "结果",
-                        "field": "result",
-                        "align": "left",
-                    },
-                    {
-                        "name": "actions",
-                        "label": "操作",
-                        "field": "actions",
-                        "align": "left",
-                    },
-                ],
-                rows=[],
-                pagination=5,
-            ).classes("w-full").props("flat dense")
-            # 状态列渲染为彩色徽章：已完成=绿、失败=红、运行中=蓝、其他=灰
-            self.history_table.add_slot(
-                "body-cell-status",
-                '<q-td :props="props">'
-                '<q-badge :color="props.row.status === \'已完成\' ? \'positive\' : '
-                "props.row.status === '失败' ? 'negative' : "
-                "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
-                "{{ props.row.status }}</q-badge></q-td>",
+        # ---- 任务历史 ----
+        ui.separator().classes("my-2")
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label("任务历史").classes("text-md font-semibold")
+            ui.button("清空历史", on_click=self.clear_history).props(
+                "outline dense"
             )
-            # 结果列：给文字一个固定 DOM id（runres-<任务id>），
-            # 运行中进度用 run_javascript 直接改写文本，避免整表重渲染吞掉按钮点击
-            self.history_table.add_slot(
-                "body-cell-result",
-                '<q-td :props="props">'
-                '<span :id="\'runres-\' + props.row.id">{{ props.row.result }}</span>'
-                "</q-td>",
-            )
-            # 操作列：所有行显示「复制」「明细」（用该行参数打开新增弹窗/查看子任务明细），运行中的行额外显示「停止」
-            self.history_table.add_slot(
-                "body-cell-actions",
-                '<q-td :props="props">'
-                '<q-btn flat dense color="primary" '
-                'label="复制" @click="$parent.$emit(\'duplicateTask\', props.row)" />'
-                '<q-btn flat dense color="grey-8" '
-                'label="明细" @click="$parent.$emit(\'detailTask\', props.row)" />'
-                '<q-btn v-if="props.row.status === \'运行中\'" flat dense color="negative" '
-                'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
-                "</q-td>",
-            )
-            self.history_table.on("stopTask", self._on_stop_event)
-            self.history_table.on("duplicateTask", self._on_duplicate_event)
-            self.history_table.on("detailTask", self._on_detail_event)
+        ui.label(
+            "记录通过本页面手动执行过的任务（含类型、账号、状态与结果），保存在工作目录下。"
+        ).classes("text-sm text-gray-500")
+        self.history_summary = ui.label("").classes("text-sm text-gray-600")
+        self.history_table = ui.table(
+            columns=[
+                {
+                    "name": "time",
+                    "label": "开始时间",
+                    "field": "time",
+                    "align": "left",
+                },
+                {
+                    "name": "type",
+                    "label": "任务类型",
+                    "field": "type",
+                    "align": "left",
+                },
+                {
+                    "name": "task",
+                    "label": "任务名",
+                    "field": "task",
+                    "align": "left",
+                },
+                {
+                    "name": "accounts",
+                    "label": "账号",
+                    "field": "accounts",
+                    "align": "left",
+                },
+                {
+                    "name": "status",
+                    "label": "状态",
+                    "field": "status",
+                    "align": "left",
+                },
+                {
+                    "name": "result",
+                    "label": "结果",
+                    "field": "result",
+                    "align": "left",
+                },
+                {
+                    "name": "actions",
+                    "label": "操作",
+                    "field": "actions",
+                    "align": "left",
+                },
+            ],
+            rows=[],
+            pagination=5,
+        ).classes("w-full").props("flat dense")
+        # 状态列渲染为彩色徽章：已完成=绿、失败=红、运行中=蓝、其他=灰
+        self.history_table.add_slot(
+            "body-cell-status",
+            '<q-td :props="props">'
+            '<q-badge :color="props.row.status === \'已完成\' ? \'positive\' : '
+            "props.row.status === '失败' ? 'negative' : "
+            "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
+            "{{ props.row.status }}</q-badge></q-td>",
+        )
+        # 结果列：给文字一个固定 DOM id（runres-<任务id>），
+        # 运行中进度用 run_javascript 直接改写文本，避免整表重渲染吞掉按钮点击
+        self.history_table.add_slot(
+            "body-cell-result",
+            '<q-td :props="props">'
+            '<span :id="\'runres-\' + props.row.id">{{ props.row.result }}</span>'
+            "</q-td>",
+        )
+        # 操作列：所有行显示「复制」「明细」（用该行参数打开新增弹窗/查看子任务明细），运行中的行额外显示「停止」
+        self.history_table.add_slot(
+            "body-cell-actions",
+            '<q-td :props="props">'
+            '<q-btn flat dense color="primary" '
+            'label="复制" @click="$parent.$emit(\'duplicateTask\', props.row)" />'
+            '<q-btn flat dense color="grey-8" '
+            'label="明细" @click="$parent.$emit(\'detailTask\', props.row)" />'
+            '<q-btn v-if="props.row.status === \'运行中\'" flat dense color="negative" '
+            'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
+            "</q-td>",
+        )
+        self.history_table.on("stopTask", self._on_stop_event)
+        self.history_table.on("duplicateTask", self._on_duplicate_event)
+        self.history_table.on("detailTask", self._on_detail_event)
 
-            self.log_area = ui.scroll_area().classes(
-                "w-full bg-gray-50 rounded-lg border border-gray-200"
+        self.log_area = ui.scroll_area().classes(
+            "w-full bg-gray-50 rounded-lg border border-gray-200"
+        )
+        self.log_area.style("max-height: 420px")
+        with self.log_area:
+            self.log_list = (
+                ui.column()
+                .classes("w-full gap-0 p-3 font-mono text-sm")
+                .style("white-space: pre;")
             )
-            self.log_area.style("max-height: 420px")
-            with self.log_area:
-                self.log_list = (
-                    ui.column()
-                    .classes("w-full gap-0 p-3 font-mono text-sm")
-                    .style("white-space: pre;")
-                )
 
-            self._timer = ui.timer(0.3, self._poll_output)
-            self._timer.deactivate()
+        self._timer = ui.timer(0.3, self._poll_output)
+        self._timer.deactivate()
 
         # ---- 新增任务弹窗 ----
         with ui.dialog() as self.dialog, ui.card().classes("w-full max-w-2xl"):
@@ -1904,6 +1906,67 @@ def _build_dashboard(container) -> None:
                 ui.label(
                     "管理 signer 和 monitor 的配置文件，支持查看、编辑和删除。"
                 ).classes("text-gray-600")
+
+                # ---- 配置导入导出（用于备份或迁移到其他设备） ----
+                def export_configs() -> None:
+                    try:
+                        data = export_backup(state.workdir)
+                        ui.download(
+                            data,
+                            f"tg-signer-backup-{datetime.now():%Y%m%d-%H%M%S}.zip",
+                            "application/zip",
+                        )
+                        ui.notify(
+                            "备份已导出（含配置和 session 文件），浏览器已开始下载",
+                            type="positive",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        notify_error(exc)
+
+                async def on_import_file(e) -> None:
+                    try:
+                        # NiceGUI 3.13：上传内容在 e.file（FileUpload），read() 为异步
+                        raw = await e.file.read()
+                        counts = import_backup(raw, state.workdir)
+                    except Exception as exc:  # noqa: BLE001
+                        notify_error(exc)
+                        return
+                    ui.notify(
+                        "导入完成：签到配置 {signer} 个、监控配置 {monitor} 个、"
+                        "session 文件 {session_files} 个、"
+                        "数据文件 {signer_data_files} 个".format(**counts),
+                        type="positive",
+                    )
+                    try:
+                        refresh_all()
+                    except Exception as exc:  # noqa: BLE001
+                        # 导入已成功，仅界面刷新失败时单独提示，避免误报导入失败
+                        notify_error(exc)
+
+                with ui.row().classes("gap-2 items-center flex-wrap"):
+                    ui.button("导出全部配置", icon="download", on_click=export_configs)
+                    ui.button(
+                        "导入配置", icon="upload", on_click=lambda: import_dlg.open()
+                    )
+
+                with ui.dialog() as import_dlg, ui.card().classes("w-[420px] max-w-full"):
+                    ui.label("导入备份").classes("text-lg font-semibold")
+                    ui.label(
+                        "选择此前「导出全部配置」生成的备份文件（.zip 或 .json）。"
+                        "同名配置会被覆盖，账户状态同步恢复；"
+                        "ZIP 还会还原 session 文件（同名覆盖）、"
+                        "最近聊天缓存和批量退频道排除关键字配置。"
+                        "任务历史不随备份迁移。"
+                        "注意：session 文件包含账号登录凭据，请妥善保管备份。"
+                    ).classes("text-sm text-gray-600")
+                    ui.upload(
+                        label="选择备份文件",
+                        on_upload=on_import_file,
+                        auto_upload=True,
+                    ).props("accept=.json,.zip").classes("w-full")
+                    with ui.row().classes("w-full justify-end"):
+                        ui.button("关闭", on_click=import_dlg.close).props("outline")
+
                 with ui.tabs().classes("mt-2") as sub_tabs:
                     tab_signer = ui.tab("Signer")
                     tab_monitor = ui.tab("Monitor")
@@ -1965,6 +2028,26 @@ def _auth_gate(container, auth_code: str, on_success: Callable[[], None]) -> Non
 
 
 def build_ui(auth_code: str = None) -> None:
+    # 固定浅色模式：NiceGUI 默认跟随系统主题，系统深色时页面会整体变黑
+    ui.dark_mode(False)
+    # 整页灰底渐变，卡片区域白色
+    ui.add_head_html(
+        """
+        <style>
+            body {
+                background: linear-gradient(180deg, #eef1f5 0%, #e3e7ee 100%) fixed !important;
+            }
+            .q-layout, .q-page, .q-page-container, .nicegui-content {
+                background: transparent !important;
+            }
+            .q-card {
+                background: #ffffff;
+                border-radius: 12px;
+                box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+            }
+        </style>
+        """
+    )
     ui.page_title("TG Signer Web 控制台")
     root = ui.column().classes("w-full gap-3")
 

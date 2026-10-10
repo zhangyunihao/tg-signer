@@ -848,156 +848,155 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 tasks[name]["_set_status"] = set_status
                 _GLOBAL_STATUS_CBS[engine_key(name)] = set_status
 
-    with ui.card().classes("w-full shadow-md"):
-        ui.label("随机发言").classes("text-lg font-semibold")
-        ui.label(
-            f"从内置 {len(PHRASES)} 条语库中随机选一句，由所选账号发送到目标群组，发送后可在指定秒数自动删除（删除延迟填 0 或留空则不删除）。支持添加多个任务并行运行。"
-        ).classes("text-sm text-gray-500")
+    ui.label("随机发言").classes("text-lg font-semibold")
+    ui.label(
+        f"从内置 {len(PHRASES)} 条语库中随机选一句，由所选账号发送到目标群组，发送后可在指定秒数自动删除（删除延迟填 0 或留空则不删除）。支持添加多个任务并行运行。"
+    ).classes("text-sm text-gray-500")
 
-        # —— 任务列表（置顶） ——
-        with ui.row().classes("w-full items-center justify-between"):
-            ui.label("任务列表").classes("font-semibold")
-            ui.button("添加任务", icon="add", on_click=lambda: add_dlg.open()).props(
+    # —— 任务列表（置顶） ——
+    with ui.row().classes("w-full items-center justify-between"):
+        ui.label("任务列表").classes("font-semibold")
+        ui.button("添加任务", icon="add", on_click=lambda: add_dlg.open()).props(
+            "outline"
+        )
+    task_list_container = ui.column().classes("w-full gap-2")
+
+    # —— 共用日志 ——
+    ui.separator()
+
+    def clear_log() -> None:
+        log_buf.clear()
+        _seen["n"] = len(log_buf)
+        send_log.clear()
+
+    with ui.row().classes("w-full items-center justify-between"):
+        ui.label("共用日志（所有任务）").classes("font-semibold")
+        ui.button(icon="delete_outline", on_click=clear_log).props(
+            "flat round dense"
+        ).tooltip("清空日志")
+    send_log = ui.log(max_lines=300).classes("w-full h-40")
+    log_buf = _GLOBAL_LOGS.setdefault(wd_key, [])
+    _seen = {"n": len(log_buf)}
+
+    for line in log_buf:
+        try:
+            send_log.push(line)
+        except Exception:
+            pass
+
+    client = ui.context.client
+
+    async def _poll_loop() -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            if not client.has_socket_connection:
+                return
+            # 每秒刷新运行中任务的进度状态列（如 "运行中 (18/100)"）
+            table = table_ref["table"]
+            if table is not None:
+                try:
+                    changed = False
+                    for r in table.rows:
+                        n = str(r.get("name") or "")
+                        if n in tasks:
+                            new_status = _status_text(n)
+                            if r.get("status") != new_status:
+                                r["status"] = new_status
+                                changed = True
+                    if changed:
+                        table.update()
+                except Exception:
+                    pass
+            if _seen["n"] > len(log_buf):
+                _seen["n"] = len(log_buf)
+            new_lines = log_buf[_seen["n"]:]
+            if not new_lines:
+                continue
+            _seen["n"] = len(log_buf)
+            try:
+                with client:
+                    for line in new_lines:
+                        try:
+                            send_log.push(line)
+                        except Exception:
+                            pass
+            except Exception:
+                return
+
+    asyncio.create_task(_poll_loop())
+
+    # —— 添加任务弹窗 ——
+    with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl"):
+        ui.label("添加任务").classes("text-lg font-semibold")
+        with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+            session_dir_input = ui.input(
+                label="会话目录（.session 所在目录）", value=default_session_dir
+            ).classes("w-56")
+            account_select = ui.select(
+                label="选择账号（可多选）",
+                options=[],
+                multiple=True,
+            ).classes("min-w-[260px]").props("use-chips")
+            ui.button("刷新账号/群组", on_click=lambda: refresh_options()).props(
                 "outline"
             )
-        task_list_container = ui.column().classes("w-full gap-2")
 
-        # —— 共用日志 ——
-        ui.separator()
-
-        def clear_log() -> None:
-            log_buf.clear()
-            _seen["n"] = len(log_buf)
-            send_log.clear()
-
-        with ui.row().classes("w-full items-center justify-between"):
-            ui.label("共用日志（所有任务）").classes("font-semibold")
-            ui.button(icon="delete_outline", on_click=clear_log).props(
-                "flat round dense"
-            ).tooltip("清空日志")
-        send_log = ui.log(max_lines=300).classes("w-full h-40")
-        log_buf = _GLOBAL_LOGS.setdefault(wd_key, [])
-        _seen = {"n": len(log_buf)}
-
-        for line in log_buf:
-            try:
-                send_log.push(line)
-            except Exception:
-                pass
-
-        client = ui.context.client
-
-        async def _poll_loop() -> None:
-            while True:
-                await asyncio.sleep(1.0)
-                if not client.has_socket_connection:
+            async def update_chats_from_tg() -> None:
+                accounts = list(account_select.value or [])
+                if not accounts:
+                    accounts = list_session_names(
+                        Path(session_dir_input.value or "."), workdir
+                    )
+                if not accounts:
+                    ui.notify("没有可用账号", type="warning")
                     return
-                # 每秒刷新运行中任务的进度状态列（如 "运行中 (18/100)"）
-                table = table_ref["table"]
-                if table is not None:
-                    try:
-                        changed = False
-                        for r in table.rows:
-                            n = str(r.get("name") or "")
-                            if n in tasks:
-                                new_status = _status_text(n)
-                                if r.get("status") != new_status:
-                                    r["status"] = new_status
-                                    changed = True
-                        if changed:
-                            table.update()
-                    except Exception:
-                        pass
-                if _seen["n"] > len(log_buf):
-                    _seen["n"] = len(log_buf)
-                new_lines = log_buf[_seen["n"]:]
-                if not new_lines:
-                    continue
-                _seen["n"] = len(log_buf)
+                update_btn.disable()
+
+                def _log(msg: str) -> None:
+                    log_buf.append(f"{datetime.now():%H:%M:%S} {msg}")
+
                 try:
-                    with client:
-                        for line in new_lines:
-                            try:
-                                send_log.push(line)
-                            except Exception:
-                                pass
-                except Exception:
-                    return
-
-        asyncio.create_task(_poll_loop())
-
-        # —— 添加任务弹窗 ——
-        with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl"):
-            ui.label("添加任务").classes("text-lg font-semibold")
-            with ui.row().classes("items-end w-full gap-3 flex-wrap"):
-                session_dir_input = ui.input(
-                    label="会话目录（.session 所在目录）", value=default_session_dir
-                ).classes("w-56")
-                account_select = ui.select(
-                    label="选择账号（可多选）",
-                    options=[],
-                    multiple=True,
-                ).classes("min-w-[260px]").props("use-chips")
-                ui.button("刷新账号/群组", on_click=lambda: refresh_options()).props(
-                    "outline"
-                )
-
-                async def update_chats_from_tg() -> None:
-                    accounts = list(account_select.value or [])
-                    if not accounts:
-                        accounts = list_session_names(
-                            Path(session_dir_input.value or "."), workdir
+                    _log(f"开始从 Telegram 更新 {len(accounts)} 个账号的群组列表...")
+                    for a in accounts:
+                        await update_account_chats(
+                            a, Path(session_dir_input.value or "."), workdir, _log
                         )
-                    if not accounts:
-                        ui.notify("没有可用账号", type="warning")
-                        return
-                    update_btn.disable()
+                    refresh_options()
+                    ui.notify("群组列表已从 Telegram 更新", type="positive")
+                finally:
+                    update_btn.enable()
 
-                    def _log(msg: str) -> None:
-                        log_buf.append(f"{datetime.now():%H:%M:%S} {msg}")
+            update_btn = ui.button(
+                "从TG更新群组", on_click=update_chats_from_tg
+            ).props("outline")
 
-                    try:
-                        _log(f"开始从 Telegram 更新 {len(accounts)} 个账号的群组列表...")
-                        for a in accounts:
-                            await update_account_chats(
-                                a, Path(session_dir_input.value or "."), workdir, _log
-                            )
-                        refresh_options()
-                        ui.notify("群组列表已从 Telegram 更新", type="positive")
-                    finally:
-                        update_btn.enable()
+        with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+            chat_input = ui.input(
+                label="目标群组（chat_id 或 @username）",
+                placeholder="-1001234567890 或 @groupname",
+            ).classes("min-w-[320px]")
+            chat_select = ui.select(
+                label="或从最近聊天选择",
+                options=[],
+                with_input=True,
+                on_change=_on_chat_pick,
+            ).classes("min-w-[280px]")
+            interval_input = ui.number(
+                label="发送间隔（秒）", value=5, min=1, max=3600, format="%d"
+            ).classes("w-36")
+            delete_input = ui.number(
+                label="删除延迟（秒，0或空=不删除）", value=20, min=0, max=86400, format="%d"
+            ).classes("w-36")
+            total_input = ui.number(
+                label="每账号发送条数（0=不限）", value=50, min=0, max=1000000, format="%d"
+            ).classes("w-48")
 
-                update_btn = ui.button(
-                    "从TG更新群组", on_click=update_chats_from_tg
-                ).props("outline")
-
-            with ui.row().classes("items-end w-full gap-3 flex-wrap"):
-                chat_input = ui.input(
-                    label="目标群组（chat_id 或 @username）",
-                    placeholder="-1001234567890 或 @groupname",
-                ).classes("min-w-[320px]")
-                chat_select = ui.select(
-                    label="或从最近聊天选择",
-                    options=[],
-                    with_input=True,
-                    on_change=_on_chat_pick,
-                ).classes("min-w-[280px]")
-                interval_input = ui.number(
-                    label="发送间隔（秒）", value=5, min=1, max=3600, format="%d"
-                ).classes("w-36")
-                delete_input = ui.number(
-                    label="删除延迟（秒，0或空=不删除）", value=20, min=0, max=86400, format="%d"
-                ).classes("w-36")
-                total_input = ui.number(
-                    label="每账号发送条数（0=不限）", value=50, min=0, max=1000000, format="%d"
-                ).classes("w-48")
-
-            ui.label(
-                "提示：发送过于频繁可能触发 Telegram 风控，建议间隔不小于 5 秒；同一账号不能同时用于多个运行中的任务。"
-            ).classes("text-xs text-amber-600")
-            with ui.row().classes("w-full justify-end"):
-                ui.button("取消", on_click=add_dlg.close).props("flat")
-                ui.button("确定添加", color="primary", on_click=on_add_task)
+        ui.label(
+            "提示：发送过于频繁可能触发 Telegram 风控，建议间隔不小于 5 秒；同一账号不能同时用于多个运行中的任务。"
+        ).classes("text-xs text-amber-600")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("取消", on_click=add_dlg.close).props("flat")
+            ui.button("确定添加", color="primary", on_click=on_add_task)
 
     refresh_options()
     render_tasks()

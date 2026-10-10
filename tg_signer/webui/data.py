@@ -2,6 +2,7 @@ import json
 import os
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
@@ -295,6 +296,170 @@ def account_identities(
             "username": data.get("username") or "",
         }
     return mapping
+
+
+EXPORT_FORMAT_VERSION = 1
+
+
+def export_all_configs(workdir: Optional[Path | str] = None) -> bytes:
+    """导出全部 WebUI 可迁移配置（签到/监控配置、账户状态）为 JSON 字节。
+
+    任务历史（随机发言任务列表）不参与导出：历史任务绑定具体设备，无需随备份迁移。
+    """
+    base = get_workdir(workdir)
+    payload: Dict[str, Any] = {
+        "format": "tg-signer-plus-configs",
+        "version": EXPORT_FORMAT_VERSION,
+        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "signer": {},
+        "monitor": {},
+    }
+    for kind in ("signer", "monitor"):
+        for name in list_task_names(kind, base):
+            try:
+                entry = load_config(kind, name, workdir=base)
+            except Exception:
+                continue
+            payload[kind][name] = entry.payload
+
+    # 任务历史（随机发言任务列表）不导出：绑定具体设备，无需迁移
+
+    # 账户状态（停用名单 + 顺序）
+    state = _read_accounts_state(_accounts_state_path(base))
+    account_state = {}
+    if isinstance(state.get("disabled"), list):
+        account_state["disabled"] = state["disabled"]
+    if isinstance(state.get("order"), list):
+        account_state["order"] = state["order"]
+    if account_state:
+        payload["account_state"] = account_state
+
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def import_all_configs(
+    raw: bytes | str, workdir: Optional[Path | str] = None
+) -> Dict[str, int]:
+    """导入导出的配置 JSON，与现有配置合并（重名覆盖），返回各类导入数量。
+
+    任务历史（随机发言任务列表）不参与导入，即使备份文件中携带也直接忽略。
+    """
+    base = get_workdir(workdir)
+    data = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+    if not isinstance(data, dict) or data.get("format") != "tg-signer-plus-configs":
+        raise ValueError("文件格式不正确：不是 tg-signer-plus 导出的配置文件")
+
+    counts: Dict[str, int] = {"signer": 0, "monitor": 0, "random_chat_tasks": 0}
+    for kind in ("signer", "monitor"):
+        items = data.get(kind)
+        if not isinstance(items, dict):
+            continue
+        for name, content in items.items():
+            save_config(kind, str(name), content, workdir=base)
+            counts[kind] += 1
+
+    # 任务历史（随机发言任务列表）不导入：绑定具体设备，无需迁移
+
+    account_state = data.get("account_state")
+    if isinstance(account_state, dict):
+        state = _read_accounts_state(_accounts_state_path(base))
+        if isinstance(account_state.get("disabled"), list):
+            state["disabled"] = account_state["disabled"]
+        if isinstance(account_state.get("order"), list):
+            state["order"] = account_state["order"]
+        _write_accounts_state(_accounts_state_path(base), state)
+
+    return counts
+
+
+def export_backup(workdir: Optional[Path | str] = None) -> bytes:
+    """导出完整备份 ZIP。
+
+    - configs.json：签到/监控配置、随机发言任务、账户状态（导入时走合并逻辑）
+    - sessions/：全部 session 文件（含 session_string，账号登录凭据）
+    - signer_data/：users 缓存（me.json / latest_chats.json）+ 批量退频道配置
+    """
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    base = get_workdir(workdir)
+
+    def _add(p: Path) -> None:
+        try:
+            zf.write(p, f"signer_data/{p.relative_to(base).as_posix()}")
+        except OSError:
+            pass
+
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("configs.json", export_all_configs(workdir))
+        session_dir = Path(".")
+        for pattern in ("*.session", "*.session_string"):
+            for p in sorted(session_dir.glob(pattern)):
+                try:
+                    zf.write(p, f"sessions/{p.name}")
+                except OSError:
+                    continue
+        # users 缓存（最近聊天列表、账户身份资料）
+        users_dir = base / "users"
+        if users_dir.is_dir():
+            for p in sorted(users_dir.rglob("*")):
+                if p.is_file() and p.name in ("me.json", "latest_chats.json"):
+                    _add(p)
+        # 批量退频道排除关键字配置
+        auto_leave_cfg = base / "auto_leave_config.json"
+        if auto_leave_cfg.is_file():
+            _add(auto_leave_cfg)
+    return buf.getvalue()
+
+
+def import_backup(raw: bytes, workdir: Optional[Path | str] = None) -> Dict[str, int]:
+    """导入备份（ZIP 或纯配置 JSON），返回各类导入/还原数量。"""
+    if raw[:2] != b"PK":
+        counts = import_all_configs(raw, workdir)
+        counts["session_files"] = 0
+        counts["signer_data_files"] = 0
+        return counts
+
+    import io
+    import zipfile
+
+    counts: Dict[str, int] = {
+        "signer": 0,
+        "monitor": 0,
+        "random_chat_tasks": 0,
+        "session_files": 0,
+        "signer_data_files": 0,
+    }
+    base = get_workdir(workdir)
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        names = zf.namelist()
+        # 1) 先还原 .signer 数据镜像（users 缓存、批量退频道配置等）
+        for name in names:
+            if not name.startswith("signer_data/"):
+                continue
+            rel = name[len("signer_data/"):]
+            if not rel or rel.endswith("/"):
+                continue
+            target = base / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(zf.read(name))
+            counts["signer_data_files"] += 1
+        # 2) 再走配置合并（随机发言任务冲突重编号、账户状态恢复）
+        if "configs.json" in names:
+            curated = import_all_configs(zf.read("configs.json"), workdir)
+            counts.update({k: v for k, v in curated.items() if k in counts})
+        # 3) 还原 session 文件到运行目录
+        session_dir = Path(".")
+        for name in names:
+            if not name.startswith("sessions/"):
+                continue
+            fname = Path(name).name
+            if not fname or fname.startswith("."):
+                continue
+            (session_dir / fname).write_bytes(zf.read(name))
+            counts["session_files"] += 1
+    return counts
 
 
 def _record_target(path: Path, signs_root: Path) -> Tuple[str, Optional[str]]:
