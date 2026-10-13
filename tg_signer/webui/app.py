@@ -188,8 +188,8 @@ class BaseConfigBlock:
     def refresh_options(self) -> None:
         options = list_task_names(self.kind, state.workdir)
         self.select.options = options
-        # 只有一个配置时默认选中（会触发 load_current 自动加载）
-        if len(options) == 1 and not self.select.value:
+        # 默认选中第一个配置（会触发 load_current 自动加载）
+        if options and not self.select.value:
             self.select.value = options[0]
         self.select.update()
 
