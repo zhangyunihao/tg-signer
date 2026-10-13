@@ -43,6 +43,86 @@ from tg_signer.webui.data import (
 from tg_signer.core import get_api_config, get_proxy
 from tg_signer.webui.interactive import InteractiveSignerConfig
 from tg_signer.webui.auto_leave import auto_leave_block
+
+
+# Windows 下把任务子进程绑到 Job Object：WebUI 服务进程退出（含被杀）时
+# 操作系统自动结束所有子进程，避免 run 定时等常驻任务变成无法停止的孤儿进程
+_JOB_HANDLE = None
+
+
+def _ensure_job_handle():
+    global _JOB_HANDLE
+    if _JOB_HANDLE is not None or not sys.platform.startswith("win"):
+        return _JOB_HANDLE
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class _BasicLimit(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_void_p),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _ExtendedLimit(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimit),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _ExtendedLimit()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+        # 9 = JobObjectExtendedLimitInformation
+        if not kernel32.SetInformationJobObject(
+            job, 9, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            kernel32.CloseHandle(job)
+            return None
+        _JOB_HANDLE = job
+    except Exception:
+        return None
+    return _JOB_HANDLE
+
+
+def _assign_to_job(proc: "subprocess.Popen") -> None:
+    job = _ensure_job_handle()
+    if job is None:
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.AssignProcessToJobObject(job, int(proc._handle))
+    except Exception:
+        pass
+
+
 from tg_signer.webui.random_chat import random_chat_block
 from tg_signer.webui.schema_utils import clean_schema
 
@@ -369,11 +449,13 @@ class TaskRunnerBlock:
         "监控 (monitor run)",
     ]
 
-    def __init__(self) -> None:
-        # record_id -> {"record": dict, "procs": [...], "queue": Queue, "start_ts": float}
-        self.runs: dict[str, dict] = {}
-        self.output_lines: list[str] = []
+    # 服务进程级共享：所有浏览器标签页看到并管理同一批运行中的任务，
+    # 服务重启后也据此把上次未结束的常驻任务自动恢复
+    runs: dict[str, dict] = {}
+    output_lines: list[str] = []
+    _restore_done: bool = False
 
+    def __init__(self) -> None:
         ui.label("签到").classes("text-lg font-semibold")
         ui.label(
             "点击「新增任务」在弹窗中选择任务类型、任务与账号；历史列表可「复制」任意历史任务的参数快速新建，运行中的任务可停止。"
@@ -458,7 +540,8 @@ class TaskRunnerBlock:
         self.history_table.add_slot(
             "body-cell-result",
             '<q-td :props="props">'
-            '<span :id="\'runres-\' + props.row.id">{{ props.row.result }}</span>'
+            '<span :id="\'runres-\' + props.row.id" '
+            'style="white-space: pre-line;">{{ props.row.result }}</span>'
             "</q-td>",
         )
         # 操作列：所有行显示「复制」「明细」（用该行参数打开新增弹窗/查看子任务明细），运行中的行额外显示「停止」
@@ -555,8 +638,26 @@ class TaskRunnerBlock:
             ]
         self.account_select.update()
 
+    def _reconcile_history(self, items: list[dict]) -> bool:
+        """校正历史中的孤儿「运行中」记录。
+
+        服务重启后 self.runs 为空，重启前启动的子进程已脱离本服务管理，
+        历史里残留的「运行中」永远无法停止。这里统一标记为「已停止」。
+        返回是否发生过校正（调用方据此持久化）。
+        """
+        changed = False
+        for r in items:
+            if r.get("status") == "运行中" and str(r.get("id") or "") not in self.runs:
+                r["status"] = "已停止"
+                r["result"] = "服务重启，任务已中断"
+                changed = True
+        if changed:
+            save_task_history(items)
+        return changed
+
     def _refresh_history_table(self) -> None:
         items = load_task_history()
+        self._reconcile_history(items)
         counts: dict[str, int] = {s: 0 for s in ("运行中", "已完成", "失败", "已停止")}
         for r in items:
             status = r.get("status", "未知")
@@ -608,9 +709,7 @@ class TaskRunnerBlock:
             self.task_select.value = None
         self.task_select.update()
 
-    def _build_args(self, account: str) -> list[str]:
-        task_type = self.type_select.value
-        task_name = self.task_select.value
+    def _build_args(self, account: str, task_type: str, task_name: str) -> list[str]:
         workdir = str(state.workdir)
         # 根命令选项（-w/-a）必须位于子命令之前
         if "run-once" in task_type:
@@ -632,7 +731,19 @@ class TaskRunnerBlock:
         if not accounts:
             ui.notify("请至少选择一个账号", type="warning")
             return
+        if self._launch(self.type_select.value or "", task_name, accounts):
+            self.dialog.close()
+
+    def _launch(
+        self,
+        task_type: str,
+        task_name: str,
+        accounts: list[str],
+        auto: bool = False,
+    ) -> bool:
+        """启动一个任务（每账号一个子进程）。auto=True 表示服务重启后的自动恢复。"""
         # 多账号时打乱启动顺序，避免每次都按相同顺序发言
+        accounts = [a for a in accounts if a]
         random.shuffle(accounts)
         env = os.environ.copy()
         env["PYTHONPATH"] = str(SOURCE_ROOT)
@@ -641,18 +752,18 @@ class TaskRunnerBlock:
         record = {
             "id": f"{time.time_ns()}",
             "start_time": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
-            "task_type": self.type_select.value or "",
+            "task_type": task_type,
             "task_name": task_name,
             "accounts": ", ".join(accounts),
             "status": "运行中",
-            "result": "",
+            "result": "服务重启后自动恢复" if auto else "",
         }
         procs: list[dict] = []
         run_queue: queue.Queue = queue.Queue()
         chats_labels = self._chat_labels(task_name)
         detail_rows: list[dict] = []
         for account in accounts:
-            args = self._build_args(account)
+            args = self._build_args(account, task_type, task_name)
             if not args:
                 ui.notify(f"无法构建命令: {account}", type="warning")
                 continue
@@ -662,7 +773,14 @@ class TaskRunnerBlock:
                 "from tg_signer.cli import tg_signer; tg_signer()",
             ] + args
             # 每账号进程独立统计聊天级进度：started=已开始的聊天数，failed=签到失败数
-            stats = {"started": 0, "failed": 0, "current_pos": None}
+            # last_sign/next_run 从子进程日志解析，用于结果列展示上次/预计下次执行时间
+            stats = {
+                "started": 0,
+                "failed": 0,
+                "current_pos": None,
+                "last_sign": None,
+                "next_run": None,
+            }
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -674,6 +792,7 @@ class TaskRunnerBlock:
                     bufsize=1,
                     env=env,
                 )
+                _assign_to_job(proc)
             except Exception as exc:
                 notify_error(exc)
                 continue
@@ -686,7 +805,7 @@ class TaskRunnerBlock:
             procs.append({"proc": proc, "reader": reader, "account": account, "stats": stats})
         if not procs:
             ui.notify("未能启动任务", type="negative")
-            return
+            return False
         record["accounts"] = ", ".join(i["account"] for i in procs)
         self.runs[record["id"]] = {
             "record": record,
@@ -700,8 +819,9 @@ class TaskRunnerBlock:
         self._refresh_history_table()
         self._timer.activate()
         self._update_status()
-        self.dialog.close()
-        ui.notify(f"已启动: {task_name}（{len(procs)} 个账号）", type="positive")
+        tip = "服务重启后已自动恢复" if auto else "已启动"
+        ui.notify(f"{tip}: {task_name}（{len(procs)} 个账号）", type="positive")
+        return True
 
     def _reader(
         self,
@@ -738,6 +858,16 @@ class TaskRunnerBlock:
                 pos = stats["current_pos"]
                 if pos is not None and detail_rows[pos]["status"] == "进行中":
                     detail_rows[pos]["status"] = "失败"
+            elif "上次执行时间:" in stripped:
+                # 形如：上次执行时间: 2026-10-14 00:44:22.965904+08:00
+                stats["last_sign"] = stripped.split("上次执行时间:", 1)[1].strip()
+            elif "下次运行时间:" in stripped:
+                # 形如：下次运行时间: 2026-10-15 00:43:08+08:00
+                stats["next_run"] = stripped.split("下次运行时间:", 1)[1].strip()
+            elif "计划时刻" in stripped:
+                # 当天签到时刻未到时：等待定时执行（计划时刻 2026-10-15 00:43:00）
+                seg = stripped.split("计划时刻", 1)[1]
+                stats["next_run"] = seg.split("）", 1)[0].strip()
             q.put(prefix + line.rstrip("\r\n"))
 
     def _chat_labels(self, task_name: str) -> list[str]:
@@ -770,6 +900,33 @@ class TaskRunnerBlock:
         if started > 0:
             return f"已完成 {ok} 个聊天 · 失败 {failed}"
         return ""
+
+    @staticmethod
+    def _short_dt(raw: str) -> str:
+        """把日志时间串精简为 MM-DD HH:MM:SS；解析失败时原样返回。"""
+        try:
+            return raw.strip()[:19][5:]
+        except Exception:
+            return raw
+
+    def _format_schedule(self, run: dict) -> str:
+        """聚合各账号子进程日志解析出的上次/预计下次执行时间（多账号去重）。"""
+        lasts: list[str] = []
+        nexts: list[str] = []
+        for item in run["procs"]:
+            s = item["stats"]
+            last = (s.get("last_sign") or "").strip()
+            nxt = (s.get("next_run") or "").strip()
+            if last and last not in lasts:
+                lasts.append(last)
+            if nxt and nxt not in nexts:
+                nexts.append(nxt)
+        parts = []
+        if lasts:
+            parts.append("上次 " + " / ".join(self._short_dt(x) for x in lasts))
+        if nexts:
+            parts.append("预计下次 " + " / ".join(self._short_dt(x) for x in nexts))
+        return " · ".join(parts)
 
     def _on_stop_event(self, e) -> None:
         row = e.args
@@ -911,6 +1068,22 @@ class TaskRunnerBlock:
     def _stop_run(self, record_id: str) -> None:
         run = self.runs.get(record_id)
         if run is None:
+            # 孤儿记录（如服务重启前启动的任务）：进程已脱离本服务管理，
+            # 仅能把历史状态校正为已停止，避免按钮点了毫无反应
+            items = load_task_history()
+            for r in items:
+                if str(r.get("id") or "") == record_id and r.get("status") == "运行中":
+                    r["status"] = "已停止"
+                    r["result"] = "服务重启，任务已脱离管理，状态已校正"
+                    save_task_history(items)
+                    self._refresh_history_table()
+                    self._update_status()
+                    ui.notify(
+                        "该任务启动于上次服务运行期间，已无法远程停止；"
+                        "如进程仍在后台运行，请在系统任务管理器中结束对应 Python 进程",
+                        type="warning",
+                    )
+                    return
             return
         for item in run["procs"]:
             proc = item["proc"]
@@ -961,7 +1134,9 @@ class TaskRunnerBlock:
                     rows[pos]["status"] = default_status
 
     def _finalize_run(self, record_id: str) -> None:
-        run = self.runs.pop(record_id)
+        run = self.runs.pop(record_id, None)
+        if run is None:
+            return  # 已被其他浏览器标签页的轮询收尾
         rcs = ", ".join(str(i["proc"].returncode) for i in run["procs"])
         ok = all(i["proc"].returncode == 0 for i in run["procs"])
         self._close_pending_details(run, "自动")
@@ -1021,11 +1196,15 @@ class TaskRunnerBlock:
                     continue
                 finished_ids.append(run_id)
             else:
-                elapsed = f"已运行 {self._format_duration_ts(run['start_ts'])}"
+                parts = [f"已运行 {self._format_duration_ts(run['start_ts'])}"]
                 progress = self._format_progress(run)
-                self._update_running_row(
-                    run_id, f"{elapsed} · {progress}" if progress else elapsed
-                )
+                if progress:
+                    parts.append(progress)
+                schedule = self._format_schedule(run)
+                if schedule:
+                    parts.append(schedule)
+                # 每项独占一行（结果列 span 为 white-space: pre-line）
+                self._update_running_row(run_id, "\n".join(parts))
         for run_id in finished_ids:
             self._finalize_run(run_id)
         self._update_status()
@@ -1033,7 +1212,7 @@ class TaskRunnerBlock:
             self._timer.deactivate()
 
     def clear_log(self) -> None:
-        self.output_lines = []
+        TaskRunnerBlock.output_lines.clear()
         self.log_list.clear()
         self.log_list.update()
 
@@ -1048,11 +1227,89 @@ class TaskRunnerBlock:
             return "text-blue-700"
         return "text-gray-800"
 
+    def _auto_restore(self) -> None:
+        """服务重启后自动恢复上次未结束的「签到 (run 定时)」常驻任务。
+
+        每个服务进程只执行一次（多个浏览器连接共享结果）。run-once 等一次性
+        任务不恢复；配置或账号已被删除的任务跳过。
+        """
+        if TaskRunnerBlock._restore_done:
+            return
+        TaskRunnerBlock._restore_done = True
+        try:
+            items = load_task_history()
+            # task_name -> 账号（保持顺序去重）；只恢复 run 定时类常驻任务
+            pending: dict[str, list[str]] = {}
+            stale_ids: list[str] = []
+            for r in items:
+                if r.get("status") != "运行中":
+                    continue
+                if "run 定时" not in str(r.get("task_type") or ""):
+                    continue
+                task_name = str(r.get("task_name") or "").strip()
+                if not task_name:
+                    continue
+                accs = [
+                    a.strip()
+                    for a in str(r.get("accounts") or "").split(",")
+                    if a.strip()
+                ]
+                bucket = pending.setdefault(task_name, [])
+                for a in accs:
+                    if a not in bucket:
+                        bucket.append(a)
+                stale_ids.append(str(r.get("id") or ""))
+
+            if not pending:
+                return
+
+            valid_tasks = set(list_task_names("signer", state.workdir))
+            valid_accounts = set(self._get_account_names())
+            restored = 0
+            for task_name, accounts in pending.items():
+                if task_name not in valid_tasks:
+                    continue
+                alive_accounts = [a for a in accounts if a in valid_accounts]
+                if not alive_accounts:
+                    continue
+                if self._launch(
+                    "签到 (run 定时)", task_name, alive_accounts, auto=True
+                ):
+                    restored += 1
+
+            # 旧的中断记录统一收尾（无论是否成功恢复，都不再显示为运行中）。
+            # 注意：_launch 已把新记录追加写入文件，这里必须重新读取，
+            # 不能用启动前的 items 快照覆盖，否则会把新「运行中」记录冲掉。
+            if stale_ids:
+                latest = load_task_history()
+                for r in latest:
+                    if str(r.get("id") or "") in stale_ids:
+                        r["status"] = "已停止"
+                        r["result"] = (
+                            "服务重启，已自动恢复为新任务" if restored else "服务重启，任务已中断"
+                        )
+                save_task_history(latest)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                ui.notify(f"自动恢复签到任务失败: {exc}", type="negative")
+            except Exception:
+                pass
+
     def __call__(self, *args, **kwargs):
+        # 首次有浏览器接入时，恢复服务重启前在跑的定时任务（仅本进程一次）。
+        # 必须在 _refresh_history_table 的孤儿校正之前执行，否则候选记录会先被改写。
+        if not TaskRunnerBlock._restore_done:
+            self._auto_restore()
         self._on_type_change()
         self._refresh_accounts()
         self._refresh_history_table()
         self._update_status()
+        # 任务由其他浏览器标签页启动、或本页刷新后重新接入时，runs 里可能已有
+        # 在跑的任务。必须激活本实例的轮询，否则表格行停留在文件中的初始结果
+        # （如空文本），永远不会更新「预计下次」等实时信息。
+        if TaskRunnerBlock.runs:
+            self._timer.activate()
+            self._poll_output()
 
 
 class AccountLoginSession:

@@ -1190,11 +1190,24 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         def need_sign(last_date_str):
             if force_rerun:
                 return True
+            cron_expr = self._validate_sign_at(config.sign_at)
             if last_date_str not in sign_record:
-                return True
+                # 当天尚无签到记录：只有今天的签到时刻已到（或已过）才补签；
+                # 若启动早于当天签到时刻，则继续等待，避免提前执行。
+                # 基准时间加 1 微秒，保证恰好整点启动时也视为时刻已到。
+                prev_run = croniter(
+                    cron_expr, now + timedelta(microseconds=1)
+                ).get_prev(datetime)
+                if prev_run.date() == now.date():
+                    return True
+                next_run_today: datetime = croniter(cron_expr, now).next(datetime)
+                self.log(
+                    f"当天签到时刻未到（计划时刻 {next_run_today:%Y-%m-%d %H:%M:%S}），等待定时执行"
+                )
+                return False
             _last_sign_at = datetime.fromisoformat(sign_record[last_date_str])
             self.log(f"上次执行时间: {_last_sign_at}")
-            _cron_it = croniter(self._validate_sign_at(config.sign_at), _last_sign_at)
+            _cron_it = croniter(cron_expr, _last_sign_at)
             _next_run: datetime = _cron_it.next(datetime)
             if _next_run > now:
                 self.log("当前未到下次执行时间，无需执行")
