@@ -145,6 +145,8 @@ async def leave_one(client, chat_id, title: str, log: Callable[[str], None]) -> 
 def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], None]:
     """构建「自动退群」标签页内容，返回刷新函数以纳入全局刷新。"""
     cfg = load_config(workdir)
+    # 会话目录固定为工作目录（全局账户统一管理），不再提供单独输入框
+    session_dir = Path(default_session_dir or ".")
     running = {"flag": False}
     rows_all: List[Dict] = []
     log_lines: List[str] = []
@@ -163,7 +165,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         save_config(
             workdir,
             {
-                "session_dir": session_dir_input.value or ".",
+                "session_dir": str(session_dir),
                 "days": int(days_input.value or 7),
                 "accounts": list(account_select.value or []),
                 "include_groups": bool(include_groups.value),
@@ -172,7 +174,6 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         )
 
     def refresh_options() -> None:
-        session_dir = Path(session_dir_input.value or ".")
         names = list_session_names(session_dir, workdir)
         account_select.options = build_account_options(session_dir, names)
         if not account_select.value:
@@ -182,7 +183,6 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         schedule_auth_checks(session_dir, names, on_done=refresh_marks)
 
     def refresh_marks() -> None:
-        session_dir = Path(session_dir_input.value or ".")
         names = list_session_names(session_dir, workdir)
         account_select.options = build_account_options(session_dir, names)
         account_select.update()
@@ -201,7 +201,6 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             return
         persist()
         days = max(1, int(days_input.value or 7))
-        session_dir = Path(session_dir_input.value or ".")
         await set_busy(True)
         try:
             rows_all.clear()
@@ -275,7 +274,6 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             return
         await set_busy(True)
         persist()
-        session_dir = Path(session_dir_input.value or ".")
         by_account: Dict[str, List[Dict]] = {}
         for row in selected:
             by_account.setdefault(row["account"], []).append(row)
@@ -332,10 +330,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         "默认全选后并发批量退出。自己是创建者的对话永远不会被退出。"
     ).classes("text-sm text-gray-500")
 
-    with ui.row().classes("w-full items-end flex-nowrap"):
-        session_dir_input = ui.input(
-            label="会话目录", value=cfg.get("session_dir") or default_session_dir
-        ).classes("w-40")
+    with ui.row().classes("w-full items-end flex-wrap"):
         days_input = ui.number(
             label="不更新天数阈值", value=cfg.get("days") or 7, min=1, step=1,
             format="%.0f",

@@ -515,6 +515,8 @@ class TaskRunnerBlock:
                     "label": "结果",
                     "field": "result",
                     "align": "left",
+                    "style": "min-width: 340px;",
+                    "classes": "result-col",
                 },
                 {
                     "name": "actions",
@@ -541,7 +543,9 @@ class TaskRunnerBlock:
             "body-cell-result",
             '<q-td :props="props">'
             '<span :id="\'runres-\' + props.row.id" '
-            'style="white-space: pre-line;">{{ props.row.result }}</span>'
+            'style="white-space: pre-line; overflow-wrap: break-word; '
+            'display: block; width: 100%;">'
+            "{{ props.row.result }}</span>"
             "</q-td>",
         )
         # 操作列：所有行显示「复制」「明细」（用该行参数打开新增弹窗/查看子任务明细），运行中的行额外显示「停止」
