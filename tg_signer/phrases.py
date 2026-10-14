@@ -1,4 +1,9 @@
-"""随机发言功能的内置语库（固定 200 条真人感群聊话：围观调侃、群内观察、淡感悟，无回应个人、无话题绑定）。"""
+"""随机发言功能的内置语库（固定 200 条真人感群聊话：围观调侃、群内观察、淡感悟，无回应个人、无话题绑定）。
+
+另提供任务级自定义语库的解析与展示辅助函数，供 WebUI 随机发言任务使用。
+"""
+
+from typing import List, Optional
 
 PHRASES = [
     # 围观调侃（对群体泛指）
@@ -216,3 +221,16 @@ PHRASES = [
 assert len(PHRASES) == 200, f"语库数量应为 200，实际 {len(PHRASES)}"
 assert len(set(PHRASES)) == 200, "语库存在重复条目"
 assert all(5 <= len(p) <= 14 for p in PHRASES), "存在长度超出 5-14 字范围的条目"
+
+
+def parse_custom_phrases(raw: Optional[str]) -> List[str]:
+    """把任务语库文本按行解析为列表：逐行去空白、丢弃空行；全空时返回 []（表示用内置语库）"""
+    if not raw:
+        return []
+    return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
+def phrase_pool_label(cfg: dict) -> str:
+    """任务表格中展示的语库来源：任务配置了非空 custom_phrases 时显示自定义条数"""
+    custom = cfg.get("custom_phrases") or []
+    return f"自定义 {len(custom)} 条" if custom else f"内置 {len(PHRASES)} 条"

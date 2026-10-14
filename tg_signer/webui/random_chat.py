@@ -1,4 +1,7 @@
-"""随机发言：选择多个账号，按固定间隔向指定群组随机发送内置语库中的消息。"""
+"""随机发言：选择多个账号，按固定间隔向指定群组随机发送语库中的消息。
+
+语库来源：任务配置 custom_phrases 非空时使用任务专属语库，否则使用内置 PHRASES。
+"""
 
 import asyncio
 import json
@@ -11,12 +14,12 @@ from typing import Callable, Dict, List, Optional, Union
 from nicegui import ui
 
 from tg_signer.core import get_client
+from tg_signer.phrases import PHRASES, parse_custom_phrases, phrase_pool_label
 from tg_signer.webui.data import (
     apply_account_order,
     load_disabled_accounts,
     load_user_infos,
 )
-from tg_signer.webui.phrases import PHRASES
 
 # 跨浏览器刷新仍可控制的运行中引擎：{workdir|task_id -> engine}
 _GLOBAL_ENGINES: Dict[str, "RandomChatEngine"] = {}
@@ -267,6 +270,9 @@ class RandomChatEngine:
         self.progress: Dict[str, int] = {}
         self._total_accounts: int = 0
         self._total_count: int = 0
+        # 本任务实际使用的语库：任务自定义语库非空时用自定义，否则用内置语库
+        self.pool: List[str] = list(PHRASES)
+        self.using_custom_pool: bool = False
 
     @property
     def running(self) -> bool:
@@ -293,6 +299,7 @@ class RandomChatEngine:
         delete_after: int = 20,
         total_count: int = 50,
         on_finish: Optional[Callable[[], None]] = None,
+        phrases: Optional[List[str]] = None,
     ) -> bool:
         if self.running:
             log("任务已在运行中")
@@ -301,6 +308,8 @@ class RandomChatEngine:
         self._stopping = False
         self._total_accounts = len(accounts)
         self._total_count = total_count
+        self.using_custom_pool = bool(phrases)
+        self.pool = list(phrases) if phrases else list(PHRASES)
         self._stop = asyncio.Event()
         self._task = asyncio.create_task(
             self._loop(
@@ -354,7 +363,7 @@ class RandomChatEngine:
             while not self._stop.is_set():
                 if total_count and sent >= total_count:
                     break
-                text = random.choice(PHRASES)
+                text = random.choice(self.pool)
                 try:
                     message = await client.send_message(chat_id, text)
                     sent += 1
@@ -460,9 +469,15 @@ class RandomChatEngine:
             log("没有可用账号，任务结束")
             return
         count_label = f"每账号 {total_count} 条" if total_count else "不限条数"
+        pool_label = (
+            f"任务自定义语库 {len(self.pool)} 条"
+            if self.using_custom_pool
+            else f"内置语库 {len(self.pool)} 条"
+        )
         log(
             f"开始随机发言：{len(clients)} 个账号 -> {chat_id}，"
-            f"每账号独立计时，间隔 {interval}~{interval + 3} 秒，{count_label}"
+            f"每账号独立计时，间隔 {interval}~{interval + 3} 秒，{count_label}，"
+            f"使用{pool_label}"
         )
         try:
             await asyncio.gather(
@@ -516,6 +531,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 "delete_after": cfg["delete_after"],
                 "total_count": cfg["total_count"],
                 "session_dir": str(cfg["session_dir"]),
+                "custom_phrases": list(cfg.get("custom_phrases") or []),
             }
         store["tasks"] = clean
         save_task_store(workdir, store)
@@ -606,6 +622,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         interval_input.value = cfg["interval"]
         delete_input.value = cfg["delete_after"]
         total_input.value = cfg["total_count"]
+        phrases_input.value = "\n".join(cfg.get("custom_phrases") or [])
         for el in (
             session_dir_input,
             account_select,
@@ -613,6 +630,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             interval_input,
             delete_input,
             total_input,
+            phrases_input,
         ):
             el.update()
         ui.notify("已复制任务参数，可修改后点击「确定添加」", type="positive")
@@ -648,6 +666,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             delete_after=cfg["delete_after"],
             total_count=cfg["total_count"],
             on_finish=_on_finish,
+            phrases=list(cfg.get("custom_phrases") or []),
         )
         if started:
             set_status(True)
@@ -684,6 +703,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         if chat_id is None:
             ui.notify("请填写目标群组 chat_id 或 @username", type="warning")
             return
+        custom_phrases = parse_custom_phrases(phrases_input.value)
         name = str(store["seq"])
         store["seq"] += 1
         tasks[name] = {
@@ -696,6 +716,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 0, int(total_input.value if total_input.value is not None else 50)
             ),
             "session_dir": str(Path(session_dir_input.value or ".")),
+            # 空列表 = 发送时使用内置语库
+            "custom_phrases": custom_phrases,
         }
         ensure_engine(name)
         _persist()
@@ -741,6 +763,12 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                     "align": "left",
                 },
                 {
+                    "name": "phrases",
+                    "label": "语库",
+                    "field": "phrases",
+                    "align": "left",
+                },
+                {
                     "name": "status",
                     "label": "状态",
                     "field": "status",
@@ -770,6 +798,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                             f"{cfg['delete_after']}s" if cfg["delete_after"] else "不删除"
                         ),
                         "total": str(cfg["total_count"]) if cfg["total_count"] else "不限",
+                        "phrases": phrase_pool_label(cfg),
                         "status": _status_text(name),
                     }
                 )
@@ -850,7 +879,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
 
     ui.label("随机发言").classes("text-lg font-semibold")
     ui.label(
-        f"从内置 {len(PHRASES)} 条语库中随机选一句，由所选账号发送到目标群组，发送后可在指定秒数自动删除（删除延迟填 0 或留空则不删除）。支持添加多个任务并行运行。"
+        f"由所选账号发送消息到目标群组，发送内容默认从内置 {len(PHRASES)} 条语库中随机抽取，"
+        "也可在添加任务时配置该任务专属语库（每行一条）。发送后可在指定秒数自动删除"
+        "（删除延迟填 0 或留空则不删除）。支持添加多个任务并行运行。"
     ).classes("text-sm text-gray-500")
 
     # —— 任务列表（置顶） ——
@@ -990,6 +1021,11 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             total_input = ui.number(
                 label="每账号发送条数（0=不限）", value=50, min=0, max=1000000, format="%d"
             ).classes("w-48")
+
+        phrases_input = ui.textarea(
+            label="本任务语库（每行一条，留空则使用内置 200 条语库）",
+            placeholder="例如：\n今天天气不错\n群里挺热闹啊\n学到了学到了",
+        ).classes("w-full").props("outlined autogrow")
 
         ui.label(
             "提示：发送过于频繁可能触发 Telegram 风控，建议间隔不小于 5 秒；同一账号不能同时用于多个运行中的任务。"
