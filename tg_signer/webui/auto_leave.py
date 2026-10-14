@@ -204,7 +204,10 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         await set_busy(True)
         try:
             rows_all.clear()
+            selected_keys.clear()
             result_table.rows = []
+            result_table.selected = []
+            render_result_cards()
             log(f"开始扫描：{len(accounts)} 个账号，阈值 {days} 天")
             for account in accounts:
                 found = await scan_stale_chats(
@@ -218,6 +221,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 rows_all.extend(found)
                 result_table.rows = list(rows_all)
                 result_table.update()
+                render_result_cards()
             if not rows_all:
                 log("未发现符合条件的对话")
             else:
@@ -229,6 +233,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 ]
                 result_table.selected = default_selected
                 result_table.update()
+                selected_keys.clear()
+                selected_keys.update(r["key"] for r in default_selected)
+                render_result_cards()
                 skipped = len(rows_all) - len(default_selected)
                 if skipped:
                     log(
@@ -308,8 +315,13 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                         remain = [r for r in rows_all if r["key"] not in done_keys]
                         rows_all.clear()
                         rows_all.extend(remain)
+                        selected_keys.difference_update(done_keys)
                         result_table.rows = list(rows_all)
+                        result_table.selected = [
+                            r for r in rows_all if r["key"] in selected_keys
+                        ]
                         result_table.update()
+                        render_result_cards()
                 except asyncio.TimeoutError:
                     log(f"[{account}] 连接超时（30s），跳过")
                 except Exception as exc:
@@ -367,13 +379,81 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         rows=[],
         row_key="key",
         selection="multiple",
-    ).classes("w-full")
+    ).classes("w-full tgs-desktop-table")
+
+    # 移动端（<=640px）卡片列表：每行一个勾选框，选中集与 result_table.selected 同步
+    selected_keys: set = set()
+    result_cards = ui.column().classes("w-full gap-2 tgs-mobile-cards")
+
+    def _sync_table_selected() -> None:
+        result_table.selected = [
+            r for r in rows_all if r["key"] in selected_keys
+        ]
+
+    # 「已选 n/m」计数标签：单个勾选只改文字，不整列重建（避免与点击事件打架）
+    count_label: ui.label | None = None
+
+    def _refresh_count_text() -> None:
+        if count_label is not None:
+            count_label.text = f"已选 {len(selected_keys)}/{len(rows_all)}"
+
+    def render_result_cards() -> None:
+        nonlocal count_label
+        result_cards.clear()
+        count_label = None
+        with result_cards:
+            if rows_all:
+                with ui.row().classes("w-full items-center gap-2"):
+                    def _select_all() -> None:
+                        selected_keys.update(r["key"] for r in rows_all)
+                        _sync_table_selected()
+                        render_result_cards()
+
+                    def _select_none() -> None:
+                        selected_keys.clear()
+                        _sync_table_selected()
+                        render_result_cards()
+
+                    ui.button("全选", on_click=_select_all).props("flat dense")
+                    ui.button("全不选", on_click=_select_none).props("flat dense")
+                    count_label = ui.label(
+                        f"已选 {len(selected_keys)}/{len(rows_all)}"
+                    ).classes("text-xs text-gray-500 ml-auto")
+            else:
+                ui.label("扫描后此处显示候选频道").classes("text-sm text-gray-400")
+            for row in rows_all:
+                key = row["key"]
+                with ui.card().classes("w-full mobile-list-card border"):
+                    with ui.row().classes("w-full items-start gap-2 no-wrap"):
+
+                        def _on_toggle(e, k: str = key) -> None:
+                            if e.value:
+                                selected_keys.add(k)
+                            else:
+                                selected_keys.discard(k)
+                            _sync_table_selected()
+                            _refresh_count_text()
+
+                        ui.checkbox(
+                            value=key in selected_keys,
+                            on_change=_on_toggle,
+                        ).props("dense").classes("mt-0.5")
+                        with ui.column().classes("gap-0 min-w-0"):
+                            ui.label(str(row["title"])).classes(
+                                "text-sm font-semibold"
+                            ).style("overflow-wrap: anywhere;")
+                            ui.label(
+                                f"账号：{row['account']}　类型：{row['type']}"
+                            ).classes("text-xs text-gray-600")
+                            ui.label(
+                                f"未更新 {row['age_days']} 天　id：{row['chat_id']}"
+                            ).classes("text-xs text-gray-500")
 
     with ui.row().classes("w-full items-center"):
         leave_btn = ui.button(
             "退出所选", on_click=confirm_leave
         ).props("color=negative outline")
-        ui.label("勾选表格左侧复选框后操作；扫描结果默认不执行任何退出").classes(
+        ui.label("勾选要退出的对话后操作；扫描结果默认不执行任何退出").classes(
             "text-xs text-gray-500"
         )
 
@@ -383,5 +463,6 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
 
     account_select.on("update:model-value", lambda: persist())
     refresh_options()
+    render_result_cards()
 
     return refresh_options

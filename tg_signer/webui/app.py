@@ -1,4 +1,5 @@
 import asyncio
+import html as html_lib
 import json
 import os
 import queue
@@ -529,7 +530,13 @@ class TaskRunnerBlock:
             ],
             rows=[],
             pagination=5,
-        ).classes("w-full").props("flat dense")
+        ).classes("w-full tgs-desktop-table").props("flat dense")
+        # 移动端（<=640px）用纵向卡片列表替代横滑宽表，桌面端隐藏
+        self.history_rows: list[dict] = []
+        self._cards_limit = 5
+        self.history_cards = ui.column().classes(
+            "w-full gap-2 tgs-mobile-cards mt-1"
+        )
         # 状态列渲染为彩色徽章：已完成=绿、失败=红、运行中=蓝、其他=灰
         self.history_table.add_slot(
             "body-cell-status",
@@ -539,12 +546,13 @@ class TaskRunnerBlock:
             "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
             "{{ props.row.status }}</q-badge></q-td>",
         )
-        # 结果列：给文字一个固定 DOM id（runres-<任务id>），
-        # 运行中进度用 run_javascript 直接改写文本，避免整表重渲染吞掉按钮点击
+        # 结果列：给文字一个固定 data-runres=<任务id>（桌面表格单元格与移动端卡片
+        # 各有一份），运行中进度用 run_javascript 直接改写两处文本，
+        # 避免整表重渲染吞掉按钮点击
         self.history_table.add_slot(
             "body-cell-result",
             '<q-td :props="props">'
-            '<span :id="\'runres-\' + props.row.id" '
+            '<span :data-runres="props.row.id" '
             'style="white-space: pre-line; overflow-wrap: break-word; '
             'display: block; width: 100%;">'
             "{{ props.row.result }}</span>"
@@ -689,8 +697,72 @@ class TaskRunnerBlock:
             }
             for r in sorted(items, key=_id_key, reverse=True)
         ]
+        self.history_rows = rows
         self.history_table.rows = rows
         self.history_table.update()
+        self._render_history_cards()
+
+    @staticmethod
+    def _status_color(status: str) -> str:
+        if status == "已完成":
+            return "positive"
+        if status == "失败":
+            return "negative"
+        if status == "运行中":
+            return "info"
+        return "grey-6"
+
+    def _render_history_cards(self) -> None:
+        """移动端卡片列表：与桌面表格共用同一批行数据与操作。"""
+        self.history_cards.clear()
+        with self.history_cards:
+            shown = self.history_rows[: self._cards_limit]
+            if not shown:
+                ui.label("暂无记录").classes("text-sm text-gray-400")
+            for row in shown:
+                with ui.card().classes("w-full mobile-list-card border"):
+                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        status = row.get("status") or "未知"
+                        ui.badge(status).props(f"color={self._status_color(status)}")
+                        ui.label(row.get("task") or "-").classes(
+                            "text-base font-semibold"
+                        )
+                    ui.label(row.get("time") or "").classes("text-xs text-gray-400")
+                    ui.label(
+                        f"类型：{row.get('type') or '-'}　账号：{row.get('accounts') or '-'}"
+                    ).classes("text-xs text-gray-600")
+                    result = row.get("result") or ""
+                    ui.html(
+                        '<div class="text-xs text-gray-700" '
+                        f'data-runres="{html_lib.escape(str(row.get("id") or ""), quote=True)}" '
+                        f'style="white-space: pre-line; overflow-wrap: anywhere;">'
+                        f"{html_lib.escape(result)}</div>"
+                    )
+                    with ui.row().classes("w-full mobile-card-actions"):
+                        ui.button(
+                            "复制",
+                            on_click=lambda r=row: self._duplicate_row(r),
+                        ).props("flat dense color=primary")
+                        ui.button(
+                            "明细",
+                            on_click=lambda r=row: self._detail_row(r),
+                        ).props("flat dense color=grey-8")
+                        if row.get("status") == "运行中":
+                            ui.button(
+                                "停止",
+                                on_click=lambda r=row: self._stop_run(
+                                    str(r.get("id") or "")
+                                ),
+                            ).props("flat dense color=negative")
+            if len(self.history_rows) > self._cards_limit:
+                ui.button(
+                    f"展开更多（共 {len(self.history_rows)} 条）",
+                    on_click=self._show_more_cards,
+                ).props("flat dense").classes("w-full")
+
+    def _show_more_cards(self) -> None:
+        self._cards_limit += 10
+        self._render_history_cards()
 
     def clear_history(self) -> None:
         save_task_history([])
@@ -934,20 +1006,27 @@ class TaskRunnerBlock:
             parts.append("预计下次 " + " / ".join(self._short_dt(x) for x in nexts))
         return " · ".join(parts)
 
-    def _on_stop_event(self, e) -> None:
-        row = e.args
+    @staticmethod
+    def _event_row(e) -> dict | None:
+        """从 Quasar 表格事件对象中取出行 dict（事件参数可能被包成 list）。"""
+        row = getattr(e, "args", None)
         if isinstance(row, list) and row and isinstance(row[0], dict):
             row = row[0]
-        if isinstance(row, dict) and row.get("id"):
+        return row if isinstance(row, dict) else None
+
+    def _on_stop_event(self, e) -> None:
+        row = self._event_row(e)
+        if row and row.get("id"):
             self._stop_run(str(row["id"]))
 
     def _on_detail_event(self, e) -> None:
+        """桌面表格「明细」按钮事件入口。"""
+        row = self._event_row(e)
+        if row is not None:
+            self._detail_row(row)
+
+    def _detail_row(self, row: dict) -> None:
         """查看某条任务记录的子任务（账号 × 聊天）成功/失败明细"""
-        row = e.args
-        if isinstance(row, list) and row and isinstance(row[0], dict):
-            row = row[0]
-        if not isinstance(row, dict):
-            return
         rid = str(row.get("id") or "")
         details: list[dict] = []
         if rid in self.runs:
@@ -1046,12 +1125,13 @@ class TaskRunnerBlock:
         dlg.open()
 
     def _on_duplicate_event(self, e) -> None:
-        """用历史行的参数打开「新增任务」弹窗"""
-        row = e.args
-        if isinstance(row, list) and row and isinstance(row[0], dict):
-            row = row[0]
-        if not isinstance(row, dict):
-            return
+        """桌面表格「复制」按钮事件入口。"""
+        row = self._event_row(e)
+        if row is not None:
+            self._duplicate_row(row)
+
+    def _duplicate_row(self, row: dict) -> None:
+        """用历史行的参数打开「新增任务」弹窗（卡片与表格共用）。"""
         if row.get("type") in self.TASK_TYPES:
             self.type_select.value = row["type"]
             self.type_select.update()
@@ -1113,8 +1193,9 @@ class TaskRunnerBlock:
         ui.notify(f"已停止: {record['task_name']}", type="positive")
 
     def _update_running_row(self, record_id: str, result_text: str) -> None:
-        # 只同步内存行数据；进度文本用 JS 直接改写单元格（固定 DOM id），
-        # 不调用 history_table.update()，避免每 0.3s 整表重渲染导致「明细/停止」点击丢失
+        # 只同步内存行数据；进度文本用 JS 直接改写表格单元格与移动端卡片（固定
+        # data-runres 属性，页面上有两份），不调用整表 update()，
+        # 避免每 0.3s 重渲染导致「明细/停止」点击丢失
         for row in self.history_table.rows:
             if row.get("id") == record_id:
                 row["result"] = result_text
@@ -1122,9 +1203,10 @@ class TaskRunnerBlock:
         safe = (
             result_text.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
         )
+        safe_id = str(record_id).replace("\\", "\\\\").replace('"', '\\"')
         ui.run_javascript(
-            f"var el = document.getElementById('runres-{record_id}');"
-            f"if (el) el.textContent = '{safe}';"
+            f'document.querySelectorAll(\'[data-runres="{safe_id}"]\').forEach('
+            f"el => {{ el.textContent = '{safe}'; }});"
         )
 
     def _close_pending_details(self, run: dict, default_status: str) -> None:
@@ -2316,8 +2398,20 @@ def build_ui(auth_code: str = None) -> None:
     ui.add_head_html(
         """
         <style>
+            /* 桌面端：隐藏移动端卡片列表（<=640px 时才显示）。
+               注意类名不可用 mobile-only/desktop-only——那是 Quasar 框架自带、
+               按 body.mobile/body.desktop 设备类（而非视口宽度）生效的可见性类 */
+            .tgs-mobile-cards { display: none !important; }
             @media (max-width: 640px) {
                 .nicegui-content { padding: 8px !important; }
+                /* 移动端：隐藏横滑宽表，改显纵向卡片列表 */
+                .tgs-desktop-table { display: none !important; }
+                .tgs-mobile-cards { display: flex !important; }
+                /* 卡片式列表统一样式：信息竖排、按钮大而易点 */
+                .mobile-list-card { gap: 3px; padding: 10px 12px; }
+                .mobile-list-card .q-card__section { padding: 0; }
+                .mobile-card-actions { gap: 6px; }
+                .mobile-card-actions .q-btn { flex: 1 1 0; min-width: 0; }
                 /* 顶部主标签：缩小横向间距、给右上菜单按钮留位，空间不足时标签栏可横向滑动 */
                 .main-tabs { padding-right: 40px; }
                 .main-tabs .q-tab { padding-left: 9px; padding-right: 9px; }
@@ -2344,16 +2438,6 @@ def build_ui(auth_code: str = None) -> None:
                 .leave-days { width: 104px; min-width: 104px; }
                 /* 表格底部分页栏字号略缩，避免拥挤 */
                 .q-table__bottom { font-size: 13px; }
-                /* 任务表「操作」列固定在表格右侧，横滑查看其他列时按钮始终可点；
-                   不透明底色防止下层文字透出，左侧阴影提示还有列可滑 */
-                .q-table .col-actions {
-                    position: sticky;
-                    right: 0;
-                    z-index: 1;
-                    background: #ffffff;
-                    box-shadow: -6px 0 8px -6px rgba(0, 0, 0, 0.18);
-                }
-                .q-table thead .col-actions { z-index: 2; }
             }
         </style>
         """

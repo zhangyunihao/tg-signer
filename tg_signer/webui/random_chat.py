@@ -809,8 +809,10 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 rows=rows,
                 row_key="name",
                 pagination=5,
-            ).classes("w-full").props("flat dense")
+            ).classes("w-full tgs-desktop-table").props("flat dense")
             table_ref["table"] = table
+            # 移动端卡片上的状态徽章（按任务名），状态回调同时更新表格行与卡片徽章
+            card_badges: dict[str, ui.badge] = {}
             # 状态列渲染为彩色徽章：运行中=蓝、未运行=灰（状态文本可能带进度，用 startsWith 匹配）
             table.add_slot(
                 "body-cell-status",
@@ -835,14 +837,25 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
 
             def make_set_status(n: str) -> Callable[[bool], None]:
                 def _set(running: bool) -> None:
+                    text = "运行中" if running else "未运行"
                     for r in table.rows:
                         if r["name"] == str(n):
-                            r["status"] = "运行中" if running else "未运行"
+                            r["status"] = text
                             try:
                                 table.update()
                             except Exception:
                                 pass
                             break
+                    badge = card_badges.get(str(n))
+                    if badge is not None:
+                        try:
+                            badge.props(
+                                f"color={'info' if running else 'grey-6'}"
+                            )
+                            badge.text = text
+                            badge.update()
+                        except Exception:
+                            pass
 
                 return _set
 
@@ -874,6 +887,84 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             table.on("stopTask", on_stop_event)
             table.on("copyTask", on_copy_event)
             table.on("deleteTask", on_delete_event)
+
+            # —— 移动端（<=640px）卡片列表：信息竖排、操作按钮直接绑定 Python ——
+            mobile_cards = ui.column().classes("w-full gap-2 tgs-mobile-cards")
+            shown_rows = rows if mobile_state["show_all"] else rows[:5]
+
+            async def _card_start(nn: str, cb) -> None:
+                await start_task(nn, cb)
+                render_tasks()  # 重建以切换「启动/停止」按钮与状态徽章
+
+            async def _card_stop(nn: str, cb) -> None:
+                await stop_task(nn, cb)
+                render_tasks()
+
+            with mobile_cards:
+                for row in shown_rows:
+                    n = str(row["name"])
+                    running = row["status"].startswith("运行中")
+                    set_status = make_set_status(n)
+                    with ui.card().classes("w-full mobile-list-card border"):
+                        with ui.row().classes(
+                            "w-full items-center gap-2 no-wrap justify-between"
+                        ):
+                            ui.label(f"任务 #{n}").classes("text-base font-semibold")
+                            badge = ui.badge(row["status"]).props(
+                                f"color={'info' if running else 'grey-6'}"
+                            )
+                            card_badges[n] = badge
+                        ui.label(f"账号：{row['accounts']}").classes(
+                            "text-xs text-gray-600"
+                        )
+                        ui.label(f"群组：{row['chat']}").classes("text-xs text-gray-600")
+                        ui.label(
+                            f"间隔：{row['interval']}　删除延迟：{row['delete_after']}"
+                        ).classes("text-xs text-gray-600")
+                        ui.label(
+                            f"每账号条数：{row['total']}　语库：{row['phrases']}"
+                        ).classes("text-xs text-gray-600")
+                        with ui.row().classes("w-full mobile-card-actions"):
+                            if not running:
+                                ui.button(
+                                    "启动",
+                                    on_click=lambda nn=n, cb=set_status: asyncio.create_task(
+                                        _card_start(nn, cb)
+                                    ),
+                                ).props("flat dense color=primary")
+                            else:
+                                ui.button(
+                                    "停止",
+                                    on_click=lambda nn=n, cb=set_status: asyncio.create_task(
+                                        _card_stop(nn, cb)
+                                    ),
+                                ).props("flat dense color=negative")
+                            ui.button(
+                                "复制",
+                                on_click=lambda nn=n: duplicate_task(nn),
+                            ).props("flat dense color=primary")
+                            ui.button(
+                                "删除",
+                                on_click=lambda nn=n: remove_task(nn),
+                            ).props("flat dense color=negative")
+                if len(rows) > 5:
+                    if mobile_state["show_all"]:
+                        ui.button(
+                            "收起",
+                            on_click=lambda: (
+                                mobile_state.update(show_all=False),
+                                render_tasks(),
+                            ),
+                        ).props("flat dense").classes("w-full")
+                    else:
+                        ui.button(
+                            f"展开更多（共 {len(rows)} 条）",
+                            on_click=lambda: (
+                                mobile_state.update(show_all=True),
+                                render_tasks(),
+                            ),
+                        ).props("flat dense").classes("w-full")
+
             for name in list(tasks):
                 set_status = make_set_status(str(name))
                 tasks[name]["_set_status"] = set_status
@@ -893,6 +984,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             "outline"
         )
     task_list_container = ui.column().classes("w-full gap-2")
+    # 移动端卡片列表的展开状态（render_tasks 每次全量重建）
+    mobile_state = {"show_all": False}
 
     # —— 共用日志 ——
     ui.separator()
