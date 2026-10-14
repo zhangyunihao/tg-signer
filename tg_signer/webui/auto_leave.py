@@ -334,7 +334,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         days_input = ui.number(
             label="不更新天数阈值", value=cfg.get("days") or 7, min=1, step=1,
             format="%.0f",
-        ).classes("w-36")
+        ).classes("w-36 leave-days")
         include_groups = ui.checkbox(
             "包含群组", value=bool(cfg.get("include_groups"))
         )

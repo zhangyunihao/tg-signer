@@ -523,6 +523,8 @@ class TaskRunnerBlock:
                     "label": "操作",
                     "field": "actions",
                     "align": "left",
+                    "classes": "col-actions",
+                    "style": "white-space: nowrap;",
                 },
             ],
             rows=[],
@@ -551,7 +553,7 @@ class TaskRunnerBlock:
         # 操作列：所有行显示「复制」「明细」（用该行参数打开新增弹窗/查看子任务明细），运行中的行额外显示「停止」
         self.history_table.add_slot(
             "body-cell-actions",
-            '<q-td :props="props">'
+            '<q-td :props="props" class="col-actions">'
             '<q-btn flat dense color="primary" '
             'label="复制" @click="$parent.$emit(\'duplicateTask\', props.row)" />'
             '<q-btn flat dense color="grey-8" '
@@ -565,7 +567,7 @@ class TaskRunnerBlock:
         self.history_table.on("detailTask", self._on_detail_event)
 
         self.log_area = ui.scroll_area().classes(
-            "w-full bg-gray-50 rounded-lg border border-gray-200"
+            "w-full bg-gray-50 rounded-lg border border-gray-200 sign-log-area"
         )
         self.log_area.style("max-height: 420px")
         with self.log_area:
@@ -1720,7 +1722,9 @@ def user_info_block() -> Callable[[], None]:
                         set_account_order(lst, state.workdir)
                         refresh()
 
-                    with ui.grid(columns=3).classes("w-full gap-2") as account_grid:
+                    with ui.grid(columns=3).classes(
+                        "w-full gap-2 accounts-grid"
+                    ) as account_grid:
                         for pos, name in enumerate(names):
                             with ui.column().classes(
                                 "border rounded p-2 gap-1 cursor-move"
@@ -2120,7 +2124,7 @@ def _build_dashboard(container) -> None:
                 ui.menu_item("签到记录", on_click=records_dialog.open)
                 ui.menu_item("日志", on_click=logs_dialog.open)
 
-        with ui.tabs().classes("w-full").props("align=left") as tabs:
+        with ui.tabs().classes("w-full main-tabs").props("align=left") as tabs:
             tab_run = ui.tab("run", "签到")
             tab_random = ui.tab("random", "随机发言")
             tab_leave = ui.tab("leave", "批量退频道")
@@ -2303,6 +2307,53 @@ def build_ui(auth_code: str = None) -> None:
                 background: #ffffff;
                 border-radius: 12px;
                 box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+            }
+        </style>
+        """
+    )
+    # 移动端竖屏适配（红米 K80 等宽度 <=640px 的设备）；所有规则限定在媒体查询内，
+    # 桌面端（>640px）布局与间距完全不变。
+    ui.add_head_html(
+        """
+        <style>
+            @media (max-width: 640px) {
+                .nicegui-content { padding: 8px !important; }
+                /* 顶部主标签：缩小横向间距、给右上菜单按钮留位，空间不足时标签栏可横向滑动 */
+                .main-tabs { padding-right: 40px; }
+                .main-tabs .q-tab { padding-left: 9px; padding-right: 9px; }
+                .main-tabs .q-tab .q-tab__label { font-size: 15px; }
+                /* 弹窗：利用几乎全部宽度，高度限制在可视区内（dvh 适配地址栏伸缩），
+                   整卡可滚动，并预留底部手势条安全区 */
+                .q-dialog__inner { padding: 8px; }
+                .q-dialog .q-card {
+                    width: 100%;
+                    max-width: 100% !important;
+                    max-height: calc(100dvh - 16px);
+                    overflow-y: auto;
+                    -webkit-overflow-scrolling: touch;
+                    border-radius: 10px;
+                    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+                }
+                /* 用户信息弹窗：账户卡片由 3 列改为单列，避免窄列里文字竖排 */
+                .accounts-grid {
+                    grid-template-columns: minmax(0, 1fr) !important;
+                }
+                /* 签到实时日志区压缩高度，把屏幕优先让给任务历史表格 */
+                .sign-log-area { max-height: 220px !important; }
+                /* 批量退频道工具栏：天数框收窄，争取与两个复选项排在同一行 */
+                .leave-days { width: 104px; min-width: 104px; }
+                /* 表格底部分页栏字号略缩，避免拥挤 */
+                .q-table__bottom { font-size: 13px; }
+                /* 任务表「操作」列固定在表格右侧，横滑查看其他列时按钮始终可点；
+                   不透明底色防止下层文字透出，左侧阴影提示还有列可滑 */
+                .q-table .col-actions {
+                    position: sticky;
+                    right: 0;
+                    z-index: 1;
+                    background: #ffffff;
+                    box-shadow: -6px 0 8px -6px rgba(0, 0, 0, 0.18);
+                }
+                .q-table thead .col-actions { z-index: 2; }
             }
         </style>
         """

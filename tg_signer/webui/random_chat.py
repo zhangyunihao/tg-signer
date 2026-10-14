@@ -779,6 +779,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                     "label": "操作",
                     "field": "actions",
                     "align": "left",
+                    "classes": "col-actions",
+                    "style": "white-space: nowrap;",
                 },
             ]
             rows = []
@@ -819,7 +821,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             # 操作列：未运行显示「启动」，运行中显示「停止」，另附「复制」「删除」
             table.add_slot(
                 "body-cell-actions",
-                '<q-td :props="props">'
+                '<q-td :props="props" class="col-actions">'
                 '<q-btn v-if="!props.row.status.startsWith(\'运行中\')" flat dense color="primary" '
                 'label="启动" @click="$parent.$emit(\'startTask\', props.row)" />'
                 '<q-btn v-if="props.row.status.startsWith(\'运行中\')" flat dense color="negative" '
