@@ -32,7 +32,7 @@ class TestBaseUserWorker:
 
         assert worker.task_name == "my_task"
         assert worker.context == {}
-        assert worker.app.key.endswith("/acct")
+        assert pathlib.Path(worker.app.key).name == "acct"
 
 
 def collect_outputs(monkeypatch, core):
