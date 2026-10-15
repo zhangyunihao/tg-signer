@@ -43,8 +43,9 @@ from tg_signer.webui.data import (
 )
 from tg_signer.core import get_api_config, get_proxy
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.interactive import InteractiveSignerConfig
 from tg_signer.webui.auto_leave import auto_leave_block
+from tg_signer.webui.giveaway import giveaway_block
+from tg_signer.webui.interactive import InteractiveSignerConfig
 
 
 # Windows 下把任务子进程绑到 Job Object：WebUI 服务进程退出（含被杀）时
@@ -2253,9 +2254,10 @@ def _build_dashboard(container) -> None:
             tab_run = ui.tab("run", "签到")
             tab_random = ui.tab("random", "随机发言")
             tab_leave = ui.tab("leave", "批量退频道")
+            tab_giveaway = ui.tab("giveaway", "自动抽奖")
             tab_configs = ui.tab("configs", "配置管理")
 
-        valid_tabs = {"run", "random", "leave", "configs"}
+        valid_tabs = {"run", "random", "leave", "giveaway", "configs"}
 
         def _tab_name(value) -> str:
             if isinstance(value, str):
@@ -2291,6 +2293,13 @@ def _build_dashboard(container) -> None:
                     "批量退出长期不更新的频道：扫描账号对话，预览确认后并发批量退出。"
                 ).classes("text-gray-600")
                 refreshers.append(auto_leave_block(state.workdir))
+
+            with ui.tab_panel(tab_giveaway):
+                ui.label(
+                    "自动参与频道抽奖：监听 t.me 抽奖机器人链接（?start= 参数），"
+                    "实时新帖与手动扫描两种方式触发，支持多账号与指定频道列表。"
+                ).classes("text-gray-600")
+                refreshers.append(giveaway_block(state.workdir))
 
             with ui.tab_panel(tab_configs):
                 ui.label(
