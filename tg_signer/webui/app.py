@@ -2042,6 +2042,18 @@ def log_block() -> Callable[[], None]:
                 max=2000,
                 format="%d",
             ).classes("w-32")
+            level_toggle = ui.toggle(
+                {"all": "全部", "warn": "警告+", "error": "仅错误"},
+                value="all",
+                on_change=lambda _: refresh(),
+            ).props("dense")
+            keyword_input = ui.input(label="关键字过滤", placeholder="回车应用").props(
+                "clearable dense"
+            ).classes("min-w-[180px]")
+            keyword_input.on("keydown.enter", lambda _: refresh())
+            keyword_input.on_value_change(
+                lambda e: refresh() if not e.value else None
+            )
             log_select = ui.select(
                 label=f"选择日志文件（{LOG_DIR}/）",
                 options=[],
@@ -2094,13 +2106,43 @@ def log_block() -> Callable[[], None]:
             except ValueError:
                 state.log_limit = 200
             state.set_log_path(log_path_input.value or str(DEFAULT_LOG_FILE))
-            path, lines = load_logs(state.log_limit, log_path_input.value)
+
+            level = level_toggle.value or "all"
+            keyword = (keyword_input.value or "").lower().strip()
+            filtering = level != "all" or bool(keyword)
+            # 过滤命中会减少可见行数，多读几倍原始行再取最新 limit 行
+            fetch_limit = state.log_limit * 4 if filtering else state.log_limit
+            path, lines = load_logs(fetch_limit, log_path_input.value)
+            if filtering and lines:
+
+                def _match(line: str) -> bool:
+                    upper = line.upper()
+                    if level == "error" and "ERROR" not in upper:
+                        return False
+                    if level == "warn" and "ERROR" not in upper and "WARN" not in upper:
+                        return False
+                    if keyword and keyword not in line.lower():
+                        return False
+                    return True
+
+                lines = [line for line in lines if _match(line)][-state.log_limit:]
+
             log_list.clear()
             if not lines:
                 with log_list:
-                    ui.label(f"未找到日志文件: {path}").classes("text-gray-500 text-sm")
+                    if filtering:
+                        ui.label("没有匹配过滤条件的日志行").classes(
+                            "text-gray-500 text-sm"
+                        )
+                    else:
+                        ui.label(f"未找到日志文件: {path}").classes(
+                            "text-gray-500 text-sm"
+                        )
                 log_list.update()
-                refresh_status(f"未找到日志文件: {path}")
+                if filtering:
+                    refresh_status("没有匹配过滤条件的日志行")
+                else:
+                    refresh_status(f"未找到日志文件: {path}")
                 return
 
             with log_list:
@@ -2108,7 +2150,8 @@ def log_block() -> Callable[[], None]:
                     color = classify_line(line)
                     ui.label(line).classes(f"w-full {color}").style("white-space: pre;")
             log_list.update()
-            refresh_status(f"文件: {path} | 显示最新 {len(lines)} 行")
+            suffix = "（已过滤）" if filtering else ""
+            refresh_status(f"文件: {path} | 显示最新 {len(lines)} 行{suffix}")
 
         with ui.row().classes("gap-2 mt-2 items-center justify-between"):
             ui.button("刷新日志", on_click=refresh)
