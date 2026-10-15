@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 from tg_signer.config import BaseJSONConfig, MonitorConfig, SignConfigV3
 from tg_signer.sign_record_store import SignRecordStore
+from tg_signer.utils import atomic_write_json
 
 ConfigKind = Literal["signer", "monitor"]
 
@@ -109,9 +110,7 @@ def save_config(
             raise ValueError("配置校验失败")
         cfg, _ = loaded
     config_file = _config_path(kind, name, workdir)
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(config_file, "w", encoding="utf-8") as fp:
-        json.dump(cfg.to_jsonable(), fp, ensure_ascii=False, indent=2)
+    atomic_write_json(config_file, cfg.to_jsonable())
     return config_file
 
 
@@ -183,9 +182,7 @@ def _read_accounts_state(path: Path) -> Dict:
 
 
 def _write_accounts_state(path: Path, state: Dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fp:
-        json.dump(state, fp, ensure_ascii=False, indent=2)
+    atomic_write_json(path, state)
 
 
 def load_disabled_accounts(workdir: Optional[Path | str] = None) -> set:

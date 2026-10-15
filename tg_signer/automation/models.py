@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from pyrogram.types import Message
 
+from tg_signer.utils import atomic_write_json
+
 if TYPE_CHECKING:
     from tg_signer.core import Client
 
@@ -78,8 +80,7 @@ class RuleStateStore:
             self.logger.debug("状态未变化，跳过写入: %s", self.path)
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as fp:
-            json.dump(self._data, fp, ensure_ascii=False, indent=2)
+        atomic_write_json(self.path, self._data)
         self._dirty = False
         self.logger.debug("状态文件写入完成: %s", self.path)
 

@@ -10,6 +10,7 @@ from nicegui import ui
 from pyrogram.errors import FloodWait, RPCError
 
 from tg_signer.core import get_client
+from tg_signer.utils import atomic_write_json
 from tg_signer.webui.random_chat import (
     build_account_options,
     list_session_names,
@@ -46,9 +47,7 @@ def load_config(workdir) -> Dict:
 
 def save_config(workdir, cfg: Dict) -> None:
     try:
-        _config_path(workdir).write_text(
-            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        atomic_write_json(_config_path(workdir), cfg)
     except Exception:
         pass
 

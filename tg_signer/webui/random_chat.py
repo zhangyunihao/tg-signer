@@ -15,6 +15,7 @@ from nicegui import ui
 
 from tg_signer.core import get_client
 from tg_signer.phrases import PHRASES, parse_custom_phrases, phrase_pool_label
+from tg_signer.utils import atomic_write_json
 from tg_signer.webui.data import (
     apply_account_order,
     load_disabled_accounts,
@@ -107,8 +108,7 @@ async def update_account_chats(
         ]
         user_dir = Path(workdir) / "users" / str(me.id)
         user_dir.mkdir(parents=True, exist_ok=True)
-        with open(user_dir / "latest_chats.json", "w", encoding="utf-8") as fp:
-            json.dump(latest, fp, indent=4, ensure_ascii=False)
+        atomic_write_json(user_dir / "latest_chats.json", latest, indent=4)
         me_file = user_dir / "me.json"
         if not me_file.is_file():
             me_file.write_text(str(me), encoding="utf-8")
@@ -235,11 +235,7 @@ def load_task_store(workdir) -> dict:
 
 
 def save_task_store(workdir, store: dict) -> None:
-    path = _store_path(workdir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    atomic_write_json(_store_path(workdir), store)
 
 
 def parse_chat_id(raw) -> Optional[Union[int, str]]:

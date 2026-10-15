@@ -42,6 +42,7 @@ from tg_signer.webui.data import (
     set_account_order,
 )
 from tg_signer.core import get_api_config, get_proxy
+from tg_signer.utils import atomic_write_json
 from tg_signer.webui.interactive import InteractiveSignerConfig
 from tg_signer.webui.auto_leave import auto_leave_block
 
@@ -419,9 +420,9 @@ def load_task_history() -> list[dict]:
 
 
 def save_task_history(items: list[dict]) -> None:
-    path = _task_history_path()
-    with open(path, "w", encoding="utf-8") as fp:
-        json.dump(items[-TASK_HISTORY_LIMIT:], fp, ensure_ascii=False, indent=2)
+    atomic_write_json(
+        _task_history_path(), items[-TASK_HISTORY_LIMIT:]
+    )
 
 
 def append_task_history(record: dict) -> None:
@@ -1431,8 +1432,7 @@ class AccountLoginSession:
         }
         user_dir = get_workdir(state.workdir) / "users" / str(me.id)
         user_dir.mkdir(parents=True, exist_ok=True)
-        with open(user_dir / "me.json", "w", encoding="utf-8") as fp:
-            json.dump(data, fp, ensure_ascii=False, indent=2)
+        atomic_write_json(user_dir / "me.json", data)
 
     async def start(self) -> str:
         """连接并发送验证码；若会话已授权则直接完成登录。"""
@@ -2462,7 +2462,32 @@ def build_ui(auth_code: str = None) -> None:
     _auth_gate(root, auth_code, render_dashboard)
 
 
+# NiceGUI 每个浏览器会话会在 .nicegui/ 下生成一个 storage-user-*.json，
+# 长期运行会无限累积，启动时清理超过保留期的旧会话文件。
+_NICEGUI_STORAGE_DIR = Path(".nicegui")
+_SESSION_CLEANUP_DAYS = 30
+
+
+def cleanup_stale_sessions(max_age_days: int = _SESSION_CLEANUP_DAYS) -> int:
+    """删除超过 max_age_days 未更新的 NiceGUI 会话缓存文件，返回删除数量。"""
+    if not _NICEGUI_STORAGE_DIR.is_dir():
+        return 0
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    for f in _NICEGUI_STORAGE_DIR.glob("storage-user-*.json"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def main(host: str = None, port: int = None, storage_secret: str = None) -> None:
+    removed = cleanup_stale_sessions()
+    if removed:
+        print(f"已清理 {removed} 个过期会话缓存文件（保留 {_SESSION_CLEANUP_DAYS} 天内）")
     ui.run(
         build_ui,
         title="TG Signer WebUI",

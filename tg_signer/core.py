@@ -65,7 +65,7 @@ from ._kurigram import SafeGetForumTopics
 from .ai_tools import AITools, OpenAIConfigManager
 from .notification.server_chan import sc_send
 from .sign_record_store import SignRecordStore
-from .utils import UserInput, get_now, print_to_user
+from .utils import UserInput, atomic_write_json, get_now, print_to_user
 from .utils import get_timezone as _get_timezone
 
 logger = logging.getLogger("tg-signer")
@@ -493,8 +493,7 @@ class BaseUserWorker(Generic[ConfigT]):
         raise NotImplementedError
 
     def write_config(self, config: BaseJSONConfig):
-        with open(self.config_file, "w", encoding="utf-8") as fp:
-            json.dump(config.to_jsonable(), fp, ensure_ascii=False)
+        atomic_write_json(self.config_file, config.to_jsonable(), indent=None)
 
     def reconfig(self):
         config = self.ask_for_config()
@@ -633,18 +632,12 @@ class BaseUserWorker(Generic[ConfigT]):
                                     # have permissions to read them.
                                     pass
 
-                    with open(
+                    atomic_write_json(
                         self.get_user_dir(me).joinpath("latest_chats.json"),
-                        "w",
-                        encoding="utf-8",
-                    ) as fp:
-                        json.dump(
-                            latest_chats,
-                            fp,
-                            indent=4,
-                            default=Object.default,
-                            ensure_ascii=False,
-                        )
+                        latest_chats,
+                        indent=4,
+                        default=Object.default,
+                    )
                     await self._call_telegram_api(
                         "auth.ExportAuthorization", self.app.save_session_string
                     )

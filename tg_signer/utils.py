@@ -1,6 +1,9 @@
+import json
 import os
 import pathlib
+import tempfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -328,3 +331,38 @@ class UserInput:
 
 def print_to_user(*args, sep=" ", end="\n", flush=False, **kwargs):
     return print(*args, sep=sep, end=end, flush=flush, **kwargs)
+
+
+def atomic_write_json(
+    path: str | os.PathLike[str],
+    data,
+    *,
+    indent: int | None = 2,
+    ensure_ascii: bool = False,
+    default=None,
+    encoding: str = "utf-8",
+) -> None:
+    """原子写入 JSON 文件：先写临时文件再 os.replace 替换。
+
+    避免进程在写入中途崩溃/断电导致目标 JSON 文件损坏。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(
+        data, ensure_ascii=ensure_ascii, indent=indent, default=default
+    )
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as fp:
+            fp.write(payload)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
