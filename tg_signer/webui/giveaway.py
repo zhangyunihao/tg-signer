@@ -1,6 +1,6 @@
 """自动抽奖标签页：监控指定频道中的 t.me/<bot>?start=<参数> 抽奖链接并自动参与。
 
-触发方式：任务启动后实时监听新消息（含编辑消息），也可随时手动扫描最近 N 条。
+触发方式：任务启动时可自动扫描最近 N 条，也可随时手动扫描。
 账号会话/授权检测/从 TG 更新对话列表等能力复用 random_chat 模块。
 """
 
@@ -35,11 +35,12 @@ _CFG_FIELDS = {
     "chats": list,
     "session_dir": str,
     "keywords": lambda: list(DEFAULT_KEYWORDS),
-    "scan_limit": lambda: 10,
     "auto_scan": lambda: True,
     "delay_min": lambda: 3,
     "delay_max": lambda: 10,
     "confirm_wait": lambda: 8,
+    "auto_join": lambda: True,
+    "max_joins": lambda: None,
 }
 
 
@@ -57,6 +58,22 @@ def list_known_channels(workdir) -> Dict[str, str]:
             title = chat.get("title") or chat.get("first_name") or "N/A"
             options[str(cid)] = f"{title} ({cid})"
     return options
+
+
+def chat_kind_map(workdir) -> Dict[str, str]:
+    """返回 {chat_id: "channel"|"group"}，供监控对象类型筛选"""
+    mapping: Dict[str, str] = {}
+    for info in load_user_infos(workdir):
+        for chat in info.latest_chats or []:
+            ctype = str(chat.get("type") or "").lower().replace("chattype.", "")
+            if ctype != "channel" and not ctype.endswith("group"):
+                continue
+            cid = chat.get("id")
+            if cid is None:
+                continue
+            kind = "channel" if ctype == "channel" else "group"
+            mapping.setdefault(str(cid), kind)
+    return mapping
 
 
 def channel_title_map(workdir) -> Dict[str, str]:
@@ -119,6 +136,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     giveaway_state = GiveawayState(workdir)
     chat_options_map: Dict[str, str] = {}
     chat_title_map: Dict[str, str] = {}
+    kind_map: Dict[str, str] = {}
     table_ref: Dict[str, object] = {"table": None}
 
     def _persist() -> None:
@@ -129,11 +147,14 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "chats": [str(c) for c in (cfg.get("chats") or [])],
                 "session_dir": str(cfg.get("session_dir") or "."),
                 "keywords": list(cfg.get("keywords") or []),
-                "scan_limit": int(cfg.get("scan_limit") or 10),
                 "auto_scan": bool(cfg.get("auto_scan", True)),
+                "auto_join": bool(cfg.get("auto_join", True)),
                 "delay_min": int(cfg.get("delay_min") or 0),
                 "delay_max": int(cfg.get("delay_max") or 0),
                 "confirm_wait": int(cfg.get("confirm_wait") or 0),
+                "max_joins": (
+                    int(cfg["max_joins"]) if cfg.get("max_joins") else None
+                ),
             }
         save_task_store(workdir, {"seq": store["seq"], "tasks": clean})
 
@@ -169,6 +190,23 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         account_select.options = build_account_options(session_dir, names)
         account_select.update()
 
+    def apply_channel_filter() -> None:
+        """按类型筛选监控对象下拉选项（全部/仅频道/仅群组），不影响已选值"""
+        try:
+            mode = channel_type_toggle.value or "all"
+        except NameError:
+            return
+        if mode == "all":
+            filtered = dict(chat_options_map)
+        else:
+            filtered = {
+                cid: label
+                for cid, label in chat_options_map.items()
+                if kind_map.get(cid) == mode
+            }
+        channel_select.options = filtered
+        channel_select.update()
+
     def refresh_options() -> None:
         session_dir = Path(session_dir_input.value or ".")
         _set_account_options()
@@ -176,10 +214,11 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         schedule_auth_checks(session_dir, names, on_done=_set_account_options)
         chat_options_map.clear()
         chat_options_map.update(list_known_channels(workdir))
-        channel_select.options = dict(chat_options_map)
-        channel_select.update()
         chat_title_map.clear()
         chat_title_map.update(channel_title_map(workdir))
+        kind_map.clear()
+        kind_map.update(chat_kind_map(workdir))
+        apply_channel_filter()
 
     def task_running(name: str) -> bool:
         engine = get_engine(name)
@@ -209,8 +248,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         channel_select.value = [str(c) for c in cfg["chats"]]
         manual_chats_input.value = ""
         keywords_input.value = "，".join(cfg.get("keywords") or [])
-        scan_limit_input.value = cfg["scan_limit"]
+        max_joins_input.value = cfg.get("max_joins") or None
         auto_scan_switch.value = cfg["auto_scan"]
+        auto_join_switch.value = cfg.get("auto_join", True)
         delay_min_input.value = cfg["delay_min"]
         delay_max_input.value = cfg["delay_max"]
         for el in (
@@ -219,8 +259,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             channel_select,
             manual_chats_input,
             keywords_input,
-            scan_limit_input,
+            max_joins_input,
             auto_scan_switch,
+            auto_join_switch,
             delay_min_input,
             delay_max_input,
         ):
@@ -256,8 +297,11 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             session_dir=Path(cfg["session_dir"]),
             log=make_log(name),
             keywords=list(cfg.get("keywords") or []),
-            scan_limit=int(cfg.get("scan_limit") or 10),
             auto_scan=bool(cfg.get("auto_scan", True)),
+            auto_join=bool(cfg.get("auto_join", True)),
+            max_joins=(
+                int(cfg["max_joins"]) if cfg.get("max_joins") else None
+            ),
             delay_range=(
                 float(cfg.get("delay_min") or 0),
                 float(cfg.get("delay_max") or 0),
@@ -287,9 +331,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         if engine.scanning:
             ui.notify("正在扫描中，请稍候", type="warning")
             return
-        limit = int(tasks[name].get("scan_limit") or 10)
-        ui.notify(f"开始扫描最近 {limit} 条消息", type="positive")
-        asyncio.create_task(engine.scan_now(limit))
+        ui.notify("开始扫描（至参与上限或连续 5 条已开奖为止）", type="positive")
+        asyncio.create_task(engine.scan_now())
 
     def _apply_status(set_status: Callable[[bool], None], running: bool) -> None:
         try:
@@ -316,11 +359,15 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             return
         keywords = _split_items(keywords_input.value or "")
         try:
-            scan_limit = max(1, int(scan_limit_input.value or 10))
+            max_joins = (
+                max(0, int(max_joins_input.value))
+                if max_joins_input.value is not None
+                else None
+            )
             delay_min = max(0, int(delay_min_input.value or 0))
             delay_max = max(0, int(delay_max_input.value or 0))
         except (TypeError, ValueError):
-            ui.notify("扫描条数/延迟需为数字", type="warning")
+            ui.notify("参与上限/延迟需为数字", type="warning")
             return
         if delay_min > delay_max:
             delay_min, delay_max = delay_max, delay_min
@@ -331,8 +378,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "chats": chats,
             "session_dir": str(Path(session_dir_input.value or ".")),
             "keywords": keywords,
-            "scan_limit": scan_limit,
+            "max_joins": max_joins,
             "auto_scan": bool(auto_scan_switch.value),
+            "auto_join": bool(auto_join_switch.value),
             "delay_min": delay_min,
             "delay_max": delay_max,
             "confirm_wait": 8,
@@ -375,7 +423,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 },
                 {
                     "name": "scan",
-                    "label": "扫描条数",
+                    "label": "参与上限",
                     "field": "scan",
                     "align": "left",
                 },
@@ -409,7 +457,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         "chats": f"{len(cfg['chats'])} 个：" + "、".join(chat_names[:3])
                         + ("…" if len(chat_names) > 3 else ""),
                         "keywords": "、".join(cfg.get("keywords") or []) or "全部链接",
-                        "scan": str(cfg.get("scan_limit") or 10),
+                        "scan": "不限" if not cfg.get("max_joins") else str(cfg["max_joins"]),
                         "status": _status_text(name),
                     }
                 )
@@ -544,7 +592,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             "text-xs text-gray-600"
                         )
                         ui.label(
-                            f"关键词：{row['keywords']}　扫描条数：{row['scan']}"
+                            f"关键词：{row['keywords']}　参与上限：{row['scan']}"
                         ).classes("text-xs text-gray-600")
                         with ui.row().classes("w-full mobile-card-actions"):
                             if not running:
@@ -601,7 +649,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     ui.label("自动抽奖").classes("text-lg font-semibold")
     ui.label(
         "监控指定频道消息中的 t.me 抽奖机器人链接（?start= 参数），自动点击参与；"
-        "任务启动后实时监听新帖，也可随时手动扫描最近消息。同一抽奖链接每个账号只参与一次，"
+        "任务启动时可自动扫描历史消息（至参与上限或连续 5 条已开奖为止），"
+        "也可随时手动扫描。同一抽奖链接每个账号只参与一次，"
         "记录持久化在工作目录，重启不重复参与。"
     ).classes("text-sm text-gray-500")
 
@@ -721,10 +770,17 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             channel_select = ui.select(
-                label="选择监控频道（可多选）",
+                label="选择监控频道（可多选，输入关键字过滤）",
                 options={},
                 multiple=True,
-            ).classes("min-w-[320px] flex-grow").props("use-chips options-dense")
+            ).classes("min-w-[320px] flex-grow").props(
+                "use-chips use-input options-dense"
+            )
+            channel_type_toggle = ui.toggle(
+                {"all": "全部", "channel": "仅频道", "group": "仅群组"},
+                value="all",
+                on_change=lambda _: apply_channel_filter(),
+            ).props("dense")
             manual_chats_input = ui.input(
                 label="手动添加频道（逗号分隔 chat_id 或 @username）",
                 placeholder="-1001234567890, @somechannel",
@@ -735,11 +791,18 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 label="消息关键词（逗号分隔，留空=含 bot 链接就参与）",
                 value="，".join(DEFAULT_KEYWORDS),
             ).classes("min-w-[280px] flex-grow")
-            scan_limit_input = ui.number(
-                label="扫描最近消息条数", value=10, min=1, max=500, format="%d"
-            ).classes("w-36")
+            max_joins_input = ui.number(
+                label="参与条数上限（留空=不限）",
+                value=None,
+                min=0,
+                max=10000,
+                format="%d",
+            ).classes("w-56")
             auto_scan_switch = ui.switch(
                 "启动时自动扫描一轮", value=True
+            ).classes("pt-6")
+            auto_join_switch = ui.switch(
+                "自动加入抽奖要求的频道/群组", value=True
             ).classes("pt-6")
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
@@ -752,7 +815,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
         ui.label(
             "提示：参与 = 以账号身份向抽奖机器人发送 /start（等同手动点开链接）；"
-            "机器人若弹出「确认参与」类按钮会自动点击。请确保账号已加入所监控的频道。"
+            "机器人若弹出「确认参与」类按钮会自动点击；开启自动加入后，"
+            "机器人回复消息中出现的频道/群组链接会被逐一加入（激进模式，可能误加）。"
+            "请确保账号已加入所监控的频道。"
         ).classes("text-xs text-amber-600")
         with ui.row().classes("w-full justify-end"):
             ui.button("取消", on_click=add_dlg.close).props("flat")
