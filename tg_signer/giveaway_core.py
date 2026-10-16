@@ -7,7 +7,8 @@
 纯解析函数不依赖网络，便于单测；GiveawayEngine 负责连接、
 历史扫描、去重与参与。
 
-触发方式：启动时可选自动扫描最近消息 + 手动扫描；同一引擎常驻连接，
+触发方式：启动时可选自动扫描最近消息 + 手动扫描 + 周期性历史补漏
+（重拉最近消息捞回漏网之鱼，含连续失败熔断暂停）；同一引擎常驻连接，
 便于随时发起扫描与参与。
 """
 
@@ -17,7 +18,7 @@ import asyncio
 import json
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -48,6 +49,15 @@ FLOOD_COOLDOWN = 3600
 EXPIRED_STOP_STREAK = 5
 # 单频道单次扫描的硬上限（条），防止无开奖日期标注时无限回溯
 SCAN_HARD_CAP = 1000
+
+# —— 历史补漏 ——
+# 周期性重拉各频道最近若干条消息，捞回此前扫描失败/中断漏掉的抽奖帖
+RESCUE_INTERVAL = 1800         # 补漏扫描间隔（秒），0 = 关闭
+RESCUE_LIMIT = 10              # 每次补漏每频道重拉的消息条数
+RESCUE_MAX_FAILS = 3           # 连续失败达该轮数后熔断暂停补漏
+RESCUE_RESUME_COOLDOWN = 1800  # 熔断后的自动恢复等待（秒）
+RESCUE_FETCH_TIMEOUT = 60      # 单频道补漏拉取消息的超时（秒）
+SEEN_CAP_PER_CHAT = 500        # 每频道保留的已处理消息 id 上限
 
 # t.me/<username> + 后续路径/查询（用户名 5~32 位，字母/数字/下划线）
 _TME_RE = re.compile(
@@ -355,14 +365,26 @@ class GiveawayEngine:
         self._bot_cache: Dict[str, bool] = {}
         # 本次运行已处理过的加入目标：{account|target_lower}，避免重复 join
         self._join_cache: set = set()
+        # 自动加入频道的限流暂停（JoinChannel FLOOD_WAIT 后暂停一段时间再恢复）
+        self._join_suspended_until: Optional[datetime] = None
+        self._join_suspend_logged = False
         # FLOOD_WAIT 熔断：{account|bot_lower: 连续次数}；达到上限加入 _flood_bots
         self._flood_counts: Dict[str, int] = {}
         self._flood_bots: set = set()
         # 跳过提示去重（已开奖消息/参与上限），避免每轮扫描重复刷日志
         self._skip_logged: set = set()
+        # 历史补漏：已处理消息 id 水位线 {account|chat_key: {msg_id: None}（保序）}
+        self._seen_msgs: Dict[str, Dict[int, None]] = {}
+        # 补漏连续失败轮数与熔断恢复时间
+        self._rescue_fail_streak = 0
+        self._rescue_suspended_until: Optional[datetime] = None
+        # 聊天类型缓存 {str(chat): 是否群组}：群组只扫置顶，频道才全量扫描
+        self._chat_types: Dict[str, bool] = {}
         self.chats: List = []
         self.keywords: Tuple[str, ...] = DEFAULT_KEYWORDS
         self.max_joins: Optional[int] = None
+        self.rescue_interval = RESCUE_INTERVAL
+        self.rescue_limit = RESCUE_LIMIT
         self.confirm_keywords: Tuple[str, ...] = DEFAULT_CONFIRM_KEYWORDS
         self.confirm_wait = 8
         self.delay_range = (3.0, 10.0)
@@ -400,6 +422,8 @@ class GiveawayEngine:
         auto_scan: bool = True,
         auto_join: bool = True,
         max_joins: Optional[int] = None,
+        rescue_interval: Optional[int] = None,
+        rescue_limit: Optional[int] = None,
         delay_range: Tuple[float, float] = (3.0, 10.0),
         confirm_wait: int = 8,
         confirm_keywords: Optional[Iterable[str]] = None,
@@ -417,6 +441,10 @@ class GiveawayEngine:
         self.confirm_wait = max(0, int(confirm_wait))
         self.auto_join = bool(auto_join)
         self.max_joins = max(0, int(max_joins)) if max_joins else None
+        if rescue_interval is not None:
+            self.rescue_interval = max(0, int(rescue_interval))
+        if rescue_limit is not None:
+            self.rescue_limit = max(1, int(rescue_limit))
         lo, hi = delay_range
         self.delay_range = (min(lo, hi), max(lo, hi))
         self.session_dir = Path(session_dir)
@@ -428,6 +456,9 @@ class GiveawayEngine:
         self._stopping = False
         self._flood_counts.clear()
         self._flood_bots.clear()
+        self._seen_msgs.clear()
+        self._rescue_fail_streak = 0
+        self._rescue_suspended_until = None
         self._stop = asyncio.Event()
         self._task = asyncio.create_task(self._run(accounts, bool(auto_scan)))
         if on_finish is not None:
@@ -526,7 +557,10 @@ class GiveawayEngine:
             )
             if auto_scan and not self._stop.is_set():
                 await self.scan_now()
-            await self._stop.wait()
+            if self.rescue_interval > 0:
+                await self._rescue_loop()
+            else:
+                await self._stop.wait()
         finally:
             for client in self._clients.values():
                 try:
@@ -564,6 +598,17 @@ class GiveawayEngine:
                     self.scan_text = f"({done}/{total})"
                     expired_streak = 0
                     scanned = 0
+                    # 先扫置顶消息：很多群的抽奖帖长期置顶；同时识别聊天类型
+                    is_group = await self._scan_pinned(account, client, chat)
+                    if (
+                        is_group
+                        or (
+                            self.max_joins is not None
+                            and self.joined >= self.max_joins
+                        )
+                    ):
+                        # 群组只扫指定（置顶）消息；达到上限也不再扫历史
+                        continue
                     try:
                         async for message in client.get_chat_history(chat):
                             scanned += 1
@@ -573,6 +618,9 @@ class GiveawayEngine:
                                     f"{SCAN_HARD_CAP} 条，停止该频道本轮扫描"
                                 )
                                 break
+                            mid = getattr(message, "id", None)
+                            if mid is not None:
+                                self._mark_seen(account, str(chat), mid)
                             outcome = await self._process_message(
                                 account, client, message
                             )
@@ -604,6 +652,166 @@ class GiveawayEngine:
             self.scan_text = ""
             if self._state is not None:
                 self._state.save()
+
+    async def _scan_pinned(
+        self, account: str, client: Any, chat: Any
+    ) -> Optional[bool]:
+        """扫描频道/群组的置顶消息并参与（抽奖帖常被置顶）。
+
+        通过 get_chat 拿到 pinned_message；置顶消息与历史消息走同一套
+        处理流程（关键词过滤、开奖日期跳过、去重、自动加入）。
+        同时缓存聊天类型：群组返回 True、频道返回 False、获取失败返回 None。
+        """
+        try:
+            chat_info = await client.get_chat(chat)
+        except Exception as exc:
+            self.log(f"[{account}] 获取 {chat} 信息失败，跳过置顶扫描: {exc}")
+            return self._chat_types.get(str(chat))
+        type_name = getattr(getattr(chat_info, "type", None), "name", "")
+        is_group = type_name in ("GROUP", "SUPERGROUP")
+        self._chat_types[str(chat)] = is_group
+        pinned = getattr(chat_info, "pinned_message", None)
+        if pinned is None:
+            return is_group
+        mid = getattr(pinned, "id", None)
+        if mid is not None:
+            self._mark_seen(account, str(chat), mid)
+        try:
+            await self._process_message(account, client, pinned)
+        except Exception as exc:
+            self.log(f"[{account}] 处理 {chat} 置顶消息失败: {exc}")
+        return is_group
+
+    def _mark_seen(self, account: str, chat_key: str, message_id: int) -> bool:
+        """记录消息已处理（水位线）。返回 False 表示此前已见过，补漏时应跳过。"""
+        if message_id is None:
+            return True
+        key = f"{account}|{chat_key}"
+        bucket = self._seen_msgs.setdefault(key, {})
+        if message_id in bucket:
+            return False
+        bucket[message_id] = None
+        if len(bucket) > SEEN_CAP_PER_CHAT:
+            # dict 保序：最先插入的是最旧的消息，超出容量丢弃最旧的
+            for old in list(bucket)[: len(bucket) - SEEN_CAP_PER_CHAT]:
+                bucket.pop(old, None)
+        return True
+
+    async def _rescue_loop(self) -> None:
+        """历史补漏主循环：周期性重拉各频道最近消息，捞回漏掉的抽奖帖。
+
+        网络异常/超时连续 RESCUE_MAX_FAILS 轮失败后熔断暂停
+        RESCUE_RESUME_COOLDOWN，再自动恢复，避免坏网络下无意义刷请求。
+        """
+        while not (self._stop is not None and self._stop.is_set()):
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=self.rescue_interval
+                )
+                return  # 收到停止信号
+            except asyncio.TimeoutError:
+                pass
+            if self.scanning:
+                continue  # 完整/手动扫描进行中，让路并重等一个周期
+            if self._rescue_suspended_until is not None:
+                if datetime.now() < self._rescue_suspended_until:
+                    continue
+                self._rescue_suspended_until = None
+                self._rescue_fail_streak = 0
+                self.log("历史补漏已从熔断暂停中恢复")
+            await self._rescue_round()
+
+    async def _rescue_round(self) -> None:
+        """执行一轮补漏：每账号 × 每频道重拉最近 rescue_limit 条消息。"""
+        failures = 0
+        joined_before = self.joined
+        total = len(self._clients) * max(1, len(self.chats))
+        done = 0
+        self.scanning = True
+        try:
+            for account, client in list(self._clients.items()):
+                if self._stop is not None and self._stop.is_set():
+                    return
+                if not await self._ensure_connected(client):
+                    self.log(f"[{account}] 补漏：连接不可用，跳过该账号")
+                    failures += 1
+                    continue
+                for chat in self.chats:
+                    if self._stop is not None and self._stop.is_set():
+                        return
+                    done += 1
+                    self.scan_text = f"补漏 ({done}/{total})"
+                    try:
+                        await self._rescue_channel(account, client, chat)
+                    except asyncio.TimeoutError:
+                        self.log(
+                            f"[{account}] 补漏 {chat} 拉取超时"
+                            f"（{RESCUE_FETCH_TIMEOUT}s）"
+                        )
+                        failures += 1
+                    except Exception as exc:
+                        self.log(f"[{account}] 补漏 {chat} 失败: {exc}")
+                        failures += 1
+            gained = self.joined - joined_before
+            if gained or failures:
+                self.log(
+                    f"补漏扫描完成：捞回并参与 {gained} 个"
+                    + (f"，{failures} 个频道拉取失败" if failures else "")
+                )
+        finally:
+            self.scanning = False
+            self.scan_text = ""
+            if self._state is not None:
+                self._state.save()
+        if failures == 0:
+            self._rescue_fail_streak = 0
+            return
+        self._rescue_fail_streak += 1
+        if self._rescue_fail_streak >= RESCUE_MAX_FAILS:
+            self._rescue_suspended_until = datetime.now() + timedelta(
+                seconds=RESCUE_RESUME_COOLDOWN
+            )
+            self.log(
+                f"补漏连续 {self._rescue_fail_streak} 轮失败，暂停 "
+                f"{RESCUE_RESUME_COOLDOWN // 60} 分钟后自动恢复"
+            )
+
+    async def _rescue_channel(self, account: str, client: Any, chat: Any) -> None:
+        """补漏单个频道：限时拉取最近 N 条，未处理过的消息走常规参与流程。"""
+        if self._chat_types.get(str(chat)):
+            # 群组不扫历史补漏，只重新检查置顶消息（群主可能换了新置顶抽奖帖）
+            await self._rescue_group_pinned(account, client, chat)
+            return
+        fetched: List[Any] = []
+
+        async def _fetch() -> None:
+            async for message in client.get_chat_history(
+                chat, limit=self.rescue_limit
+            ):
+                fetched.append(message)
+
+        # 超时仅约束网络拉取；参与流程含预期内的随机延迟，不做强杀
+        await asyncio.wait_for(_fetch(), timeout=RESCUE_FETCH_TIMEOUT)
+        for message in fetched:
+            if self._stop is not None and self._stop.is_set():
+                return
+            mid = getattr(message, "id", None)
+            if not self._mark_seen(account, str(chat), mid):
+                continue  # 已处理过（水位线去重）
+            await self._process_message(account, client, message)
+
+    async def _rescue_group_pinned(
+        self, account: str, client: Any, chat: Any
+    ) -> None:
+        """群组补漏：只重拉置顶消息并按水位线去重处理，不扫历史。"""
+        chat_info = await client.get_chat(chat)
+        pinned = getattr(chat_info, "pinned_message", None)
+        if pinned is None:
+            return
+        mid = getattr(pinned, "id", None)
+        if not self._mark_seen(account, str(chat), mid):
+            return  # 置顶未变化，此前已处理过
+        await self._process_message(account, client, pinned)
 
     def _chat_title(self, message: Any) -> str:
         chat = getattr(message, "chat", None)
@@ -773,6 +981,17 @@ class GiveawayEngine:
     ) -> bool:
         """激进模式：把消息中出现的频道/群组链接逐个加入。返回是否发生加入。"""
         joined_any = False
+        if (
+            self._join_suspended_until is not None
+            and datetime.now() < self._join_suspended_until
+        ):
+            if not self._join_suspend_logged:
+                self._join_suspend_logged = True
+                self.log(
+                    "自动加入被限流暂停中，恢复时间 "
+                    f"{self._join_suspended_until:%H:%M}（暂停期间跳过所有加入）"
+                )
+            return False
         for target in extract_channel_targets(message):
             if target.lower().lstrip("@") == bot_username.lower():
                 continue  # 跳过 bot 自己
@@ -797,6 +1016,17 @@ class GiveawayEngine:
                         "（私有群/频道，待管理员审批）"
                     )
                     joined_any = True
+                elif "FLOOD_WAIT" in msg:
+                    wait = self._flood_seconds(exc) or 60
+                    self._join_suspended_until = datetime.now() + timedelta(
+                        seconds=wait + 10
+                    )
+                    self._join_suspend_logged = False
+                    self.log(
+                        f"[{account}] 加入频道触发限流（需等待 {wait} 秒），"
+                        f"自动加入暂停至 {self._join_suspended_until:%H:%M}"
+                    )
+                    break  # 已被限流，本条消息剩余目标一并跳过
                 else:
                     self.log(f"[{account}] 加入 {target} 失败: {msg[:120]}")
         return joined_any

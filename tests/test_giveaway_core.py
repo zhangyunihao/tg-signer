@@ -188,6 +188,10 @@ class FakeClient:
         self.handlers = []
         self.history = []
         self.is_connected = True
+        self.chat_info = SimpleNamespace(pinned_message=None)
+
+    async def get_chat(self, chat):
+        return self.chat_info
 
     async def get_users(self, username):
         if username not in self.bot_users:
@@ -198,11 +202,12 @@ class FakeClient:
         self.started.append((username, param))
         return None
 
-    def get_chat_history(self, chat):
-        return self._history()
+    def get_chat_history(self, chat, limit=None):
+        return self._history(limit)
 
-    async def _history(self):
-        for m in self.history:
+    async def _history(self, limit=None):
+        items = self.history if limit is None else self.history[:limit]
+        for m in items:
             yield m
 
     def add_handler(self, handler):
@@ -330,6 +335,152 @@ def test_scan_now_stops_on_max_joins(tmp_path):
     assert len(client.started) == 1
     # 达到上限直接停止该频道扫描（不会再拉后续消息）
     assert any("本次参与 1 个" in line for line in logs)
+
+
+def test_scan_now_participates_pinned_message(tmp_path):
+    """置顶消息中的抽奖会被扫描参与，且与历史消息去重。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.chats = [123]
+    client = FakeClient(bot_users={"LotteryBot"})
+    engine._clients = {"acc": client}
+    logs: list = []
+    engine.log = logs.append
+    client.chat_info = SimpleNamespace(
+        pinned_message=_msg(text="置顶抽奖 https://t.me/LotteryBot?start=pinned1")
+    )
+    client.history = [
+        # 同一活动在历史消息里再次出现：去重不重复参与
+        _msg(text="抽奖 https://t.me/LotteryBot?start=pinned1"),
+        _msg(text="抽奖 https://t.me/LotteryBot?start=hist1"),
+    ]
+    asyncio.run(engine.scan_now())
+    assert sorted(client.started) == [
+        ("LotteryBot", "hist1"),
+        ("LotteryBot", "pinned1"),
+    ]
+    assert any("本次参与 2 个" in line for line in logs)
+
+
+def test_scan_now_pinned_expired_counts_toward_cap(tmp_path):
+    """置顶消息也受参与条数上限约束，达到上限后跳过历史扫描。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.max_joins = 1
+    engine.chats = [123]
+    client = FakeClient(bot_users={"LotteryBot", "OtherBot"})
+    engine._clients = {"acc": client}
+    logs: list = []
+    engine.log = logs.append
+    client.chat_info = SimpleNamespace(
+        pinned_message=_msg(text="抽奖 https://t.me/OtherBot?start=pin1")
+    )
+    client.history = [
+        _msg(text="抽奖 https://t.me/LotteryBot?start=h1"),
+    ]
+    asyncio.run(engine.scan_now())
+    assert client.started == [("OtherBot", "pin1")]
+
+
+def test_scan_now_survives_get_chat_failure(tmp_path):
+    """get_chat 失败（如权限/网络）不影响后续历史消息扫描。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.chats = [123]
+    client = FakeClient(bot_users={"LotteryBot"})
+    engine._clients = {"acc": client}
+    logs: list = []
+    engine.log = logs.append
+
+    async def broken_get_chat(chat):
+        raise RuntimeError("chat not found")
+
+    client.get_chat = broken_get_chat
+    client.history = [
+        _msg(text="抽奖 https://t.me/LotteryBot?start=h1"),
+    ]
+    asyncio.run(engine.scan_now())
+    assert client.started == [("LotteryBot", "h1")]
+    assert any("跳过置顶扫描" in line for line in logs)
+
+
+def test_scan_now_group_only_scans_pinned(tmp_path):
+    """群组只扫指定（置顶）消息，不做历史回溯扫描。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.chats = [123]
+    client = FakeClient(bot_users={"LotteryBot"})
+    engine._clients = {"acc": client}
+    logs: list = []
+    engine.log = logs.append
+    client.chat_info = SimpleNamespace(
+        type=SimpleNamespace(name="SUPERGROUP"),
+        pinned_message=_msg(text="置顶抽奖 https://t.me/LotteryBot?start=pin1"),
+    )
+    client.history = [
+        _msg(text="抽奖 https://t.me/LotteryBot?start=hist1"),
+    ]
+    asyncio.run(engine.scan_now())
+    assert client.started == [("LotteryBot", "pin1")]
+
+    # 同一聊天若是频道：置顶 + 历史都扫（用独立状态目录避免去重串扰）
+    engine2, _state2 = _engine(tmp_path / "channel")
+    engine2.chats = [123]
+    client2 = FakeClient(bot_users={"LotteryBot"})
+    engine2._clients = {"acc": client2}
+    engine2.log = lambda _m: None
+    client2.chat_info = SimpleNamespace(
+        type=SimpleNamespace(name="CHANNEL"),
+        pinned_message=_msg(text="置顶抽奖 https://t.me/LotteryBot?start=pin1"),
+    )
+    client2.history = [
+        _msg(text="抽奖 https://t.me/LotteryBot?start=hist1"),
+    ]
+    asyncio.run(engine2.scan_now())
+    assert sorted(client2.started) == [
+        ("LotteryBot", "hist1"),
+        ("LotteryBot", "pin1"),
+    ]
+
+
+def test_rescue_group_rechecks_pinned_only(tmp_path):
+    """群组补漏只重查置顶消息（新置顶参与、历史不扫、旧置顶去重）。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.chats = [123]
+    client = FakeClient(bot_users={"LotteryBot"})
+    engine._clients = {"acc": client}
+    logs: list = []
+    engine.log = logs.append
+    # 已通过扫描阶段缓存为群组
+    engine._chat_types["123"] = True
+    client.chat_info = SimpleNamespace(
+        pinned_message=_msg(text="新置顶抽奖 https://t.me/LotteryBot?start=pin1")
+    )
+    client.history = [
+        _msg(text="历史抽奖 https://t.me/LotteryBot?start=hist1"),
+    ]
+    asyncio.run(engine._rescue_channel("acc", client, 123))
+    assert client.started == [("LotteryBot", "pin1")]
+
+    # 同一置顶再次补漏：水位线去重，不重复参与
+    asyncio.run(engine._rescue_channel("acc", client, 123))
+    assert client.started == [("LotteryBot", "pin1")]
+
+    # 群主换了新置顶：新链接参与
+    client.chat_info = SimpleNamespace(
+        pinned_message=_msg(text="换新置顶抽奖 https://t.me/LotteryBot?start=pin2")
+    )
+    asyncio.run(engine._rescue_channel("acc", client, 123))
+    assert client.started == [
+        ("LotteryBot", "pin1"),
+        ("LotteryBot", "pin2"),
+    ]
 
 
 async def _run_process(engine, client, account, message):
@@ -531,3 +682,163 @@ def test_engine_join_invite_request_sent_is_not_failure(tmp_path):
     assert joined_any is True
     assert any("已提交加入" in line and "待管理员审批" in line for line in logs)
     assert not any("失败" in line for line in logs)
+
+
+def test_engine_join_flood_wait_suspends(tmp_path):
+    """JoinChannel 触发 FLOOD_WAIT 后暂停自动加入，恢复前跳过后续加入。"""
+    import asyncio
+
+    class FloodClient:
+        def __init__(self):
+            self.calls = []
+
+        async def join_chat(self, target):
+            self.calls.append(target)
+            if len(self.calls) == 1:
+                raise RuntimeError(
+                    "Telegram says: [420 FLOOD_WAIT_X] - Please wait 163 "
+                    'seconds before repeating the action. (caused by '
+                    '"channels.JoinChannel")'
+                )
+            return SimpleNamespace(title=f"chat-{target}")
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FloodClient()
+    msg = _msg(text="加入 @ChanA 和 @ChanB 领奖")
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBot", msg))
+    assert client.calls == ["ChanA"]
+    assert any("触发限流" in line and "163" in line for line in logs)
+    # 暂停期间：后续消息的所有加入被跳过（只提示一次）
+    msg2 = _msg(text="加入 @ChanC 和 @ChanD")
+    joined_any = asyncio.run(
+        engine._join_from_message("acc", client, "LotteryBot", msg2)
+    )
+    assert client.calls == ["ChanA"]
+    assert joined_any is False
+    assert any("自动加入被限流暂停中" in line for line in logs)
+    # 暂停恢复后正常加入
+    engine._join_suspended_until = None
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBot", msg2))
+    assert client.calls == ["ChanA", "ChanC", "ChanD"]
+
+
+# ---------------- 历史补漏（rescue） ----------------
+
+def _msgid(message, mid):
+    message.id = mid
+    return message
+
+
+def test_rescue_round_dedups_seen_and_joins_new(tmp_path):
+    """补漏只处理水位线之外的新消息，重复轮次不重复参与。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.chats = [123]
+    client = FakeClient(bot_users={"LotteryBot"})
+    engine._clients = {"acc": client}
+    logs: list = []
+    engine.log = logs.append
+
+    seen_msg = _msgid(_msg(text="抽奖 https://t.me/LotteryBot?start=old1"), 1)
+    client.history = [seen_msg]
+    asyncio.run(engine.scan_now())
+    assert client.started == [("LotteryBot", "old1")]
+
+    # 新帖到达，旧帖仍在最近列表里：补漏只参与新帖
+    new_msg = _msgid(_msg(text="抽奖 https://t.me/LotteryBot?start=new1"), 2)
+    client.history = [new_msg, seen_msg]
+    asyncio.run(engine._rescue_round())
+    assert client.started == [("LotteryBot", "old1"), ("LotteryBot", "new1")]
+
+    # 再补漏一轮：无新消息，不重复参与
+    asyncio.run(engine._rescue_round())
+    assert client.started == [("LotteryBot", "old1"), ("LotteryBot", "new1")]
+    assert any("补漏扫描完成" in line for line in logs)
+
+
+def test_rescue_respects_limit(tmp_path):
+    """补漏只重拉最近 rescue_limit 条消息。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.chats = [123]
+    engine.rescue_limit = 2
+    client = FakeClient(bot_users={"LotteryBot"})
+    engine._clients = {"acc": client}
+    # 历史消息最新在前：limit=2 只拉前 2 条，最旧一条（r2）在补漏窗口之外
+    client.history = [
+        _msgid(_msg(text="无关消息"), 1),
+        _msgid(_msg(text="抽奖 https://t.me/LotteryBot?start=r1"), 2),
+        _msgid(_msg(text="抽奖 https://t.me/LotteryBot?start=r2"), 3),
+    ]
+    asyncio.run(engine._rescue_round())
+    assert client.started == [("LotteryBot", "r1")]
+
+
+class FailingHistoryClient(FakeClient):
+    """get_chat_history 始终抛异常的假客户端（模拟坏网络/RPC 故障）"""
+
+    def get_chat_history(self, chat, limit=None):
+        return self._boom()
+
+    async def _boom(self):
+        raise RuntimeError("RPC timeout")
+        yield  # pragma: no cover  使其成为 async generator
+
+
+def test_rescue_suspends_after_consecutive_failures(tmp_path):
+    """连续 RESCUE_MAX_FAILS 轮失败后熔断暂停补漏。"""
+    import asyncio
+    from datetime import datetime
+
+    engine, _state = _engine(tmp_path)
+    engine.chats = [123]
+    client = FailingHistoryClient()
+    engine._clients = {"acc": client}
+    logs: list = []
+    engine.log = logs.append
+    for _ in range(3):
+        asyncio.run(engine._rescue_round())
+    assert engine._rescue_fail_streak == 3
+    assert engine._rescue_suspended_until is not None
+    assert engine._rescue_suspended_until > datetime.now()
+    assert any("暂停" in line and "自动恢复" in line for line in logs)
+
+    # 成功后连续失败计数清零
+    engine2, _s2 = _engine(tmp_path)
+    engine2.chats = [123]
+    ok_client = FakeClient()
+    engine2._clients = {"acc": ok_client}
+    asyncio.run(engine2._rescue_round())
+    assert engine2._rescue_fail_streak == 0
+    assert engine2._rescue_suspended_until is None
+
+
+def test_rescue_loop_skips_while_suspended_then_recovers(tmp_path):
+    """熔断暂停期间补漏循环不扫描，到期后自动恢复。"""
+    import asyncio
+    from datetime import datetime, timedelta
+
+    engine, _state = _engine(tmp_path)
+    engine.chats = [123]
+    client = FakeClient(bot_users={"LotteryBot"})
+    client.history = [_msgid(_msg(text="抽奖 https://t.me/LotteryBot?start=r1"), 5)]
+    engine._clients = {"acc": client}
+    engine.rescue_interval = 0.01
+    engine._stop = asyncio.Event()
+
+    async def scenario():
+        engine._rescue_suspended_until = datetime.now() + timedelta(seconds=1)
+        task = asyncio.create_task(engine._rescue_loop())
+        await asyncio.sleep(0.1)
+        assert client.started == []  # 暂停期间不扫描
+        engine._rescue_suspended_until = datetime.now() - timedelta(seconds=1)
+        await asyncio.sleep(0.05)
+        assert ("LotteryBot", "r1") in client.started  # 恢复后正常补漏
+        engine._stop.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(scenario())

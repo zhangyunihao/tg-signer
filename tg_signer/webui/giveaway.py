@@ -41,6 +41,8 @@ _CFG_FIELDS = {
     "confirm_wait": lambda: 8,
     "auto_join": lambda: True,
     "max_joins": lambda: None,
+    "rescue_interval_min": lambda: 30,  # 补漏扫描间隔（分钟），0=关闭
+    "rescue_limit": lambda: 10,  # 每次补漏每频道重拉条数
 }
 
 
@@ -155,6 +157,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "max_joins": (
                     int(cfg["max_joins"]) if cfg.get("max_joins") else None
                 ),
+                "rescue_interval_min": max(
+                    0, int(cfg.get("rescue_interval_min") or 0)
+                ),
+                "rescue_limit": max(1, int(cfg.get("rescue_limit") or 10)),
             }
         save_task_store(workdir, {"seq": store["seq"], "tasks": clean})
 
@@ -253,6 +259,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         auto_join_switch.value = cfg.get("auto_join", True)
         delay_min_input.value = cfg["delay_min"]
         delay_max_input.value = cfg["delay_max"]
+        rescue_interval_input.value = cfg.get("rescue_interval_min") or 0
+        rescue_limit_input.value = cfg.get("rescue_limit") or 10
         for el in (
             session_dir_input,
             account_select,
@@ -264,6 +272,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             auto_join_switch,
             delay_min_input,
             delay_max_input,
+            rescue_interval_input,
+            rescue_limit_input,
         ):
             el.update()
         ui.notify("已复制任务参数，可修改后点击「确定添加」", type="positive")
@@ -307,6 +317,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 float(cfg.get("delay_max") or 0),
             ),
             confirm_wait=int(cfg.get("confirm_wait") or 8),
+            rescue_interval=(
+                int(cfg.get("rescue_interval_min") or 0) * 60
+            ),
+            rescue_limit=int(cfg.get("rescue_limit") or 10),
             state=giveaway_state,
             on_finish=_on_finish,
         )
@@ -366,8 +380,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             )
             delay_min = max(0, int(delay_min_input.value or 0))
             delay_max = max(0, int(delay_max_input.value or 0))
+            rescue_interval_min = max(
+                0, int(rescue_interval_input.value or 0)
+            )
+            rescue_limit = max(1, int(rescue_limit_input.value or 10))
         except (TypeError, ValueError):
-            ui.notify("参与上限/延迟需为数字", type="warning")
+            ui.notify("参与上限/延迟/补漏参数需为数字", type="warning")
             return
         if delay_min > delay_max:
             delay_min, delay_max = delay_max, delay_min
@@ -384,6 +402,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "delay_min": delay_min,
             "delay_max": delay_max,
             "confirm_wait": 8,
+            "rescue_interval_min": rescue_interval_min,
+            "rescue_limit": rescue_limit,
         }
         ensure_engine(name)
         _persist()
@@ -812,11 +832,27 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             delay_max_input = ui.number(
                 label="延迟上限（秒）", value=10, min=0, max=600, format="%d"
             ).classes("w-36")
+            rescue_interval_input = ui.number(
+                label="补漏扫描间隔（分钟，0=关闭）",
+                value=30,
+                min=0,
+                max=1440,
+                format="%d",
+            ).classes("w-52")
+            rescue_limit_input = ui.number(
+                label="补漏重拉条数/频道",
+                value=10,
+                min=1,
+                max=100,
+                format="%d",
+            ).classes("w-44")
 
         ui.label(
             "提示：参与 = 以账号身份向抽奖机器人发送 /start（等同手动点开链接）；"
             "机器人若弹出「确认参与」类按钮会自动点击；开启自动加入后，"
             "机器人回复消息中出现的频道/群组链接会被逐一加入（激进模式，可能误加）。"
+            "补漏扫描会按设定间隔重拉各频道最近若干条消息，"
+            "捞回此前因网络异常/中断漏掉的抽奖帖，连续多轮拉取失败会自动暂停一段时间。"
             "请确保账号已加入所监控的频道。"
         ).classes("text-xs text-amber-600")
         with ui.row().classes("w-full justify-end"):
