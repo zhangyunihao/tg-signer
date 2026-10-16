@@ -208,9 +208,21 @@ class FakeClient:
         self.handlers = []
         self.history = []
         self.is_connected = True
-        self.chat_info = SimpleNamespace(pinned_message=None)
+        self.chat_info = SimpleNamespace(
+            pinned_message=None, type=SimpleNamespace(name="CHANNEL")
+        )
         # search_messages(filter=PINNED) 返回的置顶消息列表（默认含最新置顶）
         self.pinned_list = []
+        self.joined_targets = []
+
+    async def join_chat(self, target):
+        self.joined_targets.append(target)
+        return SimpleNamespace(title=f"chat-{target}")
+
+    async def get_chat_member(self, target, user_id):
+        raise RuntimeError(
+            "Telegram says: [400 USER_NOT_PARTICIPANT] - User not participant"
+        )
 
     async def get_chat(self, chat):
         return self.chat_info
@@ -744,14 +756,23 @@ def test_state_flood_wait_cooldown_expiry(tmp_path):
 class JoinClient:
     def __init__(self):
         self.joined = []
-        # 默认所有目标解析为频道；可按 target 覆盖类型，值为 None 表示失效无法解析
+        # 默认所有目标解析为频道且未加入；可按 target 覆盖类型，None 表示失效
         self.target_types = {}
+        # 已加入的目标（小写），get_chat_member 对这些目标不抛异常
+        self.member_targets = set()
 
     async def get_chat(self, target):
         type_name = self.target_types.get(target, "CHANNEL")
         if type_name is None:
             raise RuntimeError("PEER_ID_INVALID")
         return SimpleNamespace(type=SimpleNamespace(name=type_name))
+
+    async def get_chat_member(self, target, user_id):
+        if str(target).lower().lstrip("@") in self.member_targets:
+            return SimpleNamespace(status="member")
+        raise RuntimeError(
+            "Telegram says: [400 USER_NOT_PARTICIPANT] - User not participant"
+        )
 
     async def join_chat(self, target):
         self.joined.append(target)
@@ -798,6 +819,70 @@ def test_engine_join_precheck_filters_users_and_invalid(tmp_path):
     # 失效目标有提示日志，个人用户/机器人静默
     assert any("跳过无效目标 DeadChannel" in line for line in logs)
     assert not any("SomePerson" in line or "HelperBot" in line for line in logs)
+
+
+def test_join_precheck_logs_missing_membership(tmp_path):
+    """加入前检查成员身份：能看到哪些目标未加入，已加入的跳过。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = JoinClient()
+    client.member_targets = {"alreadychan"}  # 这个目标已在（按小写匹配）
+    msg = _msg(text="加入 @AlreadyChan 和 @NeedJoinChan 后参与")
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBot", msg))
+    # 只有未加入的目标会真正 join
+    assert client.joined == ["NeedJoinChan"]
+    assert any(
+        "尚未加入" in line and "NeedJoinChan" in line
+        and "加入后才能参与" in line
+        for line in logs
+    )
+    assert any("已在" in line and "AlreadyChan" in line for line in logs)
+
+
+def test_click_confirm_restarts_any_bot_with_join_targets(tmp_path, monkeypatch):
+    """通用策略：任何 bot 消息含加入要求时，加入后自动重发一次 start。"""
+    import asyncio
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"AnyLotteryBot"})
+    msg = _msg(text="请先加入 https://t.me/NeedJoinCh 再点下方抽奖")
+    asyncio.run(
+        engine._click_confirm("acc", client, "AnyLotteryBot", msg, "r1")
+    )
+    # 加入完成后重新 start 了一次
+    assert client.started == [("AnyLotteryBot", "r1")]
+    assert any("再次发送 start" in line for line in logs)
+
+
+def test_click_confirm_no_restart_without_join_targets(tmp_path, monkeypatch):
+    """bot 消息没有加入要求且不在强制名单：不重发 start。"""
+    import asyncio
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"OtherLotteryBot"})
+    msg = _msg(text="点击下方按钮领取奖励")
+    asyncio.run(
+        engine._click_confirm("acc", client, "OtherLotteryBot", msg, "r1")
+    )
+    assert client.started == []  # 不重新 start
+    assert not any("再次发送 start" in line for line in logs)
 
 
 def test_engine_join_invite_request_sent_is_not_failure(tmp_path):

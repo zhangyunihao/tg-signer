@@ -43,6 +43,9 @@ STATE_FILE = "giveaway_state.json"
 MAX_STATE_PER_ACCOUNT = 1000
 # 同一 bot 连续 FLOOD_WAIT 达到该次数后，本轮运行熔断（不再对其 start_bot）
 MAX_FLOOD_STRIKES = 3
+
+# 强制重参与名单：即使消息里没有加频道要求也重发 start 的 bot（小写用户名）
+BOTS_RESTART_AFTER_JOIN = frozenset({"realsaberbot", "lotterybestbot"})
 # FLOOD_WAIT 失败记录的冷却时间（秒），冷却后允许重试
 FLOOD_COOLDOWN = 3600
 # 扫描停止条件：连续这么多条「已开奖」的抽奖帖后，认为再往前都是旧抽奖
@@ -1098,7 +1101,7 @@ class GiveawayEngine:
                 "ok": True,
             }
         )
-        await self._click_confirm(account, client, username, start_msg)
+        await self._click_confirm(account, client, username, start_msg, param)
 
     async def _join_from_message(
         self, account: str, client: Any, bot_username: str, message: Any
@@ -1133,6 +1136,16 @@ class GiveawayEngine:
                     continue
                 if type_name not in ("GROUP", "SUPERGROUP", "CHANNEL"):
                     continue  # 个人用户/机器人，静默跳过
+                # 加入前检查成员身份：能看到哪些目标还没加入（bot 常要求
+                # 加入频道后才给抽奖资格）
+                already_member = await self._is_member(client, target)
+                if already_member:
+                    self.log(f"[{account}] 已在 {target} 中，跳过加入")
+                    continue
+                self.log(
+                    f"[{account}] 尚未加入 {target}"
+                    f"（@{bot_username} 要求加入后才能参与，自动加入中）"
+                )
             try:
                 chat = await client.join_chat(target)
                 title = str(getattr(chat, "title", "") or target)
@@ -1165,8 +1178,27 @@ class GiveawayEngine:
                     self.log(f"[{account}] 加入 {target} 失败: {msg[:120]}")
         return joined_any
 
+    async def _is_member(self, client: Any, target: str) -> Optional[bool]:
+        """检查当前账号是否已是 target 的成员。
+
+        返回 True（已加入）/ False（未加入）/ None（无法判断，按未处理继续）。
+        """
+        try:
+            await client.get_chat_member(target, "me")
+            return True
+        except Exception as exc:
+            msg = str(exc).upper()
+            if "NOT_PARTICIPANT" in msg or "USER_NOT_PARTICIPANT" in msg:
+                return False
+            return None  # 权限不足/无法解析等，交给 join 环节处理
+
     async def _click_confirm(
-        self, account: str, client: Any, username: str, start_msg: Any
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        start_msg: Any,
+        param: str = "",
     ) -> None:
         """start 后跟进：自动加入 bot 消息中的频道（若开启），并点确认按钮。"""
         candidates: List[Any] = []
@@ -1187,7 +1219,10 @@ class GiveawayEngine:
                     break
         if self.auto_join:
             did_join = False
+            had_join_targets = False
             for message in candidates:
+                if extract_channel_targets(message):
+                    had_join_targets = True
                 if await self._join_from_message(account, client, username, message):
                     did_join = True
             if did_join:
@@ -1198,6 +1233,35 @@ class GiveawayEngine:
                         candidates.append(recent)
                 except Exception:
                     pass
+            # 通用策略：多数抽奖 bot 要求「先加入频道再点一次抽奖」——
+            # bot 消息里出现过加入要求时，加入校验完成后重发一次 start
+            # 完成参与（此前可能已全部加入过，不必本次有新加入）
+            if had_join_targets:
+                self.log(
+                    f"[{account}] @{username} 要求加入频道后重新参与，"
+                    "再次发送 start"
+                )
+                try:
+                    restart_msg = await client.start_bot(username, param)
+                    candidates = [restart_msg] if restart_msg is not None else []
+                    await asyncio.sleep(2)
+                    async for recent in client.get_chat_history(username, limit=4):
+                        candidates.append(recent)
+                except Exception as exc:
+                    self.log(f"重新参与 @{username} 失败: {exc}")
+            elif username.lower() in BOTS_RESTART_AFTER_JOIN:
+                # 强制名单：无加入要求也重发一次
+                self.log(
+                    f"[{account}] @{username} 加入校验完成，重新发送 start"
+                )
+                try:
+                    restart_msg = await client.start_bot(username, param)
+                    candidates = [restart_msg] if restart_msg is not None else []
+                    await asyncio.sleep(2)
+                    async for recent in client.get_chat_history(username, limit=4):
+                        candidates.append(recent)
+                except Exception as exc:
+                    self.log(f"重新参与 @{username} 失败: {exc}")
         for message in candidates:
             btn = self._find_confirm_button(message)
             if btn is None:
