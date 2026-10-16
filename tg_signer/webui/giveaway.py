@@ -41,7 +41,7 @@ _CFG_FIELDS = {
     "confirm_wait": lambda: 8,
     "auto_join": lambda: True,
     "max_joins": lambda: None,
-    "rescue_interval_min": lambda: 30,  # 补漏扫描间隔（分钟），0=关闭
+    "rescue_interval_min": lambda: 10,  # 补漏扫描间隔（分钟），0=关闭
     "rescue_limit": lambda: 10,  # 每次补漏每频道重拉条数
 }
 
@@ -106,7 +106,7 @@ def load_task_store(workdir) -> dict:
     if not path.is_file():
         return {"seq": 1, "tasks": {}}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {"seq": 1, "tasks": {}}
     if not isinstance(data, dict):
@@ -184,6 +184,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     def make_log(name: str) -> Callable[[str], None]:
         def _log(msg: str) -> None:
             buf = _GLOBAL_LOGS.setdefault(wd_key, [])
+            # 消息已带时间戳（如「已参与」行）则不重复加
+            ts = f"{datetime.now():%m-%d %H:%M:%S}"
+            if not re.match(r"^\d{2}:\d{2}:\d{2}", msg):
+                msg = f"{ts} {msg}"
             buf.append(f"[#{name}] {msg}")
             if len(buf) > 300:
                 del buf[:-300]
@@ -257,6 +261,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         max_joins_input.value = cfg.get("max_joins") or None
         auto_scan_switch.value = cfg["auto_scan"]
         auto_join_switch.value = cfg.get("auto_join", True)
+        ignore_hist_switch.value = bool(cfg.get("ignore_history", True))
         delay_min_input.value = cfg["delay_min"]
         delay_max_input.value = cfg["delay_max"]
         rescue_interval_input.value = cfg.get("rescue_interval_min") or 0
@@ -270,6 +275,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             max_joins_input,
             auto_scan_switch,
             auto_join_switch,
+            ignore_hist_switch,
             delay_min_input,
             delay_max_input,
             rescue_interval_input,
@@ -309,6 +315,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             keywords=list(cfg.get("keywords") or []),
             auto_scan=bool(cfg.get("auto_scan", True)),
             auto_join=bool(cfg.get("auto_join", True)),
+            ignore_history=bool(cfg.get("ignore_history", True)),
             max_joins=(
                 int(cfg["max_joins"]) if cfg.get("max_joins") else None
             ),
@@ -371,6 +378,15 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         if not chats:
             ui.notify("请至少选择或手动填写一个频道", type="warning")
             return
+        # 群组和频道扫描策略不同（群组只扫置顶、频道全量扫），不允许混选
+        kinds = {kind_map.get(cid) for cid in chats if kind_map.get(cid)}
+        if "group" in kinds and "channel" in kinds:
+            ui.notify(
+                "群组和频道不能同时选择：群组只扫置顶消息、频道扫描全部历史，"
+                "请分开建任务",
+                type="warning",
+            )
+            return
         keywords = _split_items(keywords_input.value or "")
         try:
             max_joins = (
@@ -399,6 +415,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "max_joins": max_joins,
             "auto_scan": bool(auto_scan_switch.value),
             "auto_join": bool(auto_join_switch.value),
+            "ignore_history": bool(ignore_hist_switch.value),
             "delay_min": delay_min,
             "delay_max": delay_max,
             "confirm_wait": 8,
@@ -824,6 +841,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             auto_join_switch = ui.switch(
                 "自动加入抽奖要求的频道/群组", value=True
             ).classes("pt-6")
+            ignore_hist_switch = ui.switch(
+                "忽略历史成功记录（允许重复参与）", value=True
+            ).classes("pt-6")
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             delay_min_input = ui.number(
@@ -834,7 +854,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             ).classes("w-36")
             rescue_interval_input = ui.number(
                 label="补漏扫描间隔（分钟，0=关闭）",
-                value=30,
+                value=10,
                 min=0,
                 max=1440,
                 format="%d",

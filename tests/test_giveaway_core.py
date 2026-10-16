@@ -60,9 +60,10 @@ def test_parse_bot_start_link_invalid(url):
     assert parse_bot_start_link(url) is None
 
 
-def _msg(text=None, entities=None, caption=None, caption_entities=None, buttons=None):
+def _msg(text=None, entities=None, caption=None, caption_entities=None, buttons=None, id=None):
     reply_markup = SimpleNamespace(inline_keyboard=buttons) if buttons else None
     return SimpleNamespace(
+        id=id,
         text=text,
         entities=entities,
         caption=caption,
@@ -128,6 +129,25 @@ def test_extract_links_empty_message():
     assert extract_bot_links(_msg(text="普通聊天，无链接")) == []
 
 
+def test_extract_links_glued_without_spaces():
+    """多个链接紧挨着（仅中文标点分隔、无空格）也要逐个取出，不能只取第一个。"""
+    message = _msg(
+        text="抽奖1 t.me/AlphaBot?start=x1】抽奖2 https://t.me/BetaBotx?start=y2，"
+        "抽奖3 tg://resolve?domain=GammaBot&start=z3 和 t.me/DeltaBot?start=w4抽奖"
+    )
+    assert extract_bot_links(message) == [
+        ("AlphaBot", "x1"),
+        ("BetaBotx", "y2"),
+        ("GammaBot", "z3"),
+        ("DeltaBot", "w4"),
+    ]
+
+
+def test_extract_links_glued_same_line_no_space():
+    message = _msg(text="t.me/AlphaBot?start=a，https://t.me/BetaBotx?start=b")
+    assert extract_bot_links(message) == [("AlphaBot", "a"), ("BetaBotx", "b")]
+
+
 # ---------------- message_matches_keywords ----------------
 
 def test_message_matches_keywords():
@@ -189,9 +209,19 @@ class FakeClient:
         self.history = []
         self.is_connected = True
         self.chat_info = SimpleNamespace(pinned_message=None)
+        # search_messages(filter=PINNED) 返回的置顶消息列表（默认含最新置顶）
+        self.pinned_list = []
 
     async def get_chat(self, chat):
         return self.chat_info
+
+    async def search_messages(self, chat, filter=None, limit=None):
+        # filter=MessagesFilter.PINNED 时返回全部置顶消息
+        name = str(getattr(filter, "name", filter) or "")
+        if "PINNED" in name.upper():
+            for m in self.pinned_list:
+                yield m
+        return
 
     async def get_users(self, username):
         if username not in self.bot_users:
@@ -286,6 +316,24 @@ def _expired_msg(days_ago: int, idx: int):
     return _msg(text=f"抽奖 {past} 开奖 https://t.me/OtherBot?start=e{idx}")
 
 
+def test_engine_ignore_history_allows_repeat(tmp_path):
+    """忽略历史成功记录：已参与过的链接允许重新参与；默认仍去重。"""
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    client = FakeClient(bot_users={"LotteryBot"})
+    message = _msg(text="抽奖 https://t.me/LotteryBot?start=dup1")
+    asyncio.run(_run_process(engine, client, "acc1", message))
+    assert len(client.started) == 1
+    # 默认：同链接去重跳过
+    asyncio.run(_run_process(engine, client, "acc1", message))
+    assert len(client.started) == 1
+    # 开启忽略历史后：重新参与
+    engine.ignore_history = True
+    asyncio.run(_run_process(engine, client, "acc1", message))
+    assert len(client.started) == 2
+
+
 def test_scan_now_stops_on_expired_streak(tmp_path):
     """连续 5 条已开奖抽奖帖后停止扫描该频道。"""
     import asyncio
@@ -337,6 +385,31 @@ def test_scan_now_stops_on_max_joins(tmp_path):
     assert any("本次参与 1 个" in line for line in logs)
 
 
+def test_scan_now_enumerates_all_pinned_messages(tmp_path):
+    """群组可置顶多条消息：全部枚举处理并打印数量，get_chat 只给最新一条。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.chats = [123]
+    client = FakeClient(bot_users={"LotteryBot", "OtherBot"})
+    engine._clients = {"acc": client}
+    logs: list = []
+    engine.log = logs.append
+    latest = _msg(id=1002, text="新置顶抽奖 https://t.me/LotteryBot?start=pin2")
+    older = _msg(id=1001, text="旧置顶抽奖 https://t.me/OtherBot?start=pin1")
+    client.chat_info = SimpleNamespace(pinned_message=latest)
+    client.pinned_list = [older, latest]  # PINNED 过滤搜索返回全部置顶
+    asyncio.run(engine.scan_now())
+    # 最新置顶之外的其他置顶也被参与
+    assert sorted(client.started) == [
+        ("LotteryBot", "pin2"),
+        ("OtherBot", "pin1"),
+    ]
+    # 打印置顶消息条数
+    assert any("共有 2 条置顶消息" in line for line in logs)
+    assert any("命中 1 个抽奖链接：@OtherBot" in line for line in logs)
+
+
 def test_scan_now_participates_pinned_message(tmp_path):
     """置顶消息中的抽奖会被扫描参与，且与历史消息去重。"""
     import asyncio
@@ -361,6 +434,8 @@ def test_scan_now_participates_pinned_message(tmp_path):
         ("LotteryBot", "pinned1"),
     ]
     assert any("本次参与 2 个" in line for line in logs)
+    # 已参与日志附带抽奖帖标题
+    assert any("[已参与]" in line and "置顶抽奖" in line for line in logs)
 
 
 def test_scan_now_pinned_expired_counts_toward_cap(tmp_path):
@@ -447,6 +522,37 @@ def test_scan_now_group_only_scans_pinned(tmp_path):
     ]
 
 
+def test_scan_now_group_pinned_ignores_keywords(tmp_path):
+    """群组置顶消息不受关键词影响：无关键词命中也参与；频道置顶仍受约束。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.chats = [123]
+    client = FakeClient(bot_users={"LotteryBot"})
+    engine._clients = {"acc": client}
+    client.chat_info = SimpleNamespace(
+        type=SimpleNamespace(name="SUPERGROUP"),
+        # 文本不含任何关键词
+        pinned_message=_msg(text="福利活动 https://t.me/LotteryBot?start=pin1"),
+    )
+    client.history = []
+    asyncio.run(engine.scan_now())
+    assert client.started == [("LotteryBot", "pin1")]
+
+    # 频道置顶：不含关键词则不参与
+    engine2, _state2 = _engine(tmp_path / "channel")
+    engine2.chats = [123]
+    client2 = FakeClient(bot_users={"LotteryBot"})
+    engine2._clients = {"acc": client2}
+    client2.chat_info = SimpleNamespace(
+        type=SimpleNamespace(name="CHANNEL"),
+        pinned_message=_msg(text="福利活动 https://t.me/LotteryBot?start=pin1"),
+    )
+    client2.history = []
+    asyncio.run(engine2.scan_now())
+    assert client2.started == []
+
+
 def test_rescue_group_rechecks_pinned_only(tmp_path):
     """群组补漏只重查置顶消息（新置顶参与、历史不扫、旧置顶去重）。"""
     import asyncio
@@ -518,12 +624,18 @@ def test_engine_skips_non_bot_and_keyword_miss(tmp_path):
     import asyncio
 
     engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
     client = FakeClient()
 
-    # 关键词不命中：不参与、不 resolve
+    # 关键词不命中：不参与、不 resolve，且留下「关键词未命中」日志（附消息标题）
     miss = _msg(text="今日闲聊 t.me/LotteryBot?start=act1")
     asyncio.run(_run_process(engine, client, "acc", miss))
     assert client.started == []
+    assert any(
+        "关键词未命中" in line and "跳过" in line and "今日闲聊" in line
+        for line in logs
+    )
 
     # 链接目标不是 bot：跳过
     notbot = _msg(text="抽奖 https://t.me/NotABot?start=act3")
@@ -632,6 +744,14 @@ def test_state_flood_wait_cooldown_expiry(tmp_path):
 class JoinClient:
     def __init__(self):
         self.joined = []
+        # 默认所有目标解析为频道；可按 target 覆盖类型，值为 None 表示失效无法解析
+        self.target_types = {}
+
+    async def get_chat(self, target):
+        type_name = self.target_types.get(target, "CHANNEL")
+        if type_name is None:
+            raise RuntimeError("PEER_ID_INVALID")
+        return SimpleNamespace(type=SimpleNamespace(name=type_name))
 
     async def join_chat(self, target):
         self.joined.append(target)
@@ -653,6 +773,31 @@ def test_engine_auto_join_dedups_and_skips_self(tmp_path):
     self_msg = _msg(text="已向 @LotteryBot 发送请求")
     asyncio.run(engine._join_from_message("acc", client, "LotteryBot", self_msg))
     assert client.joined == ["GiveawayChannel", "NewsGroup"]
+
+
+def test_engine_join_precheck_filters_users_and_invalid(tmp_path):
+    """加入前预检：个人用户/机器人静默跳过，失效目标跳过并提示，不发无效 JoinChannel。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = JoinClient()
+    client.target_types = {
+        "SomePerson": "USER",
+        "HelperBot": "BOT",
+        "DeadChannel": None,
+    }
+    msg = _msg(
+        text="加 @SomePerson 和 @HelperBot，再关注 @GoodChannel 参与；"
+        "坏目标 https://t.me/DeadChannel 已失效"
+    )
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBot", msg))
+    # 只有有效频道会真正调用 join_chat
+    assert client.joined == ["GoodChannel"]
+    # 失效目标有提示日志，个人用户/机器人静默
+    assert any("跳过无效目标 DeadChannel" in line for line in logs)
+    assert not any("SomePerson" in line or "HelperBot" in line for line in logs)
 
 
 def test_engine_join_invite_request_sent_is_not_failure(tmp_path):
@@ -691,6 +836,9 @@ def test_engine_join_flood_wait_suspends(tmp_path):
     class FloodClient:
         def __init__(self):
             self.calls = []
+
+        async def get_chat(self, target):
+            return SimpleNamespace(type=SimpleNamespace(name="CHANNEL"))
 
         async def join_chat(self, target):
             self.calls.append(target)

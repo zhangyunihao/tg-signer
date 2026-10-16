@@ -52,20 +52,23 @@ SCAN_HARD_CAP = 1000
 
 # —— 历史补漏 ——
 # 周期性重拉各频道最近若干条消息，捞回此前扫描失败/中断漏掉的抽奖帖
-RESCUE_INTERVAL = 1800         # 补漏扫描间隔（秒），0 = 关闭
+RESCUE_INTERVAL = 600          # 补漏扫描间隔（秒），0 = 关闭
 RESCUE_LIMIT = 10              # 每次补漏每频道重拉的消息条数
 RESCUE_MAX_FAILS = 3           # 连续失败达该轮数后熔断暂停补漏
 RESCUE_RESUME_COOLDOWN = 1800  # 熔断后的自动恢复等待（秒）
 RESCUE_FETCH_TIMEOUT = 60      # 单频道补漏拉取消息的超时（秒）
 SEEN_CAP_PER_CHAT = 500        # 每频道保留的已处理消息 id 上限
 
+# URL 主体合法字符（不含空白与非西文字符）：链接紧贴中文/全角标点时在此截断
+_URL_BODY = r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*"
 # t.me/<username> + 后续路径/查询（用户名 5~32 位，字母/数字/下划线）
 _TME_RE = re.compile(
-    r"(?:https?://)?t\.me/(?P<name>[A-Za-z0-9_]{5,32})(?P<rest>[/?#]\S*)?",
+    r"(?:https?://)?t\.me/(?P<name>[A-Za-z0-9_]{5,32})(?P<rest>[/?#]" + _URL_BODY + r")?",
     re.IGNORECASE,
 )
 # tg://resolve?domain=<u>&start=<p> 形式
 _TG_RESOLVE_RE = re.compile(r"tg://resolve\?", re.IGNORECASE)
+_TG_RESOLVE_FULL_RE = re.compile(r"tg://resolve\?" + _URL_BODY, re.IGNORECASE)
 # start 参数合法字符：字母数字下划线短横；URL 紧贴中文时取首个非法字符之前部分
 _START_PARAM_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 # t.me 频道/群组目标：邀请链接（+hash / joinchat/hash）或公开用户名
@@ -169,6 +172,15 @@ def _message_text(message: Any) -> str:
     )
 
 
+def _giveaway_title(message: Any, limit: int = 30) -> str:
+    """截取抽奖帖标题：消息文本压成单行取前 limit 字，空文本返回空串。"""
+    text = _message_text(message).strip()
+    if not text:
+        return ""
+    snippet = re.sub(r"\s+", " ", text)
+    return snippet if len(snippet) <= limit else snippet[:limit] + "…"
+
+
 def _iter_candidate_urls(message: Any) -> Iterable[str]:
     """从消息中枚举可能含 bot 链接的 URL：明文文本 + 隐藏超链接实体 + 内联按钮。"""
     text = _message_text(message)
@@ -190,21 +202,35 @@ def _iter_candidate_urls(message: Any) -> Iterable[str]:
 
 
 def extract_bot_links(message: Any) -> List[Tuple[str, str]]:
-    """提取消息中全部去重后的 (用户名, start参数)，按出现顺序排列。"""
+    """提取消息中全部去重后的 (用户名, start参数)，按出现顺序排列。
+
+    对整段候选文本做全局正则扫描：多个链接紧挨着（仅以中文标点等
+    非 URL 字符分隔、无空格）也能逐个取出，不漏掉后面的链接。
+    """
     found: List[Tuple[str, str]] = []
     seen: set = set()
-    for candidate in _iter_candidate_urls(message):
-        # 一个候选字符串里可能含多个链接（整段消息文本）
-        for match in re.finditer(r"\S+", candidate):
-            piece = match.group(0)
-            parsed = parse_bot_start_link(piece)
-            if parsed is None:
-                continue
-            key = (parsed[0].lower(), parsed[1])
-            if key in seen:
-                continue
+
+    def _push(parsed: Optional[Tuple[str, str]]) -> None:
+        if parsed is None:
+            return
+        key = (parsed[0].lower(), parsed[1])
+        if key not in seen:
             seen.add(key)
             found.append(parsed)
+
+    for candidate in _iter_candidate_urls(message):
+        # 两种链接一起按出现位置排序，保持消息中的先后顺序
+        hits: List[Tuple[int, Tuple[str, str]]] = []
+        for m in _TME_RE.finditer(candidate):
+            parsed = parse_bot_start_link(m.group(0))
+            if parsed is not None:
+                hits.append((m.start(), parsed))
+        for m in _TG_RESOLVE_FULL_RE.finditer(candidate):
+            parsed = parse_bot_start_link(m.group(0))
+            if parsed is not None:
+                hits.append((m.start(), parsed))
+        for _, parsed in sorted(hits, key=lambda x: x[0]):
+            _push(parsed)
     return found
 
 
@@ -380,6 +406,10 @@ class GiveawayEngine:
         self._rescue_suspended_until: Optional[datetime] = None
         # 聊天类型缓存 {str(chat): 是否群组}：群组只扫置顶，频道才全量扫描
         self._chat_types: Dict[str, bool] = {}
+        # 加入目标的类型缓存 {target_lower: 类型名/None}：过滤个人用户与失效目标
+        self._join_target_types: Dict[str, Optional[str]] = {}
+        # 忽略历史成功记录（start 时可覆盖）：默认遵循去重记录
+        self.ignore_history = False
         self.chats: List = []
         self.keywords: Tuple[str, ...] = DEFAULT_KEYWORDS
         self.max_joins: Optional[int] = None
@@ -427,6 +457,7 @@ class GiveawayEngine:
         delay_range: Tuple[float, float] = (3.0, 10.0),
         confirm_wait: int = 8,
         confirm_keywords: Optional[Iterable[str]] = None,
+        ignore_history: bool = False,
         state: Optional[GiveawayState] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         on_finish: Optional[Callable[[], None]] = None,
@@ -440,6 +471,8 @@ class GiveawayEngine:
         self.confirm_keywords = tuple(confirm_keywords or DEFAULT_CONFIRM_KEYWORDS)
         self.confirm_wait = max(0, int(confirm_wait))
         self.auto_join = bool(auto_join)
+        # 忽略历史成功记录：开启后已参与过的抽奖链接允许重新参与
+        self.ignore_history = bool(ignore_history)
         self.max_joins = max(0, int(max_joins)) if max_joins else None
         if rescue_interval is not None:
             self.rescue_interval = max(0, int(rescue_interval))
@@ -552,7 +585,7 @@ class GiveawayEngine:
                 return
             mode_kw = "，".join(self.keywords) if self.keywords else "全部 bot 链接"
             self.log(
-                f"任务已启动：{len(self._clients)} 个账号、{len(self.chats)} 个频道，"
+                f"任务已启动：{len(self._clients)} 个账号、{len(self.chats)} 个监控对象，"
                 f"关键词：{mode_kw}"
             )
             if auto_scan and not self._stop.is_set():
@@ -669,17 +702,47 @@ class GiveawayEngine:
             return self._chat_types.get(str(chat))
         type_name = getattr(getattr(chat_info, "type", None), "name", "")
         is_group = type_name in ("GROUP", "SUPERGROUP")
+        first_detect = str(chat) not in self._chat_types
         self._chat_types[str(chat)] = is_group
+        if first_detect:
+            kind = "群组（仅扫置顶）" if is_group else "频道（置顶+历史）"
+            title = getattr(chat_info, "title", "") or str(chat)
+            self.log(f"[{account}] 识别 {chat} 类型：{kind}「{title}」")
         pinned = getattr(chat_info, "pinned_message", None)
-        if pinned is None:
-            return is_group
-        mid = getattr(pinned, "id", None)
-        if mid is not None:
-            self._mark_seen(account, str(chat), mid)
+        # 枚举全部置顶消息：get_chat 只返回最新一条置顶，而群/频道可置顶多条，
+        # 其余置顶只有通过 PINNED 过滤搜索才能拿到
+        pinned_list: List[Any] = []
         try:
-            await self._process_message(account, client, pinned)
+            from pyrogram.enums import MessagesFilter
+
+            async for m in client.search_messages(
+                chat, filter=MessagesFilter.PINNED
+            ):
+                pinned_list.append(m)
         except Exception as exc:
-            self.log(f"[{account}] 处理 {chat} 置顶消息失败: {exc}")
+            self.log(f"[{account}] 枚举置顶消息失败，仅处理最新置顶: {exc}")
+            pinned_list = []
+        latest_id = getattr(pinned, "id", None)
+        if pinned is not None and all(
+            getattr(m, "id", None) != latest_id for m in pinned_list
+        ):
+            pinned_list.append(pinned)  # 兜底：确保最新置顶一定被处理
+        if pinned_list:
+            self.log(
+                f"[{account}] 「{getattr(chat_info, 'title', '') or chat}」"
+                f"共有 {len(pinned_list)} 条置顶消息"
+            )
+        for msg in pinned_list:
+            if self._stop is not None and self._stop.is_set():
+                break
+            if not self._mark_seen(account, str(chat), getattr(msg, "id", None)):
+                continue  # 本轮会话中已处理过
+            try:
+                await self._process_message(
+                    account, client, msg, skip_keywords=is_group
+                )
+            except Exception as exc:
+                self.log(f"[{account}] 处理 {chat} 置顶消息失败: {exc}")
         return is_group
 
     def _mark_seen(self, account: str, chat_key: str, message_id: int) -> bool:
@@ -811,24 +874,62 @@ class GiveawayEngine:
         mid = getattr(pinned, "id", None)
         if not self._mark_seen(account, str(chat), mid):
             return  # 置顶未变化，此前已处理过
-        await self._process_message(account, client, pinned)
+        # 群组置顶不受关键词影响
+        await self._process_message(account, client, pinned, skip_keywords=True)
+
+    async def _resolve_join_target_type(
+        self, client: Any, target: str
+    ) -> Optional[str]:
+        """识别加入目标的聊天类型名（GROUP/SUPERGROUP/CHANNEL/USER/BOT）。
+
+        无法解析（用户名不存在/已失效）返回 None。结果按目标缓存。
+        """
+        key = target.lower()
+        if key in self._join_target_types:
+            return self._join_target_types[key]
+        try:
+            chat_info = await client.get_chat(target)
+            type_name = getattr(getattr(chat_info, "type", None), "name", "") or None
+        except Exception:
+            type_name = None
+        self._join_target_types[key] = type_name
+        return type_name
 
     def _chat_title(self, message: Any) -> str:
         chat = getattr(message, "chat", None)
         return str(getattr(chat, "title", "") or getattr(chat, "id", "") or "")
 
     async def _process_message(
-        self, account: str, client: Any, message: Any
+        self, account: str, client: Any, message: Any, skip_keywords: bool = False
     ) -> Optional[str]:
-        """处理单条消息。返回 "joined"（本次有参与）/"expired"（已开奖跳过）/None。"""
+        """处理单条消息。返回 "joined"（本次有参与）/"expired"（已开奖跳过）/None。
+
+        skip_keywords=True 时跳过关键词过滤（用于群组置顶消息：不受关键词影响）。
+        """
         if self._stop is not None and self._stop.is_set():
-            return None
-        if not message_matches_keywords(message, self.keywords):
             return None
         links = extract_bot_links(message)
         if not links:
             return None
+        if not skip_keywords and not message_matches_keywords(
+            message, self.keywords
+        ):
+            # 消息含 bot 链接但关键词未命中：记录一条日志（同一条消息只提示一次）
+            msg_key = (
+                account,
+                str(getattr(getattr(message, "chat", None), "id", "") or ""),
+                str(getattr(message, "id", "") or ""),
+            )
+            if msg_key not in self._skip_logged:
+                self._skip_logged.add(msg_key)
+                self.log(
+                    f"[{account}] 关键词未命中"
+                    f"（{'，'.join(self.keywords) or '无'}），跳过"
+                    f"：{_giveaway_title(message) or '(无文本)'}"
+                )
+            return None
         channel = self._chat_title(message)
+        title = _giveaway_title(message)
         # 开奖日期早于当前时间：自动跳过（同一条消息只提示一次）
         draw_dt = parse_draw_date(_message_text(message))
         if draw_dt is not None and draw_dt < datetime.now():
@@ -853,12 +954,21 @@ class GiveawayEngine:
             return None
         lock = self._locks.setdefault(account, asyncio.Lock())
         participated = 0
+        # 命中多少个抽奖入口一目了然（去重/失败仍会逐个处理）
+        self.log(
+            f"[{account}] 命中 {len(links)} 个抽奖链接："
+            + "、".join(f"@{u}" for u, _ in links)
+        )
         for username, param in links:
             if self._stop is not None and self._stop.is_set():
                 break
             if self.max_joins is not None and self.joined >= self.max_joins:
                 break
-            if self._state is not None and self._state.has(account, username, param):
+            if (
+                self._state is not None
+                and not self.ignore_history
+                and self._state.has(account, username, param)
+            ):
                 continue
             if self._state is not None and self._state.is_blocked(
                 account, username, param
@@ -869,7 +979,7 @@ class GiveawayEngine:
             async with lock:
                 before = self.joined
                 await self._participate(
-                    account, client, username, param, channel
+                    account, client, username, param, channel, title
                 )
                 if self.joined > before:
                     participated += 1
@@ -904,9 +1014,19 @@ class GiveawayEngine:
             return int(m.group(1)) if m else 0
 
     async def _participate(
-        self, account: str, client: Any, username: str, param: str, channel: str
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        param: str,
+        channel: str,
+        title: str = "",
     ) -> None:
-        if self._state is not None and self._state.has(account, username, param):
+        if (
+            self._state is not None
+            and not self.ignore_history
+            and self._state.has(account, username, param)
+        ):
             return
         if not await self._is_bot(account, client, username):
             self.log(f"[{account}] 跳过非机器人链接 @{username}")
@@ -962,15 +1082,19 @@ class GiveawayEngine:
             self._state.add(account, username, param, channel=channel)
             self._state.save()
         self.joined += 1
+        from_part = f"来自 {channel or '未知频道'}"
+        if title:
+            from_part += f"：{title}"
         self.log(
             f"{datetime.now():%H:%M:%S} [已参与] {account} -> @{username} "
-            f"（来自 {channel or '未知频道'}）"
+            f"（{from_part}）"
         )
         self._emit(
             {
                 "account": account,
                 "bot": username,
                 "channel": channel,
+                "title": title,
                 "ok": True,
             }
         )
@@ -999,6 +1123,16 @@ class GiveawayEngine:
             if key in self._join_cache:
                 continue
             self._join_cache.add(key)
+            # 用户名目标先识别类型：个人用户/机器人/失效目标直接跳过，
+            # 避免发出注定失败的 JoinChannel（CHANNEL_INVALID 噪音）。
+            # 私有邀请链接（+hash/joinchat）无法预解析，仍直接尝试加入。
+            if not target.lower().startswith(("http://", "https://")):
+                type_name = await self._resolve_join_target_type(client, target)
+                if type_name is None:
+                    self.log(f"[{account}] 跳过无效目标 {target}（无法解析或已失效）")
+                    continue
+                if type_name not in ("GROUP", "SUPERGROUP", "CHANNEL"):
+                    continue  # 个人用户/机器人，静默跳过
             try:
                 chat = await client.join_chat(target)
                 title = str(getattr(chat, "title", "") or target)
