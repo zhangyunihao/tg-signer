@@ -587,8 +587,12 @@ class TaskRunnerBlock:
                 .style("white-space: pre;")
             )
 
-        self._timer = ui.timer(0.3, self._poll_output)
-        self._timer.deactivate()
+        # 轮询改用独立 asyncio 循环而非 ui.timer：页面重建（root.clear）会删除
+        # timer 的父 slot，ui.timer 内部访问已删 slot 会抛 RuntimeError 并可能
+        # 终止服务进程；asyncio 循环配合断连退出检查更健壮。
+        self._poll_enabled = False
+        self._poll_client = ui.context.client
+        self._poll_task = asyncio.create_task(self._poll_forever())
 
         # ---- 新增任务弹窗 ----
         with ui.dialog() as self.dialog, ui.card().classes("w-full max-w-2xl"):
@@ -897,7 +901,7 @@ class TaskRunnerBlock:
         }
         append_task_history(record)
         self._refresh_history_table()
-        self._timer.activate()
+        self._poll_enabled = True
         self._update_status()
         tip = "服务重启后已自动恢复" if auto else "已启动"
         ui.notify(f"{tip}: {task_name}（{len(procs)} 个账号）", type="positive")
@@ -1299,7 +1303,21 @@ class TaskRunnerBlock:
             self._finalize_run(run_id)
         self._update_status()
         if not self.runs:
-            self._timer.deactivate()
+            self._poll_enabled = False
+
+    async def _poll_forever(self) -> None:
+        """替代 ui.timer 的轮询循环：断连自动退出，UI 更新包裹在 client 上下文。"""
+        while True:
+            await asyncio.sleep(0.3)
+            if not self._poll_client.has_socket_connection:
+                return
+            if not self._poll_enabled:
+                continue
+            try:
+                with self._poll_client:
+                    self._poll_output()
+            except Exception:
+                pass
 
     def clear_log(self) -> None:
         TaskRunnerBlock.output_lines.clear()
@@ -1398,7 +1416,7 @@ class TaskRunnerBlock:
         # 在跑的任务。必须激活本实例的轮询，否则表格行停留在文件中的初始结果
         # （如空文本），永远不会更新「预计下次」等实时信息。
         if TaskRunnerBlock.runs:
-            self._timer.activate()
+            self._poll_enabled = True
             self._poll_output()
 
 
@@ -2264,21 +2282,44 @@ def _build_dashboard(container) -> None:
                 return value
             return str(getattr(value, "name", "") or "")
 
-        saved_tab = app.storage.user.get("tg_signer_tab")
-        if saved_tab not in valid_tabs:
-            saved_tab = "run"
-
+        # 上次选中的 tab 保存在浏览器 localStorage（key: tg_signer_tab），
+        # 不依赖 cookie / 服务端存储，刷新页面、重启服务、重开浏览器都能恢复
         def _on_tab_change(e) -> None:
             name = _tab_name(e.value)
             if name in valid_tabs:
-                try:
-                    app.storage.user["tg_signer_tab"] = name
-                except Exception:
-                    pass
+                ui.run_javascript(
+                    f'localStorage.setItem("tg_signer_tab", {json.dumps(name)})'
+                )
 
         tabs.on_value_change(_on_tab_change)
 
-        with ui.tab_panels(tabs, value=saved_tab).classes("w-full"):
+        # 页面加载后从 localStorage 恢复上次选中的 tab（带重试，等待 Quasar 渲染完成）
+        # 注意 NiceGUI 元素 .id 是纯数字，DOM 中的 id 带 "c" 前缀
+        _tab_ids = {
+            "run": f"c{tab_run.id}",
+            "random": f"c{tab_random.id}",
+            "leave": f"c{tab_leave.id}",
+            "giveaway": f"c{tab_giveaway.id}",
+            "configs": f"c{tab_configs.id}",
+        }
+        ui.run_javascript(
+            f"""
+            (function() {{
+                const map = {json.dumps(_tab_ids)};
+                const name = localStorage.getItem("tg_signer_tab");
+                if (!name || !Object.prototype.hasOwnProperty.call(map, name) || name === "run") return;
+                let tries = 0;
+                const restore = () => {{
+                    const el = document.getElementById(map[name]);
+                    if (el) el.click();
+                    else if (tries++ < 30) setTimeout(restore, 100);
+                }};
+                restore();
+            }})();
+            """
+        )
+
+        with ui.tab_panels(tabs).classes("w-full"):
             with ui.tab_panel(tab_run):
                 refreshers.append(TaskRunnerBlock())
 
@@ -2536,6 +2577,22 @@ def cleanup_stale_sessions(max_age_days: int = _SESSION_CLEANUP_DAYS) -> int:
     return removed
 
 
+def _load_or_create_storage_secret() -> str:
+    """读取或生成固定的 storage secret，保证服务重启后浏览器会话存储（记住的 tab、访问码）不失效。"""
+    secret_file = _NICEGUI_STORAGE_DIR / "storage_secret.txt"
+    try:
+        if secret_file.is_file():
+            secret = secret_file.read_text(encoding="utf-8").strip()
+            if secret:
+                return secret
+        _NICEGUI_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+        secret = os.urandom(16).hex()
+        secret_file.write_text(secret, encoding="utf-8")
+        return secret
+    except OSError:
+        return os.urandom(16).hex()
+
+
 def main(host: str = None, port: int = None, storage_secret: str = None) -> None:
     removed = cleanup_stale_sessions()
     if removed:
@@ -2548,5 +2605,7 @@ def main(host: str = None, port: int = None, storage_secret: str = None) -> None
         host=host,
         port=port,
         show=False,
-        storage_secret=storage_secret or os.urandom(10).hex(),
+        storage_secret=storage_secret or _load_or_create_storage_secret(),
+        # 会话 cookie 持久化 30 天（与过期会话清理策略一致），浏览器重开/服务重启后仍能记住上次选中的 tab
+        session_middleware_kwargs={"max_age": 30 * 86400},
     )
