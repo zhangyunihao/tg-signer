@@ -336,6 +336,16 @@ def message_requires_password(message: Any) -> bool:
     return bool(PASSWORD_REQUIRE_RE.search(_message_text(message) or ""))
 
 
+# bot 回复「抽奖活动已结束」类文案（活动可能提前结束）＝终态：
+# 跳过加入、重发、点按钮等一切后续跟进，避免对已结束的抽奖反复发 start
+ENDED_REPLY_RE = re.compile(r"抽奖活动已结束|活动已结束|抽奖已结束")
+
+
+def reply_says_ended(message: Any) -> bool:
+    """bot 回复是否表明该抽奖已结束（终态）。"""
+    return bool(ENDED_REPLY_RE.search(_message_text(message) or ""))
+
+
 # —— LotteryBestBot 式回复解析 ——
 # start 后不满足条件时 bot 回复「您需加入指定的群组/频道」，逐行列出
 # 「🎫 加入-名称 ❌/✅」，名称是带 TEXT_URL 隐藏链接的文本。只提取
@@ -1383,15 +1393,25 @@ class GiveawayEngine:
             candidates.append(source_message)
         if start_msg is not None:
             candidates.append(start_msg)
+            # bot 直接回复「已结束」（活动提前结束）＝终态，立即返回，
+            # 不轮询、不加入、不重发 start
+            if reply_says_ended(start_msg):
+                self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
+                return
         if self.confirm_wait > 0:
             deadline = asyncio.get_event_loop().time() + self.confirm_wait
             while asyncio.get_event_loop().time() < deadline:
                 await asyncio.sleep(1.5)
+                fresh: List[Any] = []
                 try:
                     async for recent in client.get_chat_history(username, limit=4):
-                        candidates.append(recent)
+                        fresh.append(recent)
                 except Exception:
                     logger.debug("轮询拉取 bot 最新消息失败", exc_info=True)
+                candidates.extend(fresh)
+                if any(reply_says_ended(m) for m in fresh):
+                    self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
+                    return
                 if any(self._find_confirm_button(m) is not None for m in candidates):
                     break
         if self.auto_join:
@@ -1422,6 +1442,10 @@ class GiveawayEngine:
                 )
                 try:
                     restart_msg = await client.start_bot(username, param)
+                    if restart_msg is not None and reply_says_ended(restart_msg):
+                        # 加入期间活动提前结束，bot 终态回复，不再点按钮
+                        self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
+                        return
                     candidates = [restart_msg] if restart_msg is not None else []
                     await asyncio.sleep(2)
                     async for recent in client.get_chat_history(username, limit=4):
@@ -1433,6 +1457,9 @@ class GiveawayEngine:
                 self.log(f"[{account}] @{username} 加入校验完成，重新发送 start")
                 try:
                     restart_msg = await client.start_bot(username, param)
+                    if restart_msg is not None and reply_says_ended(restart_msg):
+                        self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
+                        return
                     candidates = [restart_msg] if restart_msg is not None else []
                     await asyncio.sleep(2)
                     async for recent in client.get_chat_history(username, limit=4):
