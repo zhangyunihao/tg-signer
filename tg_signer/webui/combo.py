@@ -17,11 +17,15 @@ from tg_signer.webui.data import get_workdir
 COMPOSITE_TASKS_FILE = "webui_composite_tasks.json"
 
 # 组合任务的子任务类型：现有任务类型（组合任务不可嵌套组合）
+# 批量退频道：使用「批量退频道」tab 的全局配置（天数/含群组/跳过置顶）+
+# 内置排除关键字；自动抽奖：选择「自动抽奖」tab 里已保存的任务
 COMBO_SUB_TYPES = [
     "签到 (run-once)",
     "签到 (run 定时)",
     "自动化 (automation run)",
     "监控 (monitor run)",
+    "自动抽奖 (giveaway run)",
+    "批量退频道 (auto leave)",
 ]
 
 

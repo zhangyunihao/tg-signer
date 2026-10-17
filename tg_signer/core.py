@@ -74,7 +74,7 @@ DICE_EMOJIS = ("🎲", "🎯", "🏀", "⚽", "🎳", "🎰")
 
 Session.START_TIMEOUT = 5  # 原始超时时间为2秒，但一些代理访问会超时，所以这里调大一点
 
-OPENAI_USE_PROMPT = "当前任务需要配置大模型，请确保运行前正确设置`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`等环境变量，或通过`tg-signer llm-config`持久化配置。"
+OPENAI_USE_PROMPT = "当前任务需要配置大模型，请确保运行前正确设置`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`等环境变量，或在`<workdir>/.openai_config.json`中持久化配置。"
 
 CHAT_TYPE_LABELS = {
     ChatType.BOT: "BOT",
@@ -1104,7 +1104,7 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
             if imported_paths:
                 joined_paths = ", ".join(str(path) for path in imported_paths)
                 self.log(
-                    f"检测到旧版签到记录文件，已自动导入 SQLite: {joined_paths}。建议执行 `tg-signer migrate-sign-records` 统一迁移历史记录。",
+                    f"检测到旧版签到记录文件，已自动导入 SQLite: {joined_paths}。",
                     level="WARNING",
                 )
         return store.load_records(self.task_name, user_id)

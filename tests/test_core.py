@@ -503,7 +503,7 @@ def test_user_signer_load_sign_record_logs_migration_hint(monkeypatch, signer_fa
     signer.load_sign_record()
 
     assert any(
-        level == "WARNING" and "migrate-sign-records" in message
+        level == "WARNING" and "已自动导入 SQLite" in message
         for level, message in messages
     )
 

@@ -1,4 +1,4 @@
-"""组合任务子进程入口：按配置顺序逐个执行子任务的 CLI 命令。
+"""组合任务子进程入口：按配置顺序逐个执行子任务。
 
 用法（由 WebUI 的组合任务启动，每账号一个进程）:
 
@@ -6,19 +6,21 @@
 
 spec 格式::
 
-    {"subs": [{"label": "签到 (run-once) · 任务A", "args": ["-w", ..., "run-once", "任务A"]}, ...]}
+    {"subs": [{"label": "签到 (run-once) · 任务A", "args": ["-w", ..., "run-once", "任务A"]},
+              {"label": "自动抽奖 (giveaway run) · 1", "module": "tg_signer.giveaway_runner",
+               "spec": {"account": "...", ...}}, ...]}
 
-子任务按列表顺序串行执行；任一子任务退出码非 0 时整体退出码为 1。
-stdout/stderr 直接透传给父进程，由 WebUI 解析「>>> 子任务开始/结束」标记行
-生成明细进度。
+带 ``args`` 的子任务通过 CLI 入口执行；带 ``module`` 的子任务以
+``python -m <module> '<json spec>'`` 方式执行（自动抽奖/批量退频道等
+无 CLI 的任务类型）。子任务按列表顺序串行执行；任一子任务退出码非 0
+时整体退出码为 1。stdout/stderr 直接透传给父进程，由 WebUI 解析
+「>>> 子任务开始/结束」标记行生成明细进度。
 """
 
 import json
 import os
 import subprocess
 import sys
-
-CLI_ENTRY = "from tg_signer.cli import tg_signer; tg_signer()"
 
 
 def main() -> None:
@@ -36,7 +38,17 @@ def main() -> None:
     for i, sub in enumerate(subs, 1):
         label = str(sub.get("label") or " ".join(sub.get("args") or []))
         print(f">>> 子任务开始 [{i}/{total}]: {label}", flush=True)
-        cmd = [sys.executable, "-c", CLI_ENTRY] + list(sub.get("args") or [])
+        if sub.get("module"):
+            cmd = [
+                sys.executable,
+                "-m",
+                str(sub["module"]),
+                json.dumps(sub.get("spec") or {}, ensure_ascii=False),
+            ]
+        else:
+            cmd = [sys.executable, "-m", "tg_signer.task_runner"] + list(
+                sub.get("args") or []
+            )
         code = subprocess.call(cmd)
         codes.append(code)
         # 多账号错峰延迟只对首个子任务生效，避免后续串行子任务重复等待

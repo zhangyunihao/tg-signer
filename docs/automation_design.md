@@ -86,7 +86,7 @@
 
 ### 4.1 启动入口
 
-CLI 入口：`tg-signer automation run <task_name>`，最终调用 `UserAutomation.run()`。
+启动入口：WebUI 拉起的内部子进程 `python -m tg_signer.task_runner -w <workdir> -a <account> automation run <task_name>`，最终调用 `UserAutomation.run()`。
 
 执行顺序：
 

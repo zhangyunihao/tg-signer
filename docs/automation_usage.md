@@ -20,9 +20,7 @@ Automation 是一个“规则引擎”：
 - 插件：`<workdir>/handlers/*.py`
 
 ### 2.1 生成模板
-```sh
-tg-signer automation init my_auto
-```
+CLI 命令已移除，模板配置请直接在 `<workdir>/automations/my_auto/config.json` 中手工创建，或参考下文的配置结构与 `tg_signer/automation/models.py`。
 
 ### 2.2 编辑配置
 默认编辑：`.signer/automations/my_auto/config.json`
@@ -33,20 +31,10 @@ pip install "tg-signer[yaml]"
 # 使用 config.yaml / config.yml 也可被自动识别
 ```
 
-### 2.3 先校验再运行
-```sh
-tg-signer automation validate my_auto
-tg-signer automation run my_auto
-```
+### 2.3 校验并运行
+任务运行统一在 WebUI 中操作：在「签到」标签页新增「自动化」类型任务并选择账号启动。配置异常会在任务日志中报错。
 
-如果需要从 Telegram 普通 Folder 发现对话，请先将目标对话手动加入该 Folder，然后运行：
-
-```sh
-tg-signer list-folders
-tg-signer automation run --from-folder Sign my_auto
-```
-
-Folder 可以使用名称或 ID。`--from-folder` 表示从该 Folder 发现对话，指定后不会使用 `--num-of-dialogs`；不支持联系人、机器人、群组或频道等动态规则 Folder。
+如需从 Telegram 普通 Folder 发现对话，请先将目标对话手动加入该 Folder。Folder 可以使用名称或 ID；不支持联系人、机器人、群组或频道等动态规则 Folder。
 
 ## 3. 先理解配置结构（心智模型）
 一个规则长这样：
@@ -249,4 +237,4 @@ HANDLERS = {"echo": echo}
 - 确认已安装 `pyyaml`：`pip install "tg-signer[yaml]"`。
 
 4. AI 相关 handler 报错？
-- 先配置 `OPENAI_API_KEY`（或运行 `tg-signer llm-config`）。
+- 先配置 `OPENAI_API_KEY` 等环境变量（或在 `<workdir>/.openai_config.json` 中持久化配置）。

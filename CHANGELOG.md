@@ -2,6 +2,12 @@
 
 ## 版本变动日志
 
+### 1.0.28
+- 命令行精简：移除 `login`/`logout`/`run`/`run-once`/`automation`/`monitor`/`send-text` 等全部命令，仅保留启动命令 `tg-signer-plus webgui`，所有操作统一走 WebUI
+- WebUI 任务子进程改由内部模块 `tg_signer.task_runner` 承接（`python -m tg_signer.task_runner`），组合任务 `combo_runner` 同步切换，行为与原 CLI 调用完全一致
+- 移除 `click` 依赖，CLI 入口改为标准库 argparse 实现
+- 清理 `llm-config`、`migrate-sign-records` 相关提示文案（LLM 配置改走环境变量或 `<workdir>/.openai_config.json`）
+
 ### 1.0.15
 - 新增「自动抽奖」标签页：监控指定频道消息中的 t.me 抽奖机器人深度链接（`?start=` 参数），以账号身份自动参与
 - 支持实时监听新帖与手动扫描最近消息两种触发方式；任务可配置多账号、多频道（可多选或手动填 chat_id/@username）、消息关键词与参与前随机延迟

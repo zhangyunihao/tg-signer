@@ -11,13 +11,15 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict
+from typing import Callable, Dict, Optional
 
 from nicegui import ui
 from pydantic import TypeAdapter
 
 from tg_signer.core import get_api_config, get_proxy, safe_disconnect
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui.auto_leave import UNSELECT_KEYWORDS as _LEAVE_EXCLUDE_KEYWORDS
+from tg_signer.webui.auto_leave import load_config as _load_leave_config
 from tg_signer.webui.combo import load_composite_tasks
 from tg_signer.webui.common import (
     SOURCE_ROOT,
@@ -45,6 +47,7 @@ from tg_signer.webui.data import (
     set_account_order,
     set_account_two_way,
 )
+from tg_signer.webui.giveaway import load_task_store as _load_giveaway_store
 from tg_signer.webui.interactive import InteractiveSignerConfig
 from tg_signer.webui.schema_utils import clean_schema
 
@@ -53,6 +56,71 @@ logger = logging.getLogger(__name__)
 # 多账号错峰启动总跨度（秒）：N 个账号的签到启动时间在此跨度内按槽位递增错开，
 # 避免同一群里连续出现多个账号的签到消息；单账号不生效
 ACCOUNT_STAGGER_SPREAD = 300
+
+
+def build_combo_sub_spec(
+    account: str, sub: dict, workdir
+) -> Optional[dict]:
+    """把组合任务的一个子任务配置构建为可执行的子任务 spec。
+
+    返回 {"label", "args"}（CLI 型）或 {"label", "module", "spec"}（内置
+    runner 型：自动抽奖/批量退频道），无法构建时返回 None。
+    """
+    sub_type = str(sub.get("type") or "")
+    task_name = str(sub.get("task") or "")
+    label = f"{sub_type} · {task_name}" if task_name else sub_type
+    if "退频道" in sub_type:
+        cfg = _load_leave_config(workdir)
+        return {
+            "label": label,
+            "module": "tg_signer.leave_runner",
+            "spec": {
+                "account": account,
+                "session_dir": str(workdir),
+                "days": int(cfg.get("days") or 7),
+                "include_groups": bool(cfg.get("include_groups")),
+                "skip_pinned": bool(cfg.get("skip_pinned", True)),
+                "exclude_keywords": list(_LEAVE_EXCLUDE_KEYWORDS),
+            },
+        }
+    if "抽奖" in sub_type:
+        store = _load_giveaway_store(workdir)
+        gcfg = store["tasks"].get(task_name)
+        if not isinstance(gcfg, dict):
+            return None
+        return {
+            "label": label,
+            "module": "tg_signer.giveaway_runner",
+            "spec": {
+                "account": account,
+                "workdir": str(workdir),
+                "task": task_name,
+                "session_dir": str(gcfg.get("session_dir") or "."),
+                "chats": [str(c) for c in (gcfg.get("chats") or [])],
+                "keywords": list(gcfg.get("keywords") or []),
+                "auto_scan": bool(gcfg.get("auto_scan", True)),
+                "auto_join": bool(gcfg.get("auto_join", True)),
+                "ignore_history": bool(gcfg.get("ignore_history", True)),
+                "max_joins": gcfg.get("max_joins"),
+                "delay_min": gcfg.get("delay_min") or 0,
+                "delay_max": gcfg.get("delay_max") or 0,
+                "confirm_wait": int(gcfg.get("confirm_wait") or 8),
+                "rescue_interval_min": int(gcfg.get("rescue_interval_min") or 0),
+                "rescue_limit": int(gcfg.get("rescue_limit") or 10),
+            },
+        }
+    if "run-once" in sub_type:
+        args = ["-w", str(workdir), "-a", account, "run-once", task_name]
+    elif "run 定时" in sub_type:
+        args = ["-w", str(workdir), "-a", account, "run", task_name]
+    elif "自动化" in sub_type:
+        args = ["-w", str(workdir), "-a", account, "automation", "run", task_name]
+    elif "监控" in sub_type:
+        args = ["-w", str(workdir), "-a", account, "monitor", "run", task_name]
+    else:
+        return None
+    return {"label": label, "args": args}
+
 
 SIGNER_TEMPLATE: Dict[str, object] = {
     "chats": [
@@ -536,6 +604,13 @@ class TaskRunnerBlock:
             return sorted(p.name for p in root.iterdir() if p.is_dir())
         elif "监控" in task_type:
             return list_task_names("monitor", workdir)
+        elif "抽奖" in task_type:
+            store = _load_giveaway_store(state.workdir)
+            return sorted(
+                store["tasks"].keys(), key=lambda k: int(k) if str(k).isdigit() else 0
+            )
+        elif "退频道" in task_type:
+            return ["默认配置"]
         elif "组合" in task_type:
             return [
                 str(c.get("name"))
@@ -783,16 +858,11 @@ class TaskRunnerBlock:
                 # 组合任务：每账号一个进程，进程内按顺序执行全部子任务
                 spec_subs = []
                 for sub in combo_subs:
-                    sub_args = self._build_args(
-                        account, str(sub.get("type") or ""), str(sub.get("task") or "")
+                    built = build_combo_sub_spec(
+                        account, sub, state.workdir
                     )
-                    if sub_args:
-                        spec_subs.append(
-                            {
-                                "label": f"{sub.get('type')} · {sub.get('task')}",
-                                "args": sub_args,
-                            }
-                        )
+                    if built:
+                        spec_subs.append(built)
                 if not spec_subs:
                     ui.notify(f"无法构建命令: {account}", type="warning")
                     continue
@@ -807,11 +877,7 @@ class TaskRunnerBlock:
                 if not args:
                     ui.notify(f"无法构建命令: {account}", type="warning")
                     continue
-                cmd = [
-                    sys.executable,
-                    "-c",
-                    "from tg_signer.cli import tg_signer; tg_signer()",
-                ] + args
+                cmd = [sys.executable, "-m", "tg_signer.task_runner"] + args
             # 每账号进程独立统计聊天级进度：started=已开始的聊天数，failed=签到失败数
             # last_sign/next_run 从子进程日志解析，用于结果列展示上次/预计下次执行时间
             stats = {

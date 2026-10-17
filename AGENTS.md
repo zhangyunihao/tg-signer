@@ -12,13 +12,13 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
   - Optional next steps
 
 ## Current Code Facts
-- Project type: Python 3.10+ CLI tool. The entry command is `tg-signer = tg_signer.__main__:signer`.
+- Project type: Python 3.10+ tool whose only user-facing entry is the WebUI. The console script `tg-signer-plus = tg_signer.__main__:signer` only exposes the `webgui` start command; all task operations happen in the WebUI, whose subprocesses run via `tg_signer/task_runner.py`.
 - The main capabilities are split into 4 parts:
   - Check-in: `UserSigner` in `tg_signer/core.py`
   - Automation rule engine: `tg_signer/automation/`
-  - Monitoring: `UserMonitor` in `tg_signer/core.py` + `tg_signer/cli/monitor.py`
+  - Monitoring: `UserMonitor` in `tg_signer/core.py` (exposed via the WebUI and the internal task runner)
   - Optional WebUI: `tg_signer/webui/`
-- For new automation-related features, prefer implementing them in the `automation` subsystem first. `monitor` is still kept and exposed through the CLI/WebUI, but it is no longer the preferred place for new capabilities.
+- For new automation-related features, prefer implementing them in the `automation` subsystem first. `monitor` is still kept and exposed through the WebUI, but it is no longer the preferred place for new capabilities.
 - The primary storage for check-in records is now SQLite: `<workdir>/data.sqlite3`. `sign_record.json` is only kept for compatibility reads/migration and is no longer the primary write target.
 - Automation configs support `config.json`, `config.yaml`, and `config.yml`. Resolution order is JSON first, then YAML. YAML requires `pyyaml`.
 - LLM configuration supports two sources:
@@ -28,7 +28,8 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
 - The current WebUI manages signer/monitor configs and check-in records; it is not an automation config editor.
 
 ## Key Directories
-- `tg_signer/cli/`: CLI command definitions. The main entry is in `signer.py`; automation and monitor subcommands are in `automation.py` and `monitor.py`.
+- `tg_signer/cli/`: Start command (`webgui`) definition only. All other CLI commands have been removed; internal task subprocesses use `tg_signer/task_runner.py`.
+- `tg_signer/task_runner.py`: Internal subprocess entry (`python -m tg_signer.task_runner`) used by the WebUI to run sign run/run-once, automation run, and monitor run; not a user-facing command.
 - `tg_signer/core.py`: `BaseUserWorker`, `UserSigner`, `UserMonitor`, Telegram API wrappers, rate limiting, and FloodWait retry handling.
 - `tg_signer/config.py`: Pydantic config models and backward-compatibility migration logic for check-in, monitoring, and automation.
 - `tg_signer/sign_record_store.py`: SQLite check-in record storage, schema migration, and legacy JSON migration.
@@ -54,39 +55,14 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
   - Speedup: `python -m pip install -e ".[speedup]"`
 
 ## Common Commands
-- Basic:
-  - `tg-signer --help`
-  - `tg-signer version`
-  - `tg-signer login`
-  - `tg-signer logout`
-- Check-in:
-  - `tg-signer list`
-  - `tg-signer run <task_name>`
-  - `tg-signer run-once <task_name>`
-  - `tg-signer reconfig <task_name>`
-  - `tg-signer export <task_name>`
-  - `tg-signer import <task_name>`
-- Messages and topics:
-  - `tg-signer send-text ...`
-  - `tg-signer send-dice ...`
-  - `tg-signer list-members --chat_id ...`
-  - `tg-signer list-topics --chat_id ...`
-  - `tg-signer schedule-messages ...`
-  - `tg-signer list-schedule-messages <chat_id>`
-- Automation:
-  - `tg-signer automation list`
-  - `tg-signer automation init <task_name>`
-  - `tg-signer automation validate <task_name>`
-  - `tg-signer automation run <task_name>`
-  - `tg-signer automation export <task_name>`
-  - `tg-signer automation import <task_name>`
-  - `tg-signer automation reconfig <task_name>`
-- Records and utilities:
-  - `tg-signer list-sign-records [task_name]`
-  - `tg-signer migrate-sign-records`
-  - `tg-signer multi-run -a account_a -a account_b <task_name>`
-  - `tg-signer llm-config`
-  - `tg-signer webgui`
+- Start the WebUI (the only user-facing command):
+  - `tg-signer-plus webgui`
+  - Optional: `--host`, `--port`, `--storage-secret`, `--auth-code` (or env `TG_SIGNER_GUI_AUTHCODE`)
+- Internal task subprocess entry (used by the WebUI/combo_runner, not for direct use):
+  - `python -m tg_signer.task_runner -w <workdir> -a <account> run-once <task_name>`
+  - `python -m tg_signer.task_runner -w <workdir> -a <account> run <task_name>`
+  - `python -m tg_signer.task_runner -w <workdir> -a <account> automation run <task_name>`
+  - `python -m tg_signer.task_runner -w <workdir> -a <account> monitor run <task_name>`
 
 ## Config And State Paths
 - The default CLI workdir is `.signer`, overridable via the global `--workdir`.
@@ -119,10 +95,7 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
 - Preserve compatibility: when changing config models, keep the `BaseJSONConfig.load()` compatibility chain working, especially the migration logic for `SignConfigV1/V2/V3`.
 - SQLite is the source of truth for record storage: when changing check-in record logic, prefer extending `SignRecordStore` and schema migration rather than making JSON the primary storage again.
 - Telegram API calls must reuse existing wrappers: prefer `BaseUserWorker._call_telegram_api()`, `get_client()`, and `get_proxy()`. Do not bypass the unified rate limiting and FloodWait handling.
-- Be aware of the existing CLI compatibility surface:
-  - `chat_id` supports both integers and `@username`
-  - Multiple commands support `message_thread_id`
-  - `run_once` / `send_text` have alias compatibility
+- Do not reintroduce user-facing CLI commands: the CLI surface is intentionally limited to `webgui`; task execution goes through `tg_signer/task_runner.py`.
 - Confirm WebUI scope before changing it: `webui/data.py` currently only handles `signer` / `monitor` configs and check-in records. Do not assume it already covers `automation`.
 
 ## Security And Privacy
@@ -132,7 +105,7 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
   - `.env`
   - `<workdir>/.openai_config.json`
   - Real account credentials and sensitive log contents
-- For LLM-related capabilities, prefer injecting configuration through environment variables or `tg-signer llm-config`. Do not hardcode secrets in code.
+- For LLM-related capabilities, prefer injecting configuration through environment variables or `<workdir>/.openai_config.json`. Do not hardcode secrets in code.
 
 ## Documentation And Test Synchronization
 - When CLI parameters, capability boundaries, directory structure, or config formats change, at minimum check and update:
