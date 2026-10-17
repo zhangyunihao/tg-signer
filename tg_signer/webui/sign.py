@@ -1515,7 +1515,13 @@ class AccountLoginSession:
                 await asyncio.wait_for(self.client.check_password(password), 60)
         except SessionPasswordNeeded:
             self.password_needed = True
-            raise ValueError("该账户开启了两步验证，请填写密码后再次点击登录")
+            hint = await self._fetch_password_hint()
+            msg = "该账户开启了两步验证，请填写密码后再次点击登录"
+            if hint:
+                msg += f"（密码提示：{hint}）"
+            else:
+                msg += "（该账户未设置密码提示）"
+            raise ValueError(msg)
         me = await asyncio.wait_for(self.client.get_me(), 30)
         self._save_me(me)
         await safe_disconnect(self.client)
@@ -1525,6 +1531,21 @@ class AccountLoginSession:
 
         _CLIENT_INSTANCES.pop(str(Path(".").joinpath(self.name).resolve()), None)
         return str(me.first_name or me.id)
+
+    async def _fetch_password_hint(self) -> str:
+        """获取账户的两步验证「密码提示」（创建云密码时可选设置的内容）。"""
+        if self.client is None:
+            return ""
+        try:
+            from pyrogram.raw import functions
+
+            pwd = await asyncio.wait_for(
+                self.client.invoke(functions.account.GetPassword()), 30
+            )
+            return (getattr(pwd, "hint", "") or "").strip()
+        except Exception:
+            logger.debug("获取两步验证密码提示失败", exc_info=True)
+            return ""
 
     async def cancel(self) -> None:
         if self.client is not None:
@@ -1568,7 +1589,7 @@ def user_info_block() -> Callable[[], None]:
         add_status = ui.label("").classes("text-sm text-gray-500")
         # 密码提示常驻显示（放在 step2 外，打开弹窗即可见）
         ui.label(
-            "提示：若账户开启了两步验证，需填写密码；发送验证码后会出现密码输入框，点击右侧眼睛图标可显示明文"
+            "提示：若账户开启了两步验证，登录时会提示需要密码，届时密码输入框才会出现"
         ).classes("text-xs text-gray-400")
 
         with ui.column().classes("w-full") as step2:
@@ -1598,7 +1619,7 @@ def user_info_block() -> Callable[[], None]:
                 add_status.classes(replace="text-sm text-positive")
                 add_status.text = msg
                 step2.visible = True
-                add_password.visible = True
+                # 密码框保持隐藏，仅当登录提示需要两步验证密码时才出现
             except Exception as exc:  # noqa: BLE001
                 add_status.classes(replace="text-sm text-negative")
                 add_status.text = f"发送失败：{exc}"

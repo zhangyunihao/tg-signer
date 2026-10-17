@@ -192,13 +192,6 @@ def _apply_paths(workdir_input, on_refresh: Callable[[], None]) -> None:
 
 def _build_dashboard(container) -> None:
     with container:
-        # 右上角版本号 + 菜单按钮，绝对定位不占布局空间（下拉项在对话框定义后填充）
-        with ui.row().classes("absolute top-1 right-3 z-10 items-center gap-0 no-wrap"):
-            ui.label(f"v{__version__}").classes(
-                "text-xs text-gray-500 select-none mr-1"
-            )
-            header_btn = ui.button(icon="more_vert").props("flat round dense")
-
         refreshers: list[Callable[[], None]] = []
 
         def refresh_all() -> None:
@@ -224,9 +217,16 @@ def _build_dashboard(container) -> None:
         ):
             pass
 
+        with (
+            ui.dialog() as configs_dialog,
+            ui.card().classes("w-full max-w-4xl") as configs_card,
+        ):
+            pass
+
         _records_block: Optional[SignRecordBlock] = None
         _users_built = False
         _logs_built = False
+        _configs_built = False
 
         def _ensure_users() -> None:
             """用户信息对话框内容懒构建（仅首次）。"""
@@ -304,9 +304,46 @@ def _build_dashboard(container) -> None:
                     )
             dialog.open()
 
+        with ui.row().classes("w-full items-center justify-between gap-2 no-wrap"):
+            with (
+                ui.tabs()
+                .classes("flex-1 min-w-0 main-tabs")
+                .props("align=left") as tabs
+            ):
+                tab_run = ui.tab("run", "签到")
+                tab_combo = ui.tab("combo", "组合任务")
+                tab_random = ui.tab("random", "随机发言")
+                tab_leave = ui.tab("leave", "批量退频道")
+                tab_giveaway = ui.tab("giveaway", "自动抽奖")
+
+            # 版本号 + 菜单按钮，与主标签栏同行（下拉项在下方绑定）
+            with ui.row().classes("items-center gap-0 no-wrap tgs-header-actions"):
+                ui.label(f"v{__version__}").classes(
+                    "text-xs text-gray-500 select-none mr-1 tgs-header-version"
+                )
+                header_btn = ui.button(icon="more_vert").props("flat round dense")
+
+        # 默认选中「签到」：未选中任何 tab（首次访问、localStorage 无记录或值失效）时，
+        # 面板区域不显示任何内容，这里显式设为 run 保证默认面板有内容
+        tabs.value = "run"
+
         # 「菜单」按钮的下拉项（点击按钮展开）
         with header_btn:
             with ui.menu():
+                # 版本号：移动端右上角空间不足已隐藏，统一在菜单顶部展示
+                with (
+                    ui.row()
+                    .classes("w-full items-center justify-center no-wrap")
+                    .style("padding: 4px 12px 2px")
+                ):
+                    ui.label(f"v{__version__}").classes(
+                        "text-xs text-gray-400 select-none"
+                    )
+                ui.separator()
+                ui.menu_item(
+                    "签到配置管理",
+                    on_click=lambda: (_ensure_configs(), configs_dialog.open()),
+                )
                 ui.menu_item("工作目录", on_click=open_settings)
                 ui.menu_item(
                     "用户信息", on_click=lambda: (_ensure_users(), users_dialog.open())
@@ -319,15 +356,26 @@ def _build_dashboard(container) -> None:
                     "日志", on_click=lambda: (_ensure_logs(), logs_dialog.open())
                 )
 
-        with ui.tabs().classes("w-full main-tabs").props("align=left") as tabs:
-            tab_run = ui.tab("run", "签到")
-            tab_combo = ui.tab("combo", "组合任务")
-            tab_random = ui.tab("random", "随机发言")
-            tab_leave = ui.tab("leave", "批量退频道")
-            tab_giveaway = ui.tab("giveaway", "自动抽奖")
-            tab_configs = ui.tab("configs", "配置管理")
+        # 移动端 tab 短标签：按 tab 顺序给每个 label 写入 data-short 短名，
+        # 宽度<=640px 时由媒体查询用短名替换全名（桌面端不受影响）。
+        # 注意：q-tab 的 name 属性不会反映到 DOM（getAttribute('name') 为 null），
+        # 因此按索引匹配而非按 name
+        _short_tab_names = ["签到", "组合", "发言", "退频道", "抽奖"]
+        ui.run_javascript(
+            "const shortNames = " + __import__("json").dumps(_short_tab_names) + ";"
+            # 带重试：Quasar 渲染 q-tab 标签可能晚于脚本执行，未全部写入则 200ms 后重试，
+            # 否则窄屏下 font-size:0 生效而 data-short 缺失，标签会全部空白
+            "(function(){let tries=0;const apply=()=>{"
+            "  const labels=document.querySelectorAll('.main-tabs .q-tab .q-tab__label');"
+            "  let done=0;"
+            "  labels.forEach((label,i)=>{"
+            "    if(shortNames[i]){label.dataset.short=shortNames[i];done++;}"
+            "  });"
+            "  if(done<labels.length&&tries++<30)setTimeout(apply,200);"
+            "};apply();})();"
+        )
 
-        valid_tabs = {"run", "combo", "random", "leave", "giveaway", "configs"}
+        valid_tabs = {"run", "combo", "random", "leave", "giveaway"}
 
         def _tab_name(value) -> str:
             if isinstance(value, str):
@@ -355,16 +403,19 @@ def _build_dashboard(container) -> None:
             "random": f"c{tab_random.id}",
             "leave": f"c{tab_leave.id}",
             "giveaway": f"c{tab_giveaway.id}",
-            "configs": f"c{tab_configs.id}",
         }
         ui.run_javascript(
             f"""
             (function() {{
                 const map = {json.dumps(_tab_ids)};
-                const name = localStorage.getItem("tg_signer_tab");
-                if (!name || !Object.prototype.hasOwnProperty.call(map, name) || name === "run") return;
+                const stored = localStorage.getItem("tg_signer_tab");
+                // 无记录/记录失效时兜底到「签到」；服务端 tabs.value 设值在部分
+                // Quasar 版本下不生效，这里统一用点击保证选中态与面板一致
+                const name = stored && Object.prototype.hasOwnProperty.call(map, stored) ? stored : "run";
                 let tries = 0;
                 const restore = () => {{
+                    const active = document.querySelector('.main-tabs .q-tab--active');
+                    if (name === "run" && active) return;  // 已有选中项则不打扰
                     const el = document.getElementById(map[name]);
                     if (el) el.click();
                     else if (tries++ < 30) setTimeout(restore, 100);
@@ -382,7 +433,6 @@ def _build_dashboard(container) -> None:
             panel_random = ui.tab_panel(tab_random)
             panel_leave = ui.tab_panel(tab_leave)
             panel_giveaway = ui.tab_panel(tab_giveaway)
-            panel_configs = ui.tab_panel(tab_configs)
 
         runner: Optional[TaskRunnerBlock] = None
 
@@ -421,8 +471,14 @@ def _build_dashboard(container) -> None:
                 ).classes("text-gray-600")
                 refreshers.append(giveaway_block(state.workdir))
 
-        def _build_configs_panel() -> None:
-            with panel_configs:
+        def _ensure_configs() -> None:
+            """配置管理对话框内容懒构建（仅首次）。"""
+            nonlocal _configs_built
+            if _configs_built:
+                return
+            _configs_built = True
+            with configs_card:
+                ui.label("签到配置管理").classes("text-lg font-semibold")
                 ui.label(
                     "管理 signer 和 monitor 的配置文件，支持查看、编辑和删除。"
                 ).classes("text-gray-600")
@@ -499,13 +555,15 @@ def _build_dashboard(container) -> None:
                     with ui.tab_panel(tab_monitor):
                         refreshers.append(MonitorBlock(MONITOR_TEMPLATE))
 
+                with ui.row().classes("w-full justify-end"):
+                    ui.button("关闭", on_click=configs_dialog.close).props("outline")
+
         _panel_builders = {
             "run": _build_run_panel,
             "combo": _build_combo_panel,
             "random": _build_random_panel,
             "leave": _build_leave_panel,
             "giveaway": _build_giveaway_panel,
-            "configs": _build_configs_panel,
         }
         _panel_built: set = set()
 
@@ -523,6 +581,21 @@ def _build_dashboard(container) -> None:
         _ensure_panel("run")
 
         refresh_all()
+
+
+def _resolve_auth_code(explicit: Optional[str]) -> str:
+    """解析 WebUI 访问授权码：显式参数优先，其次 TG_SIGNER_GUI_AUTHCODE 环境变量，空白视为未配置。"""
+    return (explicit or (os.environ.get(AUTH_CODE_ENV) or "")).strip()
+
+
+def _check_auth_code(input_code: str, auth_code: str) -> tuple[bool, str]:
+    """校验验证页输入的授权码，返回 (是否通过, 提示消息)；通过时消息为空串。"""
+    code = (input_code or "").strip()
+    if not code:
+        return False, "请输入授权码"
+    if code != auth_code:
+        return False, "授权码错误，请重试"
+    return True, ""
 
 
 def _auth_gate(container, auth_code: str, on_success: Callable[[], None]) -> None:
@@ -549,14 +622,13 @@ def _auth_gate(container, auth_code: str, on_success: Callable[[], None]) -> Non
 
                 def verify() -> None:
                     code = (code_input.value or "").strip()
-                    if not code:
-                        ui.notify("请输入授权码", type="warning")
-                        return
-                    if code != auth_code:
-                        status.text = "授权码错误，请重试"
-                        status.update()
-                        code_input.set_value("")
-                        ui.notify("认证失败", type="negative")
+                    ok, message = _check_auth_code(code, auth_code)
+                    if not ok:
+                        if code:
+                            status.text = message
+                            status.update()
+                            code_input.set_value("")
+                        ui.notify(message, type="warning" if not code else "negative")
                         return
                     app.storage.user[AUTH_STORAGE_KEY] = auth_code
                     ui.notify("认证成功", type="positive")
@@ -608,10 +680,20 @@ def build_ui(auth_code: str = None) -> None:
                 .mobile-list-card .q-card__section { padding: 0; }
                 .mobile-card-actions { gap: 6px; }
                 .mobile-card-actions .q-btn { flex: 1 1 0; min-width: 0; }
-                /* 顶部主标签：缩小横向间距、给右上菜单按钮留位，空间不足时标签栏可横向滑动 */
-                .main-tabs { padding-right: 40px; }
+                /* 顶部主标签：tab 与右上三点按钮同行（flex 布局自动分配宽度），
+                   tab 栏占满剩余空间，隐藏版本号让出空间 */
+                .tgs-header-version { display: none; }
+                .tgs-header-actions .q-btn { padding: 4px; }
+                .main-tabs { overflow: hidden; }
                 .main-tabs .q-tab { padding-left: 9px; padding-right: 9px; }
-                .main-tabs .q-tab .q-tab__label { font-size: 15px; }
+                /* tab 文字用两字短名（data-short 由页面脚本写入 label 上）：
+                   原全名字号置 0 隐藏，::before 显示短名，五个 tab 一屏放下 */
+                .main-tabs .q-tab .q-tab__label { font-size: 0; }
+                .main-tabs .q-tab .q-tab__label::before {
+                    content: attr(data-short);
+                    font-size: 15px;
+                    letter-spacing: normal;
+                }
                 /* 弹窗：利用几乎全部宽度，高度限制在可视区内（dvh 适配地址栏伸缩），
                    整卡可滚动，并预留底部手势条安全区 */
                 .q-dialog__inner { padding: 8px; }
@@ -645,7 +727,7 @@ def build_ui(auth_code: str = None) -> None:
         root.clear()
         _build_dashboard(root)
 
-    auth_code = auth_code or (os.environ.get(AUTH_CODE_ENV) or "").strip()
+    auth_code = _resolve_auth_code(auth_code)
     if not auth_code:
         render_dashboard()
         return
