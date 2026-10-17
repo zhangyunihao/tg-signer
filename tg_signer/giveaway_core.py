@@ -1046,72 +1046,21 @@ class GiveawayEngine:
         if not links:
             return None
         if not skip_keywords and not message_matches_keywords(message, self.keywords):
-            # 消息含 bot 链接但关键词未命中：记录一条日志（同一条消息只提示一次）
-            msg_key = (
-                account,
-                str(getattr(getattr(message, "chat", None), "id", "") or ""),
-                str(getattr(message, "id", "") or ""),
-            )
-            if msg_key not in self._skip_logged:
-                self._skip_logged.add(msg_key)
-                self.log(
-                    f"[{account}] 关键词未命中"
-                    f"（{'，'.join(self.keywords) or '无'}），跳过"
-                    f"：{_giveaway_title(message) or '(无文本)'}"
-                )
+            # 消息含 bot 链接但关键词未命中：静默跳过（日志逐条刷屏，不再打印）
             return None
         # 归属地限制过滤：仅参与无地区限制或含白名单地区的抽奖（对群组置顶同样生效）
         if not message_region_allowed(message):
-            limits = parse_region_limits(_message_text(message)) or []
-            first = limits[0] if limits else []
-            msg_key = (
-                account,
-                str(getattr(getattr(message, "chat", None), "id", "") or ""),
-                str(getattr(message, "id", "") or ""),
-            )
-            if msg_key not in self._skip_logged:
-                self._skip_logged.add(msg_key)
-                self.log(
-                    f"[{account}] 归属地限制（{'、'.join(first) or '未知'}），跳过"
-                    f"：{_giveaway_title(message) or '(无文本)'}"
-                )
             return None
         # 发言数要求/口令要求 + 双向账户：无法达标，自动跳过（对群组置顶同样生效）
-        two_way_reason = ""
-        if account in self.two_way_accounts:
-            if message_requires_speech(message):
-                two_way_reason = "发言数要求"
-            elif message_requires_password(message):
-                two_way_reason = "口令要求"
-        if two_way_reason:
-            msg_key = (
-                account,
-                str(getattr(getattr(message, "chat", None), "id", "") or ""),
-                str(getattr(message, "id", "") or ""),
-            )
-            if msg_key not in self._skip_logged:
-                self._skip_logged.add(msg_key)
-                self.log(
-                    f"[{account}] 账号为双向且抽奖有{two_way_reason}，跳过"
-                    f"：{_giveaway_title(message) or '(无文本)'}"
-                )
+        if account in self.two_way_accounts and (
+            message_requires_speech(message) or message_requires_password(message)
+        ):
             return None
         channel = self._chat_title(message)
         title = _giveaway_title(message)
-        # 开奖日期早于当前时间：自动跳过（同一条消息只提示一次）
+        # 开奖日期早于当前时间：自动跳过（静默，不打印逐条日志）
         draw_dt = parse_draw_date(_message_text(message))
         if draw_dt is not None and draw_dt < datetime.now():
-            msg_key = (
-                account,
-                str(getattr(getattr(message, "chat", None), "id", "") or ""),
-                str(getattr(message, "id", "") or ""),
-            )
-            if msg_key not in self._skip_logged:
-                self._skip_logged.add(msg_key)
-                self.log(
-                    f"[{account}] 已开奖（{draw_dt:%m-%d %H:%M}），跳过"
-                    + (f"：{channel}" if channel else "")
-                )
             return "expired"
         # 参与条数上限（None = 不限），达到后本轮不再参与
         if self.max_joins is not None and self.joined >= self.max_joins:
@@ -1444,7 +1393,9 @@ class GiveawayEngine:
                     restart_msg = await client.start_bot(username, param)
                     if restart_msg is not None and reply_says_ended(restart_msg):
                         # 加入期间活动提前结束，bot 终态回复，不再点按钮
-                        self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
+                        self.log(
+                            f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进"
+                        )
                         return
                     candidates = [restart_msg] if restart_msg is not None else []
                     await asyncio.sleep(2)
@@ -1458,7 +1409,9 @@ class GiveawayEngine:
                 try:
                     restart_msg = await client.start_bot(username, param)
                     if restart_msg is not None and reply_says_ended(restart_msg):
-                        self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
+                        self.log(
+                            f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进"
+                        )
                         return
                     candidates = [restart_msg] if restart_msg is not None else []
                     await asyncio.sleep(2)

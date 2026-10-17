@@ -448,7 +448,8 @@ def test_engine_skips_expired_draw_message(tmp_path):
     message = _msg(text=f"抽奖 {past} 开奖 https://t.me/LotteryBot?start=act1")
     asyncio.run(_run_process(engine, client, "acc1", message))
     assert client.started == []
-    assert any("已开奖" in line for line in logs)
+    # 已开奖静默跳过，不打印逐条日志
+    assert not any("已开奖" in line for line in logs)
 
 
 def test_engine_respects_max_joins(tmp_path):
@@ -788,14 +789,11 @@ def test_engine_skips_non_bot_and_keyword_miss(tmp_path):
     engine.log = logs.append
     client = FakeClient()
 
-    # 关键词不命中：不参与、不 resolve，且留下「关键词未命中」日志（附消息标题）
+    # 关键词不命中：不参与、不 resolve，且静默跳过（不打印逐条日志）
     miss = _msg(text="今日闲聊 t.me/LotteryBot?start=act1")
     asyncio.run(_run_process(engine, client, "acc", miss))
     assert client.started == []
-    assert any(
-        "关键词未命中" in line and "跳过" in line and "今日闲聊" in line
-        for line in logs
-    )
+    assert not any("关键词未命中" in line for line in logs)
 
     # 链接目标不是 bot：跳过
     notbot = _msg(text="抽奖 https://t.me/NotABot?start=act3")
@@ -1345,7 +1343,7 @@ def test_message_requires_password():
 
 
 def test_two_way_account_skips_password_post(tmp_path):
-    """双向账号遇口令要求帖跳过，日志注明口令要求；非双向账号正常参与。"""
+    """双向账号遇口令要求帖静默跳过；非双向账号正常参与。"""
     import asyncio
 
     engine, _state = _engine(tmp_path)
@@ -1356,7 +1354,7 @@ def test_two_way_account_skips_password_post(tmp_path):
 
     result = asyncio.run(engine._process_message("双向号", None, msg))
     assert result is None
-    assert any("账号为双向且抽奖有口令要求" in line for line in logs)
+    assert not any("跳过" in line for line in logs)
 
     # 非双向账号不受影响，正常发 start
     logs.clear()
