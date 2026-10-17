@@ -1300,19 +1300,38 @@ class GiveawayEngine:
             if not status_targets:
                 raw = _message_text(message)
                 if raw and "加入" in raw and "❌" in raw:
+                    # 逐行明细：每行文本 + 挂在该行上的链接实体，
+                    # 用于定位 ❌ 行是链接缺失还是行匹配失败
                     ents = list(getattr(message, "entities", None) or []) + list(
                         getattr(message, "caption_entities", None) or []
                     )
-                    summary = "；".join(
-                        "{}:{}".format(
-                            str(getattr(e, "type", "?")).split(".")[-1],
-                            getattr(e, "url", "") or "",
+                    line_urls: Dict[int, List[str]] = {}
+                    bounds: List[Tuple[int, int]] = []
+                    pos = 0
+                    for ln in raw.split("\n"):
+                        bounds.append((pos, pos + len(ln)))
+                        pos += len(ln) + 1
+                    for ent in ents:
+                        url = getattr(ent, "url", None)
+                        if not url:
+                            continue
+                        off = _utf16_to_index(raw, int(getattr(ent, "offset", 0) or 0))
+                        for idx, (ls, le) in enumerate(bounds):
+                            if ls <= off <= le:
+                                line_urls.setdefault(idx, []).append(str(url))
+                                break
+                    detail = "；".join(
+                        "L{}`{}`{}`".format(
+                            i + 1,
+                            raw[ls:le].strip()[:36],
+                            ("→" + "、".join(line_urls[i])) if i in line_urls else "",
                         )
-                        for e in ents[:6]
+                        for i, (ls, le) in enumerate(bounds)
+                        if "❌" in raw[ls:le] or "✅" in raw[ls:le] or i in line_urls
                     )
                     self.log(
                         f"[{account}] @LotteryBestBot 清单含未加入(❌)行但未解析到"
-                        f"链接（实体 {len(ents)} 个：{summary}）"
+                        f"链接（逐行明细：{detail}）"
                     )
             targets = targets + status_targets
         for target in targets:
