@@ -1424,6 +1424,56 @@ def test_status_targets_trigger_restart(tmp_path, monkeypatch):
     assert client.started == [("LotteryBestBot", "r1")]
 
 
+def test_lotterybest_restart_reply_participate_button_clicked(tmp_path, monkeypatch):
+    """端到端：LotteryBestBot ❌ 清单 → 加入 → 重发 start → 回复带
+    「点击参与抽奖」URL 按钮（同 bot participate 链接）→ 应自动点击。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    class _RestartClient(_CallbackClient):
+        async def start_bot(self, username, param):
+            self.started.append((username, param))
+            if param == "post1":
+                # 重发 start 后 bot 回复达标消息 + 参与按钮
+                return _msg(
+                    text="您已获得抽奖资格，请点击按钮完成参与",
+                    buttons=[
+                        [
+                            _btn(
+                                "🎟️ 点击参与抽奖",
+                                url=(
+                                    "https://t.me/LotteryBestBot"
+                                    "?start=participate_-100123_456_95"
+                                ),
+                            )
+                        ]
+                    ],
+                )
+            return None  # 参与按钮的 start 不再回复
+
+    client = _RestartClient(bot_users={"LotteryBestBot"})
+    checklist = _status_message(
+        STATUS_REPLY, {"某测试频道D": "https://t.me/test_channel_d"}
+    )
+    asyncio.run(engine._click_confirm("acc", client, "LotteryBestBot", checklist, "post1"))
+    assert "test_channel_d" in client.joined_targets
+    # 第一次：原参数重发；第二次：点击参与按钮（链接参数）
+    assert client.started == [
+        ("LotteryBestBot", "post1"),
+        ("LotteryBestBot", "participate_-100123_456_95"),
+    ]
+    assert any("参与按钮" in line for line in logs)
+
+
 # ---------------- 口令要求 + 双向账号跳过 ----------------
 
 PASSWORD_POST = """🎰 上海婷婷半价券
