@@ -17,6 +17,7 @@ from tg_signer.giveaway_core import (
 
 # ---------------- parse_bot_start_link ----------------
 
+
 @pytest.mark.parametrize(
     "url,expected",
     [
@@ -60,7 +61,9 @@ def test_parse_bot_start_link_invalid(url):
     assert parse_bot_start_link(url) is None
 
 
-def _msg(text=None, entities=None, caption=None, caption_entities=None, buttons=None, id=None):
+def _msg(
+    text=None, entities=None, caption=None, caption_entities=None, buttons=None, id=None
+):
     reply_markup = SimpleNamespace(inline_keyboard=buttons) if buttons else None
     return SimpleNamespace(
         id=id,
@@ -82,6 +85,7 @@ def _ent(entity_type, url=None):
 
 
 # ---------------- extract_bot_links ----------------
+
 
 def test_extract_links_from_plain_text_and_entities_and_buttons():
     message = _msg(
@@ -150,6 +154,7 @@ def test_extract_links_glued_same_line_no_space():
 
 # ---------------- message_matches_keywords ----------------
 
+
 def test_message_matches_keywords():
     message = _msg(text="今晚八点抽奖活动")
     assert message_matches_keywords(message, ["抽奖"])
@@ -161,6 +166,7 @@ def test_message_matches_keywords():
 
 
 # ---------------- GiveawayState 去重持久化 ----------------
+
 
 def test_state_dedup_and_persistence(tmp_path):
     state = GiveawayState(tmp_path)
@@ -200,6 +206,7 @@ def test_state_caps_per_account(tmp_path):
 
 
 # ---------------- GiveawayEngine._process_message 决策 ----------------
+
 
 class FakeClient:
     def __init__(self, bot_users=None):
@@ -271,21 +278,19 @@ def test_parse_draw_date_expired_and_future():
     now = datetime(2026, 10, 17, 12, 0, 0)
     # 已过期：明确年份的过去日期
     assert parse_draw_date("1月1日开奖", now=now) == datetime(2026, 1, 1, 23, 59, 59)
-    assert parse_draw_date(
-        "2026-01-01 20:00 开奖", now=now
-    ) == datetime(2026, 1, 1, 20, 0)
+    assert parse_draw_date("2026-01-01 20:00 开奖", now=now) == datetime(
+        2026, 1, 1, 20, 0
+    )
     # 未来：明确的将来日期
-    assert parse_draw_date(
-        "2026-12-01 开奖", now=now
-    ) == datetime(2026, 12, 1, 23, 59, 59)
+    assert parse_draw_date("2026-12-01 开奖", now=now) == datetime(
+        2026, 12, 1, 23, 59, 59
+    )
     # 无提示词 / 无日期：返回 None
     assert parse_draw_date("1月1日发红包", now=now) is None
     assert parse_draw_date("明天开奖，速来", now=now) is None
     # 无年份按当年理解：10 月看到「1月1日开奖」视为今年已开奖（跳过旧帖）
     assert parse_draw_date("1月1日开奖", now=now) == datetime(2026, 1, 1, 23, 59, 59)
-    assert parse_draw_date(
-        "2027年1月1日8点开奖", now=now
-    ) == datetime(2027, 1, 1, 8, 0)
+    assert parse_draw_date("2027年1月1日8点开奖", now=now) == datetime(2027, 1, 1, 8, 0)
 
 
 def test_engine_skips_expired_draw_message(tmp_path):
@@ -657,6 +662,7 @@ def test_engine_skips_non_bot_and_keyword_miss(tmp_path):
 
 # ---------------- extract_channel_targets（自动加入目标） ----------------
 
+
 def test_extract_channel_targets_mixed():
     msg = _msg(
         text="请关注 @GiveawayChannel 和 https://t.me/NewsGroup",
@@ -835,8 +841,7 @@ def test_join_precheck_logs_missing_membership(tmp_path):
     # 只有未加入的目标会真正 join
     assert client.joined == ["NeedJoinChan"]
     assert any(
-        "尚未加入" in line and "NeedJoinChan" in line
-        and "加入后才能参与" in line
+        "尚未加入" in line and "NeedJoinChan" in line and "加入后才能参与" in line
         for line in logs
     )
     assert any("已在" in line and "AlreadyChan" in line for line in logs)
@@ -845,6 +850,7 @@ def test_join_precheck_logs_missing_membership(tmp_path):
 def test_click_confirm_restarts_any_bot_with_join_targets(tmp_path, monkeypatch):
     """通用策略：任何 bot 消息含加入要求时，加入后自动重发一次 start。"""
     import asyncio
+
     import tg_signer.giveaway_core as gc
 
     async def _nosleep(*a, **k):
@@ -856,9 +862,7 @@ def test_click_confirm_restarts_any_bot_with_join_targets(tmp_path, monkeypatch)
     engine.log = logs.append
     client = FakeClient(bot_users={"AnyLotteryBot"})
     msg = _msg(text="请先加入 https://t.me/NeedJoinCh 再点下方抽奖")
-    asyncio.run(
-        engine._click_confirm("acc", client, "AnyLotteryBot", msg, "r1")
-    )
+    asyncio.run(engine._click_confirm("acc", client, "AnyLotteryBot", msg, "r1"))
     # 加入完成后重新 start 了一次
     assert client.started == [("AnyLotteryBot", "r1")]
     assert any("再次发送 start" in line for line in logs)
@@ -867,6 +871,7 @@ def test_click_confirm_restarts_any_bot_with_join_targets(tmp_path, monkeypatch)
 def test_click_confirm_no_restart_without_join_targets(tmp_path, monkeypatch):
     """bot 消息没有加入要求且不在强制名单：不重发 start。"""
     import asyncio
+
     import tg_signer.giveaway_core as gc
 
     async def _nosleep(*a, **k):
@@ -878,9 +883,7 @@ def test_click_confirm_no_restart_without_join_targets(tmp_path, monkeypatch):
     engine.log = logs.append
     client = FakeClient(bot_users={"OtherLotteryBot"})
     msg = _msg(text="点击下方按钮领取奖励")
-    asyncio.run(
-        engine._click_confirm("acc", client, "OtherLotteryBot", msg, "r1")
-    )
+    asyncio.run(engine._click_confirm("acc", client, "OtherLotteryBot", msg, "r1"))
     assert client.started == []  # 不重新 start
     assert not any("再次发送 start" in line for line in logs)
 
@@ -896,8 +899,8 @@ def test_engine_join_invite_request_sent_is_not_failure(tmp_path):
         async def join_chat(self, target):
             self.calls.append(target)
             raise RuntimeError(
-                'Telegram says: [400 INVITE_REQUEST_SENT] - You have '
-                'successfully requested to join this chat or channel. '
+                "Telegram says: [400 INVITE_REQUEST_SENT] - You have "
+                "successfully requested to join this chat or channel. "
                 '(caused by "channels.JoinChannel")'
             )
 
@@ -930,7 +933,7 @@ def test_engine_join_flood_wait_suspends(tmp_path):
             if len(self.calls) == 1:
                 raise RuntimeError(
                     "Telegram says: [420 FLOOD_WAIT_X] - Please wait 163 "
-                    'seconds before repeating the action. (caused by '
+                    "seconds before repeating the action. (caused by "
                     '"channels.JoinChannel")'
                 )
             return SimpleNamespace(title=f"chat-{target}")
@@ -958,6 +961,7 @@ def test_engine_join_flood_wait_suspends(tmp_path):
 
 
 # ---------------- 历史补漏（rescue） ----------------
+
 
 def _msgid(message, mid):
     message.id = mid
@@ -989,7 +993,7 @@ def test_rescue_round_dedups_seen_and_joins_new(tmp_path):
     # 再补漏一轮：无新消息，不重复参与
     asyncio.run(engine._rescue_round())
     assert client.started == [("LotteryBot", "old1"), ("LotteryBot", "new1")]
-    assert any("补漏扫描完成" in line for line in logs)
+    assert any("补漏轮次完成" in line for line in logs)
 
 
 def test_rescue_respects_limit(tmp_path):

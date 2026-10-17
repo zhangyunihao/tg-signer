@@ -6,6 +6,7 @@
 
 import asyncio
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,8 @@ from tg_signer.webui.random_chat import (
     schedule_auth_checks,
     update_account_chats,
 )
+
+logger = logging.getLogger(__name__)
 
 _GLOBAL_ENGINES: Dict[str, GiveawayEngine] = {}
 _GLOBAL_LOGS: Dict[str, List[str]] = {}
@@ -112,7 +115,8 @@ def load_task_store(workdir) -> dict:
     if not isinstance(data, dict):
         return {"seq": 1, "tasks": {}}
     data.setdefault(
-        "seq", max((int(k) for k in data.get("tasks", {}) if str(k).isdigit()), default=0) + 1
+        "seq",
+        max((int(k) for k in data.get("tasks", {}) if str(k).isdigit()), default=0) + 1,
     )
     data.setdefault("tasks", {})
     for cfg in data["tasks"].values():
@@ -154,12 +158,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "delay_min": int(cfg.get("delay_min") or 0),
                 "delay_max": int(cfg.get("delay_max") or 0),
                 "confirm_wait": int(cfg.get("confirm_wait") or 0),
-                "max_joins": (
-                    int(cfg["max_joins"]) if cfg.get("max_joins") else None
-                ),
-                "rescue_interval_min": max(
-                    0, int(cfg.get("rescue_interval_min") or 0)
-                ),
+                "max_joins": (int(cfg["max_joins"]) if cfg.get("max_joins") else None),
+                "rescue_interval_min": max(0, int(cfg.get("rescue_interval_min") or 0)),
                 "rescue_limit": max(1, int(cfg.get("rescue_limit") or 10)),
             }
         save_task_store(workdir, {"seq": store["seq"], "tasks": clean})
@@ -308,25 +308,23 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         engine = ensure_engine(name)
         started = await engine.start(
             accounts=list(cfg["accounts"]),
-            chats=[parse_chat_id(c) if parse_chat_id(c) is not None else str(c)
-                   for c in cfg["chats"]],
+            chats=[
+                parse_chat_id(c) if parse_chat_id(c) is not None else str(c)
+                for c in cfg["chats"]
+            ],
             session_dir=Path(cfg["session_dir"]),
             log=make_log(name),
             keywords=list(cfg.get("keywords") or []),
             auto_scan=bool(cfg.get("auto_scan", True)),
             auto_join=bool(cfg.get("auto_join", True)),
             ignore_history=bool(cfg.get("ignore_history", True)),
-            max_joins=(
-                int(cfg["max_joins"]) if cfg.get("max_joins") else None
-            ),
+            max_joins=(int(cfg["max_joins"]) if cfg.get("max_joins") else None),
             delay_range=(
                 float(cfg.get("delay_min") or 0),
                 float(cfg.get("delay_max") or 0),
             ),
             confirm_wait=int(cfg.get("confirm_wait") or 8),
-            rescue_interval=(
-                int(cfg.get("rescue_interval_min") or 0) * 60
-            ),
+            rescue_interval=(int(cfg.get("rescue_interval_min") or 0) * 60),
             rescue_limit=int(cfg.get("rescue_limit") or 10),
             state=giveaway_state,
             on_finish=_on_finish,
@@ -359,7 +357,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         try:
             set_status(running)
         except Exception:
-            pass
+            logger.debug("更新任务运行状态回调执行失败", exc_info=True)
 
     def on_add_task() -> None:
         accounts = list(account_select.value or [])
@@ -396,9 +394,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             )
             delay_min = max(0, int(delay_min_input.value or 0))
             delay_max = max(0, int(delay_max_input.value or 0))
-            rescue_interval_min = max(
-                0, int(rescue_interval_input.value or 0)
-            )
+            rescue_interval_min = max(0, int(rescue_interval_input.value or 0))
             rescue_limit = max(1, int(rescue_limit_input.value or 10))
         except (TypeError, ValueError):
             ui.notify("参与上限/延迟/补漏参数需为数字", type="warning")
@@ -491,19 +487,26 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     {
                         "name": str(name),
                         "accounts": ", ".join(cfg["accounts"]),
-                        "chats": f"{len(cfg['chats'])} 个：" + "、".join(chat_names[:3])
+                        "chats": f"{len(cfg['chats'])} 个："
+                        + "、".join(chat_names[:3])
                         + ("…" if len(chat_names) > 3 else ""),
                         "keywords": "、".join(cfg.get("keywords") or []) or "全部链接",
-                        "scan": "不限" if not cfg.get("max_joins") else str(cfg["max_joins"]),
+                        "scan": "不限"
+                        if not cfg.get("max_joins")
+                        else str(cfg["max_joins"]),
                         "status": _status_text(name),
                     }
                 )
-            table = ui.table(
-                columns=columns,
-                rows=rows,
-                row_key="name",
-                pagination=5,
-            ).classes("w-full tgs-desktop-table").props("flat dense")
+            table = (
+                ui.table(
+                    columns=columns,
+                    rows=rows,
+                    row_key="name",
+                    pagination=5,
+                )
+                .classes("w-full tgs-desktop-table")
+                .props("flat dense")
+            )
             table_ref["table"] = table
             card_badges: dict = {}
             # 「扫描中」也算运行态（info 蓝色）
@@ -515,7 +518,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             table.add_slot(
                 "body-cell-status",
                 '<q-td :props="props">'
-                f'<q-badge :color="({running_expr}) ? \'info\' : \'grey-6\'">'
+                f"<q-badge :color=\"({running_expr}) ? 'info' : 'grey-6'\">"
                 "{{ props.row.status }}</q-badge></q-td>",
             )
             table.add_slot(
@@ -548,7 +551,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             try:
                                 table.update()
                             except Exception:
-                                pass
+                                logger.debug("刷新任务表格 UI 失败", exc_info=True)
                             break
                     badge = card_badges.get(str(n))
                     if badge is not None:
@@ -557,7 +560,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             badge.text = text
                             badge.update()
                         except Exception:
-                            pass
+                            logger.debug("刷新任务状态徽标 UI 失败", exc_info=True)
 
                 return _set
 
@@ -635,14 +638,16 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             if not running:
                                 ui.button(
                                     "启动",
-                                    on_click=lambda nn=n, cb=set_status: asyncio.create_task(
+                                    on_click=lambda nn=n,
+                                    cb=set_status: asyncio.create_task(
                                         _card_start(nn, cb)
                                     ),
                                 ).props("flat dense color=primary")
                             else:
                                 ui.button(
                                     "停止",
-                                    on_click=lambda nn=n, cb=set_status: asyncio.create_task(
+                                    on_click=lambda nn=n,
+                                    cb=set_status: asyncio.create_task(
                                         _card_stop(nn, cb)
                                     ),
                                 ).props("flat dense color=negative")
@@ -718,7 +723,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         try:
             send_log.push(line)
         except Exception:
-            pass
+            logger.debug("回放历史日志到界面日志区失败", exc_info=True)
 
     client = ui.context.client
 
@@ -741,10 +746,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     if changed:
                         table.update()
                 except Exception:
-                    pass
+                    logger.debug("轮询刷新任务表格 UI 失败", exc_info=True)
             if _seen["n"] > len(log_buf):
                 _seen["n"] = len(log_buf)
-            new_lines = log_buf[_seen["n"]:]
+            new_lines = log_buf[_seen["n"] :]
             if not new_lines:
                 continue
             _seen["n"] = len(log_buf)
@@ -754,7 +759,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         try:
                             send_log.push(line)
                         except Exception:
-                            pass
+                            logger.debug("推送新日志到界面日志区失败", exc_info=True)
             except Exception:
                 return
 
@@ -767,11 +772,15 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             session_dir_input = ui.input(
                 label="会话目录（.session 所在目录）", value=default_session_dir
             ).classes("w-56")
-            account_select = ui.select(
-                label="选择账号（可多选）",
-                options=[],
-                multiple=True,
-            ).classes("min-w-[260px]").props("use-chips")
+            account_select = (
+                ui.select(
+                    label="选择账号（可多选）",
+                    options=[],
+                    multiple=True,
+                )
+                .classes("min-w-[260px]")
+                .props("use-chips")
+            )
             ui.button("刷新账号/频道", on_click=lambda: refresh_options()).props(
                 "outline"
             )
@@ -801,17 +810,19 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 finally:
                     update_btn.enable()
 
-            update_btn = ui.button(
-                "从TG更新频道", on_click=update_chats_from_tg
-            ).props("outline")
+            update_btn = ui.button("从TG更新频道", on_click=update_chats_from_tg).props(
+                "outline"
+            )
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
-            channel_select = ui.select(
-                label="选择监控频道（可多选，输入关键字过滤）",
-                options={},
-                multiple=True,
-            ).classes("min-w-[320px] flex-grow").props(
-                "use-chips use-input options-dense"
+            channel_select = (
+                ui.select(
+                    label="选择监控频道（可多选，输入关键字过滤）",
+                    options={},
+                    multiple=True,
+                )
+                .classes("min-w-[320px] flex-grow")
+                .props("use-chips use-input options-dense")
             )
             channel_type_toggle = ui.toggle(
                 {"all": "全部", "channel": "仅频道", "group": "仅群组"},
@@ -835,9 +846,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 max=10000,
                 format="%d",
             ).classes("w-56")
-            auto_scan_switch = ui.switch(
-                "启动时自动扫描一轮", value=True
-            ).classes("pt-6")
+            auto_scan_switch = ui.switch("启动时自动扫描一轮", value=True).classes(
+                "pt-6"
+            )
             auto_join_switch = ui.switch(
                 "自动加入抽奖要求的频道/群组", value=True
             ).classes("pt-6")

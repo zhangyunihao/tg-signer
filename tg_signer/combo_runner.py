@@ -1,0 +1,50 @@
+"""组合任务子进程入口：按配置顺序逐个执行子任务的 CLI 命令。
+
+用法（由 WebUI 的组合任务启动，每账号一个进程）:
+
+    python -m tg_signer.combo_runner '<json spec>'
+
+spec 格式::
+
+    {"subs": [{"label": "签到 (run-once) · 任务A", "args": ["-w", ..., "run-once", "任务A"]}, ...]}
+
+子任务按列表顺序串行执行；任一子任务退出码非 0 时整体退出码为 1。
+stdout/stderr 直接透传给父进程，由 WebUI 解析「>>> 子任务开始/结束」标记行
+生成明细进度。
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+CLI_ENTRY = "from tg_signer.cli import tg_signer; tg_signer()"
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        print("缺少组合任务参数", flush=True)
+        raise SystemExit(2)
+    try:
+        spec = json.loads(sys.argv[1])
+    except json.JSONDecodeError as exc:
+        print(f"组合任务参数解析失败: {exc}", flush=True)
+        raise SystemExit(2)
+    subs = spec.get("subs") or []
+    total = len(subs)
+    codes: list[int] = []
+    for i, sub in enumerate(subs, 1):
+        label = str(sub.get("label") or " ".join(sub.get("args") or []))
+        print(f">>> 子任务开始 [{i}/{total}]: {label}", flush=True)
+        cmd = [sys.executable, "-c", CLI_ENTRY] + list(sub.get("args") or [])
+        code = subprocess.call(cmd)
+        codes.append(code)
+        # 多账号错峰延迟只对首个子任务生效，避免后续串行子任务重复等待
+        if i == 1:
+            os.environ.pop("TG_SIGNER_START_DELAY", None)
+        print(f">>> 子任务结束 [{i}/{total}] 退出码 {code}", flush=True)
+    raise SystemExit(0 if all(c == 0 for c in codes) else 1)
+
+
+if __name__ == "__main__":
+    main()

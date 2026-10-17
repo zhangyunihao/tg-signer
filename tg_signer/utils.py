@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import pathlib
 import tempfile
@@ -8,6 +9,8 @@ from typing import Dict, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from typing_extensions import TypeAlias
+
+logger = logging.getLogger(__name__)
 
 NumberingLangT: TypeAlias = Literal[
     "arabic",
@@ -364,5 +367,5 @@ def atomic_write_json(
         try:
             os.unlink(tmp_path)
         except OSError:
-            pass
+            logger.debug("清理原子写入临时文件失败", exc_info=True)
         raise

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from collections import deque
 from dataclasses import dataclass
@@ -9,6 +10,8 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 from tg_signer.config import BaseJSONConfig, MonitorConfig, SignConfigV3
 from tg_signer.sign_record_store import SignRecordStore
 from tg_signer.utils import atomic_write_json
+
+logger = logging.getLogger(__name__)
 
 ConfigKind = Literal["signer", "monitor"]
 
@@ -155,7 +158,10 @@ def load_user_infos(workdir: Optional[Path | str] = None) -> List[UserInfo]:
                 try:
                     latest_chats = json.load(fp)
                 except json.JSONDecodeError:
-                    pass
+                    logger.debug(
+                        "解析用户最近会话缓存 latest_chats.json 失败，忽略",
+                        exc_info=True,
+                    )
 
         entries.append(
             UserInfo(
@@ -226,9 +232,7 @@ def load_account_order(workdir: Optional[Path | str] = None) -> List[str]:
     return list(order) if isinstance(order, list) else []
 
 
-def set_account_order(
-    order: List[str], workdir: Optional[Path | str] = None
-) -> None:
+def set_account_order(order: List[str], workdir: Optional[Path | str] = None) -> None:
     """保存账户展示顺序。"""
     path = _accounts_state_path(workdir)
     state = _read_accounts_state(path)
@@ -385,7 +389,7 @@ def export_backup(workdir: Optional[Path | str] = None) -> bytes:
         try:
             zf.write(p, f"signer_data/{p.relative_to(base).as_posix()}")
         except OSError:
-            pass
+            logger.debug("导出备份时写入文件到 ZIP 失败，已跳过", exc_info=True)
 
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("configs.json", export_all_configs(workdir))
@@ -427,7 +431,7 @@ def import_backup(raw: bytes, workdir: Optional[Path | str] = None) -> Dict[str,
         for name in names:
             if not name.startswith("signer_data/"):
                 continue
-            rel = name[len("signer_data/"):]
+            rel = name[len("signer_data/") :]
             if not rel or rel.endswith("/"):
                 continue
             target = base / rel

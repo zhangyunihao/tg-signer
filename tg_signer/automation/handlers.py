@@ -17,6 +17,8 @@ from tg_signer.notification.server_chan import sc_send
 
 from .models import AutomationContext, Event
 
+logger = logging.getLogger(__name__)
+
 # 统一 handler 返回值语义：
 # - continue: 继续执行后续 handler
 # - stop/defer: 中断当前规则链
@@ -497,7 +499,7 @@ async def schedule_next(
             else:
                 delay_seconds = value
         except (TypeError, ValueError):
-            pass
+            logger.debug("解析延时来源变量失败，使用默认延时", exc_info=True)
     offset_seconds = params.get("offset_seconds")
     if offset_seconds is None:
         offset_minutes = params.get("offset_minutes")

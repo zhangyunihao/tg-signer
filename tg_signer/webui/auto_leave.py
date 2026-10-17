@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Dict, List
@@ -9,13 +10,15 @@ from typing import Callable, Dict, List
 from nicegui import ui
 from pyrogram.errors import FloodWait, RPCError
 
-from tg_signer.core import get_client
+from tg_signer.core import get_client, safe_disconnect
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.random_chat import (
     build_account_options,
     list_session_names,
     schedule_auth_checks,
 )
+
+logger = logging.getLogger(__name__)
 
 CONFIG_NAME = "auto_leave_config.json"
 
@@ -41,7 +44,7 @@ def load_config(workdir) -> Dict:
         if isinstance(data, dict):
             defaults.update({k: v for k, v in data.items() if k in defaults})
     except Exception:
-        pass
+        logger.debug("读取自动退群配置文件失败，使用默认配置", exc_info=True)
     return defaults
 
 
@@ -49,7 +52,7 @@ def save_config(workdir, cfg: Dict) -> None:
     try:
         atomic_write_json(_config_path(workdir), cfg)
     except Exception:
-        pass
+        logger.debug("保存自动退群配置文件失败", exc_info=True)
 
 
 def _chat_type(chat) -> str:
@@ -107,17 +110,16 @@ async def scan_stale_chats(
                         "age_days": age_days,
                     }
                 )
-        log(f"[{account}] 扫描完成，共 {scanned} 个对话，{len(found)} 个超过 {days} 天未更新")
+        log(
+            f"[{account}] 扫描完成，共 {scanned} 个对话，{len(found)} 个超过 {days} 天未更新"
+        )
     except asyncio.TimeoutError:
         log(f"[{account}] 连接超时（30s），跳过")
     except Exception as exc:
         log(f"[{account}] 扫描失败: {exc}")
     finally:
         if client is not None:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+            await safe_disconnect(client)
     return found
 
 
@@ -158,7 +160,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         try:
             log_area.push(line)
         except Exception:
-            pass
+            logger.debug("推送日志到界面日志区失败", exc_info=True)
 
     def persist() -> None:
         save_config(
@@ -176,7 +178,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         names = list_session_names(session_dir, workdir)
         account_select.options = build_account_options(session_dir, names)
         if not account_select.value:
-            account_select.value = [a for a in (cfg.get("accounts") or []) if a in names]
+            account_select.value = [
+                a for a in (cfg.get("accounts") or []) if a in names
+            ]
         account_select.update()
         # 后台懒检测未授权账户，完成后刷新 ⚠️ 标注
         schedule_auth_checks(session_dir, names, on_done=refresh_marks)
@@ -228,7 +232,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 default_selected = [
                     r
                     for r in rows_all
-                    if not any(kw in str(r.get("title") or "") for kw in UNSELECT_KEYWORDS)
+                    if not any(
+                        kw in str(r.get("title") or "") for kw in UNSELECT_KEYWORDS
+                    )
                 ]
                 result_table.selected = default_selected
                 result_table.update()
@@ -264,7 +270,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                         f"[{row['account']}] {row['title']}（{row['age_days']}天未更新）"
                     ).classes("text-sm")
                 if len(selected) > 50:
-                    ui.label(f"… 等共 {len(selected)} 个").classes("text-sm text-gray-500")
+                    ui.label(f"… 等共 {len(selected)} 个").classes(
+                        "text-sm text-gray-500"
+                    )
             with ui.row().classes("w-full justify-end"):
                 ui.button("取消", on_click=dialog.close).props("flat")
 
@@ -297,19 +305,21 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     done_lock = asyncio.Lock()
                     sem = asyncio.Semaphore(8)
 
-                    async def _do_leave(row: Dict) -> None:
-                        async with sem:
+                    async def _do_leave(row: Dict) -> None:  # noqa: B023
+                        # 误报：闭包在本轮循环体内立即被 gather 消费，不会读到下一轮的变量
+                        async with sem:  # noqa: B023
                             success = await leave_one(
-                                client, row["chat_id"], row["title"], log
+                                client,  # noqa: B023
+                                row["chat_id"],
+                                row["title"],
+                                log,  # noqa: B023
                             )
                             if success:
-                                async with done_lock:
-                                    done_keys.add(row["key"])
+                                async with done_lock:  # noqa: B023
+                                    done_keys.add(row["key"])  # noqa: B023
 
                     await asyncio.gather(*[_do_leave(row) for row in items])
-                    log(
-                        f"[{account}] 批量退出完成：成功 {len(done_keys)}/{len(items)}"
-                    )
+                    log(f"[{account}] 批量退出完成：成功 {len(done_keys)}/{len(items)}")
                     if done_keys:
                         remain = [r for r in rows_all if r["key"] not in done_keys]
                         rows_all.clear()
@@ -327,10 +337,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     log(f"[{account}] 退出失败: {exc}")
                 finally:
                     if client is not None:
-                        try:
-                            await client.disconnect()
-                        except Exception:
-                            pass
+                        await safe_disconnect(client)
             log("退出流程结束")
         finally:
             await set_busy(False)
@@ -343,24 +350,23 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
 
     with ui.row().classes("w-full items-end flex-wrap"):
         days_input = ui.number(
-            label="不更新天数阈值", value=cfg.get("days") or 7, min=1, step=1,
+            label="不更新天数阈值",
+            value=cfg.get("days") or 7,
+            min=1,
+            step=1,
             format="%.0f",
         ).classes("w-36 leave-days")
-        include_groups = ui.checkbox(
-            "包含群组", value=bool(cfg.get("include_groups"))
-        )
-        skip_pinned = ui.checkbox(
-            "跳过置顶", value=bool(cfg.get("skip_pinned", True))
-        )
+        include_groups = ui.checkbox("包含群组", value=bool(cfg.get("include_groups")))
+        skip_pinned = ui.checkbox("跳过置顶", value=bool(cfg.get("skip_pinned", True)))
         account_select = ui.select(
             label="账号（可多选）",
             options=[],
             multiple=True,
             with_input=True,
         ).classes("min-w-64 flex-1")
-        scan_btn = ui.button("扫描预览", on_click=on_scan).props(
-            "outline"
-        ).classes("ml-auto")
+        scan_btn = (
+            ui.button("扫描预览", on_click=on_scan).props("outline").classes("ml-auto")
+        )
 
     result_table = ui.table(
         columns=[
@@ -373,7 +379,12 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 "field": "age_days",
                 "align": "left",
             },
-            {"name": "chat_id", "label": "chat_id", "field": "chat_id", "align": "left"},
+            {
+                "name": "chat_id",
+                "label": "chat_id",
+                "field": "chat_id",
+                "align": "left",
+            },
         ],
         rows=[],
         row_key="key",
@@ -385,9 +396,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     result_cards = ui.column().classes("w-full gap-2 tgs-mobile-cards")
 
     def _sync_table_selected() -> None:
-        result_table.selected = [
-            r for r in rows_all if r["key"] in selected_keys
-        ]
+        result_table.selected = [r for r in rows_all if r["key"] in selected_keys]
 
     # 「已选 n/m」计数标签：单个勾选只改文字，不整列重建（避免与点击事件打架）
     count_label: ui.label | None = None
@@ -403,6 +412,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         with result_cards:
             if rows_all:
                 with ui.row().classes("w-full items-center gap-2"):
+
                     def _select_all() -> None:
                         selected_keys.update(r["key"] for r in rows_all)
                         _sync_table_selected()
@@ -449,9 +459,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                             ).classes("text-xs text-gray-500")
 
     with ui.row().classes("w-full items-center"):
-        leave_btn = ui.button(
-            "退出所选", on_click=confirm_leave
-        ).props("color=negative outline")
+        leave_btn = ui.button("退出所选", on_click=confirm_leave).props(
+            "color=negative outline"
+        )
         ui.label("勾选要退出的对话后操作；扫描结果默认不执行任何退出").classes(
             "text-xs text-gray-500"
         )

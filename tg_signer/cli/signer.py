@@ -11,6 +11,8 @@ from tg_signer.config import parse_chat_id_or_username
 from tg_signer.core import ChatFolderError, UserSigner, get_proxy
 from tg_signer.sign_record_store import SignRecordStore
 
+logger = logging.getLogger(__name__)
+
 
 class AliasedGroup(click.Group):
     _aliases = {"run_once": "run-once", "send_text": "send-text"}
@@ -182,9 +184,11 @@ def tg_signer(
         try:
             _stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
-            pass
+            logger.debug("重配置控制台输出流编码为 UTF-8 失败", exc_info=True)
 
-    logger = configure_logger(log_level=log_level, log_dir=log_dir, log_file=log_file)
+    root_logger = configure_logger(
+        log_level=log_level, log_dir=log_dir, log_file=log_file
+    )
     ctx.ensure_object(dict)
     proxy = get_proxy(proxy)
     if ctx.invoked_subcommand in [
@@ -196,11 +200,11 @@ def tg_signer(
         "logout",
     ]:
         if proxy:
-            logger.info(
+            root_logger.info(
                 "Using proxy: %s"
                 % f"{proxy['scheme']}://{proxy['hostname']}:{proxy['port']}"
             )
-        logger.info(f"Using account: {account}")
+        root_logger.info(f"Using account: {account}")
     ctx.obj["proxy"] = proxy
     ctx.obj["session_dir"] = session_dir
     ctx.obj["account"] = account

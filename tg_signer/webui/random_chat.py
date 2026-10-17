@@ -5,6 +5,7 @@
 
 import asyncio
 import json
+import logging
 import random
 import re
 from datetime import datetime
@@ -13,7 +14,7 @@ from typing import Callable, Dict, List, Optional, Union
 
 from nicegui import ui
 
-from tg_signer.core import get_client
+from tg_signer.core import get_client, safe_disconnect
 from tg_signer.phrases import PHRASES, parse_custom_phrases, phrase_pool_label
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.data import (
@@ -21,6 +22,8 @@ from tg_signer.webui.data import (
     load_disabled_accounts,
     load_user_infos,
 )
+
+logger = logging.getLogger(__name__)
 
 # 跨浏览器刷新仍可控制的运行中引擎：{workdir|task_id -> engine}
 _GLOBAL_ENGINES: Dict[str, "RandomChatEngine"] = {}
@@ -32,9 +35,7 @@ _GLOBAL_STATUS_CBS: Dict[str, Callable[[bool], None]] = {}
 _TASKS_FILE = "random_chat_tasks.json"
 
 
-def list_session_names(
-    session_dir: Union[Path, str], workdir=None
-) -> List[str]:
+def list_session_names(session_dir: Union[Path, str], workdir=None) -> List[str]:
     """列出会话目录下所有 .session 文件对应的账号名（排除停用账户，按账户管理中拖动的顺序排列）"""
     base = Path(session_dir)
     if not base.is_dir():
@@ -122,10 +123,7 @@ async def update_account_chats(
         return -1
     finally:
         if client is not None:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+            await safe_disconnect(client)
 
 
 # 账户授权状态懒检测缓存：{"<session_dir>|<account>": bool}
@@ -149,15 +147,10 @@ async def _check_account_authorized(account: str, session_dir: Path) -> Optional
         return None
     finally:
         if client is not None:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            from tg_signer.core import _CLIENT_INSTANCES
+            await safe_disconnect(client)
+        from tg_signer.core import _CLIENT_INSTANCES
 
-            _CLIENT_INSTANCES.pop(
-                str(Path(session_dir).joinpath(account).resolve()), None
-            )
+        _CLIENT_INSTANCES.pop(str(Path(session_dir).joinpath(account).resolve()), None)
 
 
 def authz_cached(session_dir: Path, account: str) -> Optional[bool]:
@@ -199,13 +192,13 @@ def schedule_auth_checks(
                 finally:
                     _AUTHZ_PENDING.discard(key)
         except Exception:
-            pass
+            logger.debug("后台账户授权检测任务执行失败", exc_info=True)
         finally:
             if on_done is not None:
                 try:
                     on_done()
                 except Exception:
-                    pass
+                    logger.debug("授权检测完成回调执行失败", exc_info=True)
 
     if not todo:
         if on_done is not None:
@@ -330,7 +323,7 @@ class RandomChatEngine:
         try:
             await task
         except Exception:
-            pass
+            logger.debug("等待随机发言任务收尾时任务异常退出", exc_info=True)
         if self._task is task:
             self._task = None
 
@@ -393,7 +386,7 @@ class RandomChatEngine:
                         timeout=interval + random.uniform(0, 3),
                     )
                 except TimeoutError:
-                    pass
+                    logger.debug("发送间隔轮询等待超时，继续下一轮发送", exc_info=True)
         finally:
             # 停止发送后，已发出的消息不立即撤回，仍按设定的删除延迟依次自动删除
             if self._stop.is_set() and undelivered:
@@ -435,16 +428,10 @@ class RandomChatEngine:
                 )
                 if not is_authorized:
                     log(f"「{account}」会话未授权，已跳过（请先用 CLI 登录该账号）")
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+                    await safe_disconnect(client)
                     continue
                 if self._stop.is_set():
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+                    await safe_disconnect(client)
                     break
                 me = await asyncio.wait_for(
                     client.get_me(), timeout=self.CONNECT_TIMEOUT
@@ -455,10 +442,7 @@ class RandomChatEngine:
             except asyncio.TimeoutError:
                 log(f"「{account}」连接超时（网络或代理异常），已跳过")
                 if client is not None:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+                    await safe_disconnect(client)
             except Exception as exc:
                 log(f"「{account}」连接失败: {exc}")
         if not clients:
@@ -479,7 +463,13 @@ class RandomChatEngine:
             await asyncio.gather(
                 *[
                     self._account_loop(
-                        client, account, chat_id, interval, log, delete_after, total_count
+                        client,
+                        account,
+                        chat_id,
+                        interval,
+                        log,
+                        delete_after,
+                        total_count,
                     )
                     for account, client in clients.items()
                 ]
@@ -489,10 +479,7 @@ class RandomChatEngine:
                 log(f"每个账号均已发满 {total_count} 条（{summary}），任务完成")
         finally:
             for client in clients.values():
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
+                await safe_disconnect(client)
             log("随机发言已停止")
 
 
@@ -588,7 +575,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 f"解析={resolved!r} map大小={len(chat_options_map)}"
             )
         except Exception:
-            pass
+            logger.debug("追加最近聊天选择调试日志失败", exc_info=True)
 
     def task_running(name: str) -> bool:
         engine = get_engine(name)
@@ -645,6 +632,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                     type="warning",
                 )
                 return
+
         def _on_finish(_n: str = name) -> None:
             cb = _GLOBAL_STATUS_CBS.get(engine_key(_n)) or tasks.get(_n, {}).get(
                 "_set_status"
@@ -682,7 +670,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         try:
             set_status(running)
         except Exception:
-            pass
+            logger.debug("更新任务运行状态回调执行失败", exc_info=True)
 
     def on_add_task() -> None:
         accounts = list(account_select.value or [])
@@ -793,19 +781,27 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                         "chat": chat_display(cfg["chat_id"]),
                         "interval": f"{cfg['interval']}s",
                         "delete_after": (
-                            f"{cfg['delete_after']}s" if cfg["delete_after"] else "不删除"
+                            f"{cfg['delete_after']}s"
+                            if cfg["delete_after"]
+                            else "不删除"
                         ),
-                        "total": str(cfg["total_count"]) if cfg["total_count"] else "不限",
+                        "total": str(cfg["total_count"])
+                        if cfg["total_count"]
+                        else "不限",
                         "phrases": phrase_pool_label(cfg),
                         "status": _status_text(name),
                     }
                 )
-            table = ui.table(
-                columns=columns,
-                rows=rows,
-                row_key="name",
-                pagination=5,
-            ).classes("w-full tgs-desktop-table").props("flat dense")
+            table = (
+                ui.table(
+                    columns=columns,
+                    rows=rows,
+                    row_key="name",
+                    pagination=5,
+                )
+                .classes("w-full tgs-desktop-table")
+                .props("flat dense")
+            )
             table_ref["table"] = table
             # 移动端卡片上的状态徽章（按任务名），状态回调同时更新表格行与卡片徽章
             card_badges: dict[str, ui.badge] = {}
@@ -813,7 +809,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             table.add_slot(
                 "body-cell-status",
                 '<q-td :props="props">'
-                '<q-badge :color="props.row.status.startsWith(\'运行中\') ? \'info\' : \'grey-6\'">'
+                "<q-badge :color=\"props.row.status.startsWith('运行中') ? 'info' : 'grey-6'\">"
                 "{{ props.row.status }}</q-badge></q-td>",
             )
             # 操作列：未运行显示「启动」，运行中显示「停止」，另附「复制」「删除」
@@ -840,18 +836,16 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                             try:
                                 table.update()
                             except Exception:
-                                pass
+                                logger.debug("刷新任务表格 UI 失败", exc_info=True)
                             break
                     badge = card_badges.get(str(n))
                     if badge is not None:
                         try:
-                            badge.props(
-                                f"color={'info' if running else 'grey-6'}"
-                            )
+                            badge.props(f"color={'info' if running else 'grey-6'}")
                             badge.text = text
                             badge.update()
                         except Exception:
-                            pass
+                            logger.debug("刷新任务状态徽标 UI 失败", exc_info=True)
 
                 return _set
 
@@ -913,7 +907,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                         ui.label(f"账号：{row['accounts']}").classes(
                             "text-xs text-gray-600"
                         )
-                        ui.label(f"群组：{row['chat']}").classes("text-xs text-gray-600")
+                        ui.label(f"群组：{row['chat']}").classes(
+                            "text-xs text-gray-600"
+                        )
                         ui.label(
                             f"间隔：{row['interval']}　删除延迟：{row['delete_after']}"
                         ).classes("text-xs text-gray-600")
@@ -924,14 +920,16 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                             if not running:
                                 ui.button(
                                     "启动",
-                                    on_click=lambda nn=n, cb=set_status: asyncio.create_task(
+                                    on_click=lambda nn=n,
+                                    cb=set_status: asyncio.create_task(
                                         _card_start(nn, cb)
                                     ),
                                 ).props("flat dense color=primary")
                             else:
                                 ui.button(
                                     "停止",
-                                    on_click=lambda nn=n, cb=set_status: asyncio.create_task(
+                                    on_click=lambda nn=n,
+                                    cb=set_status: asyncio.create_task(
                                         _card_stop(nn, cb)
                                     ),
                                 ).props("flat dense color=negative")
@@ -1004,7 +1002,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         try:
             send_log.push(line)
         except Exception:
-            pass
+            logger.debug("回放历史日志到界面日志区失败", exc_info=True)
 
     client = ui.context.client
 
@@ -1028,10 +1026,10 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                     if changed:
                         table.update()
                 except Exception:
-                    pass
+                    logger.debug("轮询刷新任务表格 UI 失败", exc_info=True)
             if _seen["n"] > len(log_buf):
                 _seen["n"] = len(log_buf)
-            new_lines = log_buf[_seen["n"]:]
+            new_lines = log_buf[_seen["n"] :]
             if not new_lines:
                 continue
             _seen["n"] = len(log_buf)
@@ -1041,7 +1039,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                         try:
                             send_log.push(line)
                         except Exception:
-                            pass
+                            logger.debug("推送新日志到界面日志区失败", exc_info=True)
             except Exception:
                 return
 
@@ -1054,11 +1052,15 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             session_dir_input = ui.input(
                 label="会话目录（.session 所在目录）", value=default_session_dir
             ).classes("w-56")
-            account_select = ui.select(
-                label="选择账号（可多选）",
-                options=[],
-                multiple=True,
-            ).classes("min-w-[260px]").props("use-chips")
+            account_select = (
+                ui.select(
+                    label="选择账号（可多选）",
+                    options=[],
+                    multiple=True,
+                )
+                .classes("min-w-[260px]")
+                .props("use-chips")
+            )
             ui.button("刷新账号/群组", on_click=lambda: refresh_options()).props(
                 "outline"
             )
@@ -1088,9 +1090,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 finally:
                     update_btn.enable()
 
-            update_btn = ui.button(
-                "从TG更新群组", on_click=update_chats_from_tg
-            ).props("outline")
+            update_btn = ui.button("从TG更新群组", on_click=update_chats_from_tg).props(
+                "outline"
+            )
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             chat_input = ui.input(
@@ -1107,16 +1109,28 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 label="发送间隔（秒）", value=5, min=1, max=3600, format="%d"
             ).classes("w-36")
             delete_input = ui.number(
-                label="删除延迟（秒，0或空=不删除）", value=20, min=0, max=86400, format="%d"
+                label="删除延迟（秒，0或空=不删除）",
+                value=20,
+                min=0,
+                max=86400,
+                format="%d",
             ).classes("w-36")
             total_input = ui.number(
-                label="每账号发送条数（0=不限）", value=50, min=0, max=1000000, format="%d"
+                label="每账号发送条数（0=不限）",
+                value=50,
+                min=0,
+                max=1000000,
+                format="%d",
             ).classes("w-48")
 
-        phrases_input = ui.textarea(
-            label="本任务语库（每行一条，留空则使用内置 200 条语库）",
-            placeholder="例如：\n今天天气不错\n群里挺热闹啊\n学到了学到了",
-        ).classes("w-full").props("outlined autogrow")
+        phrases_input = (
+            ui.textarea(
+                label="本任务语库（每行一条，留空则使用内置 200 条语库）",
+                placeholder="例如：\n今天天气不错\n群里挺热闹啊\n学到了学到了",
+            )
+            .classes("w-full")
+            .props("outlined autogrow")
+        )
 
         ui.label(
             "提示：发送过于频繁可能触发 Telegram 风控，建议间隔不小于 5 秒；同一账号不能同时用于多个运行中的任务。"

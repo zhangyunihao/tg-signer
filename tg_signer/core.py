@@ -255,7 +255,7 @@ class Client(SafeGetForumTopics, BaseClient):
                 try:
                     await self.start()
                 except ConnectionError:
-                    pass
+                    logger.debug("启动客户端连接失败", exc_info=True)
             return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -268,7 +268,7 @@ class Client(SafeGetForumTopics, BaseClient):
                 try:
                     await self.stop()
                 except ConnectionError:
-                    pass
+                    logger.debug("断开客户端连接失败", exc_info=True)
                 _CLIENT_INSTANCES.pop(self.key, None)
 
     @property
@@ -339,6 +339,34 @@ def get_client(
     )
     _CLIENT_INSTANCES[key] = client
     return client
+
+
+async def safe_disconnect(client: Optional[Client], timeout: float = 15.0) -> None:
+    """兜底断连：优雅 disconnect 失败/超时后 terminate 重试，最后强制关闭 sqlite 存储。
+
+    用于覆盖所有可能持有 Pyrogram 连接的场景，避免半连接残留导致
+    session 文件锁（Windows WinError 32）或后续操作抛
+    "Cannot operate on a closed database" / "Client has not been started yet"。
+    """
+    if client is None:
+        return
+    closed = False
+    for stage in ("graceful", "terminate"):
+        try:
+            if stage == "terminate":
+                await asyncio.wait_for(client.terminate(), timeout)
+            await asyncio.wait_for(client.disconnect(), timeout)
+            closed = True
+            break
+        except Exception:
+            logger.debug("safe_disconnect %s 阶段失败", stage, exc_info=True)
+    if not closed:
+        storage = getattr(client, "storage", None)
+        if getattr(storage, "conn", None) is not None:
+            try:
+                await storage.close()
+            except Exception:
+                logger.debug("强制关闭 session 存储失败", exc_info=True)
 
 
 def make_dirs(path: pathlib.Path, exist_ok=True):
@@ -1159,6 +1187,12 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         chat_ids = [c.chat_id for c in config.chats]
 
         async def sign_once():
+            # 多账号错峰启动：TG_SIGNER_START_DELAY（秒）由 WebUI 按账号槽位下发，
+            # 签到动作前先等待，避免同一群里连续出现多个账号的签到消息
+            start_delay = float(os.environ.get("TG_SIGNER_START_DELAY", "0") or 0)
+            if start_delay > 0:
+                self.log(f"多账号错峰启动：等待 {int(start_delay)} 秒后开始签到")
+                await asyncio.sleep(start_delay)
             # TG_SIGNER_SHUFFLE_CHATS=1 时随机打乱频道执行顺序（每个账号进程各自独立打乱）
             chats = list(config.chats)
             if os.environ.get("TG_SIGNER_SHUFFLE_CHATS") == "1":

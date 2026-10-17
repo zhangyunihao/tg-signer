@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
 import re
 from datetime import datetime, timedelta
@@ -23,7 +24,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from tg_signer.core import get_client
+from tg_signer.core import get_client, safe_disconnect
+
+logger = logging.getLogger(__name__)
 
 # 命中「确认参与」类按钮的默认关键词（仅点击带 callback_data 的按钮，不碰 URL 按钮）
 DEFAULT_CONFIRM_KEYWORDS = (
@@ -55,18 +58,20 @@ SCAN_HARD_CAP = 1000
 
 # —— 历史补漏 ——
 # 周期性重拉各频道最近若干条消息，捞回此前扫描失败/中断漏掉的抽奖帖
-RESCUE_INTERVAL = 600          # 补漏扫描间隔（秒），0 = 关闭
-RESCUE_LIMIT = 10              # 每次补漏每频道重拉的消息条数
-RESCUE_MAX_FAILS = 3           # 连续失败达该轮数后熔断暂停补漏
+RESCUE_INTERVAL = 600  # 补漏扫描间隔（秒），0 = 关闭
+RESCUE_LIMIT = 10  # 每次补漏每频道重拉的消息条数
+RESCUE_MAX_FAILS = 3  # 连续失败达该轮数后熔断暂停补漏
 RESCUE_RESUME_COOLDOWN = 1800  # 熔断后的自动恢复等待（秒）
-RESCUE_FETCH_TIMEOUT = 60      # 单频道补漏拉取消息的超时（秒）
-SEEN_CAP_PER_CHAT = 500        # 每频道保留的已处理消息 id 上限
+RESCUE_FETCH_TIMEOUT = 60  # 单频道补漏拉取消息的超时（秒）
+SEEN_CAP_PER_CHAT = 500  # 每频道保留的已处理消息 id 上限
 
 # URL 主体合法字符（不含空白与非西文字符）：链接紧贴中文/全角标点时在此截断
 _URL_BODY = r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*"
 # t.me/<username> + 后续路径/查询（用户名 5~32 位，字母/数字/下划线）
 _TME_RE = re.compile(
-    r"(?:https?://)?t\.me/(?P<name>[A-Za-z0-9_]{5,32})(?P<rest>[/?#]" + _URL_BODY + r")?",
+    r"(?:https?://)?t\.me/(?P<name>[A-Za-z0-9_]{5,32})(?P<rest>[/?#]"
+    + _URL_BODY
+    + r")?",
     re.IGNORECASE,
 )
 # tg://resolve?domain=<u>&start=<p> 形式
@@ -89,7 +94,9 @@ _DATE_YMD_RE = re.compile(
     r"(?:(?P<y>20\d{2})\s*[-/.年]\s*)?(?P<m>\d{1,2})\s*[-/.月]\s*(?P<d>\d{1,2})\s*[日号]?"
 )
 # 时间：20:00 / 20点30分 / 8点
-_TIME_HM_RE = re.compile(r"(?P<h>\d{1,2})\s*[:点时]\s*(?P<mi>\d{1,2})\s*分?|(?P<h2>\d{1,2})点")
+_TIME_HM_RE = re.compile(
+    r"(?P<h>\d{1,2})\s*[:点时]\s*(?P<mi>\d{1,2})\s*分?|(?P<h2>\d{1,2})点"
+)
 
 
 def parse_draw_date(text: str, now: Optional[datetime] = None) -> Optional[datetime]:
@@ -114,7 +121,7 @@ def parse_draw_date(text: str, now: Optional[datetime] = None) -> Optional[datet
         dt = datetime(year, int(dm.group("m")), int(dm.group("d")))
     except ValueError:
         return None
-    tail = window[dm.end(): dm.end() + 12]
+    tail = window[dm.end() : dm.end() + 12]
     tm = _TIME_HM_RE.search(tail)
     if tm is not None:
         hour = int(tm.group("h") or tm.group("h2") or 0)
@@ -169,9 +176,7 @@ def parse_bot_start_link(url: str) -> Optional[Tuple[str, str]]:
 
 def _message_text(message: Any) -> str:
     return str(
-        getattr(message, "text", None)
-        or getattr(message, "caption", None)
-        or ""
+        getattr(message, "text", None) or getattr(message, "caption", None) or ""
     )
 
 
@@ -278,10 +283,7 @@ def extract_channel_targets(message: Any) -> List[str]:
                     continue  # 帖子/消息路径链接，不能 join
                 if rest.startswith("?"):
                     query = parse_qs(urlparse(rest).query)
-                    if any(
-                        k in query
-                        for k in ("start", "startgroup", "startapp")
-                    ):
+                    if any(k in query for k in ("start", "startgroup", "startapp")):
                         continue  # bot 深度链接，不属于加入目标
                 _add(target)
             for am in _AT_CHANNEL_RE.finditer(piece):
@@ -366,9 +368,9 @@ class GiveawayState:
         }
         if len(bucket) > MAX_STATE_PER_ACCOUNT:
             # 按时间戳丢弃最旧的若干条
-            for old_key in sorted(
-                bucket, key=lambda k: str(bucket[k].get("ts") or "")
-            )[: len(bucket) - MAX_STATE_PER_ACCOUNT]:
+            for old_key in sorted(bucket, key=lambda k: str(bucket[k].get("ts") or ""))[
+                : len(bucket) - MAX_STATE_PER_ACCOUNT
+            ]:
                 bucket.pop(old_key, None)
         self._dirty = True
 
@@ -470,7 +472,9 @@ class GiveawayEngine:
             return False
         self._state = state or self._state
         self.chats = list(chats)
-        self.keywords = tuple(str(k).strip() for k in (keywords or ()) if str(k).strip())
+        self.keywords = tuple(
+            str(k).strip() for k in (keywords or ()) if str(k).strip()
+        )
         self.confirm_keywords = tuple(confirm_keywords or DEFAULT_CONFIRM_KEYWORDS)
         self.confirm_wait = max(0, int(confirm_wait))
         self.auto_join = bool(auto_join)
@@ -514,7 +518,7 @@ class GiveawayEngine:
         try:
             await task
         except Exception:
-            pass
+            logger.debug("等待抽奖任务收尾时任务异常退出", exc_info=True)
         if self._task is task:
             self._task = None
 
@@ -523,7 +527,7 @@ class GiveawayEngine:
             try:
                 self.on_event(payload)
             except Exception:
-                pass
+                logger.debug("事件回调 on_event 执行失败", exc_info=True)
 
     async def _connect_accounts(self, accounts: List[str]) -> None:
         for account in accounts:
@@ -537,10 +541,7 @@ class GiveawayEngine:
                 )
                 if not ok:
                     self.log(f"「{account}」会话未授权，已跳过")
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+                    await safe_disconnect(client)
                     continue
                 # 连接成功即纳入账号表；昵称仅用于展示，获取失败不断开
                 self._clients[account] = client
@@ -556,28 +557,20 @@ class GiveawayEngine:
             except asyncio.TimeoutError:
                 self.log(f"「{account}」连接超时（网络或代理异常），已跳过")
                 if client is not None:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+                    await safe_disconnect(client)
             except Exception as exc:
                 self.log(f"「{account}」连接失败: {exc}")
                 if client is not None:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+                    await safe_disconnect(client)
 
     async def _ensure_connected(self, client: Any) -> bool:
         """确保 client 可用；断线时尝试重连一次。"""
         if getattr(client, "is_connected", False):
             return True
         try:
-            await asyncio.wait_for(
-                client.connect(), timeout=self.CONNECT_TIMEOUT
-            )
+            await asyncio.wait_for(client.connect(), timeout=self.CONNECT_TIMEOUT)
         except Exception:
-            pass
+            logger.debug("重连客户端连接失败", exc_info=True)
         return bool(getattr(client, "is_connected", False))
 
     async def _run(self, accounts: List[str], auto_scan: bool) -> None:
@@ -599,10 +592,7 @@ class GiveawayEngine:
                 await self._stop.wait()
         finally:
             for client in self._clients.values():
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
+                await safe_disconnect(client)
             self._clients.clear()
             self.log("自动抽奖已停止")
 
@@ -636,12 +626,8 @@ class GiveawayEngine:
                     scanned = 0
                     # 先扫置顶消息：很多群的抽奖帖长期置顶；同时识别聊天类型
                     is_group = await self._scan_pinned(account, client, chat)
-                    if (
-                        is_group
-                        or (
-                            self.max_joins is not None
-                            and self.joined >= self.max_joins
-                        )
+                    if is_group or (
+                        self.max_joins is not None and self.joined >= self.max_joins
                     ):
                         # 群组只扫指定（置顶）消息；达到上限也不再扫历史
                         continue
@@ -718,9 +704,7 @@ class GiveawayEngine:
         try:
             from pyrogram.enums import MessagesFilter
 
-            async for m in client.search_messages(
-                chat, filter=MessagesFilter.PINNED
-            ):
+            async for m in client.search_messages(chat, filter=MessagesFilter.PINNED):
                 pinned_list.append(m)
         except Exception as exc:
             self.log(f"[{account}] 枚举置顶消息失败，仅处理最新置顶: {exc}")
@@ -771,12 +755,10 @@ class GiveawayEngine:
         """
         while not (self._stop is not None and self._stop.is_set()):
             try:
-                await asyncio.wait_for(
-                    self._stop.wait(), timeout=self.rescue_interval
-                )
+                await asyncio.wait_for(self._stop.wait(), timeout=self.rescue_interval)
                 return  # 收到停止信号
             except asyncio.TimeoutError:
-                pass
+                logger.debug("历史补漏轮询等待超时，继续下一周期", exc_info=True)
             if self.scanning:
                 continue  # 完整/手动扫描进行中，让路并重等一个周期
             if self._rescue_suspended_until is not None:
@@ -819,11 +801,11 @@ class GiveawayEngine:
                         self.log(f"[{account}] 补漏 {chat} 失败: {exc}")
                         failures += 1
             gained = self.joined - joined_before
-            if gained or failures:
-                self.log(
-                    f"补漏扫描完成：捞回并参与 {gained} 个"
-                    + (f"，{failures} 个频道拉取失败" if failures else "")
-                )
+            # 每轮必记一行，便于确认补漏循环在按间隔运行
+            self.log(
+                f"补漏轮次完成：参与 {gained} 个"
+                + (f"，{failures} 个频道拉取失败" if failures else "")
+            )
         finally:
             self.scanning = False
             self.scan_text = ""
@@ -851,9 +833,7 @@ class GiveawayEngine:
         fetched: List[Any] = []
 
         async def _fetch() -> None:
-            async for message in client.get_chat_history(
-                chat, limit=self.rescue_limit
-            ):
+            async for message in client.get_chat_history(chat, limit=self.rescue_limit):
                 fetched.append(message)
 
         # 超时仅约束网络拉取；参与流程含预期内的随机延迟，不做强杀
@@ -866,9 +846,7 @@ class GiveawayEngine:
                 continue  # 已处理过（水位线去重）
             await self._process_message(account, client, message)
 
-    async def _rescue_group_pinned(
-        self, account: str, client: Any, chat: Any
-    ) -> None:
+    async def _rescue_group_pinned(self, account: str, client: Any, chat: Any) -> None:
         """群组补漏：只重拉置顶消息并按水位线去重处理，不扫历史。"""
         chat_info = await client.get_chat(chat)
         pinned = getattr(chat_info, "pinned_message", None)
@@ -914,9 +892,7 @@ class GiveawayEngine:
         links = extract_bot_links(message)
         if not links:
             return None
-        if not skip_keywords and not message_matches_keywords(
-            message, self.keywords
-        ):
+        if not skip_keywords and not message_matches_keywords(message, self.keywords):
             # 消息含 bot 链接但关键词未命中：记录一条日志（同一条消息只提示一次）
             msg_key = (
                 account,
@@ -953,7 +929,9 @@ class GiveawayEngine:
             cap_key = ("cap", account)
             if cap_key not in self._skip_logged:
                 self._skip_logged.add(cap_key)
-                self.log(f"[{account}] 已达参与上限 {self.max_joins} 个，后续命中不再参与")
+                self.log(
+                    f"[{account}] 已达参与上限 {self.max_joins} 个，后续命中不再参与"
+                )
             return None
         lock = self._locks.setdefault(account, asyncio.Lock())
         participated = 0
@@ -1149,9 +1127,7 @@ class GiveawayEngine:
             try:
                 chat = await client.join_chat(target)
                 title = str(getattr(chat, "title", "") or target)
-                self.log(
-                    f"[{account}] 已加入 {title}（来自 @{bot_username} 的消息）"
-                )
+                self.log(f"[{account}] 已加入 {title}（来自 @{bot_username} 的消息）")
                 joined_any = True
             except Exception as exc:
                 msg = str(exc)
@@ -1212,10 +1188,8 @@ class GiveawayEngine:
                     async for recent in client.get_chat_history(username, limit=4):
                         candidates.append(recent)
                 except Exception:
-                    pass
-                if any(
-                    self._find_confirm_button(m) is not None for m in candidates
-                ):
+                    logger.debug("轮询拉取 bot 最新消息失败", exc_info=True)
+                if any(self._find_confirm_button(m) is not None for m in candidates):
                     break
         if self.auto_join:
             did_join = False
@@ -1232,14 +1206,13 @@ class GiveawayEngine:
                     async for recent in client.get_chat_history(username, limit=4):
                         candidates.append(recent)
                 except Exception:
-                    pass
+                    logger.debug("加入频道后拉取 bot 最新消息失败", exc_info=True)
             # 通用策略：多数抽奖 bot 要求「先加入频道再点一次抽奖」——
             # bot 消息里出现过加入要求时，加入校验完成后重发一次 start
             # 完成参与（此前可能已全部加入过，不必本次有新加入）
             if had_join_targets:
                 self.log(
-                    f"[{account}] @{username} 要求加入频道后重新参与，"
-                    "再次发送 start"
+                    f"[{account}] @{username} 要求加入频道后重新参与，再次发送 start"
                 )
                 try:
                     restart_msg = await client.start_bot(username, param)
@@ -1251,9 +1224,7 @@ class GiveawayEngine:
                     self.log(f"重新参与 @{username} 失败: {exc}")
             elif username.lower() in BOTS_RESTART_AFTER_JOIN:
                 # 强制名单：无加入要求也重发一次
-                self.log(
-                    f"[{account}] @{username} 加入校验完成，重新发送 start"
-                )
+                self.log(f"[{account}] @{username} 加入校验完成，重新发送 start")
                 try:
                     restart_msg = await client.start_bot(username, param)
                     candidates = [restart_msg] if restart_msg is not None else []
