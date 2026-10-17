@@ -239,7 +239,10 @@ def _build_dashboard(container) -> None:
                 ui.label("查看当前已登录账户信息 (users/*/me.json)。").classes(
                     "text-gray-600"
                 )
-                refreshers.append(user_info_block())
+                users_refresh = user_info_block()
+                refreshers.append(users_refresh)
+                # 块本身只创建空容器并返回 refresh，需立即调用一次填充内容
+                users_refresh()
                 with ui.row().classes("w-full justify-end"):
                     ui.button("关闭", on_click=users_dialog.close).props("outline")
 
@@ -255,6 +258,8 @@ def _build_dashboard(container) -> None:
                 ).classes("text-gray-600")
                 _records_block = SignRecordBlock()
                 refreshers.append(_records_block)
+                # SignRecordBlock 构造时同样只建空容器，需立即 refresh 填充
+                _records_block.refresh()
                 with ui.row().classes("w-full justify-end"):
                     ui.button("关闭", on_click=records_dialog.close).props("outline")
 
@@ -267,7 +272,9 @@ def _build_dashboard(container) -> None:
             with logs_card:
                 ui.label("日志").classes("text-lg font-semibold")
                 ui.label("查看日志文件的最新行。").classes("text-gray-600")
-                refreshers.append(log_block())
+                logs_refresh = log_block()
+                refreshers.append(logs_refresh)
+                logs_refresh()
                 with ui.row().classes("w-full justify-end"):
                     ui.button("关闭", on_click=logs_dialog.close).props("outline")
 
