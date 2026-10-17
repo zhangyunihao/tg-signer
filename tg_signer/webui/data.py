@@ -212,13 +212,34 @@ def set_account_enabled(
     _write_accounts_state(path, state)
 
 
+def load_two_way_accounts(workdir: Optional[Path | str] = None) -> set:
+    """读取标记为「双向」的账户名集合（webui_accounts.json，默认空集 = 都不是双向）。"""
+    two_way = _read_accounts_state(_accounts_state_path(workdir)).get("two_way")
+    return set(two_way) if isinstance(two_way, list) else set()
+
+
+def set_account_two_way(
+    name: str, two_way: bool, workdir: Optional[Path | str] = None
+) -> None:
+    """标记/取消账户「双向」，持久化到 webui_accounts.json（保留其他字段）。"""
+    path = _accounts_state_path(workdir)
+    state = _read_accounts_state(path)
+    values = set(state.get("two_way") or [])
+    if two_way:
+        values.add(name)
+    else:
+        values.discard(name)
+    state["two_way"] = sorted(values)
+    _write_accounts_state(path, state)
+
+
 def rename_account_state(
     old: str, new: str, workdir: Optional[Path | str] = None
 ) -> None:
-    """账户重命名后，同步更新 webui_accounts.json 中的 disabled 与 order 记录。"""
+    """账户重命名后，同步更新 webui_accounts.json 中的 disabled/order/two_way 记录。"""
     path = _accounts_state_path(workdir)
     state = _read_accounts_state(path)
-    for field in ("disabled", "order"):
+    for field in ("disabled", "order", "two_way"):
         values = state.get(field)
         if isinstance(values, list) and old in values:
             values[values.index(old)] = new
@@ -325,13 +346,15 @@ def export_all_configs(workdir: Optional[Path | str] = None) -> bytes:
 
     # 任务历史（随机发言任务列表）不导出：绑定具体设备，无需迁移
 
-    # 账户状态（停用名单 + 顺序）
+    # 账户状态（停用名单 + 顺序 + 双向标记）
     state = _read_accounts_state(_accounts_state_path(base))
     account_state = {}
     if isinstance(state.get("disabled"), list):
         account_state["disabled"] = state["disabled"]
     if isinstance(state.get("order"), list):
         account_state["order"] = state["order"]
+    if isinstance(state.get("two_way"), list):
+        account_state["two_way"] = state["two_way"]
     if account_state:
         payload["account_state"] = account_state
 
@@ -368,6 +391,8 @@ def import_all_configs(
             state["disabled"] = account_state["disabled"]
         if isinstance(account_state.get("order"), list):
             state["order"] = account_state["order"]
+        if isinstance(account_state.get("two_way"), list):
+            state["two_way"] = account_state["two_way"]
         _write_accounts_state(_accounts_state_path(base), state)
 
     return counts

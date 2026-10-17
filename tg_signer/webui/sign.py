@@ -37,11 +37,13 @@ from tg_signer.webui.data import (
     load_config,
     load_disabled_accounts,
     load_sign_records,
+    load_two_way_accounts,
     load_user_infos,
     rename_account_state,
     save_config,
     set_account_enabled,
     set_account_order,
+    set_account_two_way,
 )
 from tg_signer.webui.interactive import InteractiveSignerConfig
 from tg_signer.webui.schema_utils import clean_schema
@@ -1645,9 +1647,17 @@ def user_info_block() -> Callable[[], None]:
         set_account_enabled(name, enabled, state.workdir)
         ui.notify(f"账户 {name} 已{'启用' if enabled else '停用'}", type="positive")
 
+    def toggle_two_way(name: str, two_way: bool) -> None:
+        set_account_two_way(name, two_way, state.workdir)
+        ui.notify(
+            f"账户 {name} 已{'标记为双向（发言数要求类抽奖自动跳过）' if two_way else '取消双向标记'}",
+            type="positive",
+        )
+
     def refresh() -> None:
         container.clear()
         disabled = load_disabled_accounts(state.workdir)
+        two_ways = load_two_way_accounts(state.workdir)
         with container:
             # —— 账户管理 ——
             with ui.card().classes("w-full shadow-sm"):
@@ -1831,6 +1841,19 @@ def user_info_block() -> Callable[[], None]:
                                         on_click=lambda n=name: delete_account(n),
                                     ).props("flat round dense color=negative").tooltip(
                                         "删除账户"
+                                    )
+                                with ui.row().classes(
+                                    "w-full items-center justify-between"
+                                ):
+                                    ui.switch(
+                                        "双向",
+                                        value=name in two_ways,
+                                        on_change=lambda e, n=name: toggle_two_way(
+                                            n, e.value
+                                        ),
+                                    ).props("dense").tooltip(
+                                        "双向账号无法接收陌生人主动私聊，"
+                                        "遇「发言数大于 N 条」类抽奖自动跳过"
                                     )
                                 info = identities.get(name)
                                 if info:

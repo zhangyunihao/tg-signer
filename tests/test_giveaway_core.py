@@ -11,8 +11,11 @@ from tg_signer.giveaway_core import (
     extract_bot_links,
     extract_channel_targets,
     message_matches_keywords,
+    message_region_allowed,
+    message_requires_speech,
     parse_bot_start_link,
     parse_draw_date,
+    parse_region_limits,
 )
 
 # ---------------- parse_bot_start_link ----------------
@@ -163,6 +166,86 @@ def test_message_matches_keywords():
     assert message_matches_keywords(message, [])
     # caption 也算文本
     assert message_matches_keywords(_msg(caption="抽奖"), ["抽奖"])
+
+
+# ---------------- 归属地限制过滤 ----------------
+
+
+def test_parse_region_limits():
+    # 无「归属地」行 = 不限地区
+    assert parse_region_limits("正常抽奖帖，无地区限制") is None
+    # 常规格式
+    assert parse_region_limits("奖品：现金\n归属地 陕西") == [["陕西"]]
+    assert parse_region_limits("归属地 上海,江苏") == [["上海", "江苏"]]
+    # 全角冒号与空格
+    assert parse_region_limits("归属地：上海、江苏") == [["上海", "江苏"]]
+    # 行首 emoji 装饰
+    assert parse_region_limits("📍归属地：陕西") == [["陕西"]]
+    # 句子中间提及「归属地」不误判
+    assert parse_region_limits("请填写归属地信息后参与") is None
+
+
+def test_message_region_allowed():
+    # 无归属地行：放行
+    assert message_region_allowed(_msg(text="https://t.me/LotteryBestBot?start=x"))
+    # 限制地区不含上海：拦截
+    assert not message_region_allowed(
+        _msg(text="抽奖\n归属地 陕西\nhttps://t.me/LotteryBestBot?start=x")
+    )
+    # 限制地区含上海：放行
+    assert message_region_allowed(
+        _msg(text="抽奖\n归属地 上海,江苏\nhttps://t.me/LotteryBestBot?start=x")
+    )
+    # 全国/不限：放行
+    assert message_region_allowed(_msg(text="归属地 全国"))
+    assert message_region_allowed(_msg(text="归属地 不限"))
+    # caption 同样生效
+    assert not message_region_allowed(_msg(caption="归属地 北京"))
+    # 多行归属地：任一行放行即可
+    assert message_region_allowed(_msg(text="归属地 陕西\n归属地 上海"))
+
+
+# ---------------- 发言数要求检测与双向账户跳过 ----------------
+
+
+def test_message_requires_speech():
+    # 用户给出的两种真实帖式样
+    assert message_requires_speech(_msg(text="🎫 加入-群组\n└  🎟️ 发言数大于 10 条"))
+    assert message_requires_speech(_msg(text="发言数大于10条"))
+    assert message_requires_speech(_msg(text="发言数超过 5 条"))
+    assert message_requires_speech(_msg(text="发言数不少于 3 条"))
+    assert message_requires_speech(_msg(text="发言大于 8 条"))
+    # 无发言要求 / 口令要求不算发言要求
+    assert not message_requires_speech(_msg(text="正常抽奖，发送口令激活"))
+    assert not message_requires_speech(_msg(text="发言数要求见群规"))
+
+
+def test_engine_two_way_account_skips_speech_required(tmp_path):
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    client = FakeClient(bot_users={"LotteryBot"})
+    engine.two_way_accounts = {"acc_two_way"}
+    engine.log = lambda _m: None
+
+    text = (
+        "🎰 萝莉岛抽奖 参与条件：加入群组\n"
+        "└  🎟️ 发言数大于 10 条\n"
+        "https://t.me/LotteryBot?start=x1"
+    )
+    message = _msg(text=text)
+
+    # 双向账户：发言数要求抽奖自动跳过，不发 start
+    asyncio.run(_run_process(engine, client, "acc_two_way", message))
+    assert client.started == []
+    # 非双向账户：正常参与
+    asyncio.run(_run_process(engine, client, "acc_normal", message))
+    assert client.started == [("LotteryBot", "x1")]
+
+    # 同一抽奖无发言数要求时，双向账户也正常参与
+    plain = _msg(text="抽奖啦 https://t.me/LotteryBot?start=x2")
+    asyncio.run(_run_process(engine, client, "acc_two_way", plain))
+    assert client.started == [("LotteryBot", "x1"), ("LotteryBot", "x2")]
 
 
 # ---------------- GiveawayState 去重持久化 ----------------

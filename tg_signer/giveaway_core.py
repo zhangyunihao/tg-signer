@@ -251,6 +251,53 @@ def message_matches_keywords(message: Any, keywords: Iterable[str]) -> bool:
     return any(kw in text for kw in kws)
 
 
+# —— 归属地限制过滤 ——
+# 消息中出现「归属地 xxx」行（如「归属地 陕西」「归属地 上海,江苏」）视为地区限制抽奖：
+# 无该行 = 不限地区；有该行时仅当受限地区包含白名单地区（或写明全国/不限）才参与。
+# 允许行首有至多 4 个非中文字符的装饰（emoji、符号等），「归属地」必须位于行首附近，
+# 避免句子中间提及「归属地」被误判为限制声明。
+REGION_LIMIT_RE = re.compile(
+    r"^[^\u4e00-\u9fff\n]{0,4}归属地\s*[:：]?\s*(\S.*)$", re.MULTILINE
+)
+REGION_SPLIT_RE = re.compile(r"[，,、/|\s]+")
+ALLOWED_REGIONS = ("上海",)
+REGION_UNLIMITED_WORDS = ("全国", "不限", "所有", "全部")
+
+
+def parse_region_limits(text: str) -> Optional[List[List[str]]]:
+    """提取文本中全部「归属地」行的地区列表；无该行返回 None（不限地区）。"""
+    limits: List[List[str]] = []
+    for m in REGION_LIMIT_RE.finditer(text or ""):
+        regions = [r for r in REGION_SPLIT_RE.split(m.group(1).strip()) if r]
+        if regions:
+            limits.append(regions)
+    return limits or None
+
+
+def message_region_allowed(message: Any) -> bool:
+    """归属地限制过滤：无「归属地」行，或任一行的地区含白名单地区/全国不限时放行。"""
+    limits = parse_region_limits(_message_text(message))
+    if limits is None:
+        return True
+    for regions in limits:
+        if any(any(w in r for w in REGION_UNLIMITED_WORDS) for r in regions):
+            return True
+        if any(any(want in r for r in regions) for want in ALLOWED_REGIONS):
+            return True
+    return False
+
+
+# —— 发言数要求检测 ——
+# 抽奖帖含「发言数大于 N 条」「发言数超过 N 条」等参与条件时，双向账号
+# （隐私设置导致无法被 bot/群成员主动私聊核实）无法达标，需自动跳过。
+SPEECH_REQUIRE_RE = re.compile(r"发言数?\s*(?:大于等于|不少于|大于|超过|>=|>)\s*\d+")
+
+
+def message_requires_speech(message: Any) -> bool:
+    """消息是否带「发言数」类参与条件。"""
+    return bool(SPEECH_REQUIRE_RE.search(_message_text(message) or ""))
+
+
 def extract_channel_targets(message: Any) -> List[str]:
     """从消息文本/实体/按钮中提取频道与群组加入目标（激进模式）。
 
@@ -415,6 +462,8 @@ class GiveawayEngine:
         self._join_target_types: Dict[str, Optional[str]] = {}
         # 忽略历史成功记录（start 时可覆盖）：默认遵循去重记录
         self.ignore_history = False
+        # 标记为「双向」的账户集合：发言数要求类抽奖自动跳过
+        self.two_way_accounts: set = set()
         self.chats: List = []
         self.keywords: Tuple[str, ...] = DEFAULT_KEYWORDS
         self.max_joins: Optional[int] = None
@@ -463,6 +512,7 @@ class GiveawayEngine:
         confirm_wait: int = 8,
         confirm_keywords: Optional[Iterable[str]] = None,
         ignore_history: bool = False,
+        two_way_accounts: Optional[Iterable[str]] = None,
         state: Optional[GiveawayState] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         on_finish: Optional[Callable[[], None]] = None,
@@ -480,6 +530,8 @@ class GiveawayEngine:
         self.auto_join = bool(auto_join)
         # 忽略历史成功记录：开启后已参与过的抽奖链接允许重新参与
         self.ignore_history = bool(ignore_history)
+        # 双向账户集合：发言数要求类抽奖自动跳过
+        self.two_way_accounts = {str(a) for a in (two_way_accounts or ())}
         self.max_joins = max(0, int(max_joins)) if max_joins else None
         if rescue_interval is not None:
             self.rescue_interval = max(0, int(rescue_interval))
@@ -904,6 +956,36 @@ class GiveawayEngine:
                 self.log(
                     f"[{account}] 关键词未命中"
                     f"（{'，'.join(self.keywords) or '无'}），跳过"
+                    f"：{_giveaway_title(message) or '(无文本)'}"
+                )
+            return None
+        # 归属地限制过滤：仅参与无地区限制或含白名单地区的抽奖（对群组置顶同样生效）
+        if not message_region_allowed(message):
+            limits = parse_region_limits(_message_text(message)) or []
+            first = limits[0] if limits else []
+            msg_key = (
+                account,
+                str(getattr(getattr(message, "chat", None), "id", "") or ""),
+                str(getattr(message, "id", "") or ""),
+            )
+            if msg_key not in self._skip_logged:
+                self._skip_logged.add(msg_key)
+                self.log(
+                    f"[{account}] 归属地限制（{'、'.join(first) or '未知'}），跳过"
+                    f"：{_giveaway_title(message) or '(无文本)'}"
+                )
+            return None
+        # 发言数要求 + 双向账户：无法达标，自动跳过（对群组置顶同样生效）
+        if account in self.two_way_accounts and message_requires_speech(message):
+            msg_key = (
+                account,
+                str(getattr(getattr(message, "chat", None), "id", "") or ""),
+                str(getattr(message, "id", "") or ""),
+            )
+            if msg_key not in self._skip_logged:
+                self._skip_logged.add(msg_key)
+                self.log(
+                    f"[{account}] 账号为双向且抽奖有发言数要求，跳过"
                     f"：{_giveaway_title(message) or '(无文本)'}"
                 )
             return None

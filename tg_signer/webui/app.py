@@ -10,6 +10,7 @@ from typing import Callable
 
 from nicegui import app, ui
 
+from tg_signer import __version__
 from tg_signer.webui.auto_leave import auto_leave_block
 from tg_signer.webui.combo import combo_block
 from tg_signer.webui.common import notify_error, state
@@ -191,12 +192,14 @@ def _apply_paths(workdir_input, on_refresh: Callable[[], None]) -> None:
 
 def _build_dashboard(container) -> None:
     with container:
-        # 右上角菜单按钮，绝对定位不占布局空间（下拉项在对话框定义后填充）
-        header_btn = (
-            ui.button(icon="more_vert")
-            .props("flat round dense")
-            .classes("absolute top-1 right-3 z-10")
-        )
+        # 右上角版本号 + 菜单按钮，绝对定位不占布局空间（下拉项在对话框定义后填充）
+        with ui.row().classes(
+            "absolute top-1 right-3 z-10 items-center gap-0 no-wrap"
+        ):
+            ui.label(f"v{__version__}").classes(
+                "text-xs text-gray-500 select-none mr-1"
+            )
+            header_btn = ui.button(icon="more_vert").props("flat round dense")
 
         refreshers: list[Callable[[], None]] = []
         refresh_records: "SignRecordBlock"

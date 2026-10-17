@@ -16,7 +16,7 @@ from nicegui import ui
 
 from tg_signer.giveaway_core import DEFAULT_KEYWORDS, GiveawayEngine, GiveawayState
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.data import load_user_infos
+from tg_signer.webui.data import load_two_way_accounts, load_user_infos
 from tg_signer.webui.random_chat import (
     build_account_options,
     list_session_names,
@@ -318,6 +318,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             auto_scan=bool(cfg.get("auto_scan", True)),
             auto_join=bool(cfg.get("auto_join", True)),
             ignore_history=bool(cfg.get("ignore_history", True)),
+            two_way_accounts=sorted(load_two_way_accounts(workdir)),
             max_joins=(int(cfg["max_joins"]) if cfg.get("max_joins") else None),
             delay_range=(
                 float(cfg.get("delay_min") or 0),
