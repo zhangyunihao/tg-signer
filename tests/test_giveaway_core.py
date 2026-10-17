@@ -1029,6 +1029,118 @@ def test_click_confirm_no_restart_without_join_targets(tmp_path, monkeypatch):
     assert not any("再次发送 start" in line for line in logs)
 
 
+class _CallbackClient(FakeClient):
+    """带 callback 点击记录的客户端；bot 用户名的 get_chat 返回 BOT 类型。"""
+
+    def __init__(self, bot_users=None):
+        super().__init__(bot_users)
+        self.callback_clicks = []
+
+    async def get_chat(self, chat):
+        if str(chat).lower() in {u.lower() for u in self.bot_users}:
+            return SimpleNamespace(
+                pinned_message=None, type=SimpleNamespace(name="BOT")
+            )
+        return self.chat_info
+
+    async def request_callback_answer(self, chat_id, message_id, callback_data):
+        self.callback_clicks.append((chat_id, message_id, callback_data))
+
+
+def test_click_confirm_clicks_same_bot_url_button(tmp_path, monkeypatch):
+    """bot 回复「您已获得抽奖资格」类消息带 URL 按钮「点击参与抽奖」，
+    链接指向同一 bot 的 start 深度链接时，按链接参数重发 start 完成参与。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _CallbackClient(bot_users={"BaibaoxiangCjBot"})
+    msg = _msg(
+        text="您已获得抽奖资格（已达标）✅您已完成所有任务，请直接参与抽奖！",
+        buttons=[[_btn("🎟️ 点击参与抽奖", url="https://t.me/BaibaoxiangCjBot?start=q1")]],
+    )
+    asyncio.run(engine._click_confirm("acc", client, "BaibaoxiangCjBot", msg, "r1"))
+    assert client.started == [("BaibaoxiangCjBot", "q1")]
+    assert any("参与按钮" in line and "点击参与抽奖" in line for line in logs)
+
+
+def test_click_confirm_clicks_plain_same_bot_url_button(tmp_path, monkeypatch):
+    """URL 按钮指向同一 bot 但无 start 参数：重发 start（空参数）。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _CallbackClient(bot_users={"SomeGiveBot"})
+    msg = _msg(
+        text="请点击下方按钮参与抽奖",
+        buttons=[[_btn("点击参与抽奖", url="https://t.me/SomeGiveBot")]],
+    )
+    asyncio.run(engine._click_confirm("acc", client, "SomeGiveBot", msg, "r1"))
+    assert client.started == [("SomeGiveBot", "")]
+
+
+def test_click_confirm_ignores_url_button_other_target(tmp_path, monkeypatch):
+    """URL 按钮指向其他频道/bot：不点击，也不重发 start。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _CallbackClient(bot_users={"SomeGiveBot"})
+    msg = _msg(
+        text="抽奖活动",
+        buttons=[[_btn("点击参与抽奖", url="https://t.me/OtherChannel?start=x")]],
+    )
+    asyncio.run(engine._click_confirm("acc", client, "SomeGiveBot", msg, "r1"))
+    assert client.started == []
+    assert client.callback_clicks == []
+    assert not any("参与按钮" in line for line in logs)
+
+
+def test_click_confirm_still_clicks_callback_button(tmp_path, monkeypatch):
+    """callback 按钮行为不变：request_callback_answer 点击。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _CallbackClient(bot_users={"ConfirmBot"})
+    msg = _msg(
+        text="请确认参与",
+        buttons=[[_btn("✅ 确认参与抽奖", callback_data="confirm_1")]],
+    )
+    asyncio.run(engine._click_confirm("acc", client, "ConfirmBot", msg, "r1"))
+    assert client.callback_clicks == [("ConfirmBot", msg.id, "confirm_1")]
+    assert client.started == []
+    assert any("确认按钮" in line for line in logs)
+
+
 def test_engine_join_invite_request_sent_is_not_failure(tmp_path):
     """私有群审批制：INVITE_REQUEST_SENT 视为申请已提交，不算失败。"""
     import asyncio

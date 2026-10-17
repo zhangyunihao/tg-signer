@@ -28,7 +28,8 @@ from tg_signer.core import get_client, safe_disconnect
 
 logger = logging.getLogger(__name__)
 
-# 命中「确认参与」类按钮的默认关键词（仅点击带 callback_data 的按钮，不碰 URL 按钮）
+# 命中「确认参与」类按钮的默认关键词（callback 按钮直接点击；URL 按钮仅当
+# 链接指向同一 bot 的 start 深度链接时才点击，即重发 start 完成参与）
 DEFAULT_CONFIRM_KEYWORDS = (
     "确认",
     "参与",
@@ -1368,7 +1369,14 @@ class GiveawayEngine:
             did_join = False
             had_join_targets = False
             for message in candidates:
-                if extract_channel_targets(message) or (
+                # 排除指向当前 bot 自身的 t.me 链接（按钮「点击参与抽奖」等）：
+                # 那是参与入口不是加入目标，交给下方 URL 按钮点击逻辑处理
+                join_targets = [
+                    t
+                    for t in extract_channel_targets(message)
+                    if str(t).lower().lstrip("@") != username.lower()
+                ]
+                if join_targets or (
                     username.lower() == LOTTERYBEST_BOT
                     and extract_join_status_targets(message)
                 ):
@@ -1425,13 +1433,36 @@ class GiveawayEngine:
             if btn is None:
                 continue
             try:
-                await client.request_callback_answer(
-                    chat_id=username,
-                    message_id=message.id,
-                    callback_data=btn.callback_data,
-                )
-                self.log(f"已点击 @{username} 的确认按钮「{btn.text}」")
-                return
+                if getattr(btn, "callback_data", None):
+                    await client.request_callback_answer(
+                        chat_id=username,
+                        message_id=message.id,
+                        callback_data=btn.callback_data,
+                    )
+                    self.log(f"已点击 @{username} 的确认按钮「{btn.text}」")
+                    return
+                # URL 按钮：仅当链接指向同一 bot（含/不含 start 参数）时才「点击」
+                # （等同按链接参数重发 start 完成参与），其他链接一律不碰
+                url_btn = str(getattr(btn, "url", "") or "").strip()
+                link = parse_bot_start_link(url_btn)
+                plain_same_bot = False
+                if link is None:
+                    m = _TME_RE.search(url_btn)
+                    if m and not (m.group("rest") or ""):
+                        plain_same_bot = m.group("name").lower() == username.lower()
+                if link is not None and link[0].lower() == username.lower():
+                    await client.start_bot(username, link[1])
+                    self.log(
+                        f"已点击 @{username} 的参与按钮「{btn.text}」"
+                        f"（按链接参数重新参与）"
+                    )
+                    return
+                if plain_same_bot:
+                    await client.start_bot(username, "")
+                    self.log(
+                        f"已点击 @{username} 的参与按钮「{btn.text}」（重发 start）"
+                    )
+                    return
             except Exception as exc:
                 self.log(f"点击 @{username} 确认按钮失败: {exc}")
                 return
@@ -1441,7 +1472,9 @@ class GiveawayEngine:
         for row in getattr(reply_markup, "inline_keyboard", None) or []:
             for btn in row or []:
                 text = str(getattr(btn, "text", "") or "")
-                if not getattr(btn, "callback_data", None):
+                if not (
+                    getattr(btn, "callback_data", None) or getattr(btn, "url", None)
+                ):
                     continue
                 if any(kw in text for kw in self.confirm_keywords):
                     return btn

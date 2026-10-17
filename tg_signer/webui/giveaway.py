@@ -39,8 +39,8 @@ _CFG_FIELDS = {
     "session_dir": str,
     "keywords": lambda: list(DEFAULT_KEYWORDS),
     "auto_scan": lambda: True,
-    "delay_min": lambda: 3,
-    "delay_max": lambda: 10,
+    "delay_min": lambda: 1,
+    "delay_max": lambda: 3,
     "confirm_wait": lambda: 8,
     "auto_join": lambda: True,
     "max_joins": lambda: None,
@@ -264,8 +264,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         ignore_hist_switch.value = bool(cfg.get("ignore_history", True))
         delay_min_input.value = cfg["delay_min"]
         delay_max_input.value = cfg["delay_max"]
-        rescue_interval_input.value = cfg.get("rescue_interval_min") or 0
+        rescue_interval_input.value = cfg.get("rescue_interval_min") or 30
         rescue_limit_input.value = cfg.get("rescue_limit") or 10
+        rescue_switch.value = bool(cfg.get("rescue_interval_min"))
+        _apply_rescue_visibility()
         for el in (
             session_dir_input,
             account_select,
@@ -395,7 +397,11 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             )
             delay_min = max(0, int(delay_min_input.value or 0))
             delay_max = max(0, int(delay_max_input.value or 0))
-            rescue_interval_min = max(0, int(rescue_interval_input.value or 0))
+            rescue_interval_min = (
+                max(0, int(rescue_interval_input.value or 0))
+                if rescue_switch.value
+                else 0
+            )
             rescue_limit = max(1, int(rescue_limit_input.value or 10))
         except (TypeError, ValueError):
             ui.notify("参与上限/延迟/补漏参数需为数字", type="warning")
@@ -856,18 +862,22 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             ignore_hist_switch = ui.switch(
                 "忽略历史成功记录（允许重复参与）", value=True
             ).classes("pt-6")
+            rescue_switch = ui.switch(
+                "启用历史补漏扫描", value=False, on_change=lambda: _apply_rescue_visibility()
+            ).classes("pt-6")
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             delay_min_input = ui.number(
-                label="参与前随机延迟下限（秒）", value=3, min=0, max=600, format="%d"
+                label="参与前随机延迟下限（秒）", value=1, min=0, max=600, format="%d"
             ).classes("w-44")
             delay_max_input = ui.number(
-                label="延迟上限（秒）", value=10, min=0, max=600, format="%d"
+                label="延迟上限（秒）", value=3, min=0, max=600, format="%d"
             ).classes("w-36")
+
             rescue_interval_input = ui.number(
-                label="补漏扫描间隔（分钟，0=关闭）",
-                value=0,
-                min=0,
+                label="补漏扫描间隔（分钟）",
+                value=30,
+                min=1,
                 max=1440,
                 format="%d",
             ).classes("w-52")
@@ -878,6 +888,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 max=100,
                 format="%d",
             ).classes("w-44")
+
+        def _apply_rescue_visibility() -> None:
+            visible = bool(rescue_switch.value)
+            rescue_interval_input.visible = visible
+            rescue_limit_input.visible = visible
+
+        _apply_rescue_visibility()
 
         ui.label(
             "提示：参与 = 以账号身份向抽奖机器人发送 /start（等同手动点开链接）；"
