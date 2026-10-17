@@ -354,6 +354,22 @@ def reply_says_ended(message: Any) -> bool:
 LOTTERYBEST_BOT = "lotterybestbot"
 
 
+def _utf16_to_index(text: str, u16_offset: int) -> int:
+    """Telegram 实体 offset 按 UTF-16 code units 计，转成 Python 字符索引。
+
+    消息里含 🎫🎰🧸 等 emoji（UTF-16 占 2 位）时，直接用实体 offset 对齐
+    Python 行区间会逐行漂移，导致实体被错分到相邻行而丢失加入目标。
+    """
+    if u16_offset <= 0:
+        return 0
+    units = 0
+    for i, ch in enumerate(text):
+        if units >= u16_offset:
+            return i
+        units += 2 if ord(ch) > 0xFFFF else 1
+    return len(text)
+
+
 def extract_join_status_targets(message: Any) -> List[str]:
     """从「加入-名称 ❌」式回复提取隐藏链接加入目标（仅未加入行）。"""
     text = _message_text(message)
@@ -382,19 +398,27 @@ def extract_join_status_targets(message: Any) -> List[str]:
         url = getattr(ent, "url", None)
         if not url:
             continue
-        offset = int(getattr(ent, "offset", 0) or 0)
+        url_s = str(url)
+        offset = _utf16_to_index(text, int(getattr(ent, "offset", 0) or 0))
         line = next((lt for ls, le, lt in bounds if ls <= offset < le), "")
         if "加入" not in line or "❌" not in line or "✅" in line:
             continue
-        m = _TME_CHANNEL_RE.search(str(url))
+        if url_s.lower().startswith("tg://resolve"):
+            # tg://resolve?domain=xxx 形态的隐藏链接
+            query = parse_qs(urlparse(url_s).query)
+            domain = (query.get("domain") or [""])[0]
+            if re.fullmatch(r"[A-Za-z0-9_]{5,32}", domain or ""):
+                _add(domain)
+            continue
+        m = _TME_CHANNEL_RE.search(url_s)
         if m is None:
             continue
         target = m.group("target")
         rest = m.group("rest") or ""
         if target.lower().startswith(("+", "joinchat/")):
             _add(f"https://t.me/{target}")
-        elif rest.startswith("/") or rest.startswith("?"):
-            continue  # 帖子路径/bot 深度链接，不属于加入目标
+        elif rest not in ("", "/"):
+            continue  # 帖子路径（t.me/x/123）或 bot 深度链接，不属于加入目标
         else:
             _add(target)
     return targets
@@ -428,8 +452,8 @@ def extract_channel_targets(message: Any) -> List[str]:
                     # 私有邀请链接
                     _add(f"https://t.me/{target}")
                     continue
-                if rest.startswith("/"):
-                    continue  # 帖子/消息路径链接，不能 join
+                if rest not in ("", "/") and not rest.startswith("?"):
+                    continue  # 帖子/消息路径链接（t.me/x/123），不能 join
                 if rest.startswith("?"):
                     query = parse_qs(urlparse(rest).query)
                     if any(k in query for k in ("start", "startgroup", "startapp")):
@@ -1251,11 +1275,19 @@ class GiveawayEngine:
             # LotteryBestBot 的回复把「加入-名称」做成带隐藏链接的❌/✅清单，
             # 补充提取其中 ❌（未加入）行的链接目标
             known = {t.lower() for t in targets}
-            targets = targets + [
+            status_targets = [
                 t
                 for t in extract_join_status_targets(message)
                 if t.lower() not in known
             ]
+            if not status_targets:
+                raw = _message_text(message)
+                if raw and "加入" in raw and "❌" in raw:
+                    self.log(
+                        f"[{account}] @LotteryBestBot 清单含未加入(❌)行但未解析到"
+                        "链接，跳过自动加入"
+                    )
+            targets = targets + status_targets
         for target in targets:
             if target.lower().lstrip("@") == bot_username.lower():
                 continue  # 跳过 bot 自己

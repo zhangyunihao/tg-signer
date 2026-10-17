@@ -1344,13 +1344,26 @@ STATUS_REPLY = """您需加入指定的群组/频道
 🎫 加入-某测试频道E报告榜 ❌"""
 
 
+def _u16_len(s: str) -> int:
+    """字符串的 UTF-16 code unit 长度（astral emoji 占 2）。"""
+    return sum(2 if ord(c) > 0xFFFF else 1 for c in s)
+
+
 def _status_message(text, name_urls):
-    """按 name->url 构造带 TEXT_URL 实体的消息，实体覆盖名称本身。"""
+    """按 name->url 构造带 TEXT_URL 实体的消息，实体覆盖名称本身。
+
+    offset 按 UTF-16 code units 计，与真实 Telegram 协议一致。
+    """
     entities = []
     for name, url in name_urls.items():
-        offset = text.index(name)
+        prefix = text[: text.index(name)]
         entities.append(
-            SimpleNamespace(type="TEXT_URL", url=url, offset=offset, length=len(name))
+            SimpleNamespace(
+                type="TEXT_URL",
+                url=url,
+                offset=_u16_len(prefix),
+                length=_u16_len(name),
+            )
         )
     return _msg(text=text, entities=entities)
 
@@ -1380,6 +1393,40 @@ def test_extract_join_status_targets():
         == []
     )
     assert extract_join_status_targets(_msg(text="开奖日期：2026年10月20日")) == []
+
+
+def test_extract_join_status_targets_utf16_and_edge_urls():
+    """真实场景回归：astral emoji 造成 UTF-16 偏移漂移、尾斜杠链接、
+    tg://resolve 形态链接、帖子路径链接仍被排除。"""
+    from tg_signer.giveaway_core import extract_join_status_targets
+
+    text = (
+        "您需加入指定的群组/频道\n"
+        "\n"
+        "🎰 10月福利第二弹！【出击大药房】 ❌【BBW群】\n"
+        "🎫 加入-出击大药房 ❌\n"
+        "🎫 加入-BBW成都群🧸[大胸大屁股万岁] ❌\n"
+        "🎫 加入-印度药|伟哥|增硬延时💊 ❌"
+    )
+    msg = _status_message(
+        text,
+        {
+            "加入-出击大药房": "https://t.me/chujiya/",
+            "BBW成都群🧸[大胸大屁股万岁]": "tg://resolve?domain=bbw_cd_group",
+            "印度药|伟哥|增硬延时💊": "https://t.me/yindianyao",
+        },
+    )
+    assert extract_join_status_targets(msg) == [
+        "chujiya",
+        "bbw_cd_group",
+        "yindianyao",
+    ]
+    # 帖子路径链接（t.me/x/123）仍不作为加入目标
+    msg2 = _status_message(
+        "🎫 加入-某测试频道F ❌",
+        {"某测试频道F": "https://t.me/some_chan/123"},
+    )
+    assert extract_join_status_targets(msg2) == []
 
 
 def test_engine_joins_only_unjoined_status_targets(tmp_path):
