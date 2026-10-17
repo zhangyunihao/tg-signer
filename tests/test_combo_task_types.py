@@ -4,14 +4,20 @@ import json
 
 from tg_signer.giveaway_runner import engine_kwargs_from_spec
 from tg_signer.leave_runner import filter_candidates
-from tg_signer.webui.sign import build_combo_sub_spec
+from tg_signer.webui import sign as sign_mod
+from tg_signer.webui.sign import TaskRunnerBlock, build_combo_sub_spec
 
 
 def test_build_combo_sub_spec_leave(tmp_path):
-    """批量退频道子任务：使用退频道 tab 全局配置 + 内置排除关键字。"""
-    from tg_signer.webui.auto_leave import UNSELECT_KEYWORDS, save_config
+    """批量退频道子任务：优先按任务名读取任务配置；「默认配置」回退全局配置。"""
+    from tg_signer.webui.auto_leave import (
+        UNSELECT_KEYWORDS,
+        save_config,
+        save_leave_tasks,
+    )
 
     save_config(tmp_path, {"days": 14, "include_groups": True, "skip_pinned": False})
+    # 无同名任务 → 回退全局配置
     spec = build_combo_sub_spec(
         "alice",
         {"type": "批量退频道 (auto leave)", "task": "默认配置"},
@@ -27,6 +33,35 @@ def test_build_combo_sub_spec_leave(tmp_path):
     assert inner["include_groups"] is True
     assert inner["skip_pinned"] is False
     assert inner["exclude_keywords"] == list(UNSELECT_KEYWORDS)
+
+    # 按任务名命中 → 使用该任务自己的配置
+    save_leave_tasks(
+        tmp_path,
+        [
+            {
+                "id": "leave_test1",
+                "name": "夜世轩任务",
+                "accounts": ["alice"],
+                "days": 30,
+                "include_groups": False,
+                "skip_pinned": True,
+                "keywords": ["抽奖", "榜"],
+                "auto_leave": False,
+            }
+        ],
+    )
+    spec = build_combo_sub_spec(
+        "alice",
+        {"type": "批量退频道 (auto leave)", "task": "夜世轩任务"},
+        tmp_path,
+    )
+    assert spec is not None
+    inner = spec["spec"]
+    assert inner["days"] == 30
+    assert inner["include_groups"] is False
+    assert inner["skip_pinned"] is True
+    assert inner["exclude_keywords"] == ["抽奖", "榜"]
+    assert inner["auto_leave"] is False  # 仅扫描，不自动退出
 
 
 def test_build_combo_sub_spec_giveaway(tmp_path):
@@ -106,6 +141,192 @@ def test_leave_runner_filter_candidates():
     assert [r["key"] for r in out] == ["1", "4"]
     assert filter_candidates(rows, []) == rows
     assert filter_candidates(rows, ["不存在词"])[0]["key"] in {"1", "2", "3", "4"}
+
+
+def test_combo_runonce_lists_history_tasks(monkeypatch):
+    """签到 (run-once) 的组合任务下拉应列出历史执行过的任务名并附账号/频道摘要。"""
+    monkeypatch.setattr(
+        sign_mod,
+        "load_task_history",
+        lambda: [
+            {
+                "task_type": "签到 (run-once)",
+                "task_name": "旧任务",
+                "accounts": "",
+            },
+            {"task_type": "签到 (run 定时)", "task_name": "定时任务"},
+            {"task_type": "自动抽奖 (giveaway run)", "task_name": "3"},
+            {"task_type": "签到 (run-once)", "task_name": "my-sign", "accounts": ""},
+            {
+                "task_type": "签到 (run-once)",
+                "task_name": "旧任务",
+                "accounts": "alice, bob",
+            },
+        ],
+    )
+
+    class _FakeEntry:
+        payload = {
+            "chats": [
+                {"name": "频道A"},
+                {"name": None, "chat_id": -100123},
+            ]
+        }
+
+    monkeypatch.setattr(sign_mod, "load_config", lambda *a, **k: _FakeEntry())
+
+    # 跳过 __init__（不建 UI），仅用方法逻辑
+    blk = TaskRunnerBlock.__new__(TaskRunnerBlock)
+
+    names = blk._get_combo_task_names("签到 (run-once)")
+    assert names == {
+        "旧任务": "旧任务｜账号：alice, bob｜频道：频道A、-100123",
+        "my-sign": "my-sign｜账号：未绑定｜频道：频道A、-100123",
+    }  # 最新执行的任务排最前
+
+    # 配置读取失败时频道显示「未设置」，不影响任务列出
+    def _boom(*a, **k):
+        raise FileNotFoundError("x")
+
+    monkeypatch.setattr(sign_mod, "load_config", _boom)
+    names = blk._get_combo_task_names("签到 (run-once)")
+    assert names["my-sign"].endswith("频道：未设置")
+
+    # 退频道类型：仅列出开启「自动退出」的任务（仅扫描任务在组合中无意义）
+    monkeypatch.setattr(
+        sign_mod,
+        "_load_leave_tasks",
+        lambda _wd: [
+            {
+                "id": "leave_t1",
+                "name": "夜世轩任务",
+                "accounts": ["alice"],
+                "days": 30,
+                "auto_leave": False,
+            },
+            {
+                "id": "leave_t2",
+                "name": "自动退任务",
+                "accounts": ["bob"],
+                "days": 14,
+                "auto_leave": True,
+            },
+        ],
+    )
+    opts = blk._get_combo_task_names("批量退频道 (auto leave)")
+    assert opts == {"自动退任务": "自动退任务（14天｜自动退出｜账号：bob）"}
+    # 无符合条件任务时返回空（无兜底项）
+    monkeypatch.setattr(sign_mod, "_load_leave_tasks", lambda _wd: [])
+    assert blk._get_combo_task_names("批量退频道 (auto leave)") == {}
+
+
+def test_combo_giveaway_options_show_accounts_chats(monkeypatch):
+    """自动抽奖的任务下拉应显示「编号｜账号｜监控对象（优先名称）」，选中值仍是任务编号。"""
+    monkeypatch.setattr(
+        sign_mod,
+        "_load_giveaway_store",
+        lambda _wd: {
+            "tasks": {
+                "3": {"accounts": ["alice", "bob"], "chats": ["@c1", "-100x"]},
+                "7": {"accounts": [], "chats": []},
+            }
+        },
+    )
+    # 已缓存的 chat_id 显示名称，未缓存的保留原 id
+    monkeypatch.setattr(
+        sign_mod,
+        "_chat_title_map",
+        lambda _wd: {"-100x": "鲸鱼群组"},
+    )
+
+    blk = TaskRunnerBlock.__new__(TaskRunnerBlock)
+
+    opts = blk._get_combo_task_names("自动抽奖 (giveaway run)")
+    assert opts["3"] == "3｜账号：alice、bob｜监控：@c1、鲸鱼群组"
+    assert opts["7"] == "7｜账号：未设置｜监控：未设置"
+    # 超过 5 个监控对象截断显示
+    monkeypatch.setattr(
+        sign_mod,
+        "_load_giveaway_store",
+        lambda _wd: {
+            "tasks": {"2": {"accounts": ["a"], "chats": [f"@c{i}" for i in range(7)]}}
+        },
+    )
+    opts = blk._get_combo_task_names("自动抽奖 (giveaway run)")
+    assert opts["2"].endswith("等7个")
+
+
+def test_combo_sub_accounts_resolution(monkeypatch):
+    """组合子任务使用自身绑定的账号：抽奖取任务配置、退频道取任务账号、
+    签到 run-once 取任务绑定（无绑定时回退最近一次执行记录）。"""
+    monkeypatch.setattr(
+        sign_mod,
+        "_load_giveaway_store",
+        lambda _wd: {"tasks": {"6": {"accounts": ["鲸鱼cinq"]}, "8": {}}},
+    )
+    monkeypatch.setattr(
+        sign_mod,
+        "_load_leave_tasks",
+        lambda _wd: [
+            {"name": "仅扫描任务", "accounts": ["alice"], "auto_leave": False},
+            {"name": "退频道任务", "accounts": ["bob"], "auto_leave": True},
+        ],
+    )
+    monkeypatch.setattr(
+        sign_mod, "_load_leave_config", lambda _wd: {"accounts": ["legacy"]}
+    )
+    monkeypatch.setattr(
+        sign_mod,
+        "load_task_accounts",
+        lambda: {"签到 (run-once)|任务A": ["alice", "bob"]},
+    )
+    monkeypatch.setattr(
+        sign_mod,
+        "load_task_history",
+        lambda: [
+            {"task_type": "签到 (run-once)", "task_name": "任务B", "accounts": ""},
+            {
+                "task_type": "签到 (run-once)",
+                "task_name": "任务B",
+                "accounts": "carol, dave",
+            },
+        ],
+    )
+
+    # 抽奖：取任务配置中的账号
+    assert sign_mod._combo_sub_accounts(
+        {"type": "自动抽奖 (giveaway run)", "task": "6"}, None
+    ) == ["鲸鱼cinq"]
+    # 抽奖任务未设置账号 → 空
+    assert (
+        sign_mod._combo_sub_accounts(
+            {"type": "自动抽奖 (giveaway run)", "task": "8"}, None
+        )
+        == []
+    )
+    # 退频道：按任务名取账号
+    assert sign_mod._combo_sub_accounts(
+        {"type": "批量退频道 (auto leave)", "task": "退频道任务"}, None
+    ) == ["bob"]
+    # 退频道任务不存在 → 回退旧版全局配置
+    assert sign_mod._combo_sub_accounts(
+        {"type": "批量退频道 (auto leave)", "task": "不存在"}, None
+    ) == ["legacy"]
+    # 签到 run-once：优先任务绑定账号
+    assert sign_mod._combo_sub_accounts(
+        {"type": "签到 (run-once)", "task": "任务A"}, None
+    ) == ["alice", "bob"]
+    # 无绑定时回退最近一次执行记录（最新记录在前，取第一个命中的）
+    assert sign_mod._combo_sub_accounts(
+        {"type": "签到 (run-once)", "task": "任务B"}, None
+    ) == ["carol", "dave"]
+    # 完全无来源 → 空
+    assert (
+        sign_mod._combo_sub_accounts(
+            {"type": "签到 (run-once)", "task": "任务C"}, None
+        )
+        == []
+    )
 
 
 def test_giveaway_runner_engine_kwargs():

@@ -8,11 +8,12 @@ spec 格式::
 
     {"account": "账号名", "session_dir": "工作目录",
      "days": 7, "include_groups": false, "skip_pinned": true,
-     "exclude_keywords": ["抽奖", ...]}
+     "exclude_keywords": ["抽奖", ...], "auto_leave": true}
 
 行为与「批量退频道」tab 一致但非交互：扫描超过 N 天未更新的频道/群组
 （始终跳过自己是创建者、置顶对话），排除命中关键字的对话后全部自动退出
-（并发 8）。日志输出到 stdout 由 WebUI 组合任务采集。
+（并发 8）；auto_leave=false 时仅扫描不退出。日志输出到 stdout 由
+WebUI 组合任务采集。
 """
 
 import asyncio
@@ -54,6 +55,11 @@ async def run_leave(spec: dict) -> int:
         bool(spec.get("skip_pinned", True)),
         log,
     )
+    if not bool(spec.get("auto_leave", True)):
+        # 任务未开启「自动退出未命中关键字的频道」：组合场景无法手动确认，
+        # 仅扫描记录，不做任何退出
+        log(f"[{account}] 任务未开启自动退出，仅扫描：共 {len(rows)} 个超期对话")
+        return 0
     kws = list(spec.get("exclude_keywords") or [])
     if kws:
         before = len(rows)

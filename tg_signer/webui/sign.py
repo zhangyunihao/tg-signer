@@ -20,6 +20,7 @@ from tg_signer.core import get_api_config, get_proxy, safe_disconnect
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.auto_leave import UNSELECT_KEYWORDS as _LEAVE_EXCLUDE_KEYWORDS
 from tg_signer.webui.auto_leave import load_config as _load_leave_config
+from tg_signer.webui.auto_leave import load_leave_tasks as _load_leave_tasks
 from tg_signer.webui.combo import load_composite_tasks
 from tg_signer.webui.common import (
     SOURCE_ROOT,
@@ -47,7 +48,12 @@ from tg_signer.webui.data import (
     set_account_order,
     set_account_two_way,
 )
-from tg_signer.webui.giveaway import load_task_store as _load_giveaway_store
+from tg_signer.webui.giveaway import (
+    channel_title_map as _chat_title_map,
+)
+from tg_signer.webui.giveaway import (
+    load_task_store as _load_giveaway_store,
+)
 from tg_signer.webui.interactive import InteractiveSignerConfig
 from tg_signer.webui.schema_utils import clean_schema
 
@@ -70,6 +76,32 @@ def build_combo_sub_spec(
     task_name = str(sub.get("task") or "")
     label = f"{sub_type} · {task_name}" if task_name else sub_type
     if "退频道" in sub_type:
+        # 按名称选择退频道任务（任务列表模式）；「默认配置」或找不到时
+        # 回退旧版全局配置，兼容历史保存的组合
+        leave_task = next(
+            (
+                t
+                for t in _load_leave_tasks(workdir)
+                if str(t.get("name")) == task_name
+            ),
+            None,
+        )
+        if leave_task is not None:
+            return {
+                "label": label,
+                "module": "tg_signer.leave_runner",
+                "spec": {
+                    "account": account,
+                    "session_dir": str(workdir),
+                    "days": int(leave_task.get("days") or 7),
+                    "include_groups": bool(leave_task.get("include_groups")),
+                    "skip_pinned": bool(leave_task.get("skip_pinned", True)),
+                    "exclude_keywords": list(
+                        leave_task.get("keywords") or _LEAVE_EXCLUDE_KEYWORDS
+                    ),
+                    "auto_leave": bool(leave_task.get("auto_leave", False)),
+                },
+            }
         cfg = _load_leave_config(workdir)
         return {
             "label": label,
@@ -120,6 +152,50 @@ def build_combo_sub_spec(
     else:
         return None
     return {"label": label, "args": args}
+
+
+def _combo_sub_accounts(sub: dict, workdir) -> list[str]:
+    """获取组合子任务自身绑定的账号列表（组合执行不再手动选账号）。
+
+    - 自动抽奖：抽奖任务配置里的 accounts；
+    - 批量退频道：退频道任务的 accounts（找不到任务时回退旧版全局配置）；
+    - 签到 (run-once)：任务绑定账号（webui_task_accounts.json），无绑定时
+      回退最近一次执行记录中的账号。
+    """
+    sub_type = str(sub.get("type") or "")
+    task_name = str(sub.get("task") or "")
+    if "抽奖" in sub_type:
+        store = _load_giveaway_store(workdir)
+        gcfg = store["tasks"].get(task_name) or {}
+        return [str(a) for a in (gcfg.get("accounts") or []) if a]
+    if "退频道" in sub_type:
+        leave_task = next(
+            (
+                t
+                for t in _load_leave_tasks(workdir)
+                if str(t.get("name")) == task_name
+            ),
+            None,
+        )
+        if leave_task is not None:
+            return [str(a) for a in (leave_task.get("accounts") or []) if a]
+        return [
+            str(a)
+            for a in (_load_leave_config(workdir).get("accounts") or [])
+            if a
+        ]
+    if "run-once" in sub_type:
+        bound = load_task_accounts().get(f"{sub_type}|{task_name}", [])
+        if bound:
+            return [str(a) for a in bound if a]
+        for r in reversed(load_task_history()):
+            if (
+                "签到 (run-once)" in str(r.get("task_type") or "")
+                and str(r.get("task_name") or "") == task_name
+            ):
+                parts = str(r.get("accounts") or "").split(",")
+                return [a.strip() for a in parts if a.strip()]
+    return []
 
 
 SIGNER_TEMPLATE: Dict[str, object] = {
@@ -393,6 +469,34 @@ def append_task_history(record: dict) -> None:
     save_task_history(items)
 
 
+# 任务绑定账号：任务首次执行后记住所用账号，后续执行无需再选
+TASK_ACCOUNTS_FILE = "webui_task_accounts.json"
+
+
+def _task_accounts_path() -> Path:
+    return get_workdir(state.workdir) / TASK_ACCOUNTS_FILE
+
+
+def load_task_accounts() -> dict[str, list[str]]:
+    path = _task_accounts_path()
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_task_binding(task_type: str, task_name: str, accounts: list[str]) -> None:
+    if not task_type or not task_name or not accounts:
+        return
+    data = load_task_accounts()
+    data[f"{task_type}|{task_name}"] = list(accounts)
+    atomic_write_json(_task_accounts_path(), data)
+
+
 def update_task_history(record: dict) -> None:
     """按记录 id 更新已存在的历史条目并持久化。"""
     items = load_task_history()
@@ -573,6 +677,7 @@ class TaskRunnerBlock:
                     label="选择任务",
                     options=[],
                     with_input=True,
+                    on_change=self._on_task_change,
                 ).classes("min-w-[200px]")
 
                 self.account_select = (
@@ -584,7 +689,13 @@ class TaskRunnerBlock:
                     .classes("min-w-[240px]")
                     .props("use-chips")
                 )
-            ui.label("账号来自 *.session 文件；多选时每个账号各启动一个进程。").classes(
+            with ui.row().classes("items-center gap-2 w-full") as self.binding_row:
+                self.binding_label = ui.label("").classes("text-sm text-primary")
+                ui.button(
+                    "更改账号", on_click=self._show_account_select
+                ).props("flat dense")
+            self.binding_row.set_visibility(False)
+            ui.label("账号来自 *.session 文件；多选时每个账号各启动一个进程。首次执行后账号与任务绑定，后续执行无需再选。").classes(
                 "text-xs text-gray-500"
             )
             with ui.row().classes("gap-2 justify-end w-full"):
@@ -618,6 +729,66 @@ class TaskRunnerBlock:
                 if c.get("name")
             ]
         return []
+
+    def _get_combo_task_names(self, task_type: str) -> list[str] | dict[str, str]:
+        """组合任务弹窗的任务下拉：签到 (run-once) 列出历史上执行过的任务名
+        （而非 signs/ 下的任务配置），并附「账号｜频道」摘要；自动抽奖列出
+        「编号｜账号｜监控对象」；其余类型沿用 _get_task_names。"""
+        if "run-once" in task_type:
+            names: dict[str, str] = {}
+            for r in reversed(load_task_history()):
+                if "签到 (run-once)" not in str(r.get("task_type") or ""):
+                    continue
+                name = str(r.get("task_name") or "")
+                if not name or name in names:
+                    continue
+                accounts = str(r.get("accounts") or "").strip()
+                chats_text = ""
+                try:
+                    entry = load_config("signer", name, state.workdir)
+                    chats = entry.payload.get("chats") or []
+                    labels = [
+                        str(c.get("name") or c.get("chat_id") or "") for c in chats
+                    ]
+                    labels = [x for x in labels if x]
+                    chats_text = "、".join(labels[:5])
+                    if len(labels) > 5:
+                        chats_text += f" 等{len(labels)}个"
+                except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+                    logger.debug("读取签到任务配置失败：%s", name, exc_info=True)
+                names[name] = f"{name}｜账号：{accounts or '未绑定'}｜频道：{chats_text or '未设置'}"
+            return names
+        if "抽奖" in task_type:
+            store = _load_giveaway_store(state.workdir)
+            title_map = _chat_title_map(state.workdir)
+            opts: dict[str, str] = {}
+            for tid in sorted(
+                store["tasks"].keys(), key=lambda k: int(k) if str(k).isdigit() else 0
+            ):
+                cfg = store["tasks"][tid] or {}
+                accounts = "、".join(str(a) for a in (cfg.get("accounts") or []))
+                chats = [str(c) for c in (cfg.get("chats") or [])]
+                # 监控对象优先显示频道/群组名称，未缓存的保留原 id
+                labels = [title_map.get(c, c) for c in chats]
+                chats_text = "、".join(labels[:5])
+                if len(labels) > 5:
+                    chats_text += f" 等{len(labels)}个"
+                opts[str(tid)] = (
+                    f"{tid}｜账号：{accounts or '未设置'}｜监控：{chats_text or '未设置'}"
+                )
+            return opts
+        if "退频道" in task_type:
+            # 批量退频道为任务列表模式：仅列出开启了「自动退出未命中关键字的
+            # 频道」的任务（组合执行无人工确认环节，仅扫描任务在组合中无意义）
+            opts = {}
+            for t in _load_leave_tasks(state.workdir):
+                name = str(t.get("name") or "")
+                if not name or not t.get("auto_leave"):
+                    continue
+                accs = "、".join(str(a) for a in (t.get("accounts") or []))
+                opts[name] = f"{name}（{t.get('days')}天｜自动退出｜账号：{accs or '未设置'}）"
+            return opts
+        return self._get_task_names(task_type)
 
     def _get_account_names(self) -> list[str]:
         """账号来自 session 文件（与 CLI 默认 session_dir='.' 一致），另附加 TG_ACCOUNT 环境变量；
@@ -760,12 +931,10 @@ class TaskRunnerBlock:
         ui.notify("已清空任务历史", type="positive")
 
     def open_dialog(self) -> None:
-        self._on_type_change()
         self._refresh_accounts()
-        # 默认全选发现的账号
-        if not self.account_select.value and self.account_select.options:
-            self.account_select.value = list(self.account_select.options)
-            self.account_select.update()
+        self._on_type_change()
+        # 任务选中后按绑定账号自动填充，无需手动选择
+        self._on_task_change()
         self.dialog.open()
 
     def _on_type_change(self) -> None:
@@ -776,6 +945,38 @@ class TaskRunnerBlock:
         else:
             self.task_select.value = None
         self.task_select.update()
+
+    def _get_bound_accounts(self, task_name: str) -> list[str]:
+        """任务已绑定的账号（过滤掉当前已不存在的账号）。"""
+        task_type = self.type_select.value or ""
+        bound = load_task_accounts().get(f"{task_type}|{task_name}", [])
+        options = self.account_select.options or []
+        return [a for a in bound if a and a in options]
+
+    def _on_task_change(self) -> None:
+        """任务选择变化：有绑定时直接使用绑定账号并隐藏选择框，无绑定时默认全选。"""
+        task_name = self.task_select.value
+        bound = self._get_bound_accounts(task_name) if task_name else []
+        if bound:
+            self.account_select.value = list(bound)
+            self.binding_label.text = (
+                f"已绑定账号：{'、'.join(bound)}，执行时无需再选择"
+            )
+            self.account_select.set_visibility(False)
+            self.binding_row.set_visibility(True)
+        else:
+            self.binding_row.set_visibility(False)
+            self.account_select.set_visibility(True)
+            if not self.account_select.value and self.account_select.options:
+                self.account_select.value = list(self.account_select.options)
+        self.account_select.update()
+        self.binding_row.update()
+
+    def _show_account_select(self) -> None:
+        """点击「更改账号」：重新显示账号选择框，绑定账号已预填可直接调整。"""
+        self.binding_row.set_visibility(False)
+        self.account_select.set_visibility(True)
+        self.account_select.update()
 
     def _build_args(self, account: str, task_type: str, task_name: str) -> list[str]:
         workdir = str(state.workdir)
@@ -799,6 +1000,8 @@ class TaskRunnerBlock:
         if not accounts:
             ui.notify("请至少选择一个账号", type="warning")
             return
+        # 记住该任务使用的账号，下次执行无需再选
+        save_task_binding(self.type_select.value or "", task_name, accounts)
         if self._launch(self.type_select.value or "", task_name, accounts):
             self.dialog.close()
 
@@ -810,6 +1013,36 @@ class TaskRunnerBlock:
         auto: bool = False,
     ) -> bool:
         """启动一个任务（每账号一个子进程）。auto=True 表示服务重启后的自动恢复。"""
+        is_combo = "组合" in task_type
+        combo_subs: list[dict] = []
+        sub_account_sets: list[list[str]] = []
+        if is_combo:
+            combo = next(
+                (
+                    c
+                    for c in load_composite_tasks(state.workdir)
+                    if c.get("name") == task_name
+                ),
+                None,
+            )
+            if not combo or not combo.get("subs"):
+                ui.notify("组合任务不存在或没有子任务", type="warning")
+                return False
+            combo_subs = combo["subs"]
+            # 组合任务：不使用外部传入账号，各子任务使用其自身绑定的账号并集
+            sub_account_sets = [
+                _combo_sub_accounts(sub, state.workdir) for sub in combo_subs
+            ]
+            accounts = []
+            for accs in sub_account_sets:
+                for a in accs:
+                    if a and a not in accounts:
+                        accounts.append(a)
+            available = set(self._get_account_names())
+            accounts = [a for a in accounts if a in available]
+            if not accounts:
+                ui.notify("组合任务的子任务都没有绑定可用账号", type="warning")
+                return False
         # 多账号时打乱启动顺序，避免每次都按相同顺序发言
         accounts = [a for a in accounts if a]
         random.shuffle(accounts)
@@ -836,28 +1069,17 @@ class TaskRunnerBlock:
         }
         procs: list[dict] = []
         run_queue: queue.Queue = queue.Queue()
-        is_combo = "组合" in task_type
-        combo_subs: list[dict] = []
-        if is_combo:
-            combo = next(
-                (
-                    c
-                    for c in load_composite_tasks(state.workdir)
-                    if c.get("name") == task_name
-                ),
-                None,
-            )
-            if not combo or not combo.get("subs"):
-                ui.notify("组合任务不存在或没有子任务", type="warning")
-                return False
-            combo_subs = combo["subs"]
         chats_labels = [] if is_combo else self._chat_labels(task_name)
         detail_rows: list[dict] = []
         for account in accounts:
             if is_combo:
-                # 组合任务：每账号一个进程，进程内按顺序执行全部子任务
+                # 组合任务：每账号一个进程，进程内按顺序执行该账号参与的全部子任务
                 spec_subs = []
-                for sub in combo_subs:
+                for sub, sub_accs in zip(
+                    combo_subs, sub_account_sets, strict=True
+                ):
+                    if account not in sub_accs:
+                        continue
                     built = build_combo_sub_spec(
                         account, sub, state.workdir
                     )

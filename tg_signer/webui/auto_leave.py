@@ -1,4 +1,11 @@
-"""自动退群：扫描所选账号的对话，找出超过 N 天不更新的频道（可选含群组），预览确认后批量退出。"""
+"""自动退群：任务列表模式。
+
+新建任务（选择账号、不更新天数阈值、保护关键字、自动退出开关），
+启动后扫描所选账号超过 N 天未更新的频道（可选含群组）：
+- 未命中保护关键字的频道：开关打开时自动退出（无需确认）；
+- 命中保护关键字的频道：始终展示在任务结果里，可手动勾选后退出。
+自己是创建者的对话永远不会被退出。
+"""
 
 import asyncio
 import json
@@ -15,15 +22,17 @@ from tg_signer.utils import atomic_write_json
 from tg_signer.webui.random_chat import (
     build_account_options,
     list_session_names,
-    schedule_auth_checks,
 )
 
 logger = logging.getLogger(__name__)
 
 CONFIG_NAME = "auto_leave_config.json"
+LEAVE_TASKS_FILE = "webui_leave_tasks.json"
 
-# 扫描结果默认不勾选的关键字（频道名命中即排除，防止误退）
+# 保护关键字（频道名命中即不自动退出，仅在结果中展示供手动勾选）
 UNSELECT_KEYWORDS = ("抽奖", "嫩妹社", "野寻", "榜")
+
+DEFAULT_KEYWORDS = "抽奖,嫩妹社,野寻,榜"
 
 
 def _config_path(workdir) -> Path:
@@ -53,6 +62,42 @@ def save_config(workdir, cfg: Dict) -> None:
         atomic_write_json(_config_path(workdir), cfg)
     except Exception:
         logger.debug("保存自动退群配置文件失败", exc_info=True)
+
+
+def _tasks_path(workdir) -> Path:
+    return Path(workdir) / LEAVE_TASKS_FILE
+
+
+def load_leave_tasks(workdir) -> List[Dict]:
+    """读取退频道任务列表；缺失时尝试从旧版单配置迁移出一条默认任务"""
+    try:
+        data = json.loads(_tasks_path(workdir).read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [t for t in data if isinstance(t, dict) and t.get("id")]
+    except Exception:
+        logger.debug("读取退频道任务列表失败，视为空", exc_info=True)
+    cfg = load_config(workdir)
+    if cfg.get("accounts"):
+        return [
+            {
+                "id": f"leave_{datetime.now():%Y%m%d%H%M%S}",
+                "name": "默认退频道任务",
+                "accounts": list(cfg.get("accounts") or []),
+                "days": int(cfg.get("days") or 7),
+                "include_groups": bool(cfg.get("include_groups")),
+                "skip_pinned": bool(cfg.get("skip_pinned", True)),
+                "keywords": list(UNSELECT_KEYWORDS),
+                "auto_leave": False,
+            }
+        ]
+    return []
+
+
+def save_leave_tasks(workdir, tasks: List[Dict]) -> None:
+    try:
+        atomic_write_json(_tasks_path(workdir), tasks)
+    except Exception:
+        logger.debug("保存退频道任务列表失败", exc_info=True)
 
 
 def _chat_type(chat) -> str:
@@ -143,14 +188,81 @@ async def leave_one(client, chat_id, title: str, log: Callable[[str], None]) -> 
     return False
 
 
+async def _leave_rows(
+    account: str,
+    session_dir: Path,
+    rows: List[Dict],
+    log: Callable[[str], None],
+    should_stop: Callable[[], bool] | None = None,
+) -> set:
+    """按账号并发退出给定对话（并发 8），返回成功退出的 key 集合"""
+    done: set = set()
+    if not rows:
+        return done
+    client = None
+    try:
+        client = get_client(account, workdir=str(session_dir))
+        ok = await asyncio.wait_for(client.connect(), 30)
+        if not ok:
+            log(f"[{account}] 会话未授权，跳过 {len(rows)} 个")
+            return done
+        log(f"[{account}] 开始批量退出 {len(rows)} 个对话（并发 8）")
+        done_lock = asyncio.Lock()
+        sem = asyncio.Semaphore(8)
+
+        async def _do_leave(row: Dict) -> None:  # noqa: B023
+            if should_stop is not None and should_stop():
+                return
+            async with sem:  # noqa: B023
+                success = await leave_one(
+                    client,  # noqa: B023
+                    row["chat_id"],
+                    row["title"],
+                    log,  # noqa: B023
+                )
+                if success:
+                    async with done_lock:  # noqa: B023
+                        done.add(row["key"])  # noqa: B023
+
+        await asyncio.gather(*[_do_leave(row) for row in rows])
+        log(f"[{account}] 批量退出完成：成功 {len(done)}/{len(rows)}")
+    except asyncio.TimeoutError:
+        log(f"[{account}] 连接超时（30s），跳过")
+    except Exception as exc:
+        log(f"[{account}] 退出失败: {exc}")
+    finally:
+        if client is not None:
+            await safe_disconnect(client)
+    return done
+
+
+def _split_keywords(text: str) -> List[str]:
+    return [
+        kw.strip() for kw in (text or "").replace("，", ",").split(",") if kw.strip()
+    ]
+
+
 def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], None]:
-    """构建「自动退群」标签页内容，返回刷新函数以纳入全局刷新。"""
-    cfg = load_config(workdir)
-    # 会话目录固定为工作目录（全局账户统一管理），不再提供单独输入框
+    """构建「批量退频道」标签页内容，返回刷新函数以纳入全局刷新。"""
     session_dir = Path(default_session_dir or ".")
-    running = {"flag": False}
-    rows_all: List[Dict] = []
+    tasks = load_leave_tasks(workdir)
+    if tasks:
+        save_leave_tasks(workdir, tasks)  # 旧配置迁移后立即落盘
+
+    # 每个任务（执行记录）的运行时状态：running/stop/rows/selected/status/auto_left
+    task_states: Dict[str, Dict] = {
+        t["id"]: {
+            "running": False,
+            "stop": False,
+            "rows": [],
+            "selected": set(),
+            "status": str(t.get("status") or "—"),
+            "auto_left": 0,
+        }
+        for t in tasks
+    }
     log_lines: List[str] = []
+    toggle_counts: Dict[str, ui.label | None] = {}
 
     def log(msg: str) -> None:
         line = f"{datetime.now():%H:%M:%S} {msg}"
@@ -162,98 +274,96 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         except Exception:
             logger.debug("推送日志到界面日志区失败", exc_info=True)
 
-    def persist() -> None:
-        save_config(
-            workdir,
-            {
-                "session_dir": str(session_dir),
-                "days": int(days_input.value or 7),
-                "accounts": list(account_select.value or []),
-                "include_groups": bool(include_groups.value),
-                "skip_pinned": bool(skip_pinned.value),
-            },
-        )
+    def find_task(task_id: str) -> Dict | None:
+        return next((t for t in tasks if t["id"] == task_id), None)
 
-    def refresh_options() -> None:
-        names = list_session_names(session_dir, workdir)
-        account_select.options = build_account_options(session_dir, names)
-        if not account_select.value:
-            account_select.value = [
-                a for a in (cfg.get("accounts") or []) if a in names
-            ]
-        account_select.update()
-        # 后台懒检测未授权账户，完成后刷新 ⚠️ 标注
-        schedule_auth_checks(session_dir, names, on_done=refresh_marks)
+    list_container: ui.column | None = None
 
-    def refresh_marks() -> None:
-        names = list_session_names(session_dir, workdir)
-        account_select.options = build_account_options(session_dir, names)
-        account_select.update()
+    def _kw_hit(task: Dict, title: str) -> bool:
+        return any(kw in str(title or "") for kw in (task.get("keywords") or []))
 
-    async def set_busy(busy: bool) -> None:
-        running["flag"] = busy
-        for btn in (scan_btn, leave_btn):
-            btn.enable() if not busy else btn.disable()
-
-    async def on_scan() -> None:
-        if running["flag"]:
+    async def run_task(task_id: str) -> None:
+        task = find_task(task_id)
+        st = task_states.get(task_id)
+        if not task or not st or st["running"]:
             return
-        accounts = list(account_select.value or [])
+        accounts = list(task.get("accounts") or [])
         if not accounts:
-            ui.notify("请至少选择一个账号", type="warning")
+            ui.notify("请先为该任务选择账号（删除后新建）", type="warning")
             return
-        persist()
-        days = max(1, int(days_input.value or 7))
-        await set_busy(True)
+        st["running"] = True
+        st["stop"] = False
+        st["rows"].clear()
+        st["selected"].clear()
+        st["auto_left"] = 0
+        st["status"] = "扫描中"
+        render_list()
+        log(
+            f"[{task['name']}] 启动：{len(accounts)} 个账号，阈值 {task.get('days')} 天"
+        )
+        auto_leave_on = bool(task.get("auto_leave"))
         try:
-            rows_all.clear()
-            selected_keys.clear()
-            result_table.rows = []
-            result_table.selected = []
-            render_result_cards()
-            log(f"开始扫描：{len(accounts)} 个账号，阈值 {days} 天")
             for account in accounts:
+                if st["stop"]:
+                    log(f"[{task['name']}] 已停止，跳过账号 {account}")
+                    break
                 found = await scan_stale_chats(
                     account,
                     session_dir,
-                    days,
-                    bool(include_groups.value),
-                    bool(skip_pinned.value),
+                    int(task.get("days") or 7),
+                    bool(task.get("include_groups")),
+                    bool(task.get("skip_pinned", True)),
                     log,
                 )
-                rows_all.extend(found)
-                result_table.rows = list(rows_all)
-                result_table.update()
-                render_result_cards()
-            if not rows_all:
-                log("未发现符合条件的对话")
-            else:
-                # 默认全选，但名字含敏感关键字的频道不勾选（防误退抽奖/特定频道）
-                default_selected = [
-                    r
-                    for r in rows_all
-                    if not any(
-                        kw in str(r.get("title") or "") for kw in UNSELECT_KEYWORDS
-                    )
-                ]
-                result_table.selected = default_selected
-                result_table.update()
-                selected_keys.clear()
-                selected_keys.update(r["key"] for r in default_selected)
-                render_result_cards()
-                skipped = len(rows_all) - len(default_selected)
-                if skipped:
+                if auto_leave_on:
+                    auto_rows = [r for r in found if not _kw_hit(task, r["title"])]
+                    if auto_rows:
+                        done = await _leave_rows(
+                            account,
+                            session_dir,
+                            auto_rows,
+                            log,
+                            should_stop=lambda: st["stop"],
+                        )
+                        st["auto_left"] += len(done)
+                    kept = [r for r in found if _kw_hit(task, r["title"])]
                     log(
-                        f"共 {len(rows_all)} 个候选，命中排除关键字（{'、'.join(UNSELECT_KEYWORDS)}）"
-                        f"的 {skipped} 个已默认不勾选，点击「退出所选」执行"
+                        f"[{account}] 命中保护关键字 {len(kept)} 个（待手动确认），"
+                        f"未命中 {len(auto_rows)} 个自动退出"
                     )
+                    st["rows"].extend(kept)
                 else:
-                    log(f"共 {len(rows_all)} 个候选，已默认全选，点击「退出所选」执行")
+                    st["rows"].extend(found)
+                render_list()
+            if st["stop"]:
+                st["status"] = "已停止"
+            else:
+                st["status"] = (
+                    f"完成：自动退出 {st['auto_left']} 个，待确认 {len(st['rows'])} 个"
+                )
+            log(f"[{task['name']}] {st['status']}")
+        except Exception as exc:
+            st["status"] = f"异常：{exc}"
+            log(f"[{task['name']}] 运行异常: {exc}")
+            logger.debug("退频道任务运行异常", exc_info=True)
         finally:
-            await set_busy(False)
+            st["running"] = False
+            # 终态写回记录并持久化，刷新页面后仍可见
+            task["status"] = st["status"]
+            save_leave_tasks(workdir, tasks)
+            render_list()
 
-    def confirm_leave() -> None:
-        selected = list(result_table.selected or [])
+    def stop_task(task_id: str) -> None:
+        st = task_states.get(task_id)
+        if st:
+            st["stop"] = True
+
+    async def leave_selected(task_id: str) -> None:
+        task = find_task(task_id)
+        st = task_states.get(task_id)
+        if not task or not st or st["running"]:
+            return
+        selected = [r for r in st["rows"] if r["key"] in st["selected"]]
         if not selected:
             ui.notify("请先勾选要退出的对话", type="warning")
             return
@@ -278,200 +388,286 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
 
                 async def do_leave() -> None:
                     dialog.close()
-                    await on_leave(selected)
+                    st["running"] = True
+                    st["status"] = "退出中"
+                    render_list()
+                    try:
+                        by_account: Dict[str, List[Dict]] = {}
+                        for row in selected:
+                            by_account.setdefault(row["account"], []).append(row)
+                        done_keys: set = set()
+                        for account, items in by_account.items():
+                            done_keys |= await _leave_rows(
+                                account, session_dir, items, log
+                            )
+                        if done_keys:
+                            st["rows"] = [
+                                r for r in st["rows"] if r["key"] not in done_keys
+                            ]
+                            st["selected"].difference_update(done_keys)
+                        st["status"] = f"退出完成，剩余待确认 {len(st['rows'])} 个"
+                    except Exception as exc:
+                        st["status"] = f"异常：{exc}"
+                        log(f"[{task['name']}] 退出异常: {exc}")
+                        logger.debug("退频道手动退出异常", exc_info=True)
+                    finally:
+                        st["running"] = False
+                        task["status"] = st["status"]
+                        save_leave_tasks(workdir, tasks)
+                        render_list()
 
                 ui.button("确认退出", on_click=do_leave).props("color=negative")
         dialog.open()
 
-    async def on_leave(selected: List[Dict]) -> None:
-        if running["flag"]:
+    def delete_task(task_id: str) -> None:
+        task = find_task(task_id)
+        st = task_states.get(task_id)
+        if not task:
             return
-        await set_busy(True)
-        persist()
-        by_account: Dict[str, List[Dict]] = {}
-        for row in selected:
-            by_account.setdefault(row["account"], []).append(row)
-        try:
-            for account, items in by_account.items():
-                client = None
-                try:
-                    client = get_client(account, workdir=str(session_dir))
-                    ok = await asyncio.wait_for(client.connect(), 30)
-                    if not ok:
-                        log(f"[{account}] 会话未授权，跳过 {len(items)} 个")
-                        continue
-                    log(f"[{account}] 开始批量退出 {len(items)} 个对话（并发 8）")
-                    done_keys: set = set()
-                    done_lock = asyncio.Lock()
-                    sem = asyncio.Semaphore(8)
+        if st and st["running"]:
+            ui.notify("任务运行中，请先停止再删除", type="warning")
+            return
+        with ui.dialog() as dialog, ui.card():
 
-                    async def _do_leave(row: Dict) -> None:  # noqa: B023
-                        # 误报：闭包在本轮循环体内立即被 gather 消费，不会读到下一轮的变量
-                        async with sem:  # noqa: B023
-                            success = await leave_one(
-                                client,  # noqa: B023
-                                row["chat_id"],
-                                row["title"],
-                                log,  # noqa: B023
-                            )
-                            if success:
-                                async with done_lock:  # noqa: B023
-                                    done_keys.add(row["key"])  # noqa: B023
+            def do_delete() -> None:
+                dialog.close()
+                tasks.remove(task)
+                task_states.pop(task_id, None)
+                save_leave_tasks(workdir, tasks)
+                log(f"已删除任务：{task['name']}")
+                render_list()
 
-                    await asyncio.gather(*[_do_leave(row) for row in items])
-                    log(f"[{account}] 批量退出完成：成功 {len(done_keys)}/{len(items)}")
-                    if done_keys:
-                        remain = [r for r in rows_all if r["key"] not in done_keys]
-                        rows_all.clear()
-                        rows_all.extend(remain)
-                        selected_keys.difference_update(done_keys)
-                        result_table.rows = list(rows_all)
-                        result_table.selected = [
-                            r for r in rows_all if r["key"] in selected_keys
-                        ]
-                        result_table.update()
-                        render_result_cards()
-                except asyncio.TimeoutError:
-                    log(f"[{account}] 连接超时（30s），跳过")
-                except Exception as exc:
-                    log(f"[{account}] 退出失败: {exc}")
-                finally:
-                    if client is not None:
-                        await safe_disconnect(client)
-            log("退出流程结束")
-        finally:
-            await set_busy(False)
+            ui.label(f"确认删除任务「{task['name']}」？").classes(
+                "text-lg font-semibold"
+            )
+            with ui.row().classes("w-full justify-end"):
+                ui.button("取消", on_click=dialog.close).props("flat")
+                ui.button("删除", on_click=do_delete).props("color=negative")
+        dialog.open()
+
+    def open_create_dialog(prefill: Dict | None = None) -> None:
+        prefill = prefill or {}
+        names = list_session_names(session_dir, workdir)
+        with (
+            ui.dialog() as dialog,
+            ui.card().classes("w-[520px] max-w-[96vw] max-h-[88vh] overflow-auto"),
+        ):
+            ui.label("复制退频道任务" if prefill else "新建退频道任务").classes(
+                "text-lg font-semibold"
+            )
+            default_name = (
+                f"{prefill.get('name', '')} 副本"
+                if prefill
+                else f"退频道任务 {datetime.now():%m-%d %H:%M}"
+            )
+            name_input = ui.input("任务名称", value=default_name).classes("w-full")
+            account_sel = ui.select(
+                label="账号（可多选）",
+                options=build_account_options(session_dir, names),
+                multiple=True,
+                with_input=True,
+                value=[a for a in (prefill.get("accounts") or []) if a in names]
+                or None,
+            ).classes("w-full")
+            with ui.row().classes("w-full items-end flex-wrap gap-2"):
+                days_input = ui.number(
+                    label="不更新天数阈值",
+                    value=int(prefill.get("days") or 7),
+                    min=1,
+                    step=1,
+                    format="%.0f",
+                ).classes("w-36")
+                ig = ui.checkbox("包含群组", value=bool(prefill.get("include_groups")))
+                sp = ui.checkbox(
+                    "跳过置顶", value=bool(prefill.get("skip_pinned", True))
+                )
+            kw_input = ui.input(
+                "保护关键字（逗号分隔）",
+                value=",".join(prefill.get("keywords") or []) or DEFAULT_KEYWORDS,
+            ).classes("w-full")
+            ui.label(
+                "未命中关键字的频道将在启动后自动退出；命中关键字的频道仅展示，需手动勾选退出"
+            ).classes("text-xs text-gray-500")
+            auto_cb = ui.checkbox(
+                "自动退出未命中关键字的频道",
+                value=bool(prefill.get("auto_leave")),
+            )
+            with ui.row().classes("w-full justify-end"):
+
+                def do_create() -> None:
+                    accounts = list(account_sel.value or [])
+                    if not accounts:
+                        ui.notify("请至少选择一个账号", type="warning")
+                        return
+                    task = {
+                        "id": f"leave_{datetime.now():%Y%m%d%H%M%S%f}",
+                        "name": str(name_input.value or "").strip() or "退频道任务",
+                        "accounts": accounts,
+                        "days": max(1, int(days_input.value or 7)),
+                        "include_groups": bool(ig.value),
+                        "skip_pinned": bool(sp.value),
+                        "keywords": _split_keywords(str(kw_input.value or "")),
+                        "auto_leave": bool(auto_cb.value),
+                        "status": "—",
+                    }
+                    tasks.append(task)
+                    task_states[task["id"]] = {
+                        "running": False,
+                        "stop": False,
+                        "rows": [],
+                        "selected": set(),
+                        "status": "—",
+                        "auto_left": 0,
+                    }
+                    save_leave_tasks(workdir, tasks)
+                    dialog.close()
+                    render_list()
+                    # 每次执行都是一条新记录，创建后立即启动
+                    run_task(task["id"])
+
+                ui.button("取消", on_click=dialog.close).props("flat")
+                ui.button("启动执行", on_click=do_create).props("color=primary")
+        dialog.open()
+
+    def render_task_card(container, task: Dict) -> None:
+        st = task_states[task["id"]]
+        with container:
+            with ui.card().classes("w-full leave-task-card border"):
+                with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+                    ui.label(task["name"]).classes("text-base font-semibold")
+                    status_text = str(st["status"] or "—")
+                    (
+                        ui.label(status_text).classes("text-xs text-blue-600")
+                        if st["running"]
+                        else ui.label(status_text).classes("text-xs text-gray-500")
+                    )
+                    with ui.row().classes("ml-auto gap-1"):
+                        ui.button(
+                            "停止", on_click=lambda t=task["id"]: stop_task(t)
+                        ).props("outline dense color=warning").classes(
+                            "min-w-0"
+                        ).bind_visibility_from(st, "running")
+                        ui.button(
+                            "复制",
+                            on_click=lambda t=task: open_create_dialog(
+                                {k: v for k, v in t.items() if k != "status"}
+                            ),
+                        ).props("outline dense color=primary")
+                        ui.button(
+                            "删除", on_click=lambda t=task["id"]: delete_task(t)
+                        ).props("outline dense color=negative")
+                ui.label(
+                    f"账号：{'、'.join(task.get('accounts') or []) or '未选择'}　"
+                    f"阈值：{task.get('days')} 天　"
+                    f"{'含群组，' if task.get('include_groups') else ''}"
+                    f"{'跳过置顶，' if task.get('skip_pinned', True) else ''}"
+                    f"{'自动退出未命中，' if task.get('auto_leave') else '仅展示，'}"
+                    f"关键字：{'、'.join(task.get('keywords') or []) or '无'}"
+                ).classes("text-xs text-gray-600")
+                # 结果区：命中关键字的频道（或自动退出关闭时的全部候选）
+                if st["rows"]:
+
+                    def _on_toggle(e, k: str, tid=task["id"]) -> None:
+                        sts = task_states[tid]
+                        if e.value:
+                            sts["selected"].add(k)
+                        else:
+                            sts["selected"].discard(k)
+                        if toggle_counts.get(tid) is not None:
+                            toggle_counts[
+                                tid
+                            ].text = f"已选 {len(sts['selected'])}/{len(sts['rows'])}"
+
+                    with ui.row().classes("w-full items-center gap-2"):
+
+                        def _select_all(t=task) -> None:
+                            sts = task_states[t["id"]]
+                            sts["selected"].update(r["key"] for r in sts["rows"])
+                            render_list()
+
+                        def _select_none(t=task) -> None:
+                            sts = task_states[t["id"]]
+                            sts["selected"].clear()
+                            render_list()
+
+                        ui.button("全选", on_click=_select_all).props("flat dense")
+                        ui.button("全不选", on_click=_select_none).props("flat dense")
+                        toggle_counts[task["id"]] = ui.label(
+                            f"已选 {len(st['selected'])}/{len(st['rows'])}"
+                        ).classes("text-xs text-gray-500 ml-auto")
+                    for row in st["rows"]:
+                        key = row["key"]
+                        with ui.row().classes(
+                            "w-full items-start gap-2 no-wrap p-2 rounded border"
+                        ):
+                            ui.checkbox(
+                                value=key in st["selected"],
+                                on_change=lambda e, k=key, t=task["id"]: _on_toggle(
+                                    e, k, t
+                                ),
+                            ).props("dense").classes("mt-0.5")
+                            with ui.column().classes("gap-0 min-w-0"):
+                                ui.label(str(row["title"])).classes(
+                                    "text-sm font-semibold"
+                                ).style("overflow-wrap: anywhere;")
+                                ui.label(
+                                    f"账号：{row['account']}　类型：{row['type']}　"
+                                    f"未更新 {row['age_days']} 天"
+                                ).classes("text-xs text-gray-500")
+                    with ui.row().classes("w-full items-center"):
+                        ui.button(
+                            "退出所选", on_click=lambda t=task["id"]: leave_selected(t)
+                        ).props("color=negative outline dense")
+                        ui.label("退出不可撤销，请仔细核对").classes(
+                            "text-xs text-gray-500"
+                        )
+
+    def render_list() -> None:
+        if list_container is None:
+            return
+        toggle_counts.clear()
+        list_container.clear()
+        with list_container:
+            if not tasks:
+                ui.label("暂无执行记录，点击「新建任务」开始").classes(
+                    "text-sm text-gray-400"
+                )
+            # 最新执行的记录显示在最上方
+            for task in reversed(tasks):
+                if task["id"] not in task_states:
+                    task_states[task["id"]] = {
+                        "running": False,
+                        "stop": False,
+                        "rows": [],
+                        "selected": set(),
+                        "status": str(task.get("status") or "—"),
+                        "auto_left": 0,
+                    }
+                render_task_card(list_container, task)
 
     ui.label("批量退频道").classes("text-lg font-semibold")
     ui.label(
-        "扫描所选账号的对话，列出超过指定天数没有新消息的频道（可选包含群组），"
-        "默认全选后并发批量退出。自己是创建者的对话永远不会被退出。"
+        "扫描所选账号超过指定天数没有新消息的频道（可选包含群组）并批量退出。"
+        "开启「自动退出未命中关键字」后，未命中保护关键字的频道自动退出；"
+        "命中关键字的频道展示在任务结果中，需手动勾选退出。自己是创建者的对话永远不会被退出。"
     ).classes("text-sm text-gray-500")
 
-    with ui.row().classes("w-full items-end flex-wrap"):
-        days_input = ui.number(
-            label="不更新天数阈值",
-            value=cfg.get("days") or 7,
-            min=1,
-            step=1,
-            format="%.0f",
-        ).classes("w-36 leave-days")
-        include_groups = ui.checkbox("包含群组", value=bool(cfg.get("include_groups")))
-        skip_pinned = ui.checkbox("跳过置顶", value=bool(cfg.get("skip_pinned", True)))
-        account_select = ui.select(
-            label="账号（可多选）",
-            options=[],
-            multiple=True,
-            with_input=True,
-        ).classes("min-w-64 flex-1")
-        scan_btn = (
-            ui.button("扫描预览", on_click=on_scan).props("outline").classes("ml-auto")
-        )
-
-    result_table = ui.table(
-        columns=[
-            {"name": "account", "label": "账号", "field": "account", "align": "left"},
-            {"name": "title", "label": "名称", "field": "title", "align": "left"},
-            {"name": "type", "label": "类型", "field": "type", "align": "left"},
-            {
-                "name": "age_days",
-                "label": "未更新(天)",
-                "field": "age_days",
-                "align": "left",
-            },
-            {
-                "name": "chat_id",
-                "label": "chat_id",
-                "field": "chat_id",
-                "align": "left",
-            },
-        ],
-        rows=[],
-        row_key="key",
-        selection="multiple",
-    ).classes("w-full tgs-desktop-table")
-
-    # 移动端（<=640px）卡片列表：每行一个勾选框，选中集与 result_table.selected 同步
-    selected_keys: set = set()
-    result_cards = ui.column().classes("w-full gap-2 tgs-mobile-cards")
-
-    def _sync_table_selected() -> None:
-        result_table.selected = [r for r in rows_all if r["key"] in selected_keys]
-
-    # 「已选 n/m」计数标签：单个勾选只改文字，不整列重建（避免与点击事件打架）
-    count_label: ui.label | None = None
-
-    def _refresh_count_text() -> None:
-        if count_label is not None:
-            count_label.text = f"已选 {len(selected_keys)}/{len(rows_all)}"
-
-    def render_result_cards() -> None:
-        nonlocal count_label
-        result_cards.clear()
-        count_label = None
-        with result_cards:
-            if rows_all:
-                with ui.row().classes("w-full items-center gap-2"):
-
-                    def _select_all() -> None:
-                        selected_keys.update(r["key"] for r in rows_all)
-                        _sync_table_selected()
-                        render_result_cards()
-
-                    def _select_none() -> None:
-                        selected_keys.clear()
-                        _sync_table_selected()
-                        render_result_cards()
-
-                    ui.button("全选", on_click=_select_all).props("flat dense")
-                    ui.button("全不选", on_click=_select_none).props("flat dense")
-                    count_label = ui.label(
-                        f"已选 {len(selected_keys)}/{len(rows_all)}"
-                    ).classes("text-xs text-gray-500 ml-auto")
-            else:
-                ui.label("扫描后此处显示候选频道").classes("text-sm text-gray-400")
-            for row in rows_all:
-                key = row["key"]
-                with ui.card().classes("w-full mobile-list-card border"):
-                    with ui.row().classes("w-full items-start gap-2 no-wrap"):
-
-                        def _on_toggle(e, k: str = key) -> None:
-                            if e.value:
-                                selected_keys.add(k)
-                            else:
-                                selected_keys.discard(k)
-                            _sync_table_selected()
-                            _refresh_count_text()
-
-                        ui.checkbox(
-                            value=key in selected_keys,
-                            on_change=_on_toggle,
-                        ).props("dense").classes("mt-0.5")
-                        with ui.column().classes("gap-0 min-w-0"):
-                            ui.label(str(row["title"])).classes(
-                                "text-sm font-semibold"
-                            ).style("overflow-wrap: anywhere;")
-                            ui.label(
-                                f"账号：{row['account']}　类型：{row['type']}"
-                            ).classes("text-xs text-gray-600")
-                            ui.label(
-                                f"未更新 {row['age_days']} 天　id：{row['chat_id']}"
-                            ).classes("text-xs text-gray-500")
-
     with ui.row().classes("w-full items-center"):
-        leave_btn = ui.button("退出所选", on_click=confirm_leave).props(
-            "color=negative outline"
+        ui.button("新建任务", on_click=lambda: open_create_dialog()).props(
+            "color=primary"
         )
-        ui.label("勾选要退出的对话后操作；扫描结果默认不执行任何退出").classes(
-            "text-xs text-gray-500"
+        ui.label("每次执行都会在列表新增一条记录，可复制配置再次执行").classes(
+            "text-xs text-gray-500 ml-auto"
         )
+
+    list_container = ui.column().classes("w-full gap-2")
+    render_list()
 
     log_area = ui.log(max_lines=300).classes("w-full h-48 mt-2")
     for line in log_lines:
         log_area.push(line)
 
-    account_select.on("update:model-value", lambda: persist())
-    refresh_options()
-    render_result_cards()
+    def refresh() -> None:
+        render_list()
 
-    return refresh_options
+    return refresh

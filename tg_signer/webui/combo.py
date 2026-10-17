@@ -1,4 +1,4 @@
-"""组合任务 tab：把已有任务按顺序组合为命名组合，多账号并行、子任务串行执行。
+"""组合任务 tab：把已有任务按顺序组合为命名组合，各子任务用其绑定账号执行。
 
 持久化在工作目录 ``webui_composite_tasks.json``；执行复用 TaskRunnerBlock
 的 _launch（task_type="组合任务"），运行状态与历史统一记录在「签到」tab。
@@ -16,14 +16,12 @@ from tg_signer.webui.data import get_workdir
 
 COMPOSITE_TASKS_FILE = "webui_composite_tasks.json"
 
-# 组合任务的子任务类型：现有任务类型（组合任务不可嵌套组合）
-# 批量退频道：使用「批量退频道」tab 的全局配置（天数/含群组/跳过置顶）+
-# 内置排除关键字；自动抽奖：选择「自动抽奖」tab 里已保存的任务
+# 组合任务的子任务类型（组合任务不可嵌套组合）
+# 已移除的类型及原因：自动化/监控（常驻型任务，放入组合会永久阻塞后续子任务）、
+# 签到 run 定时（同样是常驻等待定时的任务，会阻塞组合）；批量退频道使用
+# 「批量退频道」tab 的任务配置；自动抽奖：选择「自动抽奖」tab 里已保存的任务
 COMBO_SUB_TYPES = [
     "签到 (run-once)",
-    "签到 (run 定时)",
-    "自动化 (automation run)",
-    "监控 (monitor run)",
     "自动抽奖 (giveaway run)",
     "批量退频道 (auto leave)",
 ]
@@ -61,7 +59,7 @@ class ComboTaskBlock:
 
         ui.label("组合任务").classes("text-lg font-semibold")
         ui.label(
-            "把多个已有任务按顺序组合成一个组合任务；执行时每个账号依次跑完全部子任务，"
+            "把多个已有任务按顺序组合成一个组合任务；执行时各子任务使用其绑定的账号，"
             "账号之间并行。运行状态与历史记录在「签到」tab 查看。"
         ).classes("text-sm text-gray-500")
 
@@ -91,9 +89,6 @@ class ComboTaskBlock:
 
     def _save(self, items: list[dict]) -> None:
         save_composite_tasks(items, self.workdir)
-
-    def _accounts(self) -> list[str]:
-        return self.runner._get_account_names()
 
     # ---- 页面渲染 ----
 
@@ -194,7 +189,7 @@ class ComboTaskBlock:
         with ui.dialog() as self.combo_dialog, ui.card().classes("w-full max-w-2xl"):
             self.combo_title = ui.label("新增组合任务").classes("text-lg font-semibold")
             ui.label(
-                "把多个已有任务按顺序组合；执行时每个账号依次跑完全部子任务，账号之间并行。"
+                "把多个已有任务按顺序组合；执行时各子任务使用其绑定的账号，账号之间并行。"
             ).classes("text-xs text-gray-500")
             self.combo_name_input = ui.input(label="组合名称").classes("w-full")
             ui.label("子任务（按添加顺序执行，可用箭头调整）").classes(
@@ -255,7 +250,7 @@ class ComboTaskBlock:
                         ),
                     ).classes("min-w-[200px]")
                     task_sel = ui.select(
-                        self.runner._get_task_names(item["type"]),
+                        self.runner._get_combo_task_names(item["type"]),
                         value=item.get("task"),
                         label="选择任务",
                         with_input=True,
@@ -281,7 +276,7 @@ class ComboTaskBlock:
         item["task"] = None
         sel = item.get("task_select")
         if sel is not None:
-            sel.options = self.runner._get_task_names(value)
+            sel.options = self.runner._get_combo_task_names(value)
             sel.value = None
             sel.update()
 
@@ -343,18 +338,9 @@ class ComboTaskBlock:
             self.run_subs_label = ui.label("").classes(
                 "text-xs text-gray-600 whitespace-pre-line"
             )
-            self.run_account_select = (
-                ui.select(
-                    label="选择账号（可多选，默认全选）",
-                    options=[],
-                    multiple=True,
-                )
-                .classes("w-full min-w-[240px]")
-                .props("use-chips")
-            )
-            ui.label("每个账号依次执行全部子任务，账号之间并行启动。").classes(
-                "text-xs text-gray-500"
-            )
+            ui.label(
+                "各子任务使用其绑定的账号执行，账号之间并行启动；无需手动选择账号。"
+            ).classes("text-xs text-gray-500")
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=self.run_dialog.close).props("outline")
                 ui.button("执行", color="primary", on_click=self._start_run)
@@ -364,24 +350,26 @@ class ComboTaskBlock:
         if not combo or not combo.get("subs"):
             ui.notify("组合任务不存在或没有子任务", type="warning")
             return
+        # 延迟导入避免循环依赖（sign.py 在模块级导入 combo.py）
+        from tg_signer.webui.data import apply_account_order
+        from tg_signer.webui.sign import _combo_sub_accounts
+
         self.run_title.text = f"执行组合任务: {name}"
-        self.run_subs_label.text = "\n".join(
-            f"{i}. {s.get('type')} · {s.get('task')}"
-            for i, s in enumerate(combo["subs"], 1)
-        )
+        lines = []
+        for i, sub in enumerate(combo["subs"], 1):
+            accs = apply_account_order(
+                _combo_sub_accounts(sub, self.workdir), self.workdir
+            )
+            lines.append(
+                f"{i}. {sub.get('type')} · {sub.get('task')}"
+                f"｜账号：{'、'.join(accs) if accs else '未绑定'}"
+            )
+        self.run_subs_label.text = "\n".join(lines)
         self._run_name = name
-        options = self._accounts()
-        self.run_account_select.options = options
-        self.run_account_select.value = list(options)
-        self.run_account_select.update()
         self.run_dialog.open()
 
     def _start_run(self) -> None:
-        accounts = [a for a in (self.run_account_select.value or []) if a]
-        if not accounts:
-            ui.notify("请至少选择一个账号", type="warning")
-            return
-        if self.runner._launch("组合任务", self._run_name, accounts):
+        if self.runner._launch("组合任务", self._run_name, []):
             self.run_dialog.close()
             self._render_running()
 
