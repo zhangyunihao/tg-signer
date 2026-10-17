@@ -243,12 +243,40 @@ def extract_bot_links(message: Any) -> List[Tuple[str, str]]:
 
 
 def message_matches_keywords(message: Any, keywords: Iterable[str]) -> bool:
-    """消息文本是否包含任一关键词；关键词为空表示全部放行。"""
+    """消息文本是否包含任一关键词；关键词为空表示全部放行。
+
+    匹配时剔除「抽奖说明」段落：该段落是规则描述，常出现与奖品无关的
+    关键字（如说明里提到群内每日现金红包），不应据此判定抽奖命中关键词。
+    """
     kws = [str(k).strip() for k in (keywords or []) if str(k).strip()]
     if not kws:
         return True
-    text = _message_text(message)
+    text = strip_rules_section(_message_text(message))
     return any(kw in text for kw in kws)
+
+
+# 「抽奖说明」段落边界：段头行含「抽奖说明」，段落延续到下一个
+# 「行首 emoji + 文字 + 冒号」的段头（如 🔋人品加成 / 💁参与情况 / 📅开奖日期），
+# 无后续段头则到文本末尾。
+_RULES_HEADER_RE = re.compile(r"抽奖说明")
+_SECTION_HEADER_RE = re.compile(r"^[^\w\s\u4e00-\u9fff]+\s*\S*[：:]", re.MULTILINE)
+
+
+def strip_rules_section(text: str) -> str:
+    """剔除抽奖帖「抽奖说明」段落（含段头行），只保留其余内容。"""
+    if not text:
+        return text
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        if not _RULES_HEADER_RE.search(line):
+            continue
+        end = len(lines)
+        for j in range(idx + 1, len(lines)):
+            if _SECTION_HEADER_RE.match(lines[j]):
+                end = j
+                break
+        return "\n".join(lines[:idx] + lines[end:])
+    return text
 
 
 # —— 归属地限制过滤 ——

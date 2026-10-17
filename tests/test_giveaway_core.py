@@ -16,6 +16,7 @@ from tg_signer.giveaway_core import (
     parse_bot_start_link,
     parse_draw_date,
     parse_region_limits,
+    strip_rules_section,
 )
 
 # ---------------- parse_bot_start_link ----------------
@@ -166,6 +167,65 @@ def test_message_matches_keywords():
     assert message_matches_keywords(message, [])
     # caption 也算文本
     assert message_matches_keywords(_msg(caption="抽奖"), ["抽奖"])
+
+
+# ---------------- 抽奖说明段落剔除（@LotteryBestBot 帖式） ----------------
+
+LOTTERYBEST_POST = """🎰 福田七七半价抽奖
+
+📮 参与条件：
+🎫 加入-深圳研究协会备用
+🎫 加入-深圳研究协会
+└  🎟️ 发言数大于 10 条
+🎫 加入-七七后花园
+🎫 加入-深圳研究协会报告录
+🎫 加入-深圳研究协会榜
+
+🎁 奖品内容：
+💰️ 半价p × 1
+
+⚠️ 抽奖说明：
+1.中奖请在24小时之内联系老师
+2.七天内使用，写报告素质出击
+3.退群及频道默认放弃抽奖资格 炸号者无效
+4.禁止🚫刷屏乱水
+5. 深圳研究协会群内每日现金红包🧧 半价劵  等你来拿
+
+🔋 人品加成：⚡️× 9  规则
+
+💁 参与情况：4达标 / 6报名
+
+📅 开奖日期：(北京时间)
+2026年10月20日 17时22分00秒"""
+
+
+def test_strip_rules_section():
+    stripped = strip_rules_section(LOTTERYBEST_POST)
+    # 说明段落（1.中奖请在24小时... 现金红包 ...）被整体剔除
+    assert "现金红包" not in stripped
+    assert "24小时之内联系老师" not in stripped
+    assert "抽奖说明" not in stripped
+    # 其余段落保留
+    assert "参与条件" in stripped
+    assert "半价p × 1" in stripped
+    assert "人品加成" in stripped
+    assert "开奖日期" in stripped
+    assert "2026年10月20日" in stripped
+    # 无说明段头的文本原样返回
+    assert strip_rules_section("普通抽奖帖，无说明段") == "普通抽奖帖，无说明段"
+    # 末尾说明段（无后续段头）也整体剔除
+    assert strip_rules_section("奖品：现金\n抽奖说明：xxxx") == "奖品：现金"
+
+
+def test_keywords_ignore_rules_section():
+    # 说明段里的「现金」「红包」不应触发关键字（奖品内容是半价p，无关键字）
+    assert not message_matches_keywords(
+        _msg(text=LOTTERYBEST_POST), ["上海", "现金", "红包"]
+    )
+    # 关键字出现在标题/奖品内容等正常段落时仍然命中
+    assert message_matches_keywords(_msg(text=LOTTERYBEST_POST), ["半价"])
+    # 无说明段落时行为不变
+    assert message_matches_keywords(_msg(text="奖品：现金红包"), ["现金"])
 
 
 # ---------------- 归属地限制过滤 ----------------
