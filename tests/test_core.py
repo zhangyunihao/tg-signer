@@ -905,7 +905,7 @@ async def test_wait_for_send_text_passes_message_thread_id(signer_factory):
     signer = signer_factory()
     signer.send_message = AsyncMock(return_value=None)
     chat = SignChatV3(
-        chat_id=-1003763902761,
+        chat_id=-1009876543210,
         message_thread_id=1,
         delete_after=10,
         actions=[SendTextAction(text="checkin")],
@@ -914,7 +914,7 @@ async def test_wait_for_send_text_passes_message_thread_id(signer_factory):
     await signer.wait_for(chat, chat.actions[0])
 
     signer.send_message.assert_awaited_once_with(
-        -1003763902761,
+        -1009876543210,
         "checkin",
         10,
         message_thread_id=1,
@@ -932,13 +932,13 @@ async def test_resolve_chat_route_key_supports_username(monkeypatch, signer_fact
 
     async def fake_get_chat(chat_id):
         assert chat_id == "@neo"
-        return SimpleNamespace(id=-1003763902761)
+        return SimpleNamespace(id=-1009876543210)
 
     monkeypatch.setattr(signer.app, "get_chat", fake_get_chat)
 
     route_key = await signer.resolve_chat_route_key(chat)
 
-    assert route_key == (-1003763902761, None)
+    assert route_key == (-1009876543210, None)
     assert signer.context.resolved_route_keys[("@neo", None)] == route_key
 
 
@@ -951,7 +951,7 @@ async def test_wait_for_uses_resolved_route_key_for_username(signer_factory):
         actions=[ClickKeyboardByTextAction(text="签到")],
     )
     raw_key = signer.get_route_key("@neo", None)
-    resolved_key = signer.get_route_key(-1003763902761, None)
+    resolved_key = signer.get_route_key(-1009876543210, None)
     message = SimpleNamespace(id=99, text="签到", photo=None, reply_markup=None)
     signer.context.resolved_route_keys[raw_key] = resolved_key
     signer.context.chat_messages[resolved_key][99] = message
@@ -1229,16 +1229,16 @@ async def test_choose_option_by_image_rejects_invalid_option_index(signer_factor
 async def test_on_message_routes_by_chat_id_and_message_thread_id(signer_factory):
     signer = signer_factory()
     signer.context = signer.ensure_ctx()
-    route_key = signer.get_route_key(-1003763902761, 11)
+    route_key = signer.get_route_key(-1009876543210, 11)
     signer.context.sign_chats[route_key].append(
         SignChatV3(
-            chat_id=-1003763902761,
+            chat_id=-1009876543210,
             message_thread_id=11,
             actions=[SendTextAction(text="checkin")],
         )
     )
     message = SimpleNamespace(
-        chat=SimpleNamespace(id=-1003763902761),
+        chat=SimpleNamespace(id=-1009876543210),
         message_thread_id=11,
         id=99,
     )
@@ -1252,15 +1252,15 @@ async def test_on_message_routes_by_chat_id_and_message_thread_id(signer_factory
 async def test_on_message_falls_back_to_non_thread_route(signer_factory):
     signer = signer_factory()
     signer.context = signer.ensure_ctx()
-    fallback_key = signer.get_route_key(-1003763902761, None)
+    fallback_key = signer.get_route_key(-1009876543210, None)
     signer.context.sign_chats[fallback_key].append(
         SignChatV3(
-            chat_id=-1003763902761,
+            chat_id=-1009876543210,
             actions=[SendTextAction(text="checkin")],
         )
     )
     message = SimpleNamespace(
-        chat=SimpleNamespace(id=-1003763902761),
+        chat=SimpleNamespace(id=-1009876543210),
         message_thread_id=22,
         id=100,
     )
@@ -1274,7 +1274,7 @@ async def test_on_message_falls_back_to_non_thread_route(signer_factory):
 async def test_on_message_routes_username_chat_by_resolved_chat_id(signer_factory):
     signer = signer_factory()
     signer.context = signer.ensure_ctx()
-    resolved_key = signer.get_route_key(-1003763902761, None)
+    resolved_key = signer.get_route_key(-1009876543210, None)
     signer.context.sign_chats[resolved_key].append(
         SignChatV3(
             chat_id="@neo",
@@ -1282,7 +1282,7 @@ async def test_on_message_routes_username_chat_by_resolved_chat_id(signer_factor
         )
     )
     message = SimpleNamespace(
-        chat=SimpleNamespace(id=-1003763902761),
+        chat=SimpleNamespace(id=-1009876543210),
         message_thread_id=None,
         id=101,
     )
@@ -1297,7 +1297,7 @@ async def test_on_message_ignores_unexpected_chat(signer_factory):
     signer = signer_factory()
     signer.context = signer.ensure_ctx()
     message = SimpleNamespace(
-        chat=SimpleNamespace(id=-1003763902761),
+        chat=SimpleNamespace(id=-1009876543210),
         message_thread_id=22,
         id=100,
     )
@@ -1331,7 +1331,7 @@ async def test_schedule_messages_passes_message_thread_id(monkeypatch, signer_fa
     monkeypatch.setattr(signer, "_call_telegram_api", direct_call)
 
     await signer.schedule_messages(
-        -1003763902761,
+        -1009876543210,
         "checkin",
         "0 6 * * *",
         next_times=1,
@@ -1365,7 +1365,7 @@ async def test_get_schedule_messages_calls_chat_level_api(monkeypatch, signer_fa
     signer.app = DummyApp()
     monkeypatch.setattr(signer, "_call_telegram_api", direct_call)
 
-    await signer.get_schedule_messages(-1003763902761)
+    await signer.get_schedule_messages(-1009876543210)
 
     assert calls[0]["kwargs"] == {}
 

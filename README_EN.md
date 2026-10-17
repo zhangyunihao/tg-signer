@@ -129,13 +129,13 @@ tg-signer list-sign-records linuxdo -n 5  # View the latest 5 check-in records f
 tg-signer migrate-sign-records  # Migrate check-in records under .signer/signs to SQLite
 tg-signer send-text 8671234001 /test  # Send '/test' to chat_id '8671234001'
 tg-signer send-text @neo /test  # Send '/test' to username '@neo'
-tg-signer send-text --message-thread-id 1 -- -1003763902761 checkin  # Send to a group topic (message_thread_id=1)
+tg-signer send-text --message-thread-id 1 -- -1009876543210 checkin  # Send to a group topic (message_thread_id=1)
 tg-signer send-text -- -10006758812 water  # For negative numbers, use POSIX style and add '--' before '-'
 tg-signer send-text --delete-after 1 8671234001 /test  # Send '/test' to chat_id '8671234001' and delete it after 1 second
 tg-signer list-members --chat_id -1001680975844 --admin  # List channel admins
-tg-signer list-topics --chat_id -1003763902761 --limit 50  # List group topics and message_thread_id
+tg-signer list-topics --chat_id -1009876543210 --limit 50  # List group topics and message_thread_id
 tg-signer schedule-messages --crontab '0 0 * * *' --next-times 10 -- -1001680975844 hello  # Send a message to '-1001680975844' at 00:00 for the next 10 days
-tg-signer schedule-messages --crontab '0 0 * * *' --next-times 3 --message-thread-id 1 -- -1003763902761 hello  # Configure scheduled messages for a group topic
+tg-signer schedule-messages --crontab '0 0 * * *' --next-times 3 --message-thread-id 1 -- -1009876543210 hello  # Configure scheduled messages for a group topic
 tg-signer monitor run  # Configure and run personal/group/channel message monitoring and auto reply
 tg-signer multi-run -a account_a -a account_b same_task  # Run 'account_a' and 'account_b' using the same 'same_task' config
 tg-signer webgui --auth-code averycomplexcode  # Start the WebGUI
@@ -200,7 +200,7 @@ the process.
 ### Get Group Topic IDs
 
 ```sh
-tg-signer list-topics --chat_id -1003763902761
+tg-signer list-topics --chat_id -1009876543210
 ```
 
 This prints the visible topics in the forum group, including each
@@ -302,7 +302,7 @@ Start configuring task <my_monitor>
 Both chat IDs and user IDs support either integer IDs or string usernames. Usernames must start with @, such as @neo.
 
 Configure monitor item 1
-1. Chat ID (the ID shown in the recent chats output during login): -4573702599
+1. Chat ID (the ID shown in the recent chats output during login): -1001234567890
 2. Match rule ('exact', 'contains', 'regex', 'all'): contains
 3. Rule value (required): kfc
 4. Only match messages from specific user IDs (comma-separated; press Enter to match all): @neo
@@ -312,7 +312,7 @@ Configure monitor item 1
 Continue configuring? (y/N): y
 
 Configure monitor item 2
-1. Chat ID (the ID shown in the recent chats output during login): -4573702599
+1. Chat ID (the ID shown in the recent chats output during login): -1001234567890
 2. Match rule ('exact', 'contains', 'regex'): regex
 3. Rule value (required): Participation keyword: 「.*?」
 4. Only match messages from specific user IDs (comma-separated; press Enter to match all): 61244351
@@ -323,7 +323,7 @@ Configure monitor item 2
 Continue configuring? (y/N): y
 
 Configure monitor item 3
-1. Chat ID (the ID shown in the recent chats output during login): -4573702599
+1. Chat ID (the ID shown in the recent chats output during login): -1001234567890
 2. Match rule (exact, contains, regex, all): all
 3. Only match messages from specific user IDs (comma-separated; press Enter to match all):
 4. Always ignore messages sent by yourself (y/N): y
@@ -343,7 +343,7 @@ Continue configuring? (y/N): n
 
 1. Both `chat_id` and `user_id` support integer IDs and string usernames.
    Usernames must start with `@`, so use `@neo` instead of `neo`. Note that a
-   username may not exist. In the example above, `chat_id=-4573702599` means the
+   username may not exist. In the example above, `chat_id=-1001234567890` means the
    rule only applies to that chat.
 
 2. Matching rules are currently all case-insensitive:
@@ -468,13 +468,13 @@ Continue configuring? (y/N): n
 
 ```text
 [INFO] [tg-signer] 2024-10-25 12:29:06,516 core.py 458 Starting monitoring...
-[INFO] [tg-signer] 2024-10-25 12:29:37,034 core.py 439 Matched monitor item: MatchConfig(chat_id=-4573702599, rule=contains, rule_value=kfc), default_send_text=V me 50, send_text_search_regex=None
+[INFO] [tg-signer] 2024-10-25 12:29:37,034 core.py 439 Matched monitor item: MatchConfig(chat_id=-1001234567890, rule=contains, rule_value=kfc), default_send_text=V me 50, send_text_search_regex=None
 [INFO] [tg-signer] 2024-10-25 12:29:37,035 core.py 442 Sending text: V me 50
-[INFO] [tg-signer] 2024-10-25 12:30:02,726 core.py 439 Matched monitor item: MatchConfig(chat_id=-4573702599, rule=regex, rule_value=参与关键词：「.*?」), default_send_text=None, send_text_search_regex=参与关键词：「(?P<keyword>(.*?))」\n
+[INFO] [tg-signer] 2024-10-25 12:30:02,726 core.py 439 Matched monitor item: MatchConfig(chat_id=-1001234567890, rule=regex, rule_value=参与关键词：「.*?」), default_send_text=None, send_text_search_regex=参与关键词：「(?P<keyword>(.*?))」\n
 [INFO] [tg-signer] 2024-10-25 12:30:02,727 core.py 442 Sending text: 我要抽奖
-[INFO] [tg-signer] 2024-10-25 12:30:03,001 core.py 226 Message "我要抽奖" to -4573702599 will be deleted after 5 seconds.
+[INFO] [tg-signer] 2024-10-25 12:30:03,001 core.py 226 Message "我要抽奖" to -1001234567890 will be deleted after 5 seconds.
 [INFO] [tg-signer] 2024-10-25 12:30:03,001 core.py 229 Waiting...
-[INFO] [tg-signer] 2024-10-25 12:30:08,260 core.py 232 Message "我要抽奖" to -4573702599 deleted!
+[INFO] [tg-signer] 2024-10-25 12:30:08,260 core.py 232 Message "我要抽奖" to -1001234567890 deleted!
 ```
 
 ### Changelog

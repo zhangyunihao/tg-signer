@@ -171,15 +171,15 @@ def test_message_matches_keywords():
 
 # ---------------- 抽奖说明段落剔除（@LotteryBestBot 帖式） ----------------
 
-LOTTERYBEST_POST = """🎰 福田七七半价抽奖
+LOTTERYBEST_POST = """🎰 XX福利半价抽奖
 
 📮 参与条件：
-🎫 加入-深圳研究协会备用
-🎫 加入-深圳研究协会
+🎫 加入-某测试群组A备用
+🎫 加入-某测试群组A
 └  🎟️ 发言数大于 10 条
 🎫 加入-七七后花园
-🎫 加入-深圳研究协会报告录
-🎫 加入-深圳研究协会榜
+🎫 加入-某测试群组A报告录
+🎫 加入-某测试群组A榜
 
 🎁 奖品内容：
 💰️ 半价p × 1
@@ -189,7 +189,7 @@ LOTTERYBEST_POST = """🎰 福田七七半价抽奖
 2.七天内使用，写报告素质出击
 3.退群及频道默认放弃抽奖资格 炸号者无效
 4.禁止🚫刷屏乱水
-5. 深圳研究协会群内每日现金红包🧧 半价劵  等你来拿
+5. 某测试群组A群内每日现金红包🧧 半价劵  等你来拿
 
 🔋 人品加成：⚡️× 9  规则
 
@@ -289,7 +289,7 @@ def test_engine_two_way_account_skips_speech_required(tmp_path):
     engine.log = lambda _m: None
 
     text = (
-        "🎰 萝莉岛抽奖 参与条件：加入群组\n"
+        "🎰 某测试频道B抽奖 参与条件：加入群组\n"
         "└  🎟️ 发言数大于 10 条\n"
         "https://t.me/LotteryBot?start=x1"
     )
@@ -1226,10 +1226,10 @@ def test_rescue_loop_skips_while_suspended_then_recovers(tmp_path):
 
 STATUS_REPLY = """您需加入指定的群组/频道
 
-🎰 长宁贝贝福利
-🎫 加入-贝贝的新频道 ❌
-🎫 加入-上海狼友互动区（免费上榜） ✅
-🎫 加入-上海狼友互动区报告榜 ❌"""
+🎰 某测试频道C
+🎫 加入-某测试频道D ❌
+🎫 加入-某测试频道E（免费上榜） ✅
+🎫 加入-某测试频道E报告榜 ❌"""
 
 
 def _status_message(text, name_urls):
@@ -1249,14 +1249,14 @@ def test_extract_join_status_targets():
     msg = _status_message(
         STATUS_REPLY,
         {
-            "贝贝的新频道": "https://t.me/BeibeiChan",
-            "上海狼友互动区（免费上榜）": "https://t.me/ShLangyou",
-            "上海狼友互动区报告榜": "https://t.me/+abc12345678",
+            "某测试频道D": "https://t.me/test_channel_d",
+            "某测试频道E（免费上榜）": "https://t.me/test_channel_e",
+            "某测试频道E报告榜": "https://t.me/+abc12345678",
         },
     )
     # 只提取 ❌（未加入）行的链接，✅ 行跳过；私有邀请链接保留
     assert extract_join_status_targets(msg) == [
-        "BeibeiChan",
+        "test_channel_d",
         "https://t.me/+abc12345678",
     ]
     # 无实体 / 无❌标记 / 普通消息均返回空
@@ -1281,17 +1281,17 @@ def test_engine_joins_only_unjoined_status_targets(tmp_path):
     msg = _status_message(
         STATUS_REPLY,
         {
-            "贝贝的新频道": "https://t.me/BeibeiChan",
-            "上海狼友互动区报告榜": "https://t.me/+abc12345678",
+            "某测试频道D": "https://t.me/test_channel_d",
+            "某测试频道E报告榜": "https://t.me/+abc12345678",
         },
     )
     asyncio.run(engine._join_from_message("acc", client, "LotteryBestBot", msg))
-    assert client.joined == ["BeibeiChan", "https://t.me/+abc12345678"]
-    assert any("尚未加入 BeibeiChan" in line for line in logs)
+    assert client.joined == ["test_channel_d", "https://t.me/+abc12345678"]
+    assert any("尚未加入 test_channel_d" in line for line in logs)
     # 非 LotteryBestBot 不解析❌/✅格式：纯名称行无链接实体，不应触发任何加入
-    plain_msg = _msg(text="🎫 加入-贝贝的新频道 ❌")
+    plain_msg = _msg(text="🎫 加入-某测试频道D ❌")
     asyncio.run(engine._join_from_message("acc", client, "OtherBot", plain_msg))
-    assert client.joined == ["BeibeiChan", "https://t.me/+abc12345678"]
+    assert client.joined == ["test_channel_d", "https://t.me/+abc12345678"]
 
 
 def test_status_targets_trigger_restart(tmp_path, monkeypatch):
@@ -1306,9 +1306,9 @@ def test_status_targets_trigger_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
     engine, _state = _engine(tmp_path)
     client = FakeClient(bot_users={"LotteryBestBot"})
-    msg = _status_message(STATUS_REPLY, {"贝贝的新频道": "https://t.me/BeibeiChan"})
+    msg = _status_message(STATUS_REPLY, {"某测试频道D": "https://t.me/test_channel_d"})
     asyncio.run(engine._click_confirm("acc", client, "LotteryBestBot", msg, "r1"))
-    assert "BeibeiChan" in client.joined_targets
+    assert "test_channel_d" in client.joined_targets
     assert client.started == [("LotteryBestBot", "r1")]
 
 
@@ -1338,7 +1338,7 @@ def test_message_requires_password():
     assert message_requires_password(_msg(text="请先参与抽奖，再发送口令激活"))
     # 普通帖不带口令要求
     assert not message_requires_password(
-        _msg(text="🎫 加入-上海萝莉岛\n🎁 奖品：现金红包")
+        _msg(text="🎫 加入-上海某测试频道B\n🎁 奖品：现金红包")
     )
 
 
