@@ -97,6 +97,8 @@ def log_block() -> Callable[[], None]:
                 return "text-blue-700"
             return "text-gray-800"
 
+        current_lines: list[str] = []
+
         def refresh_log_options() -> None:
             options = [str(p) for p in list_log_files(LOG_DIR)]
             current_path = str(log_path_input.value or state.log_path)
@@ -114,6 +116,7 @@ def log_block() -> Callable[[], None]:
             refresh()
 
         def refresh() -> None:
+            nonlocal current_lines
             refresh_log_options()
             try:
                 state.log_limit = int(limit_input.value or state.log_limit)
@@ -143,6 +146,7 @@ def log_block() -> Callable[[], None]:
 
             log_list.clear()
             if not lines:
+                current_lines = []
                 with log_list:
                     if filtering:
                         ui.label("没有匹配过滤条件的日志行").classes(
@@ -163,12 +167,39 @@ def log_block() -> Callable[[], None]:
                 for line in lines:
                     color = classify_line(line)
                     ui.label(line).classes(f"w-full {color}").style("white-space: pre;")
+            current_lines = lines
             log_list.update()
             suffix = "（已过滤）" if filtering else ""
             refresh_status(f"文件: {path} | 显示最新 {len(lines)} 行{suffix}")
 
+        def copy_logs() -> None:
+            """把当前显示的全部日志行复制到剪贴板（含安全上下文降级方案）。"""
+            if not current_lines:
+                ui.notify("暂无可复制的日志", type="warning")
+                return
+            text = "\n".join(current_lines)
+            # json.dumps 产出合法的 JS 字符串字面量，换行/引号均已转义
+            payload = json.dumps(text, ensure_ascii=False)
+            ui.run_javascript(
+                "(async () => {"
+                f"const t = {payload};"
+                "try {"
+                "if (navigator.clipboard && window.isSecureContext) {"
+                "await navigator.clipboard.writeText(t); return;"
+                "}"
+                "} catch (e) {}"
+                "const ta = document.createElement('textarea');"
+                "ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';"
+                "document.body.appendChild(ta); ta.focus(); ta.select();"
+                "document.execCommand('copy'); ta.remove();"
+                "})()"
+            )
+            ui.notify(f"已复制 {len(current_lines)} 行日志", type="positive")
+
         with ui.row().classes("gap-2 mt-2 items-center justify-between"):
-            ui.button("刷新日志", on_click=refresh)
+            with ui.row().classes("gap-2 items-center"):
+                ui.button("刷新日志", on_click=refresh)
+                ui.button("一键复制日志", on_click=copy_logs).props("outline")
             log_status = ui.label("").classes("text-xs text-gray-500")
 
         def refresh_status(text: str) -> None:

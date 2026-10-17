@@ -39,8 +39,8 @@ _CFG_FIELDS = {
     "session_dir": str,
     "keywords": lambda: list(DEFAULT_KEYWORDS),
     "auto_scan": lambda: True,
-    "delay_min": lambda: 1,
-    "delay_max": lambda: 3,
+    "delay_min": lambda: 3,
+    "delay_max": lambda: 10,
     "confirm_wait": lambda: 8,
     "auto_join": lambda: True,
     "max_joins": lambda: None,
@@ -182,15 +182,26 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         return f"{title} ({cid})" if title else str(cid)
 
     def make_log(name: str) -> Callable[[str], None]:
+        log_file = Path(workdir) / "logs" / "giveaway.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+
         def _log(msg: str) -> None:
             buf = _GLOBAL_LOGS.setdefault(wd_key, [])
             # 消息已带时间戳（如「已参与」行）则不重复加
             ts = f"{datetime.now():%m-%d %H:%M:%S}"
             if not re.match(r"^\d{2}:\d{2}:\d{2}", msg):
                 msg = f"{ts} {msg}"
-            buf.append(f"[#{name}] {msg}")
+            line = f"[#{name}] {msg}"
+            buf.append(line)
             if len(buf) > 300:
                 del buf[:-300]
+            # 同时落盘，便于服务重启后仍可追溯（单文件上限约 2MB）
+            try:
+                if not log_file.exists() or log_file.stat().st_size < 2_000_000:
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+            except OSError:
+                logger.debug("写入抽奖日志文件失败", exc_info=True)
 
         return _log
 
@@ -868,10 +879,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             delay_min_input = ui.number(
-                label="参与前随机延迟下限（秒）", value=1, min=0, max=600, format="%d"
+                label="参与前随机延迟下限（秒）", value=3, min=0, max=600, format="%d"
             ).classes("w-44")
             delay_max_input = ui.number(
-                label="延迟上限（秒）", value=3, min=0, max=600, format="%d"
+                label="延迟上限（秒）", value=10, min=0, max=600, format="%d"
             ).classes("w-36")
 
             rescue_interval_input = ui.number(
