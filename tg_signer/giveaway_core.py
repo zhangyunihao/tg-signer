@@ -326,6 +326,69 @@ def message_requires_speech(message: Any) -> bool:
     return bool(SPEECH_REQUIRE_RE.search(_message_text(message) or ""))
 
 
+# 口令参与条件：「发送口令﹝xx﹞」「发送口令激活」及「口令提示」段落头，
+# 出现即代表参与需先发送口令（双向账号无法完成该私聊互动）。
+PASSWORD_REQUIRE_RE = re.compile(r"发送口令|口令提示")
+
+
+def message_requires_password(message: Any) -> bool:
+    """消息是否带「发送口令」类参与条件。"""
+    return bool(PASSWORD_REQUIRE_RE.search(_message_text(message) or ""))
+
+
+# —— LotteryBestBot 式回复解析 ——
+# start 后不满足条件时 bot 回复「您需加入指定的群组/频道」，逐行列出
+# 「🎫 加入-名称 ❌/✅」，名称是带 TEXT_URL 隐藏链接的文本。只提取
+# ❌（未加入）行的链接目标，✅ 已加入行跳过；无链接实体的行不处理。
+LOTTERYBEST_BOT = "lotterybestbot"
+
+
+def extract_join_status_targets(message: Any) -> List[str]:
+    """从「加入-名称 ❌」式回复提取隐藏链接加入目标（仅未加入行）。"""
+    text = _message_text(message)
+    if not text or "加入" not in text:
+        return []
+    # 行区间表：实体 offset 定位所在行，据此判断该行是否为 ❌ 未加入
+    bounds: List[Tuple[int, int, str]] = []
+    start = 0
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            bounds.append((start, i, text[start:i]))
+            start = i + 1
+    bounds.append((start, len(text), text[start:]))
+    targets: List[str] = []
+    seen: set = set()
+
+    def _add(target: str) -> None:
+        key = target.lower()
+        if key not in seen:
+            seen.add(key)
+            targets.append(target)
+
+    for ent in getattr(message, "entities", None) or []:
+        if "TEXT_URL" not in str(getattr(ent, "type", "")).upper():
+            continue
+        url = getattr(ent, "url", None)
+        if not url:
+            continue
+        offset = int(getattr(ent, "offset", 0) or 0)
+        line = next((lt for ls, le, lt in bounds if ls <= offset < le), "")
+        if "加入" not in line or "❌" not in line or "✅" in line:
+            continue
+        m = _TME_CHANNEL_RE.search(str(url))
+        if m is None:
+            continue
+        target = m.group("target")
+        rest = m.group("rest") or ""
+        if target.lower().startswith(("+", "joinchat/")):
+            _add(f"https://t.me/{target}")
+        elif rest.startswith("/") or rest.startswith("?"):
+            continue  # 帖子路径/bot 深度链接，不属于加入目标
+        else:
+            _add(target)
+    return targets
+
+
 def extract_channel_targets(message: Any) -> List[str]:
     """从消息文本/实体/按钮中提取频道与群组加入目标（激进模式）。
 
@@ -1003,8 +1066,14 @@ class GiveawayEngine:
                     f"：{_giveaway_title(message) or '(无文本)'}"
                 )
             return None
-        # 发言数要求 + 双向账户：无法达标，自动跳过（对群组置顶同样生效）
-        if account in self.two_way_accounts and message_requires_speech(message):
+        # 发言数要求/口令要求 + 双向账户：无法达标，自动跳过（对群组置顶同样生效）
+        two_way_reason = ""
+        if account in self.two_way_accounts:
+            if message_requires_speech(message):
+                two_way_reason = "发言数要求"
+            elif message_requires_password(message):
+                two_way_reason = "口令要求"
+        if two_way_reason:
             msg_key = (
                 account,
                 str(getattr(getattr(message, "chat", None), "id", "") or ""),
@@ -1013,7 +1082,7 @@ class GiveawayEngine:
             if msg_key not in self._skip_logged:
                 self._skip_logged.add(msg_key)
                 self.log(
-                    f"[{account}] 账号为双向且抽奖有发言数要求，跳过"
+                    f"[{account}] 账号为双向且抽奖有{two_way_reason}，跳过"
                     f"：{_giveaway_title(message) or '(无文本)'}"
                 )
             return None
@@ -1216,7 +1285,17 @@ class GiveawayEngine:
                     f"{self._join_suspended_until:%H:%M}（暂停期间跳过所有加入）"
                 )
             return False
-        for target in extract_channel_targets(message):
+        targets = extract_channel_targets(message)
+        if bot_username.lower() == LOTTERYBEST_BOT:
+            # LotteryBestBot 的回复把「加入-名称」做成带隐藏链接的❌/✅清单，
+            # 补充提取其中 ❌（未加入）行的链接目标
+            known = {t.lower() for t in targets}
+            targets = targets + [
+                t
+                for t in extract_join_status_targets(message)
+                if t.lower() not in known
+            ]
+        for target in targets:
             if target.lower().lstrip("@") == bot_username.lower():
                 continue  # 跳过 bot 自己
             key = f"{account}|{target.lower()}"
@@ -1319,7 +1398,10 @@ class GiveawayEngine:
             did_join = False
             had_join_targets = False
             for message in candidates:
-                if extract_channel_targets(message):
+                if extract_channel_targets(message) or (
+                    username.lower() == LOTTERYBEST_BOT
+                    and extract_join_status_targets(message)
+                ):
                     had_join_targets = True
                 if await self._join_from_message(account, client, username, message):
                     did_join = True

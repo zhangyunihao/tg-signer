@@ -1222,3 +1222,146 @@ def test_rescue_loop_skips_while_suspended_then_recovers(tmp_path):
         await asyncio.wait_for(task, timeout=2)
 
     asyncio.run(scenario())
+
+
+# ---------------- LotteryBestBot 回复「加入-名称 ❌」链接解析 ----------------
+
+STATUS_REPLY = """您需加入指定的群组/频道
+
+🎰 长宁贝贝福利
+🎫 加入-贝贝的新频道 ❌
+🎫 加入-上海狼友互动区（免费上榜） ✅
+🎫 加入-上海狼友互动区报告榜 ❌"""
+
+
+def _status_message(text, name_urls):
+    """按 name->url 构造带 TEXT_URL 实体的消息，实体覆盖名称本身。"""
+    entities = []
+    for name, url in name_urls.items():
+        offset = text.index(name)
+        entities.append(
+            SimpleNamespace(type="TEXT_URL", url=url, offset=offset, length=len(name))
+        )
+    return _msg(text=text, entities=entities)
+
+
+def test_extract_join_status_targets():
+    from tg_signer.giveaway_core import extract_join_status_targets
+
+    msg = _status_message(
+        STATUS_REPLY,
+        {
+            "贝贝的新频道": "https://t.me/BeibeiChan",
+            "上海狼友互动区（免费上榜）": "https://t.me/ShLangyou",
+            "上海狼友互动区报告榜": "https://t.me/+abc12345678",
+        },
+    )
+    # 只提取 ❌（未加入）行的链接，✅ 行跳过；私有邀请链接保留
+    assert extract_join_status_targets(msg) == [
+        "BeibeiChan",
+        "https://t.me/+abc12345678",
+    ]
+    # 无实体 / 无❌标记 / 普通消息均返回空
+    assert extract_join_status_targets(_msg(text=STATUS_REPLY)) == []
+    assert (
+        extract_join_status_targets(
+            _status_message("🎫 加入-某频道", {"某频道": "https://t.me/SomeChan"})
+        )
+        == []
+    )
+    assert extract_join_status_targets(_msg(text="开奖日期：2026年10月20日")) == []
+
+
+def test_engine_joins_only_unjoined_status_targets(tmp_path):
+    """LotteryBestBot 回复：只加入 ❌ 行目标；其他 bot 不解析该格式。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = JoinClient()
+    msg = _status_message(
+        STATUS_REPLY,
+        {
+            "贝贝的新频道": "https://t.me/BeibeiChan",
+            "上海狼友互动区报告榜": "https://t.me/+abc12345678",
+        },
+    )
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBestBot", msg))
+    assert client.joined == ["BeibeiChan", "https://t.me/+abc12345678"]
+    assert any("尚未加入 BeibeiChan" in line for line in logs)
+    # 非 LotteryBestBot 不解析❌/✅格式：纯名称行无链接实体，不应触发任何加入
+    plain_msg = _msg(text="🎫 加入-贝贝的新频道 ❌")
+    asyncio.run(engine._join_from_message("acc", client, "OtherBot", plain_msg))
+    assert client.joined == ["BeibeiChan", "https://t.me/+abc12345678"]
+
+
+def test_status_targets_trigger_restart(tmp_path, monkeypatch):
+    """LotteryBestBot 回复只含 ❌ 清单时，加入后同样触发重发 start。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    msg = _status_message(STATUS_REPLY, {"贝贝的新频道": "https://t.me/BeibeiChan"})
+    asyncio.run(engine._click_confirm("acc", client, "LotteryBestBot", msg, "r1"))
+    assert "BeibeiChan" in client.joined_targets
+    assert client.started == [("LotteryBestBot", "r1")]
+
+
+# ---------------- 口令要求 + 双向账号跳过 ----------------
+
+PASSWORD_POST = """🎰 上海婷婷半价券
+
+📮 参与条件：
+🌏️ 归属地 上海,江苏
+🪪 必须设置用户名
+🎫 加入-婷宝大队💕
+🎫 加入-野寻·上海学生交流群
+🎫 加入-野寻·上海打卡通告群
+└  🔑 发送口令﹝出击婷婷宝宝﹞
+
+❗ 口令提示：
+请先参与抽奖，再发送口令激活
+
+🎁 奖品内容：
+💰️ 婷婷半价券 × 1"""
+
+
+def test_message_requires_password():
+    from tg_signer.giveaway_core import message_requires_password
+
+    assert message_requires_password(_msg(text=PASSWORD_POST))
+    assert message_requires_password(_msg(text="请先参与抽奖，再发送口令激活"))
+    # 普通帖不带口令要求
+    assert not message_requires_password(
+        _msg(text="🎫 加入-上海萝莉岛\n🎁 奖品：现金红包")
+    )
+
+
+def test_two_way_account_skips_password_post(tmp_path):
+    """双向账号遇口令要求帖跳过，日志注明口令要求；非双向账号正常参与。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.two_way_accounts = {"双向号"}
+    logs: list = []
+    engine.log = logs.append
+    msg = _msg(text=f"{PASSWORD_POST}\n\n抽奖 https://t.me/LotteryBot?start=pw1")
+
+    result = asyncio.run(engine._process_message("双向号", None, msg))
+    assert result is None
+    assert any("账号为双向且抽奖有口令要求" in line for line in logs)
+
+    # 非双向账号不受影响，正常发 start
+    logs.clear()
+    client = FakeClient(bot_users={"LotteryBot"})
+    engine._clients = {"普通号": client}
+    asyncio.run(engine._process_message("普通号", client, msg))
+    assert ("LotteryBot", "pw1") in client.started
+    assert not any("口令要求" in line for line in logs)
