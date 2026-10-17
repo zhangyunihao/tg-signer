@@ -1485,6 +1485,13 @@ class GiveawayEngine:
                         candidates.append(recent)
                 except Exception as exc:
                     self.log(f"重新参与 @{username} 失败: {exc}")
+
+        def _confirm_log(text: str) -> str:
+            """按钮文字含「已参加」= bot 已确认参与成功，日志按成功口径输出。"""
+            if "已参加" in text:
+                return f"@{username} 参与成功（{text}）"
+            return f"已点击 @{username} 的确认按钮「{text}」"
+
         for message in candidates:
             btn = self._find_confirm_button(message)
             if btn is None:
@@ -1496,7 +1503,7 @@ class GiveawayEngine:
                         message_id=message.id,
                         callback_data=btn.callback_data,
                     )
-                    self.log(f"已点击 @{username} 的确认按钮「{btn.text}」")
+                    self.log(_confirm_log(btn.text))
                     return
                 # URL 按钮：仅当链接指向同一 bot（含/不含 start 参数）时才「点击」
                 # （等同按链接参数重发 start 完成参与），其他链接一律不碰
