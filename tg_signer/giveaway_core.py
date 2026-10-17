@@ -1492,6 +1492,11 @@ class GiveawayEngine:
                 return f"@{username} 参与成功（{text}）"
             return f"已点击 @{username} 的确认按钮「{text}」"
 
+        stop_set = self._stop is not None and self._stop.is_set()
+        if had_join_targets and not stop_set:
+            # 加入频道后稍等再点确认按钮，给 bot 侧成员状态同步留时间，
+            # 避免「立刻参加抽奖」点了却因身份未同步而不生效
+            await asyncio.sleep(5)
         for message in candidates:
             btn = self._find_confirm_button(message)
             if btn is None:
@@ -1504,6 +1509,7 @@ class GiveawayEngine:
                         callback_data=btn.callback_data,
                     )
                     self.log(_confirm_log(btn.text))
+                    await self._verify_after_click(account, client, username)
                     return
                 # URL 按钮：仅当链接指向同一 bot（含/不含 start 参数）时才「点击」
                 # （等同按链接参数重发 start 完成参与），其他链接一律不碰
@@ -1520,16 +1526,38 @@ class GiveawayEngine:
                         f"已点击 @{username} 的参与按钮「{btn.text}」"
                         f"（按链接参数重新参与）"
                     )
+                    await self._verify_after_click(account, client, username)
                     return
                 if plain_same_bot:
                     await client.start_bot(username, "")
                     self.log(
                         f"已点击 @{username} 的参与按钮「{btn.text}」（重发 start）"
                     )
+                    await self._verify_after_click(account, client, username)
                     return
             except Exception as exc:
                 self.log(f"点击 @{username} 确认按钮失败: {exc}")
                 return
+
+    async def _verify_after_click(
+        self, account: str, client: Any, username: str
+    ) -> None:
+        """点击确认/参与按钮后核对 bot 回复，把结果写进日志（不再盲点）。"""
+        try:
+            await asyncio.sleep(3)
+            if self._stop is not None and self._stop.is_set():
+                return
+            async for msg in client.get_chat_history(username, limit=1):
+                text = (_message_text(msg) or "").strip()
+                if not text:
+                    return
+                flat = " ".join(str(text).split())[:40]
+                if "已参加" in text:
+                    self.log(f"@{username} 参与成功（{flat}）")
+                elif not reply_says_ended(msg):
+                    self.log(f"@{username} 点击后回复：{flat}")
+        except Exception:
+            logger.debug("核对确认按钮回复失败", exc_info=True)
 
     def _find_confirm_button(self, message: Any) -> Optional[Any]:
         reply_markup = getattr(message, "reply_markup", None)
