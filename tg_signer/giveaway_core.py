@@ -741,8 +741,9 @@ class GiveawayEngine:
                 await self.scan_now()
             if self.rescue_interval > 0:
                 await self._rescue_loop()
-            else:
-                await self._stop.wait()
+            elif not self._stop.is_set():
+                # 补漏未开启：首轮扫描完成后直接结束任务，不常驻待命
+                self.log("补漏扫描未开启，本轮扫描完成，任务结束")
         finally:
             for client in self._clients.values():
                 await safe_disconnect(client)
