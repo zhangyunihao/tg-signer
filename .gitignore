@@ -123,3 +123,6 @@ _test*.json
 .nicegui
 
 .agent
+
+# PyPI 发布凭据（twine --config-file .pypirc）
+.pypirc
