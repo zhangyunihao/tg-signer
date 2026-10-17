@@ -6,7 +6,7 @@ import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from nicegui import app, ui
 
@@ -193,50 +193,88 @@ def _apply_paths(workdir_input, on_refresh: Callable[[], None]) -> None:
 def _build_dashboard(container) -> None:
     with container:
         # 右上角版本号 + 菜单按钮，绝对定位不占布局空间（下拉项在对话框定义后填充）
-        with ui.row().classes(
-            "absolute top-1 right-3 z-10 items-center gap-0 no-wrap"
-        ):
+        with ui.row().classes("absolute top-1 right-3 z-10 items-center gap-0 no-wrap"):
             ui.label(f"v{__version__}").classes(
                 "text-xs text-gray-500 select-none mr-1"
             )
             header_btn = ui.button(icon="more_vert").props("flat round dense")
 
         refreshers: list[Callable[[], None]] = []
-        refresh_records: "SignRecordBlock"
 
         def refresh_all() -> None:
             for refresh in refreshers:
                 refresh()
 
-        # ---- 预构建"数据查看"对话框（用户信息 / 签到记录 / 日志） ----
-        with ui.dialog() as users_dialog, ui.card().classes("w-full max-w-4xl"):
-            ui.label("用户信息").classes("text-lg font-semibold")
-            ui.label("查看当前已登录账户信息 (users/*/me.json)。").classes(
-                "text-gray-600"
-            )
-            refreshers.append(user_info_block())
-            with ui.row().classes("w-full justify-end"):
-                ui.button("关闭", on_click=users_dialog.close).props("outline")
+        # ---- 预创建"数据查看"对话框（内容首次打开时才构建，减少首屏负载） ----
+        with (
+            ui.dialog() as users_dialog,
+            ui.card().classes("w-full max-w-4xl") as users_card,
+        ):
+            pass
 
-        with ui.dialog() as records_dialog, ui.card().classes("w-full max-w-4xl"):
-            ui.label("签到记录").classes("text-lg font-semibold")
-            ui.label("签到记录（优先读取 SQLite，兼容旧 sign_record.json）").classes(
-                "text-gray-600"
-            )
-            refresh_records = SignRecordBlock()
-            refreshers.append(refresh_records)
-            with ui.row().classes("w-full justify-end"):
-                ui.button("关闭", on_click=records_dialog.close).props("outline")
+        with (
+            ui.dialog() as records_dialog,
+            ui.card().classes("w-full max-w-4xl") as records_card,
+        ):
+            pass
 
-        with ui.dialog() as logs_dialog, ui.card().classes("w-full max-w-4xl"):
-            ui.label("日志").classes("text-lg font-semibold")
-            ui.label("查看日志文件的最新行。").classes("text-gray-600")
-            refreshers.append(log_block())
-            with ui.row().classes("w-full justify-end"):
-                ui.button("关闭", on_click=logs_dialog.close).props("outline")
+        with (
+            ui.dialog() as logs_dialog,
+            ui.card().classes("w-full max-w-4xl") as logs_card,
+        ):
+            pass
+
+        _records_block: Optional[SignRecordBlock] = None
+        _users_built = False
+        _logs_built = False
+
+        def _ensure_users() -> None:
+            """用户信息对话框内容懒构建（仅首次）。"""
+            nonlocal _users_built
+            if _users_built:
+                return
+            _users_built = True
+            with users_card:
+                ui.label("用户信息").classes("text-lg font-semibold")
+                ui.label("查看当前已登录账户信息 (users/*/me.json)。").classes(
+                    "text-gray-600"
+                )
+                refreshers.append(user_info_block())
+                with ui.row().classes("w-full justify-end"):
+                    ui.button("关闭", on_click=users_dialog.close).props("outline")
+
+        def _ensure_records() -> None:
+            """签到记录对话框内容懒构建（仅首次）。"""
+            nonlocal _records_block
+            if _records_block is not None:
+                return
+            with records_card:
+                ui.label("签到记录").classes("text-lg font-semibold")
+                ui.label(
+                    "签到记录（优先读取 SQLite，兼容旧 sign_record.json）"
+                ).classes("text-gray-600")
+                _records_block = SignRecordBlock()
+                refreshers.append(_records_block)
+                with ui.row().classes("w-full justify-end"):
+                    ui.button("关闭", on_click=records_dialog.close).props("outline")
+
+        def _ensure_logs() -> None:
+            """日志对话框内容懒构建（仅首次）。"""
+            nonlocal _logs_built
+            if _logs_built:
+                return
+            _logs_built = True
+            with logs_card:
+                ui.label("日志").classes("text-lg font-semibold")
+                ui.label("查看日志文件的最新行。").classes("text-gray-600")
+                refreshers.append(log_block())
+                with ui.row().classes("w-full justify-end"):
+                    ui.button("关闭", on_click=logs_dialog.close).props("outline")
 
         def goto_records(task_name: str) -> None:
-            refresh_records.filter_input.set_value(task_name)
+            _ensure_records()
+            assert _records_block is not None
+            _records_block.filter_input.set_value(task_name)
             records_dialog.open()
 
         def open_settings() -> None:
@@ -263,9 +301,16 @@ def _build_dashboard(container) -> None:
         with header_btn:
             with ui.menu():
                 ui.menu_item("工作目录", on_click=open_settings)
-                ui.menu_item("用户信息", on_click=users_dialog.open)
-                ui.menu_item("签到记录", on_click=records_dialog.open)
-                ui.menu_item("日志", on_click=logs_dialog.open)
+                ui.menu_item(
+                    "用户信息", on_click=lambda: (_ensure_users(), users_dialog.open())
+                )
+                ui.menu_item(
+                    "签到记录",
+                    on_click=lambda: (_ensure_records(), records_dialog.open()),
+                )
+                ui.menu_item(
+                    "日志", on_click=lambda: (_ensure_logs(), logs_dialog.open())
+                )
 
         with ui.tabs().classes("w-full main-tabs").props("align=left") as tabs:
             tab_run = ui.tab("run", "签到")
@@ -283,10 +328,12 @@ def _build_dashboard(container) -> None:
             return str(getattr(value, "name", "") or "")
 
         # 上次选中的 tab 保存在浏览器 localStorage（key: tg_signer_tab），
-        # 不依赖 cookie / 服务端存储，刷新页面、重启服务、重开浏览器都能恢复
+        # 不依赖 cookie / 服务端存储，刷新页面、重启服务、重开浏览器都能恢复；
+        # 切换 tab 时同时懒构建对应面板内容
         def _on_tab_change(e) -> None:
             name = _tab_name(e.value)
             if name in valid_tabs:
+                _ensure_panel(name)
                 ui.run_javascript(
                     f'localStorage.setItem("tg_signer_tab", {json.dumps(name)})'
                 )
@@ -320,37 +367,55 @@ def _build_dashboard(container) -> None:
             """
         )
 
+        # 除默认「签到」tab 外全部懒构建：首次切到对应 tab 才创建内容元素，
+        # 大幅减少手机端首屏的元素数量与序列化传输量
         with ui.tab_panels(tabs).classes("w-full"):
-            with ui.tab_panel(tab_run):
+            panel_run = ui.tab_panel(tab_run)
+            panel_combo = ui.tab_panel(tab_combo)
+            panel_random = ui.tab_panel(tab_random)
+            panel_leave = ui.tab_panel(tab_leave)
+            panel_giveaway = ui.tab_panel(tab_giveaway)
+            panel_configs = ui.tab_panel(tab_configs)
+
+        runner: Optional[TaskRunnerBlock] = None
+
+        def _build_run_panel() -> None:
+            nonlocal runner
+            with panel_run:
                 runner = TaskRunnerBlock()
                 refreshers.append(runner)
 
-            with ui.tab_panel(tab_combo):
+        def _build_combo_panel() -> None:
+            with panel_combo:
                 ui.label(
                     "组合任务：把多个已有任务按顺序组合执行，每个账号依次跑完全部子任务。"
                 ).classes("text-gray-600")
                 refreshers.append(combo_block(runner, state.workdir))
 
-            with ui.tab_panel(tab_random):
+        def _build_random_panel() -> None:
+            with panel_random:
                 ui.label(
                     "多账号随机发言：选择账号与目标群组，按固定间隔从内置语库随机发送消息。"
                 ).classes("text-gray-600")
                 refreshers.append(random_chat_block(state.workdir))
 
-            with ui.tab_panel(tab_leave):
+        def _build_leave_panel() -> None:
+            with panel_leave:
                 ui.label(
                     "批量退出长期不更新的频道：扫描账号对话，预览确认后并发批量退出。"
                 ).classes("text-gray-600")
                 refreshers.append(auto_leave_block(state.workdir))
 
-            with ui.tab_panel(tab_giveaway):
+        def _build_giveaway_panel() -> None:
+            with panel_giveaway:
                 ui.label(
                     "自动参与频道抽奖：监听 t.me 抽奖机器人链接（?start= 参数），"
                     "实时新帖与手动扫描两种方式触发，支持多账号与指定频道列表。"
                 ).classes("text-gray-600")
                 refreshers.append(giveaway_block(state.workdir))
 
-            with ui.tab_panel(tab_configs):
+        def _build_configs_panel() -> None:
+            with panel_configs:
                 ui.label(
                     "管理 signer 和 monitor 的配置文件，支持查看、编辑和删除。"
                 ).classes("text-gray-600")
@@ -426,6 +491,29 @@ def _build_dashboard(container) -> None:
                         )
                     with ui.tab_panel(tab_monitor):
                         refreshers.append(MonitorBlock(MONITOR_TEMPLATE))
+
+        _panel_builders = {
+            "run": _build_run_panel,
+            "combo": _build_combo_panel,
+            "random": _build_random_panel,
+            "leave": _build_leave_panel,
+            "giveaway": _build_giveaway_panel,
+            "configs": _build_configs_panel,
+        }
+        _panel_built: set = set()
+
+        def _ensure_panel(name: str) -> None:
+            """首次激活 tab 时构建对应面板（幂等）。"""
+            if name in _panel_built:
+                return
+            builder = _panel_builders.get(name)
+            if builder is None:
+                return
+            _panel_built.add(name)
+            builder()
+
+        # 默认 tab（run/签到）立即构建，保证首屏可用
+        _ensure_panel("run")
 
         refresh_all()
 
@@ -643,6 +731,12 @@ def main(host: str = None, port: int = None, storage_secret: str = None) -> None
     @app.on_startup
     async def _setup_loop_handler() -> None:
         _install_loop_exception_handler()
+
+    # GZip 压缩：NiceGUI 静态资源约 6MB（Vue/Quasar/字体等），gzip 后约 1.5MB，
+    # 显著降低手机等弱网环境的首次加载耗时
+    from starlette.middleware.gzip import GZipMiddleware
+
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     ui.run(
         build_ui,

@@ -1042,7 +1042,13 @@ class GiveawayEngine:
             async with lock:
                 before = self.joined
                 await self._participate(
-                    account, client, username, param, channel, title
+                    account,
+                    client,
+                    username,
+                    param,
+                    channel,
+                    title,
+                    source_message=message,
                 )
                 if self.joined > before:
                     participated += 1
@@ -1084,6 +1090,7 @@ class GiveawayEngine:
         param: str,
         channel: str,
         title: str = "",
+        source_message: Any = None,
     ) -> None:
         if (
             self._state is not None
@@ -1161,7 +1168,9 @@ class GiveawayEngine:
                 "ok": True,
             }
         )
-        await self._click_confirm(account, client, username, start_msg, param)
+        await self._click_confirm(
+            account, client, username, start_msg, param, source_message=source_message
+        )
 
     async def _join_from_message(
         self, account: str, client: Any, bot_username: str, message: Any
@@ -1257,9 +1266,14 @@ class GiveawayEngine:
         username: str,
         start_msg: Any,
         param: str = "",
+        source_message: Any = None,
     ) -> None:
         """start 后跟进：自动加入 bot 消息中的频道（若开启），并点确认按钮。"""
         candidates: List[Any] = []
+        # 原始抽奖帖参与条件中的频道（如「加入：xx 频道」）与 bot 回复一并进行提取，
+        # 否则只覆盖 bot 回复会漏加原始帖列出的频道
+        if source_message is not None:
+            candidates.append(source_message)
         if start_msg is not None:
             candidates.append(start_msg)
         if self.confirm_wait > 0:
