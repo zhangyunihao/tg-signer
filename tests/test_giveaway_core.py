@@ -1429,6 +1429,29 @@ def test_extract_join_status_targets_utf16_and_edge_urls():
     assert extract_join_status_targets(msg2) == []
 
 
+def test_extract_join_status_targets_caption_entities():
+    """带图帖子的清单实体在 caption_entities 里，同样要能提取。"""
+    from types import SimpleNamespace
+
+    from tg_signer.giveaway_core import extract_join_status_targets
+
+    text = "🎫 加入-某测试频道G ❌"
+    msg = SimpleNamespace(
+        text=None,
+        caption=text,
+        entities=[],
+        caption_entities=[
+            SimpleNamespace(
+                type="TEXT_URL",
+                url="https://t.me/some_channel_g",
+                offset=5,
+                length=6,
+            )
+        ],
+    )
+    assert extract_join_status_targets(msg) == ["some_channel_g"]
+
+
 def test_engine_joins_only_unjoined_status_targets(tmp_path):
     """LotteryBestBot 回复：只加入 ❌ 行目标；其他 bot 不解析该格式。"""
     import asyncio

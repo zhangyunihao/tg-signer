@@ -392,35 +392,36 @@ def extract_join_status_targets(message: Any) -> List[str]:
             seen.add(key)
             targets.append(target)
 
-    for ent in getattr(message, "entities", None) or []:
-        if "TEXT_URL" not in str(getattr(ent, "type", "")).upper():
-            continue
-        url = getattr(ent, "url", None)
-        if not url:
-            continue
-        url_s = str(url)
-        offset = _utf16_to_index(text, int(getattr(ent, "offset", 0) or 0))
-        line = next((lt for ls, le, lt in bounds if ls <= offset < le), "")
-        if "加入" not in line or "❌" not in line or "✅" in line:
-            continue
-        if url_s.lower().startswith("tg://resolve"):
-            # tg://resolve?domain=xxx 形态的隐藏链接
-            query = parse_qs(urlparse(url_s).query)
-            domain = (query.get("domain") or [""])[0]
-            if re.fullmatch(r"[A-Za-z0-9_]{5,32}", domain or ""):
-                _add(domain)
-            continue
-        m = _TME_CHANNEL_RE.search(url_s)
-        if m is None:
-            continue
-        target = m.group("target")
-        rest = m.group("rest") or ""
-        if target.lower().startswith(("+", "joinchat/")):
-            _add(f"https://t.me/{target}")
-        elif rest not in ("", "/"):
-            continue  # 帖子路径（t.me/x/123）或 bot 深度链接，不属于加入目标
-        else:
-            _add(target)
+    for attr in ("entities", "caption_entities"):
+        for ent in getattr(message, attr, None) or []:
+            if "TEXT_URL" not in str(getattr(ent, "type", "")).upper():
+                continue
+            url = getattr(ent, "url", None)
+            if not url:
+                continue
+            url_s = str(url)
+            offset = _utf16_to_index(text, int(getattr(ent, "offset", 0) or 0))
+            line = next((lt for ls, le, lt in bounds if ls <= offset < le), "")
+            if "加入" not in line or "❌" not in line or "✅" in line:
+                continue
+            if url_s.lower().startswith("tg://resolve"):
+                # tg://resolve?domain=xxx 形态的隐藏链接
+                query = parse_qs(urlparse(url_s).query)
+                domain = (query.get("domain") or [""])[0]
+                if re.fullmatch(r"[A-Za-z0-9_]{5,32}", domain or ""):
+                    _add(domain)
+                continue
+            m = _TME_CHANNEL_RE.search(url_s)
+            if m is None:
+                continue
+            target = m.group("target")
+            rest = m.group("rest") or ""
+            if target.lower().startswith(("+", "joinchat/")):
+                _add(f"https://t.me/{target}")
+            elif rest not in ("", "/"):
+                continue  # 帖子路径（t.me/x/123）或 bot 深度链接，不属于加入目标
+            else:
+                _add(target)
     return targets
 
 
@@ -442,6 +443,13 @@ def extract_channel_targets(message: Any) -> List[str]:
             targets.append(item)
 
     for candidate in _iter_candidate_urls(message):
+        if candidate.lower().startswith("tg://resolve"):
+            # tg://resolve?domain=xxx 形态的隐藏链接
+            query = parse_qs(urlparse(candidate).query)
+            domain = (query.get("domain") or [""])[0]
+            if re.fullmatch(r"[A-Za-z0-9_]{5,32}", domain or ""):
+                _add(domain)
+            continue
         for match in re.finditer(r"\S+", candidate):
             piece = match.group(0)
             m = _TME_CHANNEL_RE.search(piece)
@@ -1290,9 +1298,19 @@ class GiveawayEngine:
             if not status_targets:
                 raw = _message_text(message)
                 if raw and "加入" in raw and "❌" in raw:
+                    ents = list(getattr(message, "entities", None) or []) + list(
+                        getattr(message, "caption_entities", None) or []
+                    )
+                    summary = "；".join(
+                        "{}:{}".format(
+                            str(getattr(e, "type", "?")).split(".")[-1],
+                            getattr(e, "url", "") or "",
+                        )
+                        for e in ents[:6]
+                    )
                     self.log(
                         f"[{account}] @LotteryBestBot 清单含未加入(❌)行但未解析到"
-                        "链接，跳过自动加入"
+                        f"链接（实体 {len(ents)} 个：{summary}）"
                     )
             targets = targets + status_targets
         for target in targets:
