@@ -44,7 +44,7 @@ _CFG_FIELDS = {
     "confirm_wait": lambda: 8,
     "auto_join": lambda: True,
     "max_joins": lambda: None,
-    "rescue_interval_min": lambda: 10,  # 补漏扫描间隔（分钟），0=关闭
+    "rescue_interval_min": lambda: 0,  # 补漏扫描间隔（分钟），0=关闭（默认关闭）
     "rescue_limit": lambda: 10,  # 每次补漏每频道重拉条数
 }
 
@@ -866,7 +866,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             ).classes("w-36")
             rescue_interval_input = ui.number(
                 label="补漏扫描间隔（分钟，0=关闭）",
-                value=10,
+                value=0,
                 min=0,
                 max=1440,
                 format="%d",
