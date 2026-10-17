@@ -1099,11 +1099,9 @@ class GiveawayEngine:
             return None
         lock = self._locks.setdefault(account, asyncio.Lock())
         participated = 0
-        # 命中多少个抽奖入口一目了然（去重/失败仍会逐个处理）
-        self.log(
-            f"[{account}] 命中 {len(links)} 个抽奖链接："
-            + "、".join(f"@{u}" for u, _ in links)
-        )
+        # 先过滤出可参与的链接（未参与过/未冷却/未熔断），全部不可参与时
+        # 连「命中」日志也静默，避免熔断或历史去重期间刷屏
+        actionable: list = []
         for username, param in links:
             if self._stop is not None and self._stop.is_set():
                 break
@@ -1121,6 +1119,15 @@ class GiveawayEngine:
                 continue
             if self._flood_key(account, username) in self._flood_bots:
                 continue
+            actionable.append((username, param))
+        if not actionable:
+            return "joined" if participated else None
+        # 命中多少个抽奖入口一目了然
+        self.log(
+            f"[{account}] 命中 {len(actionable)} 个抽奖链接："
+            + "、".join(f"@{u}" for u, _ in actionable)
+        )
+        for username, param in actionable:
             async with lock:
                 before = self.joined
                 await self._participate(
