@@ -1452,6 +1452,29 @@ def test_extract_join_status_targets_caption_entities():
     assert extract_join_status_targets(msg) == ["some_channel_g"]
 
 
+def test_extract_join_status_targets_pyrogram_text_link():
+    """Pyrogram 的隐藏链接实体叫 TEXT_LINK（非 Telethon 的 TEXT_URL），
+    之前被类型过滤整体丢弃，导致 ❌ 清单永远解析不到链接。"""
+    from types import SimpleNamespace
+
+    from tg_signer.giveaway_core import extract_join_status_targets
+
+    msg = SimpleNamespace(
+        text="🎫 加入-某测试频道H ❌",
+        caption=None,
+        entities=[
+            SimpleNamespace(
+                type="TEXT_LINK",
+                url="https://t.me/some_channel_h",
+                offset=5,
+                length=6,
+            )
+        ],
+        caption_entities=[],
+    )
+    assert extract_join_status_targets(msg) == ["some_channel_h"]
+
+
 def test_engine_joins_only_unjoined_status_targets(tmp_path):
     """LotteryBestBot 回复：只加入 ❌ 行目标；其他 bot 不解析该格式。"""
     import asyncio

@@ -199,8 +199,8 @@ def _iter_candidate_urls(message: Any) -> Iterable[str]:
         for ent in getattr(message, attr, None) or []:
             ent_type = str(getattr(ent, "type", ""))
             url = getattr(ent, "url", None)
-            # 文本超链接实体（pyrogram: MessageEntityType.TEXT_URL）
-            if "TEXT_URL" in ent_type.upper() and url:
+            # 文本超链接实体（pyrogram: TEXT_LINK；telethon: TEXT_URL）
+            if ("TEXT_URL" in ent_type.upper() or "TEXT_LINK" in ent_type.upper()) and url:
                 yield str(url)
     reply_markup = getattr(message, "reply_markup", None)
     for row in getattr(reply_markup, "inline_keyboard", None) or []:
@@ -394,7 +394,9 @@ def extract_join_status_targets(message: Any) -> List[str]:
 
     for attr in ("entities", "caption_entities"):
         for ent in getattr(message, attr, None) or []:
-            if "TEXT_URL" not in str(getattr(ent, "type", "")).upper():
+            # 隐藏链接实体：Pyrogram 叫 TEXT_LINK，Telethon 叫 TEXT_URL
+            ent_type = str(getattr(ent, "type", "")).upper()
+            if "TEXT_URL" not in ent_type and "TEXT_LINK" not in ent_type:
                 continue
             url = getattr(ent, "url", None)
             if not url:
