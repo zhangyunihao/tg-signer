@@ -28,8 +28,11 @@ from tg_signer.webui.common import (
     _assign_to_job,
     add_dialog_close_button,
     attach_select_all,
+    build_debug_report,
+    copy_text_to_clipboard,
     notify_error,
     pretty_json,
+    read_file_tail,
     state,
     with_select_all,
 )
@@ -534,11 +537,18 @@ class TaskRunnerBlock:
             "点击「新增任务」在弹窗中选择任务类型、任务与账号；组合任务的创建与执行在独立的「组合任务」tab；历史列表可「复制」任意历史任务的参数快速新建，运行中的任务可停止。"
         ).classes("text-sm text-gray-500")
 
-        with ui.row().classes("gap-2 items-center"):
+        with ui.row().classes("gap-2 items-center flex-wrap"):
             ui.button(
                 "新增任务", icon="add", color="primary", on_click=self.open_dialog
             )
             ui.button("清空输出", on_click=self.clear_log).props("outline")
+            ui.button(
+                "复制调试日志",
+                icon="bug_report",
+                on_click=self.copy_debug_log,
+            ).props("outline").tooltip(
+                "复制环境信息+运行输出+任务历史+日志文件，粘贴到电脑排查复现"
+            )
 
         self.status_label = ui.label("空闲").classes("text-sm text-gray-500")
 
@@ -1644,6 +1654,42 @@ class TaskRunnerBlock:
         TaskRunnerBlock.output_lines.clear()
         self.log_list.clear()
         self.log_list.update()
+
+    def _load_task_history_tail(self, limit: int) -> str:
+        """读取任务历史文件尾部记录（读取失败返回空串，不打扰用户）。"""
+        path = Path(state.workdir) / "webui_task_history.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            logger.debug("读取任务历史失败: %s", path, exc_info=True)
+            return ""
+        if isinstance(data, list) and data:
+            return pretty_json(data[-limit:])
+        return ""
+
+    def copy_debug_log(self) -> None:
+        """复制调试日志：环境信息 + 实时输出 + 任务历史 + 子进程日志文件尾部。
+
+        手机端报错后一键复制，粘贴到电脑即可拿到定位/复现所需的全部上下文。
+        """
+        wd = Path(state.workdir)
+        sections: list[tuple[str, str]] = []
+        if TaskRunnerBlock.output_lines:
+            sections.append(
+                ("本次运行输出（最近300行）", "\n".join(TaskRunnerBlock.output_lines[-300:]))
+            )
+        history_tail = self._load_task_history_tail(15)
+        if history_tail:
+            sections.append(("任务历史（最近15条）", history_tail))
+        # 子进程日志相对服务进程 cwd 与工作目录都可能落盘，两处都尝试
+        sections.append(
+            ("logs/tg-signer.log（工作目录）最近200行", read_file_tail(wd / "logs" / "tg-signer.log"))
+        )
+        sections.append(
+            ("logs/tg-signer.log（服务进程目录）最近200行", read_file_tail(Path("logs") / "tg-signer.log"))
+        )
+        copy_text_to_clipboard(build_debug_report(wd, sections))
+        ui.notify("已复制调试日志（含环境信息与任务历史），粘贴给电脑即可排查", type="positive")
 
     @staticmethod
     def _classify_line(line: str) -> str:

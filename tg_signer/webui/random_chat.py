@@ -238,6 +238,13 @@ def save_task_store(workdir, store: dict) -> None:
     atomic_write_json(_store_path(workdir), store)
 
 
+def speak_task_running(workdir, name: str) -> bool:
+    """消息中心用：判断指定发言任务当前是否在运行（引擎状态为进程级共享）"""
+    wd_key = str(Path(workdir).resolve())
+    engine = _GLOBAL_ENGINES.get(f"{wd_key}|{name}")
+    return engine is not None and engine.running
+
+
 def parse_chat_id(raw) -> Optional[Union[int, str]]:
     text = (raw or "").strip()
     if not text:
@@ -267,6 +274,8 @@ class RandomChatEngine:
         self._stopping: bool = False
         # 运行截止时间（time.monotonic），start 时设置
         self._deadline: float | None = None
+        # 自然跑完/停止/超时强终为 True，异常中断保持 False（供消息中心判断任务是否完成）
+        self.completed_naturally: bool = False
         # 运行进度：{account: 已发送条数}，供任务表格状态列展示
         self.progress: Dict[str, int] = {}
         self._total_accounts: int = 0
@@ -307,6 +316,7 @@ class RandomChatEngine:
             return False
         self.progress = {}
         self._stopping = False
+        self.completed_naturally = False
         self._total_accounts = len(accounts)
         self._total_count = total_count
         self.using_custom_pool = bool(phrases)
@@ -537,6 +547,9 @@ class RandomChatEngine:
             elif total_count:
                 summary = ", ".join(f"{a}:{total_count}" for a in sorted(clients))
                 log(f"每个账号均已发满 {total_count} 条（{summary}），任务完成")
+            # 走到发送阶段末尾（跑完/手动停止/超时强终均算）才标记完成；
+            # 连接失败提前结束或异常中断不标记，消息中心继续视为待完成
+            self.completed_naturally = True
         finally:
             for client in clients.values():
                 await safe_disconnect(client)
@@ -576,6 +589,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 "session_dir": str(cfg["session_dir"]),
                 "custom_phrases": list(cfg.get("custom_phrases") or []),
             }
+            # 已完成标记（消息中心据此过滤待完成任务），仅在为真时写入
+            if cfg.get("done"):
+                clean[name]["done"] = True
         store["tasks"] = clean
         save_task_store(workdir, store)
 
@@ -696,6 +712,17 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 return
 
         def _on_finish(_n: str = name) -> None:
+            # 任务收尾：正常跑完/停止/超时强终时标记完成，供消息中心过滤待完成任务
+            engine = get_engine(_n)
+            cfg_done = tasks.get(_n)
+            if (
+                engine is not None
+                and engine.completed_naturally
+                and cfg_done is not None
+                and not cfg_done.get("done")
+            ):
+                cfg_done["done"] = True
+                _persist()
             cb = _GLOBAL_STATUS_CBS.get(engine_key(_n)) or tasks.get(_n, {}).get(
                 "_set_status"
             )

@@ -256,19 +256,24 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         save_leave_tasks(workdir, tasks)  # 旧配置迁移后立即落盘
 
     # 每个任务（执行记录）的运行时状态：running/stop/rows/selected/status/auto_left
-    task_states: Dict[str, Dict] = {
-        t["id"]: {
+    # rows（命中/待确认频道）从任务记录恢复，任务完成后重新打开仍可见
+    def _default_state(task: Dict) -> Dict:
+        return {
             "running": False,
             "stop": False,
-            "rows": [],
+            "rows": [dict(r) for r in (task.get("rows") or []) if isinstance(r, dict)],
             "selected": set(),
-            "status": str(t.get("status") or "—"),
+            "status": str(task.get("status") or "—"),
             "auto_left": 0,
         }
-        for t in tasks
-    }
+
+    task_states: Dict[str, Dict] = {t["id"]: _default_state(t) for t in tasks}
     log_lines: List[str] = []
-    toggle_counts: Dict[str, ui.label | None] = {}
+    # 页面级持久弹窗的引用与状态（弹窗不在事件槽位里动态创建）
+    detail_refs: Dict = {"task_id": None, "body": None, "count": None}
+    leave_confirm: Dict = {"task_id": None, "selected": []}
+    delete_state: Dict = {"task_id": None}
+    cards_limit = {"n": 5}
 
     def log(msg: str) -> None:
         line = f"{datetime.now():%H:%M:%S} {msg}"
@@ -282,8 +287,6 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
 
     def find_task(task_id: str) -> Dict | None:
         return next((t for t in tasks if t["id"] == task_id), None)
-
-    list_container: ui.column | None = None
 
     def _kw_hit(task: Dict, title: str) -> bool:
         return any(kw in str(title or "") for kw in (task.get("keywords") or []))
@@ -354,8 +357,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             logger.debug("退频道任务运行异常", exc_info=True)
         finally:
             st["running"] = False
-            # 终态写回记录并持久化，刷新页面后仍可见
+            # 终态与命中频道写回记录并持久化，刷新页面后仍可见
             task["status"] = st["status"]
+            task["rows"] = [dict(r) for r in st["rows"]]
             save_leave_tasks(workdir, tasks)
             render_list()
 
@@ -373,58 +377,55 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         if not selected:
             ui.notify("请先勾选要退出的对话", type="warning")
             return
-        with ui.dialog() as dialog, ui.card():
-            add_dialog_close_button(dialog)
-            ui.label(f"确认退出以下 {len(selected)} 个对话？").classes(
-                "text-lg font-semibold"
-            )
-            ui.label("退出后需要重新搜索/加群才能回来，请仔细核对！").classes(
-                "text-sm text-orange-600"
-            )
-            with ui.column().classes("max-h-60 overflow-auto w-full"):
-                for row in selected[:50]:
-                    ui.label(
-                        f"[{row['account']}] {row['title']}（{row['age_days']}天未更新）"
-                    ).classes("text-sm")
-                if len(selected) > 50:
-                    ui.label(f"… 等共 {len(selected)} 个").classes(
-                        "text-sm text-gray-500"
-                    )
-            with ui.row().classes("w-full justify-end"):
-                ui.button("取消", on_click=dialog.close).props("flat")
+        # 填充页面级持久确认弹窗（不在事件槽位里动态创建弹窗）
+        leave_confirm["task_id"] = task_id
+        leave_confirm["selected"] = selected
+        confirm_title.text = f"确认退出以下 {len(selected)} 个对话？"
+        confirm_list.clear()
+        with confirm_list:
+            for row in selected[:50]:
+                ui.label(
+                    f"[{row['account']}] {row['title']}（{row['age_days']}天未更新）"
+                ).classes("text-sm")
+            if len(selected) > 50:
+                ui.label(f"… 等共 {len(selected)} 个").classes("text-sm text-gray-500")
+        confirm_dialog.open()
 
-                async def do_leave() -> None:
-                    dialog.close()
-                    st["running"] = True
-                    st["status"] = "退出中"
-                    render_list()
-                    try:
-                        by_account: Dict[str, List[Dict]] = {}
-                        for row in selected:
-                            by_account.setdefault(row["account"], []).append(row)
-                        done_keys: set = set()
-                        for account, items in by_account.items():
-                            done_keys |= await _leave_rows(
-                                account, session_dir, items, log
-                            )
-                        if done_keys:
-                            st["rows"] = [
-                                r for r in st["rows"] if r["key"] not in done_keys
-                            ]
-                            st["selected"].difference_update(done_keys)
-                        st["status"] = f"退出完成，剩余待确认 {len(st['rows'])} 个"
-                    except Exception as exc:
-                        st["status"] = f"异常：{exc}"
-                        log(f"[{task['name']}] 退出异常: {exc}")
-                        logger.debug("退频道手动退出异常", exc_info=True)
-                    finally:
-                        st["running"] = False
-                        task["status"] = st["status"]
-                        save_leave_tasks(workdir, tasks)
-                        render_list()
-
-                ui.button("确认退出", on_click=do_leave).props("color=negative")
-        dialog.open()
+    async def _do_leave_selected() -> None:
+        task_id = leave_confirm.get("task_id")
+        task = find_task(task_id) if task_id else None
+        st = task_states.get(task_id) if task_id else None
+        confirm_dialog.close()
+        if not task or not st:
+            return
+        selected = list(leave_confirm.get("selected") or [])
+        if not selected:
+            return
+        st["running"] = True
+        st["status"] = "退出中"
+        render_list()
+        try:
+            by_account: Dict[str, List[Dict]] = {}
+            for row in selected:
+                by_account.setdefault(row["account"], []).append(row)
+            done_keys: set = set()
+            for account, items in by_account.items():
+                done_keys |= await _leave_rows(account, session_dir, items, log)
+            if done_keys:
+                st["rows"] = [r for r in st["rows"] if r["key"] not in done_keys]
+                st["selected"].difference_update(done_keys)
+            st["status"] = f"退出完成，剩余待确认 {len(st['rows'])} 个"
+        except Exception as exc:
+            st["status"] = f"异常：{exc}"
+            log(f"[{task['name']}] 退出异常: {exc}")
+            logger.debug("退频道手动退出异常", exc_info=True)
+        finally:
+            st["running"] = False
+            task["status"] = st["status"]
+            task["rows"] = [dict(r) for r in st["rows"]]
+            save_leave_tasks(workdir, tasks)
+            _refresh_detail(task_id)
+            render_list()
 
     def delete_task(task_id: str) -> None:
         task = find_task(task_id)
@@ -434,245 +435,448 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         if st and st["running"]:
             ui.notify("任务运行中，请先停止再删除", type="warning")
             return
-        with ui.dialog() as dialog, ui.card():
-            add_dialog_close_button(dialog)
+        # 填充页面级持久确认弹窗（不在事件槽位里动态创建弹窗）
+        delete_state["task_id"] = task_id
+        delete_label.text = f"确认删除任务「{task['name']}」？"
+        delete_dialog.open()
 
-            def do_delete() -> None:
-                dialog.close()
-                tasks.remove(task)
-                task_states.pop(task_id, None)
-                save_leave_tasks(workdir, tasks)
-                log(f"已删除任务：{task['name']}")
-                render_list()
-
-            ui.label(f"确认删除任务「{task['name']}」？").classes(
-                "text-lg font-semibold"
-            )
-            with ui.row().classes("w-full justify-end"):
-                ui.button("取消", on_click=dialog.close).props("flat")
-                ui.button("删除", on_click=do_delete).props("color=negative")
-        dialog.open()
+    def _do_delete() -> None:
+        tid = delete_state.get("task_id")
+        task = find_task(tid) if tid else None
+        delete_dialog.close()
+        if not task:
+            return
+        tasks.remove(task)
+        task_states.pop(task["id"], None)
+        if detail_refs.get("task_id") == task["id"]:
+            detail_refs.update({"task_id": None, "body": None, "count": None})
+        save_leave_tasks(workdir, tasks)
+        log(f"已删除任务：{task['name']}")
+        render_list()
 
     def open_create_dialog(prefill: Dict | None = None) -> None:
         prefill = prefill or {}
         names = list_session_names(session_dir, workdir)
-        with (
-            ui.dialog() as dialog,
-            ui.card().classes("w-[520px] max-w-[96vw] max-h-[88vh] overflow-auto"),
-        ):
-            add_dialog_close_button(dialog)
-            ui.label("复制退频道任务" if prefill else "新建退频道任务").classes(
-                "text-lg font-semibold"
-            )
-            default_name = (
-                f"{prefill.get('name', '')} 副本"
-                if prefill
-                else f"退频道任务 {datetime.now():%m-%d %H:%M}"
-            )
-            name_input = ui.input("任务名称", value=default_name).classes("w-full")
-            account_sel = ui.select(
-                label="账号（可多选）",
-                options=with_select_all(build_account_options(session_dir, names)),
-                multiple=True,
-                with_input=True,
-                value=[a for a in (prefill.get("accounts") or []) if a in names]
-                or None,
-            ).classes("w-full")
-            attach_select_all(account_sel)
-            with ui.row().classes("w-full items-end flex-wrap gap-2"):
-                days_input = ui.number(
-                    label="不更新天数阈值",
-                    value=int(prefill.get("days") or 7),
-                    min=1,
-                    step=1,
-                    format="%.0f",
-                ).classes("w-36")
-                ig = ui.checkbox("包含群组", value=bool(prefill.get("include_groups")))
-                sp = ui.checkbox(
-                    "跳过置顶", value=bool(prefill.get("skip_pinned", True))
-                )
-            kw_input = ui.input(
-                "保护关键字（逗号分隔）",
-                value=",".join(prefill.get("keywords") or []) or DEFAULT_KEYWORDS,
-            ).classes("w-full")
-            ui.label(
-                "未命中关键字的频道将在启动后自动退出；命中关键字的频道仅展示，需手动勾选退出"
-            ).classes("text-xs text-gray-500")
-            auto_cb = ui.checkbox(
-                "自动退出未命中关键字的频道",
-                value=bool(prefill.get("auto_leave")),
-            )
-            with ui.row().classes("w-full justify-end"):
+        # 填充页面级持久新建/复制弹窗（不在事件槽位里动态创建弹窗）
+        create_title.text = "复制退频道任务" if prefill else "新建退频道任务"
+        name_input.value = (
+            f"{prefill.get('name', '')} 副本"
+            if prefill
+            else f"退频道任务 {datetime.now():%m-%d %H:%M}"
+        )
+        account_sel.options = with_select_all(build_account_options(session_dir, names))
+        account_sel.value = [
+            a for a in (prefill.get("accounts") or []) if a in names
+        ] or None
+        account_sel.update()
+        days_input.value = int(prefill.get("days") or 7)
+        ig.value = bool(prefill.get("include_groups"))
+        sp.value = bool(prefill.get("skip_pinned", True))
+        kw_input.value = ",".join(prefill.get("keywords") or []) or DEFAULT_KEYWORDS
+        auto_cb.value = bool(prefill.get("auto_leave"))
+        create_dialog.open()
 
-                def do_create() -> None:
-                    accounts = list(account_sel.value or [])
-                    if not accounts:
-                        ui.notify("请至少选择一个账号", type="warning")
-                        return
-                    task = {
-                        "id": f"leave_{datetime.now():%Y%m%d%H%M%S%f}",
-                        "name": str(name_input.value or "").strip() or "退频道任务",
-                        "accounts": accounts,
-                        "days": max(1, int(days_input.value or 7)),
-                        "include_groups": bool(ig.value),
-                        "skip_pinned": bool(sp.value),
-                        "keywords": _split_keywords(str(kw_input.value or "")),
-                        "auto_leave": bool(auto_cb.value),
-                        "status": "—",
-                    }
-                    tasks.append(task)
-                    task_states[task["id"]] = {
-                        "running": False,
-                        "stop": False,
-                        "rows": [],
-                        "selected": set(),
-                        "status": "—",
-                        "auto_left": 0,
-                    }
-                    save_leave_tasks(workdir, tasks)
-                    dialog.close()
-                    render_list()
-                    # 每次执行都是一条新记录，创建后立即启动
-                    run_task(task["id"])
-
-                ui.button("取消", on_click=dialog.close).props("flat")
-                ui.button("启动执行", on_click=do_create).props("color=primary")
-        dialog.open()
-
-    def render_task_card(container, task: Dict) -> None:
-        st = task_states[task["id"]]
-        with container:
-            with ui.card().classes("w-full leave-task-card border"):
-                with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-                    ui.label(task["name"]).classes("text-base font-semibold")
-                    status_text = str(st["status"] or "—")
-                    (
-                        ui.label(status_text).classes("text-xs text-blue-600")
-                        if st["running"]
-                        else ui.label(status_text).classes("text-xs text-gray-500")
-                    )
-                    with ui.row().classes("ml-auto gap-1"):
-                        ui.button(
-                            "停止", on_click=lambda t=task["id"]: stop_task(t)
-                        ).props("outline dense color=warning").classes(
-                            "min-w-0"
-                        ).bind_visibility_from(st, "running")
-                        ui.button(
-                            "复制",
-                            on_click=lambda t=task: open_create_dialog(
-                                {k: v for k, v in t.items() if k != "status"}
-                            ),
-                        ).props("outline dense color=primary")
-                        ui.button(
-                            "删除", on_click=lambda t=task["id"]: delete_task(t)
-                        ).props("outline dense color=negative")
-                ui.label(
-                    f"任务ID：{task['id']}　"
-                    f"账号：{'、'.join(task.get('accounts') or []) or '未选择'}　"
-                    f"阈值：{task.get('days')} 天　"
-                    f"{'含群组，' if task.get('include_groups') else ''}"
-                    f"{'跳过置顶，' if task.get('skip_pinned', True) else ''}"
-                    f"{'自动退出未命中，' if task.get('auto_leave') else '仅展示，'}"
-                    f"关键字：{'、'.join(task.get('keywords') or []) or '无'}"
-                ).classes("text-xs text-gray-600")
-                # 结果区：命中关键字的频道（或自动退出关闭时的全部候选）
-                if st["rows"]:
-
-                    def _on_toggle(e, k: str, tid=task["id"]) -> None:
-                        sts = task_states[tid]
-                        if e.value:
-                            sts["selected"].add(k)
-                        else:
-                            sts["selected"].discard(k)
-                        if toggle_counts.get(tid) is not None:
-                            toggle_counts[
-                                tid
-                            ].text = f"已选 {len(sts['selected'])}/{len(sts['rows'])}"
-
-                    with ui.row().classes("w-full items-center gap-2"):
-
-                        def _select_all(t=task) -> None:
-                            sts = task_states[t["id"]]
-                            sts["selected"].update(r["key"] for r in sts["rows"])
-                            render_list()
-
-                        def _select_none(t=task) -> None:
-                            sts = task_states[t["id"]]
-                            sts["selected"].clear()
-                            render_list()
-
-                        ui.button("全选", on_click=_select_all).props("flat dense")
-                        ui.button("全不选", on_click=_select_none).props("flat dense")
-                        toggle_counts[task["id"]] = ui.label(
-                            f"已选 {len(st['selected'])}/{len(st['rows'])}"
-                        ).classes("text-xs text-gray-500 ml-auto")
-                    for row in st["rows"]:
-                        key = row["key"]
-                        with ui.row().classes(
-                            "w-full items-start gap-2 no-wrap p-2 rounded border"
-                        ):
-                            ui.checkbox(
-                                value=key in st["selected"],
-                                on_change=lambda e, k=key, t=task["id"]: _on_toggle(
-                                    e, k, t
-                                ),
-                            ).props("dense").classes("mt-0.5")
-                            with ui.column().classes("gap-0 min-w-0"):
-                                ui.label(str(row["title"])).classes(
-                                    "text-sm font-semibold"
-                                ).style("overflow-wrap: anywhere;")
-                                ui.label(
-                                    f"账号：{row['account']}　类型：{row['type']}　"
-                                    f"未更新 {row['age_days']} 天"
-                                ).classes("text-xs text-gray-500")
-                    with ui.row().classes("w-full items-center"):
-                        ui.button(
-                            "退出所选", on_click=lambda t=task["id"]: leave_selected(t)
-                        ).props("color=negative outline dense")
-                        ui.label("退出不可撤销，请仔细核对").classes(
-                            "text-xs text-gray-500"
-                        )
-
-    def render_list() -> None:
-        if list_container is None:
+    async def _do_create() -> None:
+        accounts = list(account_sel.value or [])
+        if not accounts:
+            ui.notify("请至少选择一个账号", type="warning")
             return
-        toggle_counts.clear()
-        list_container.clear()
-        with list_container:
-            if not tasks:
+        task = {
+            "id": f"leave_{datetime.now():%Y%m%d%H%M%S%f}",
+            "name": str(name_input.value or "").strip() or "退频道任务",
+            "accounts": accounts,
+            "days": max(1, int(days_input.value or 7)),
+            "include_groups": bool(ig.value),
+            "skip_pinned": bool(sp.value),
+            "keywords": _split_keywords(str(kw_input.value or "")),
+            "auto_leave": bool(auto_cb.value),
+            "status": "—",
+        }
+        tasks.append(task)
+        task_states[task["id"]] = _default_state(task)
+        save_leave_tasks(workdir, tasks)
+        create_dialog.close()
+        render_list()
+        # 每次执行都是一条新记录，创建后立即启动
+        await run_task(task["id"])
+
+    def _short_status(st: Dict) -> str:
+        full = str(st.get("status") or "—")
+        if st.get("running"):
+            return "运行中"
+        if full.startswith("完成") or full.startswith("退出完成"):
+            return "已完成"
+        if full == "已停止":
+            return "已停止"
+        if full.startswith("异常"):
+            return "失败"
+        return "—"
+
+    def _status_color(status: str) -> str:
+        if status == "已完成":
+            return "positive"
+        if status == "失败":
+            return "negative"
+        if status == "运行中":
+            return "info"
+        return "grey-6"
+
+    def _event_row(e) -> Dict | None:
+        """从 Quasar 表格事件对象中取出行 dict（事件参数可能被包成 list）。"""
+        row = getattr(e, "args", None)
+        if isinstance(row, list) and row and isinstance(row[0], dict):
+            row = row[0]
+        return row if isinstance(row, dict) else None
+
+    def _prefill_of(task: Dict) -> Dict:
+        # 复制仅取配置，不带上次状态与命中频道
+        return {k: v for k, v in task.items() if k not in ("status", "rows")}
+
+    def _dup_by_id(task_id: str) -> None:
+        task = find_task(task_id)
+        if task:
+            open_create_dialog(_prefill_of(task))
+
+    # ---- 任务明细弹窗：展示命中/待确认频道，可勾选手动退出 ----
+
+    def _detail_on_toggle(e, key: str, task_id: str) -> None:
+        sts = task_states.get(task_id)
+        if not sts:
+            return
+        if e.value:
+            sts["selected"].add(key)
+        else:
+            sts["selected"].discard(key)
+        cnt = detail_refs.get("count")
+        if cnt is not None:
+            cnt.text = f"已选 {len(sts['selected'])}/{len(sts['rows'])}"
+
+    def _detail_select(task_id: str, all_on: bool) -> None:
+        sts = task_states.get(task_id)
+        if not sts:
+            return
+        if all_on:
+            sts["selected"].update(r["key"] for r in sts["rows"])
+        else:
+            sts["selected"].clear()
+        render_detail_rows(task_id)
+
+    def render_detail_rows(task_id: str) -> None:
+        body = detail_refs.get("body")
+        if body is None:
+            return
+        st = task_states.get(task_id) or {"rows": [], "selected": set()}
+        body.clear()
+        with body:
+            rows = st["rows"]
+            if not rows:
+                ui.label("暂无待确认的频道").classes("text-sm text-gray-400")
+                return
+            with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+                ui.button(
+                    "全选", on_click=lambda t=task_id: _detail_select(t, True)
+                ).props("flat dense")
+                ui.button(
+                    "全不选", on_click=lambda t=task_id: _detail_select(t, False)
+                ).props("flat dense")
+                ui.button(
+                    "退出所选", on_click=lambda t=task_id: leave_selected(t)
+                ).props("outline dense color=negative")
+                detail_refs["count"] = ui.label(
+                    f"已选 {len(st['selected'])}/{len(rows)}"
+                ).classes("text-xs text-gray-500 ml-auto")
+            for row in rows:
+                key = row["key"]
+                with ui.row().classes(
+                    "w-full items-start gap-2 no-wrap p-2 rounded border"
+                ):
+                    ui.checkbox(
+                        value=key in st["selected"],
+                        on_change=lambda e, k=key, t=task_id: _detail_on_toggle(
+                            e, k, t
+                        ),
+                    ).props("dense").classes("mt-0.5")
+                    with ui.column().classes("gap-0 min-w-0"):
+                        ui.label(str(row["title"])).classes(
+                            "text-sm font-semibold"
+                        ).style("overflow-wrap: anywhere;")
+                        ui.label(
+                            f"账号：{row['account']}　类型：{row['type']}　"
+                            f"未更新 {row['age_days']} 天"
+                        ).classes("text-xs text-gray-500")
+            ui.label("退出不可撤销，请仔细核对").classes("text-xs text-gray-500")
+
+    def open_detail_dialog(task_id: str) -> None:
+        task = find_task(task_id)
+        if not task:
+            return
+        if task_id not in task_states:
+            task_states[task_id] = _default_state(task)
+        # 填充页面级持久明细弹窗（不在事件槽位里动态创建弹窗）
+        detail_refs["task_id"] = task_id
+        detail_refs["body"] = detail_body
+        detail_title.text = f"任务明细 — {task['name']}"
+        render_detail_rows(task_id)
+        detail_dialog.open()
+
+    def _refresh_detail(task_id: str) -> None:
+        if (
+            detail_refs.get("task_id") == task_id
+            and detail_refs.get("body") is not None
+        ):
+            try:
+                render_detail_rows(task_id)
+            except Exception:
+                logger.debug("刷新任务明细弹窗失败", exc_info=True)
+
+    # ---- 任务列表：桌面表格 + 移动端卡片双渲染 ----
+
+    def render_mobile_cards(rows: List[Dict]) -> None:
+        cards_container.clear()
+        with cards_container:
+            shown = rows[: cards_limit["n"]]
+            if not shown:
                 ui.label("暂无执行记录，点击「新建任务」开始").classes(
                     "text-sm text-gray-400"
                 )
-            # 最新执行的记录显示在最上方
-            for task in reversed(tasks):
-                if task["id"] not in task_states:
-                    task_states[task["id"]] = {
-                        "running": False,
-                        "stop": False,
-                        "rows": [],
-                        "selected": set(),
-                        "status": str(task.get("status") or "—"),
-                        "auto_left": 0,
-                    }
-                render_task_card(list_container, task)
+            for row in shown:
+                with ui.card().classes("w-full mobile-list-card border"):
+                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        ui.badge(row["status"]).props(
+                            f"color={_status_color(row['status'])}"
+                        )
+                        ui.label(row["name"]).classes("text-base font-semibold")
+                    ui.label(f"任务ID：{row['id']}").classes("text-xs text-gray-400")
+                    ui.label(f"账号：{row['accounts']}").classes(
+                        "text-xs text-gray-600"
+                    )
+                    ui.label(row["result"]).classes("text-xs text-gray-700").style(
+                        "overflow-wrap: anywhere;"
+                    )
+                    with ui.row().classes("w-full mobile-card-actions"):
+                        ui.button(
+                            "复制", on_click=lambda r=row: _dup_by_id(str(r["id"]))
+                        ).props("flat dense color=primary")
+                        ui.button(
+                            "明细",
+                            on_click=lambda r=row: open_detail_dialog(str(r["id"])),
+                        ).props("flat dense color=grey-8")
+                        if row["running"]:
+                            ui.button(
+                                "停止",
+                                on_click=lambda r=row: stop_task(str(r["id"])),
+                            ).props("flat dense color=warning")
+                        ui.button(
+                            "删除", on_click=lambda r=row: delete_task(str(r["id"]))
+                        ).props("flat dense color=negative")
+            if len(rows) > cards_limit["n"]:
+
+                def _more() -> None:
+                    cards_limit["n"] += 10
+                    render_list()
+
+                ui.button(f"展开更多（共 {len(rows)} 条）", on_click=_more).props(
+                    "flat dense"
+                ).classes("w-full")
+
+    def render_list() -> None:
+        # 最新执行的记录显示在最上方
+        rows = []
+        for task in reversed(tasks):
+            if task["id"] not in task_states:
+                task_states[task["id"]] = _default_state(task)
+            st = task_states[task["id"]]
+            rows.append(
+                {
+                    "id": task["id"],
+                    "name": str(task.get("name") or ""),
+                    "accounts": "、".join(str(a) for a in (task.get("accounts") or []))
+                    or "未选择",
+                    "status": _short_status(st),
+                    "result": str(st.get("status") or "—"),
+                    "running": bool(st.get("running")),
+                }
+            )
+        leave_table.rows = rows
+        leave_table.update()
+        render_mobile_cards(rows)
+
+    def _on_leave_dup(e) -> None:
+        row = _event_row(e)
+        if row and row.get("id"):
+            _dup_by_id(str(row["id"]))
+
+    def _on_leave_detail(e) -> None:
+        row = _event_row(e)
+        if row and row.get("id"):
+            open_detail_dialog(str(row["id"]))
+
+    def _on_leave_stop(e) -> None:
+        row = _event_row(e)
+        if row and row.get("id"):
+            stop_task(str(row["id"]))
+
+    def _on_leave_del(e) -> None:
+        row = _event_row(e)
+        if row and row.get("id"):
+            delete_task(str(row["id"]))
 
     ui.label("批量退频道").classes("text-lg font-semibold")
     ui.label(
         "扫描所选账号超过指定天数没有新消息的频道（可选包含群组）并批量退出。"
         "开启「自动退出未命中关键字」后，未命中保护关键字的频道自动退出；"
-        "命中关键字的频道展示在任务结果中，需手动勾选退出。自己是创建者的对话永远不会被退出。"
+        "命中关键字的频道在「明细」中展示，需手动勾选退出。自己是创建者的对话永远不会被退出。"
     ).classes("text-sm text-gray-500")
 
     with ui.row().classes("w-full items-center"):
         ui.button("新建任务", on_click=lambda: open_create_dialog()).props(
             "color=primary"
         )
-        ui.label("每次执行都会在列表新增一条记录，可复制配置再次执行").classes(
-            "text-xs text-gray-500 ml-auto"
-        )
+        ui.label(
+            "每次执行都会在列表新增一条记录，可复制配置再次执行；点击「明细」查看命中的频道"
+        ).classes("text-xs text-gray-500 ml-auto")
 
-    list_container = ui.column().classes("w-full gap-2")
+    leave_table = (
+        ui.table(
+            columns=[
+                {
+                    "name": "name",
+                    "label": "任务名",
+                    "field": "name",
+                    "align": "left",
+                },
+                {
+                    "name": "id",
+                    "label": "任务ID",
+                    "field": "id",
+                    "align": "left",
+                },
+                {
+                    "name": "accounts",
+                    "label": "账号",
+                    "field": "accounts",
+                    "align": "left",
+                },
+                {
+                    "name": "status",
+                    "label": "状态",
+                    "field": "status",
+                    "align": "left",
+                },
+                {
+                    "name": "result",
+                    "label": "结果",
+                    "field": "result",
+                    "align": "left",
+                    "style": "min-width: 280px;",
+                    "classes": "result-col",
+                },
+                {
+                    "name": "actions",
+                    "label": "操作",
+                    "field": "actions",
+                    "align": "left",
+                    "classes": "col-actions",
+                    "style": "white-space: nowrap;",
+                },
+            ],
+            rows=[],
+            pagination=5,
+        )
+        .classes("w-full tgs-desktop-table")
+        .props("flat dense")
+    )
+    # 状态列渲染为彩色徽章：已完成=绿、失败=红、运行中=蓝、其他=灰
+    leave_table.add_slot(
+        "body-cell-status",
+        '<q-td :props="props">'
+        "<q-badge :color=\"props.row.status === '已完成' ? 'positive' : "
+        "props.row.status === '失败' ? 'negative' : "
+        "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
+        "{{ props.row.status }}</q-badge></q-td>",
+    )
+    # 操作列：复制 / 明细（命中频道）/ 停止（运行中）/ 删除
+    leave_table.add_slot(
+        "body-cell-actions",
+        '<q-td :props="props" class="col-actions">'
+        '<q-btn flat dense color="primary" '
+        'label="复制" @click="$parent.$emit(\'leaveDup\', props.row)" />'
+        '<q-btn flat dense color="grey-8" '
+        'label="明细" @click="$parent.$emit(\'leaveDetail\', props.row)" />'
+        '<q-btn v-if="props.row.running" flat dense color="warning" '
+        'label="停止" @click="$parent.$emit(\'leaveStop\', props.row)" />'
+        '<q-btn flat dense color="negative" '
+        'label="删除" @click="$parent.$emit(\'leaveDel\', props.row)" />'
+        "</q-td>",
+    )
+    leave_table.on("leaveDup", _on_leave_dup)
+    leave_table.on("leaveDetail", _on_leave_detail)
+    leave_table.on("leaveStop", _on_leave_stop)
+    leave_table.on("leaveDel", _on_leave_del)
+    # 移动端（<=640px）用纵向卡片列表替代横滑宽表，桌面端隐藏
+    cards_container = ui.column().classes("w-full gap-2 tgs-mobile-cards mt-1")
     render_list()
+
+    # ---- 页面级持久弹窗（统一在页面构建时创建，事件里只填充并打开，
+    # 避免在表格单元格等事件槽位里动态创建弹窗导致 Quasar 渲染异常）----
+
+    with (
+        ui.dialog() as create_dialog,
+        ui.card().classes("w-[520px] max-w-[96vw] max-h-[88vh] overflow-auto"),
+    ):
+        add_dialog_close_button(create_dialog)
+        create_title = ui.label("新建退频道任务").classes("text-lg font-semibold")
+        name_input = ui.input("任务名称").classes("w-full")
+        account_sel = ui.select(
+            label="账号（可多选）", options=[], multiple=True, with_input=True
+        ).classes("w-full")
+        attach_select_all(account_sel)
+        with ui.row().classes("w-full items-end flex-wrap gap-2"):
+            days_input = ui.number(
+                label="不更新天数阈值", value=7, min=1, step=1, format="%.0f"
+            ).classes("w-36")
+            ig = ui.checkbox("包含群组")
+            sp = ui.checkbox("跳过置顶", value=True)
+        kw_input = ui.input("保护关键字（逗号分隔）", value=DEFAULT_KEYWORDS).classes(
+            "w-full"
+        )
+        ui.label(
+            "未命中关键字的频道将在启动后自动退出；命中关键字的频道仅展示，需手动勾选退出"
+        ).classes("text-xs text-gray-500")
+        auto_cb = ui.checkbox("自动退出未命中关键字的频道")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("取消", on_click=create_dialog.close).props("flat")
+            ui.button("启动执行", on_click=_do_create).props("color=primary")
+
+    with (
+        ui.dialog() as detail_dialog,
+        ui.card().classes("w-[560px] max-w-[96vw] max-h-[88vh] overflow-auto"),
+    ):
+        add_dialog_close_button(detail_dialog)
+        detail_title = ui.label("任务明细").classes("text-lg font-semibold")
+        ui.label(
+            "以下频道不会被自动退出（命中保护关键字或未开启自动退出），"
+            "可勾选后手动退出。明细已持久化，任务完成后重新打开仍可见。"
+        ).classes("text-xs text-gray-500")
+        detail_body = ui.column().classes("w-full gap-2")
+
+    with ui.dialog() as confirm_dialog, ui.card():
+        add_dialog_close_button(confirm_dialog)
+        confirm_title = ui.label("确认退出？").classes("text-lg font-semibold")
+        ui.label("退出后需要重新搜索/加群才能回来，请仔细核对！").classes(
+            "text-sm text-orange-600"
+        )
+        confirm_list = ui.column().classes("max-h-60 overflow-auto w-full")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("取消", on_click=confirm_dialog.close).props("flat")
+            ui.button("确认退出", on_click=_do_leave_selected).props("color=negative")
+
+    with ui.dialog() as delete_dialog, ui.card():
+        add_dialog_close_button(delete_dialog)
+        delete_label = ui.label("确认删除任务？").classes("text-lg font-semibold")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("取消", on_click=delete_dialog.close).props("flat")
+            ui.button("删除", on_click=_do_delete).props("color=negative")
 
     def copy_log() -> None:
         if not log_lines:

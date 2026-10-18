@@ -1713,12 +1713,17 @@ class GiveawayEngine:
         username: str,
         source_message: Any,
         bot_messages: List[Any],
+        ignore_sent: bool = False,
+        link_messages: Optional[List[Any]] = None,
     ) -> None:
         """回复清单/帖内口令任务：定位口令群组并发送口令文本。
 
         时序遵循「请先参与抽奖，再发送口令激活」：start 已发、加入完成
-        后在此发送口令，随后由重发 start 让 bot 核验。每账号×bot×群组
-        只发送一次（进程内去重），避免重复参与时反复发言。
+        后在此发送口令，随后由重发 start 让 bot 核验。每账号×bot×群组×
+        口令文本只发送一次（进程内去重），避免重复参与时反复发言——
+        同一群组常被多个抽奖复用且各带不同口令，去重键必须含口令文本。
+        报名成功后的激活清单补发场景传 ignore_sent=True 忽略去重
+        （清单仍标 ❌ 即代表 bot 未计入此前发送，需要重发）。
         """
         # 口令任务以 bot 回复清单为准（原帖与回复都可能出现「发送口令﹝xx﹞」行）：
         # bot 返回了口令任务（❌ 未完成行）才发送，✅ 行已发送过自动跳过。
@@ -1739,14 +1744,19 @@ class GiveawayEngine:
         if not tasks:
             return
         # bot 回复清单「加入-名称」行的（名称 → 目标）映射，❌/✅ 行均收集：
-        # 口令群即使已加入（✅）也需拿到目标才能发言
+        # 口令群即使已加入（✅）也需拿到目标才能发言；补发场景可传入
+        # 更早的回复一并定位（link_messages 优先级高于 bot_messages）
+        if link_messages is None:
+            link_sources = list(bot_messages)
+        else:
+            link_sources = list(link_messages)
         name_links: Dict[str, str] = {}
-        for message in bot_messages:
+        for message in link_sources:
             for name, target in extract_join_name_links(message):
                 name_links.setdefault(name.lower(), target)
         for group_name, password in tasks:
-            sent_key = f"{account}|{username}|{group_name.lower()}"
-            if sent_key in self._password_sent:
+            sent_key = f"{account}|{username}|{group_name.lower()}|{password}"
+            if not ignore_sent and sent_key in self._password_sent:
                 continue
             target = name_links.get(group_name.lower())
             if target is None:
@@ -2043,7 +2053,9 @@ class GiveawayEngine:
                         )
                         return
                     self.log(_confirm_log(btn.text))
-                    await self._verify_after_click(account, client, username)
+                    await self._verify_after_click(
+                        account, client, username, candidates
+                    )
                     return
                 # URL 按钮：仅当链接指向同一 bot（含/不含 start 参数）时才「点击」
                 # （等同按链接参数重发 start 完成参与），其他链接一律不碰
@@ -2060,21 +2072,29 @@ class GiveawayEngine:
                         f"已点击 @{username} 的参与按钮「{btn.text}」"
                         f"（按链接参数重新参与）"
                     )
-                    await self._verify_after_click(account, client, username)
+                    await self._verify_after_click(
+                        account, client, username, candidates
+                    )
                     return
                 if plain_same_bot:
                     await client.start_bot(username, "")
                     self.log(
                         f"已点击 @{username} 的参与按钮「{btn.text}」（重发 start）"
                     )
-                    await self._verify_after_click(account, client, username)
+                    await self._verify_after_click(
+                        account, client, username, candidates
+                    )
                     return
             except Exception as exc:
                 self.log(f"点击 @{username} 确认按钮失败: {exc}")
                 return
 
     async def _verify_after_click(
-        self, account: str, client: Any, username: str
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        candidates: Optional[List[Any]] = None,
     ) -> None:
         """点击确认/参与按钮后核对 bot 回复，把结果写进日志（不再盲点）。"""
         try:
@@ -2090,6 +2110,23 @@ class GiveawayEngine:
                     # 「已参加…」或「已成功报名抽奖（未达标β）/已获得抽奖资格」
                     # 均为参与成功（未达标仅剩发言数等激活任务，标记为完成）
                     self.log(f"@{username} 参与成功（{flat}）")
+                    # 报名成功后的激活任务清单若仍列出 ❌ 口令任务
+                    # （发送口令﹝xx﹞），说明 bot 未计入此前发送的口令
+                    # （部分 bot 只核验报名之后在群里的发言），立即按清单
+                    # 补发一次；✅ 已完成行由解析自动跳过，发言数等其余
+                    # 激活任务不处理
+                    try:
+                        await self._send_password_tasks(
+                            account,
+                            client,
+                            username,
+                            None,
+                            [msg],
+                            ignore_sent=True,
+                            link_messages=[msg, *(candidates or [])],
+                        )
+                    except Exception:
+                        logger.debug("报名成功后补发口令任务失败", exc_info=True)
                 elif not reply_says_ended(msg):
                     self.log(f"@{username} 点击后回复：{flat}")
         except Exception:

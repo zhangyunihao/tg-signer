@@ -2111,3 +2111,134 @@ def test_send_password_tasks_dedup(tmp_path, monkeypatch):
     assert ("daka_group", "出击婷婷宝宝") in client.sent
     assert len(client.sent) == 1
     assert len([line for line in logs if "发送口令" in line]) == 1
+
+
+def test_send_password_tasks_dedup_per_password(tmp_path, monkeypatch):
+    """去重键含口令文本：同一群组被多个抽奖复用且各带不同口令时，
+    第二个抽奖的口令不被首个口令的去重误拦（旧键 account|bot|群组
+    导致整轮只有第一个抽奖的口令真正发出）。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    checklist = _status_message(
+        "您需加入指定的群组/频道\n\n🎫 加入-野寻·上海打卡通告群 ✅",
+        {"野寻·上海打卡通告群": "https://t.me/daka_group"},
+    )
+    asyncio.run(
+        engine._send_password_tasks(
+            "acc", client, "LotteryBestBot", _msg(text=PASSWORD_POST), [checklist]
+        )
+    )
+    other_post = PASSWORD_POST.replace("婷婷", "雾织星")
+    asyncio.run(
+        engine._send_password_tasks(
+            "acc", client, "LotteryBestBot", _msg(text=other_post), [checklist]
+        )
+    )
+    assert ("daka_group", "出击婷婷宝宝") in client.sent
+    assert ("daka_group", "出击雾织星宝宝") in client.sent
+
+
+ACTIVATION_REPLY = (
+    "您已成功报名抽奖（未达标α）\n"
+    "\n"
+    "您还需完成激活任务才能抽奖！\n"
+    "\n"
+    "🎰 上海雾织星半价券\n"
+    "🎫 已加入-野寻·上海学生交流群\n"
+    "└  🎟️ 发言数大于 6 条 ❌\n"
+    "🎫 已加入-野寻·上海打卡通告群\n"
+    "└  🔑 发送口令﹝出击雾织星宝宝﹞ ❌\n"
+    "\n"
+    "💁 参与情况：69达标 / 90报名\n"
+    "🔋 人品加成：6票\n"
+    "\n"
+    "📅 开奖日期：(北京时间)\n"
+    "2026年10月21日 13时00分00秒"
+)
+
+
+def test_extract_password_tasks_activation_reply():
+    """报名成功后的激活任务清单：❌ 口令子行按上方最近「已加入-名称」
+    行归属群组；✅ 行跳过；发言数子行不视为口令任务。"""
+    from tg_signer.giveaway_core import extract_password_tasks
+
+    msg = _status_message(
+        ACTIVATION_REPLY,
+        {
+            "已加入-野寻·上海学生交流群": "https://t.me/xuesheng_group",
+            "已加入-野寻·上海打卡通告群": "https://t.me/daka_group2",
+        },
+    )
+    assert extract_password_tasks(msg) == [("野寻·上海打卡通告群", "出击雾织星宝宝")]
+    # ✅ 已完成行不产生口令任务
+    done = ACTIVATION_REPLY.replace("发送口令﹝出击雾织星宝宝﹞ ❌", "发送口令﹝出击雾织星宝宝﹞ ✅")
+    assert extract_password_tasks(_msg(text=done)) == []
+
+
+def test_verify_after_click_resends_pending_password(tmp_path, monkeypatch):
+    """报名成功回复的激活清单仍列 ❌ 口令任务＝bot 未计入此前发送：
+    立即按清单补发口令（忽略预发送去重），发言数任务不处理。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    activation = _status_message(
+        ACTIVATION_REPLY,
+        {
+            "已加入-野寻·上海学生交流群": "https://t.me/xuesheng_group",
+            "已加入-野寻·上海打卡通告群": "https://t.me/daka_group2",
+        },
+    )
+    client.history = [activation]
+    # 预发送阶段已发过同一口令（模拟 bot 未计入的场景）
+    engine._password_sent.add(
+        "acc|LotteryBestBot|野寻·上海打卡通告群|出击雾织星宝宝"
+    )
+    asyncio.run(engine._verify_after_click("acc", client, "LotteryBestBot", [activation]))
+    assert ("daka_group2", "出击雾织星宝宝") in client.sent
+    assert ("xuesheng_group", "发言数大于 6 条") not in client.sent
+
+
+def test_verify_after_click_done_password_not_resent(tmp_path, monkeypatch):
+    """激活清单口令行标 ✅（bot 已计入）：不重发口令。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    done_reply = ACTIVATION_REPLY.replace(
+        "发送口令﹝出击雾织星宝宝﹞ ❌", "发送口令﹝出击雾织星宝宝﹞ ✅"
+    )
+    activation = _status_message(
+        done_reply,
+        {
+            "已加入-野寻·上海学生交流群": "https://t.me/xuesheng_group",
+            "已加入-野寻·上海打卡通告群": "https://t.me/daka_group2",
+        },
+    )
+    client.history = [activation]
+    asyncio.run(engine._verify_after_click("acc", client, "LotteryBestBot", [activation]))
+    assert client.sent == []

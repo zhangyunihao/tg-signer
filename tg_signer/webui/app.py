@@ -15,8 +15,10 @@ from tg_signer.webui.auto_leave import auto_leave_block
 from tg_signer.webui.combo import combo_block
 from tg_signer.webui.common import (
     add_dialog_close_button,
+    build_debug_report,
     copy_text_to_clipboard,
     notify_error,
+    pretty_json,
     state,
 )
 from tg_signer.webui.data import (
@@ -29,6 +31,7 @@ from tg_signer.webui.data import (
     load_logs,
 )
 from tg_signer.webui.giveaway import giveaway_block
+from tg_signer.webui.messages import message_center_button
 from tg_signer.webui.random_chat import random_chat_block
 from tg_signer.webui.sign import (
     MONITOR_TEMPLATE,
@@ -46,7 +49,8 @@ AUTH_CODE_ENV = "TG_SIGNER_GUI_AUTHCODE"
 AUTH_STORAGE_KEY = "tg_signer_gui_auth_code"
 
 
-def log_block() -> Callable[[], None]:
+def log_block(card: Optional[ui.card] = None) -> Callable[[], None]:
+    """日志查看卡片；传入外部弹窗卡片（card）时提供全屏显示切换。"""
     with ui.card().classes("w-full shadow-sm"):
         ui.label("日志查看").classes("text-md font-semibold")
         ui.label("查看最新日志行，可自定义文件路径和行数。").classes(
@@ -82,7 +86,7 @@ def log_block() -> Callable[[], None]:
                 label="日志路径（可自定义）", value=str(state.log_path)
             ).classes("w-full")
         log_area = ui.scroll_area().classes(
-            "w-full bg-gray-50 rounded-lg border border-gray-200"
+            "w-full bg-gray-50 rounded-lg border border-gray-200 tgs-log-area"
         )
         log_area.style("max-height: 420px")
         with log_area:
@@ -185,10 +189,57 @@ def log_block() -> Callable[[], None]:
             copy_text_to_clipboard("\n".join(current_lines))
             ui.notify(f"已复制 {len(current_lines)} 行日志", type="positive")
 
+        def copy_debug_info() -> None:
+            """复制调试信息：环境头 + 当前日志文件与显示行 + 任务历史。
+
+            手机端报错后一键复制，粘贴到电脑即可拿到定位/复现所需的上下文。
+            """
+            sections: list[tuple[str, str]] = [
+                ("当前日志文件", str(log_path_input.value or state.log_path))
+            ]
+            if current_lines:
+                sections.append(("当前显示日志行", "\n".join(current_lines)))
+            try:
+                hist = json.loads(
+                    (Path(state.workdir) / "webui_task_history.json").read_text(
+                        encoding="utf-8-sig"
+                    )
+                )
+                if isinstance(hist, list) and hist:
+                    sections.append(("任务历史（最近10条）", pretty_json(hist[-10:])))
+            except (OSError, json.JSONDecodeError):
+                logger.debug("读取任务历史失败", exc_info=True)
+            copy_text_to_clipboard(build_debug_report(state.workdir, sections))
+            ui.notify("已复制调试信息（含环境信息），粘贴给电脑即可排查", type="positive")
+
+        fullscreen_on = False
+
+        def toggle_fullscreen() -> None:
+            """切换日志弹窗全屏态：卡片撑满视口，日志区占满剩余高度。"""
+            nonlocal fullscreen_on
+            if card is None:
+                return
+            fullscreen_on = not fullscreen_on
+            if fullscreen_on:
+                card.classes(add="tgs-log-fullscreen")
+                fullscreen_btn.text = "退出全屏"
+            else:
+                card.classes(remove="tgs-log-fullscreen")
+                fullscreen_btn.text = "全屏显示"
+            fullscreen_btn.update()
+            log_area.update()
+
         with ui.row().classes("gap-2 mt-2 items-center justify-between"):
-            with ui.row().classes("gap-2 items-center"):
+            with ui.row().classes("gap-2 items-center flex-wrap"):
                 ui.button("刷新日志", on_click=refresh)
                 ui.button("一键复制日志", on_click=copy_logs).props("outline")
+                ui.button("复制调试信息", on_click=copy_debug_info).props("outline").tooltip(
+                    "复制环境信息+当前日志+任务历史，粘贴到电脑排查复现"
+                )
+                if card is not None:
+                    fullscreen_btn = ui.button(
+                        "全屏显示", on_click=toggle_fullscreen
+                    ).props("outline")
             log_status = ui.label("").classes("text-xs text-gray-500")
 
         def refresh_status(text: str) -> None:
@@ -296,7 +347,7 @@ def _build_dashboard(container) -> None:
             with logs_card:
                 ui.label("日志").classes("text-lg font-semibold")
                 ui.label("查看日志文件的最新行。").classes("text-gray-600")
-                logs_refresh = log_block()
+                logs_refresh = log_block(logs_card)
                 refreshers.append(logs_refresh)
                 logs_refresh()
                 with ui.row().classes("w-full justify-end"):
@@ -341,11 +392,13 @@ def _build_dashboard(container) -> None:
                 tab_leave = ui.tab("leave", "批量退频道")
                 tab_giveaway = ui.tab("giveaway", "自动抽奖")
 
-            # 版本号 + 菜单按钮，与主标签栏同行（下拉项在下方绑定）
+            # 版本号 + 消息中心 + 菜单按钮，与主标签栏同行（下拉项在下方绑定）
             with ui.row().classes("items-center gap-0 no-wrap tgs-header-actions"):
                 ui.label(f"v{__version__}").classes(
                     "text-xs text-gray-500 select-none mr-1 tgs-header-version"
                 )
+                # 消息中心：铃铛按钮 + 未读数徽标 + 消息弹窗（加入失败提醒/待完成发言任务）
+                refreshers.append(message_center_button())
                 header_btn = ui.button(icon="more_vert").props("flat round dense")
 
         # 默认选中「签到」：未选中任何 tab（首次访问、localStorage 无记录或值失效）时，
@@ -695,6 +748,22 @@ def build_ui(auth_code: str = None) -> None:
                 color: #666 !important;
                 background: rgba(0, 0, 0, 0.05) !important;
                 border-radius: 50% !important;
+            }
+            /* 日志弹窗全屏态：卡片撑满视口，日志区占满剩余高度（标题/过滤/按钮行保持原样） */
+            .tgs-log-fullscreen {
+                width: 96vw !important;
+                max-width: 96vw !important;
+                height: 92vh !important;
+                max-height: 92vh !important;
+                display: flex !important;
+                flex-direction: column;
+            }
+            .tgs-log-fullscreen > * { flex-shrink: 0; }
+            .tgs-log-fullscreen .tgs-log-area {
+                flex: 1 1 auto !important;
+                min-height: 0;
+                height: auto !important;
+                max-height: none !important;
             }
             /* 全局通知消息移到页面顶部：默认底部弹出会遮挡弹窗底部的「确定」按钮 */
             .q-notifications__list--bottom {

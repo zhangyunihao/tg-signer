@@ -19,7 +19,10 @@ from tg_signer.utils import atomic_write_json
 from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
+    build_debug_report,
     copy_text_to_clipboard,
+    pretty_json,
+    read_file_tail,
     with_select_all,
 )
 from tg_signer.webui.data import (
@@ -790,9 +793,38 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         copy_text_to_clipboard("\n".join(log_buf))
         ui.notify(f"已复制 {len(log_buf)} 行日志", type="positive")
 
+    def copy_debug_log() -> None:
+        """复制调试日志：环境信息 + 任务配置/状态 + 任务历史 + giveaway.log 尾部。
+
+        手机端报错后一键复制，粘贴到电脑即可拿到定位/复现所需的全部上下文。
+        """
+        wd = Path(workdir)
+        sections: list[tuple[str, str]] = [
+            ("任务配置（所有抽奖任务）", pretty_json(tasks)),
+            ("任务状态", pretty_json({n: _status_text(n) for n in tasks})),
+        ]
+        try:
+            hist = json.loads(
+                (wd / "webui_task_history.json").read_text(encoding="utf-8-sig")
+            )
+            if isinstance(hist, list) and hist:
+                sections.append(("任务历史（最近15条）", pretty_json(hist[-15:])))
+        except (OSError, json.JSONDecodeError):
+            logger.debug("读取任务历史失败", exc_info=True)
+        sections.append(
+            ("logs/giveaway.log 最近200行", read_file_tail(wd / "logs" / "giveaway.log"))
+        )
+        copy_text_to_clipboard(build_debug_report(wd, sections))
+        ui.notify("已复制调试日志（含环境信息与任务配置），粘贴给电脑即可排查", type="positive")
+
     with ui.row().classes("w-full items-center justify-between"):
         ui.label("共用日志（所有任务）").classes("font-semibold")
         with ui.row().classes("gap-1 items-center"):
+            ui.button(
+                "复制调试日志", icon="bug_report", on_click=copy_debug_log
+            ).props("flat dense").tooltip(
+                "复制环境信息+任务配置+任务历史+日志文件，粘贴到电脑排查复现"
+            )
             ui.button(icon="content_copy", on_click=copy_log).props(
                 "flat round dense"
             ).tooltip("一键复制日志")

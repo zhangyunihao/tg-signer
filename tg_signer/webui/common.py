@@ -1,12 +1,16 @@
 import json
 import logging
+import os
+import platform
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict
 
 from nicegui import ui
 
+from tg_signer import __version__
 from tg_signer.webui.data import DEFAULT_LOG_FILE, DEFAULT_WORKDIR, get_workdir
 
 logger = logging.getLogger(__name__)
@@ -180,3 +184,60 @@ def copy_text_to_clipboard(text: str) -> None:
         "document.execCommand('copy'); ta.remove();"
         "})()"
     )
+
+
+def read_file_tail(path: Path | str, max_lines: int = 200, max_bytes: int = 512_000) -> str:
+    """读取文本文件最后 max_lines 行（最多回读 max_bytes，避免大文件占用过多内存）。
+
+    文件不存在或读取失败返回空字符串；被截断时丢弃可能不完整的首行。
+    """
+    p = Path(path)
+    if not p.is_file():
+        return ""
+    try:
+        size = p.stat().st_size
+        with open(p, "rb") as f:
+            f.seek(max(0, size - max_bytes))
+            data = f.read().decode("utf-8", errors="replace")
+        lines = data.splitlines()
+        if size > max_bytes and lines:
+            lines = lines[1:]
+        return "\n".join(lines[-max_lines:])
+    except OSError:
+        logger.debug("读取日志文件尾部失败: %s", p, exc_info=True)
+        return ""
+
+
+def build_debug_report(workdir, extra_sections: list[tuple[str, str]]) -> str:
+    """组装「复制调试日志」文本：环境头（版本/Python/系统/工作目录）+ 各数据段。
+
+    用于手机端一键复制后粘贴到电脑定位问题；空段自动跳过。
+    """
+    termux = bool(os.environ.get("TERMUX_VERSION")) or "com.termux" in (
+        os.environ.get("PREFIX") or ""
+    )
+    env_desc = "Termux (Android)" if termux else platform.system()
+    try:
+        workdir_text = str(Path(workdir).resolve())
+    except OSError:
+        workdir_text = str(workdir)
+    header = "\n".join(
+        [
+            "==================== tg-signer 调试信息 ====================",
+            f"复制时间: {datetime.now():%Y-%m-%d %H:%M:%S}",
+            f"版本: tg-signer-plus {__version__}",
+            f"Python: {platform.python_version()}",
+            f"系统: {platform.platform()}",
+            f"运行环境: {env_desc}",
+            f"工作目录: {workdir_text}",
+            f"服务进程目录: {Path.cwd()}",
+            "============================================================",
+        ]
+    )
+    parts = [header]
+    for title, content in extra_sections:
+        content = (content or "").strip()
+        if not content:
+            continue
+        parts.append(f"\n----- {title} -----\n{content}")
+    return "\n".join(parts)
