@@ -319,12 +319,20 @@ def get_client(
     workdir: Union[str, pathlib.Path] = ".",
     session_string: str = None,
     in_memory: bool = False,
+    reuse: bool = True,
     **kwargs,
 ) -> Client:
+    """获取（或创建）Pyrogram 客户端。
+
+    reuse=True 时复用 _CLIENT_INSTANCES 里的同名客户端；后台探测类调用
+    （授权检测等短暂连接即断开）必须传 reuse=False 使用私有客户端，
+    避免与任务流程共用同一个还在连接中的客户端产生并发 connect 竞态
+    （sqlite 报 "Cannot operate on a closed database"）。
+    """
     proxy = proxy or get_proxy()
     api_id, api_hash = get_api_config()
     key = str(pathlib.Path(workdir).joinpath(name).resolve())
-    if key in _CLIENT_INSTANCES:
+    if reuse and key in _CLIENT_INSTANCES:
         return _CLIENT_INSTANCES[key]
     client = Client(
         name,
@@ -337,7 +345,8 @@ def get_client(
         key=key,
         **kwargs,
     )
-    _CLIENT_INSTANCES[key] = client
+    if reuse:
+        _CLIENT_INSTANCES[key] = client
     return client
 
 
@@ -347,6 +356,11 @@ async def safe_disconnect(client: Optional[Client], timeout: float = 15.0) -> No
     用于覆盖所有可能持有 Pyrogram 连接的场景，避免半连接残留导致
     session 文件锁（Windows WinError 32）或后续操作抛
     "Cannot operate on a closed database" / "Client has not been started yet"。
+
+    断开完成后会把客户端从 _CLIENT_INSTANCES 缓存移除：pyrogram 的
+    disconnect/terminate 会永久关闭 sqlite 存储（connect 不会重新打开），
+    缓存里的断开客户端再次 connect 必报 "Cannot operate on a closed
+    database"，因此断开后的客户端一律不可复用，下次 get_client 重建。
     """
     if client is None:
         return
@@ -367,6 +381,9 @@ async def safe_disconnect(client: Optional[Client], timeout: float = 15.0) -> No
                 await storage.close()
             except Exception:
                 logger.debug("强制关闭 session 存储失败", exc_info=True)
+    for key, inst in list(_CLIENT_INSTANCES.items()):
+        if inst is client:
+            _CLIENT_INSTANCES.pop(key, None)
 
 
 def make_dirs(path: pathlib.Path, exist_ok=True):

@@ -147,7 +147,9 @@ async def _check_account_authorized(account: str, session_dir: Path) -> Optional
     """
     client = None
     try:
-        client = get_client(account, workdir=str(session_dir))
+        # reuse=False：探测用私有客户端，不进全局缓存，避免与任务流程
+        # 共用同一连接中的客户端产生并发 connect 竞态（closed database）
+        client = get_client(account, workdir=str(session_dir), reuse=False)
         ok = await asyncio.wait_for(client.connect(), 15)
         return bool(ok)
     except Exception:
@@ -155,9 +157,6 @@ async def _check_account_authorized(account: str, session_dir: Path) -> Optional
     finally:
         if client is not None:
             await safe_disconnect(client)
-        from tg_signer.core import _CLIENT_INSTANCES
-
-        _CLIENT_INSTANCES.pop(str(Path(session_dir).joinpath(account).resolve()), None)
 
 
 def authz_cached(session_dir: Path, account: str) -> Optional[bool]:
