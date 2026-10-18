@@ -1040,8 +1040,15 @@ class GiveawayEngine:
                     self.scan_text = f"({done['n']}/{total})"
                     expired_streak = 0
                     scanned = 0
-                    # 先扫置顶消息：很多群的抽奖帖长期置顶；同时识别聊天类型
-                    is_group = await self._scan_pinned(account, client, chat)
+                    # 识别聊天类型：群组仍只扫置顶；频道忽略置顶（多为长期
+                    # 挂着的旧抽奖帖），直接从最新历史消息开始扫
+                    is_group, chat_info = await self._detect_chat_type(
+                        account, client, chat
+                    )
+                    if is_group:
+                        await self._scan_pinned(
+                            account, client, chat, chat_info=chat_info
+                        )
                     if is_group or (
                         self.max_joins is not None and self.joined >= self.max_joins
                     ):
@@ -1098,28 +1105,43 @@ class GiveawayEngine:
             if self._state is not None:
                 self._state.save()
 
-    async def _scan_pinned(
+    async def _detect_chat_type(
         self, account: str, client: Any, chat: Any
-    ) -> Optional[bool]:
-        """扫描频道/群组的置顶消息并参与（抽奖帖常被置顶）。
+    ) -> tuple[Optional[bool], Any]:
+        """get_chat 识别聊天类型并缓存。
 
-        通过 get_chat 拿到 pinned_message；置顶消息与历史消息走同一套
-        处理流程（关键词过滤、开奖日期跳过、去重、自动加入）。
-        同时缓存聊天类型：群组返回 True、频道返回 False、获取失败返回 None。
+        群组返回 (True, chat_info)、频道返回 (False, chat_info)、
+        获取失败返回 (None, None)（沿用缓存的旧类型，无法识别时为 None）。
         """
         try:
             chat_info = await client.get_chat(chat)
         except Exception as exc:
-            self.log(f"[{account}] 获取 {chat} 信息失败，跳过置顶扫描: {exc}")
-            return self._chat_types.get(str(chat))
+            self.log(f"[{account}] 获取 {chat} 信息失败，跳过类型识别: {exc}")
+            return self._chat_types.get(str(chat)), None
         type_name = getattr(getattr(chat_info, "type", None), "name", "")
         is_group = type_name in ("GROUP", "SUPERGROUP")
         first_detect = str(chat) not in self._chat_types
         self._chat_types[str(chat)] = is_group
         if first_detect:
-            kind = "群组（仅扫置顶）" if is_group else "频道（置顶+历史）"
+            kind = "群组（仅扫置顶）" if is_group else "频道（仅历史，忽略置顶）"
             title = getattr(chat_info, "title", "") or str(chat)
             self.log(f"[{account}] 识别 {chat} 类型：{kind}「{title}」")
+        return is_group, chat_info
+
+    async def _scan_pinned(
+        self, account: str, client: Any, chat: Any, chat_info: Any = None
+    ) -> None:
+        """扫描群组的置顶消息并参与（群组只扫指定/置顶消息）。
+
+        置顶消息与历史消息走同一套处理流程（关键词过滤、开奖日期跳过、
+        去重、自动加入）。聊天类型识别由 _detect_chat_type 完成。
+        """
+        if chat_info is None:
+            try:
+                chat_info = await client.get_chat(chat)
+            except Exception as exc:
+                self.log(f"[{account}] 获取 {chat} 信息失败，跳过置顶扫描: {exc}")
+                return
         pinned = getattr(chat_info, "pinned_message", None)
         # 枚举全部置顶消息：get_chat 只返回最新一条置顶，而群/频道可置顶多条，
         # 其余置顶只有通过 PINNED 过滤搜索才能拿到
@@ -1149,11 +1171,10 @@ class GiveawayEngine:
                 continue  # 本轮会话中已处理过
             try:
                 await self._process_message(
-                    account, client, msg, skip_keywords=is_group
-                )
+                    account, client, msg, skip_keywords=True
+                )  # 仅群组走此路径：置顶不受关键词过滤
             except Exception as exc:
                 self.log(f"[{account}] 处理 {chat} 置顶消息失败: {exc}")
-        return is_group
 
     def _mark_seen(self, account: str, chat_key: str, message_id: int) -> bool:
         """记录消息已处理（水位线）。返回 False 表示此前已见过，补漏时应跳过。"""

@@ -589,7 +589,9 @@ def test_scan_now_enumerates_all_pinned_messages(tmp_path):
     engine.log = logs.append
     latest = _msg(id=1002, text="新置顶抽奖 https://t.me/LotteryBot?start=pin2")
     older = _msg(id=1001, text="旧置顶抽奖 https://t.me/OtherBot?start=pin1")
-    client.chat_info = SimpleNamespace(pinned_message=latest)
+    client.chat_info = SimpleNamespace(
+        pinned_message=latest, type=SimpleNamespace(name="SUPERGROUP")
+    )
     client.pinned_list = [older, latest]  # PINNED 过滤搜索返回全部置顶
     asyncio.run(engine.scan_now())
     # 最新置顶之外的其他置顶也被参与
@@ -603,7 +605,7 @@ def test_scan_now_enumerates_all_pinned_messages(tmp_path):
 
 
 def test_scan_now_participates_pinned_message(tmp_path):
-    """置顶消息中的抽奖会被扫描参与，且与历史消息去重。"""
+    """群组仅扫置顶消息：置顶抽奖被参与，历史消息不再拉取。"""
     import asyncio
 
     engine, _state = _engine(tmp_path)
@@ -613,19 +615,16 @@ def test_scan_now_participates_pinned_message(tmp_path):
     logs: list = []
     engine.log = logs.append
     client.chat_info = SimpleNamespace(
-        pinned_message=_msg(text="置顶抽奖 https://t.me/LotteryBot?start=pinned1")
+        pinned_message=_msg(text="置顶抽奖 https://t.me/LotteryBot?start=pinned1"),
+        type=SimpleNamespace(name="SUPERGROUP"),
     )
     client.history = [
-        # 同一活动在历史消息里再次出现：去重不重复参与
-        _msg(text="抽奖 https://t.me/LotteryBot?start=pinned1"),
+        # 群组不扫历史：即使历史里也有抽奖帖也不参与
         _msg(text="抽奖 https://t.me/LotteryBot?start=hist1"),
     ]
     asyncio.run(engine.scan_now())
-    assert sorted(client.started) == [
-        ("LotteryBot", "hist1"),
-        ("LotteryBot", "pinned1"),
-    ]
-    assert any("本次参与 2 个" in line for line in logs)
+    assert client.started == [("LotteryBot", "pinned1")]
+    assert any("本次参与 1 个" in line for line in logs)
     # 已参与日志附带抽奖帖标题
     assert any("[已参与]" in line and "置顶抽奖" in line for line in logs)
 
@@ -642,7 +641,8 @@ def test_scan_now_pinned_expired_counts_toward_cap(tmp_path):
     logs: list = []
     engine.log = logs.append
     client.chat_info = SimpleNamespace(
-        pinned_message=_msg(text="抽奖 https://t.me/OtherBot?start=pin1")
+        pinned_message=_msg(text="抽奖 https://t.me/OtherBot?start=pin1"),
+        type=SimpleNamespace(name="SUPERGROUP"),
     )
     client.history = [
         _msg(text="抽奖 https://t.me/LotteryBot?start=h1"),
@@ -671,7 +671,7 @@ def test_scan_now_survives_get_chat_failure(tmp_path):
     ]
     asyncio.run(engine.scan_now())
     assert client.started == [("LotteryBot", "h1")]
-    assert any("跳过置顶扫描" in line for line in logs)
+    assert any("跳过类型识别" in line for line in logs)
 
 
 def test_scan_now_group_only_scans_pinned(tmp_path):
@@ -694,7 +694,7 @@ def test_scan_now_group_only_scans_pinned(tmp_path):
     asyncio.run(engine.scan_now())
     assert client.started == [("LotteryBot", "pin1")]
 
-    # 同一聊天若是频道：置顶 + 历史都扫（用独立状态目录避免去重串扰）
+    # 同一聊天若是频道：忽略置顶，仅扫历史（用独立状态目录避免去重串扰）
     engine2, _state2 = _engine(tmp_path / "channel")
     engine2.chats = [123]
     client2 = FakeClient(bot_users={"LotteryBot"})
@@ -708,10 +708,7 @@ def test_scan_now_group_only_scans_pinned(tmp_path):
         _msg(text="抽奖 https://t.me/LotteryBot?start=hist1"),
     ]
     asyncio.run(engine2.scan_now())
-    assert sorted(client2.started) == [
-        ("LotteryBot", "hist1"),
-        ("LotteryBot", "pin1"),
-    ]
+    assert client2.started == [("LotteryBot", "hist1")]
 
 
 def test_scan_now_group_pinned_ignores_keywords(tmp_path):
