@@ -18,7 +18,7 @@ from nicegui import ui
 from tg_signer.core import get_client, safe_disconnect
 from tg_signer.phrases import PHRASES, parse_custom_phrases, phrase_pool_label
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.common import copy_text_to_clipboard
+from tg_signer.webui.common import add_dialog_close_button, copy_text_to_clipboard
 from tg_signer.webui.data import (
     apply_account_order,
     load_disabled_accounts,
@@ -96,7 +96,7 @@ async def update_account_chats(
             return -1
         me = await asyncio.wait_for(client.get_me(), 30)
         chats = []
-        async for dialog in client.get_dialogs(limit=200):
+        async for dialog in client.get_dialogs(limit=500):
             chats.append(dialog.chat)
         latest = [
             {
@@ -1113,6 +1113,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
 
     # —— 添加任务弹窗 ——
     with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl"):
+        add_dialog_close_button(add_dlg)
         ui.label("添加任务").classes("text-lg font-semibold")
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             session_dir_input = ui.input(

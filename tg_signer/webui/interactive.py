@@ -16,6 +16,7 @@ from tg_signer.config import (
     SupportAction,
     parse_chat_id_or_username,
 )
+from tg_signer.webui.common import add_dialog_close_button
 from tg_signer.webui.data import load_user_infos, save_config
 
 
@@ -156,6 +157,7 @@ class InteractiveSignerConfig:
 
         dialog = ui.dialog()
         with dialog, ui.card().classes("w-full max-w-2xl"):
+            add_dialog_close_button(dialog)
             ui.label("编辑任务" if chat else "添加任务").classes(
                 "text-lg font-bold mb-4"
             )
@@ -279,6 +281,7 @@ class InteractiveSignerConfig:
 
             def add_action_ui():
                 with ui.dialog() as act_dialog, ui.card():
+                    add_dialog_close_button(act_dialog)
                     ui.label("添加动作").classes("font-bold")
                     act_type = ui.select(
                         options={a: a.desc for a in SupportAction},

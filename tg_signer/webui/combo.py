@@ -12,6 +12,7 @@ from typing import Optional
 from nicegui import ui
 
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui.common import add_dialog_close_button
 from tg_signer.webui.data import get_workdir
 
 COMPOSITE_TASKS_FILE = "webui_composite_tasks.json"
@@ -166,6 +167,7 @@ class ComboTaskBlock:
 
     def _confirm_delete(self, name: str) -> None:
         with ui.dialog() as dlg, ui.card():
+            add_dialog_close_button(dlg)
             ui.label(f"确定删除组合任务「{name}」？").classes("text-base")
             with ui.row().classes("w-full justify-end gap-2"):
                 ui.button("取消", on_click=dlg.close).props("outline")
@@ -187,6 +189,7 @@ class ComboTaskBlock:
 
     def _build_combo_dialog(self) -> None:
         with ui.dialog() as self.combo_dialog, ui.card().classes("w-full max-w-2xl"):
+            add_dialog_close_button(self.combo_dialog)
             self.combo_title = ui.label("新增组合任务").classes("text-lg font-semibold")
             ui.label(
                 "把多个已有任务按顺序组合；执行时各子任务使用其绑定的账号，账号之间并行。"
@@ -334,12 +337,21 @@ class ComboTaskBlock:
 
     def _build_run_dialog(self) -> None:
         with ui.dialog() as self.run_dialog, ui.card().classes("w-full max-w-xl"):
+            add_dialog_close_button(self.run_dialog)
             self.run_title = ui.label("执行组合任务").classes("text-lg font-semibold")
             self.run_subs_label = ui.label("").classes(
                 "text-xs text-gray-600 whitespace-pre-line"
             )
+            # 可选账号覆盖：留空走各子任务绑定账号，选了则全部子任务仅用所选账号
+            self.run_accounts_select = ui.select(
+                label="指定账号（可选，选了则全部子任务仅用所选账号）",
+                options={},
+                multiple=True,
+                on_change=None,
+            ).classes("w-full")
             ui.label(
-                "各子任务使用其绑定的账号执行，账号之间并行启动；无需手动选择账号。"
+                "留空：各子任务使用其绑定的账号执行（账号之间并行启动）。"
+                "选择账号后：所有子任务仅用所选账号执行。"
             ).classes("text-xs text-gray-500")
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=self.run_dialog.close).props("outline")
@@ -365,11 +377,17 @@ class ComboTaskBlock:
                 f"｜账号：{'、'.join(accs) if accs else '未绑定'}"
             )
         self.run_subs_label.text = "\n".join(lines)
+        # 刷新可选账号（仅活跃账号，按账户管理排序），并清空上次的选择
+        options = {name: name for name in self.runner._get_account_names()}
+        self.run_accounts_select.options = options
+        self.run_accounts_select.update()
+        self.run_accounts_select.set_value([])
         self._run_name = name
         self.run_dialog.open()
 
     def _start_run(self) -> None:
-        if self.runner._launch("组合任务", self._run_name, []):
+        selected = list(self.run_accounts_select.value or [])
+        if self.runner._launch("组合任务", self._run_name, selected):
             self.run_dialog.close()
             self._render_running()
 

@@ -13,7 +13,12 @@ from nicegui import app, ui
 from tg_signer import __version__
 from tg_signer.webui.auto_leave import auto_leave_block
 from tg_signer.webui.combo import combo_block
-from tg_signer.webui.common import copy_text_to_clipboard, notify_error, state
+from tg_signer.webui.common import (
+    add_dialog_close_button,
+    copy_text_to_clipboard,
+    notify_error,
+    state,
+)
 from tg_signer.webui.data import (
     DEFAULT_LOG_FILE,
     DEFAULT_WORKDIR,
@@ -219,24 +224,28 @@ def _build_dashboard(container) -> None:
             ui.card().classes("w-full max-w-4xl") as users_card,
         ):
             pass
+        add_dialog_close_button(users_dialog)
 
         with (
             ui.dialog() as records_dialog,
             ui.card().classes("w-full max-w-4xl") as records_card,
         ):
             pass
+        add_dialog_close_button(records_dialog)
 
         with (
             ui.dialog() as logs_dialog,
             ui.card().classes("w-full max-w-4xl") as logs_card,
         ):
             pass
+        add_dialog_close_button(logs_dialog)
 
         with (
             ui.dialog() as configs_dialog,
             ui.card().classes("w-full max-w-4xl") as configs_card,
         ):
             pass
+        add_dialog_close_button(configs_dialog)
 
         _records_block: Optional[SignRecordBlock] = None
         _users_built = False
@@ -301,6 +310,7 @@ def _build_dashboard(container) -> None:
 
         def open_settings() -> None:
             with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
+                add_dialog_close_button(dialog)
                 ui.label("工作目录").classes("text-lg font-semibold")
                 workdir_input = ui.input(
                     label="工作目录",
@@ -543,6 +553,7 @@ def _build_dashboard(container) -> None:
                     ui.dialog() as import_dlg,
                     ui.card().classes("w-[420px] max-w-full"),
                 ):
+                    add_dialog_close_button(import_dlg)
                     ui.label("导入备份").classes("text-lg font-semibold")
                     ui.label(
                         "选择此前「导出全部配置」生成的备份文件（.zip 或 .json）。"
@@ -672,6 +683,18 @@ def build_ui(auth_code: str = None) -> None:
                 background: #ffffff;
                 border-radius: 12px;
                 box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+            }
+            /* 弹窗右上角悬浮关闭按钮（移动端友好），不占布局空间 */
+            .dialog-close-fab {
+                position: absolute !important;
+                top: 6px !important;
+                right: 6px !important;
+                z-index: 30;
+                min-width: 40px !important;
+                min-height: 40px !important;
+                color: #666 !important;
+                background: rgba(0, 0, 0, 0.05) !important;
+                border-radius: 50% !important;
             }
         </style>
         """

@@ -16,7 +16,7 @@ from nicegui import ui
 
 from tg_signer.giveaway_core import DEFAULT_KEYWORDS, GiveawayEngine, GiveawayState
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.common import copy_text_to_clipboard
+from tg_signer.webui.common import add_dialog_close_button, copy_text_to_clipboard
 from tg_signer.webui.data import load_two_way_accounts, load_user_infos
 from tg_signer.webui.random_chat import (
     build_account_options,
@@ -389,16 +389,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             if parsed is not None and str(parsed) not in chats:
                 chats.append(str(parsed))
         if not chats:
-            ui.notify("请至少选择或手动填写一个频道", type="warning")
-            return
-        # 群组和频道扫描策略不同（群组只扫置顶、频道全量扫），不允许混选
-        kinds = {kind_map.get(cid) for cid in chats if kind_map.get(cid)}
-        if "group" in kinds and "channel" in kinds:
-            ui.notify(
-                "群组和频道不能同时选择：群组只扫置顶消息、频道扫描全部历史，"
-                "请分开建任务",
-                type="warning",
-            )
+            ui.notify("请至少选择或手动填写一个监控对象", type="warning")
             return
         keywords = _split_items(keywords_input.value or "")
         try:
@@ -463,7 +454,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 },
                 {
                     "name": "chats",
-                    "label": "监控频道",
+                    "label": "监控对象",
                     "field": "chats",
                     "align": "left",
                 },
@@ -709,7 +700,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
     ui.label("自动抽奖").classes("text-lg font-semibold")
     ui.label(
-        "监控指定频道消息中的 t.me 抽奖机器人链接（?start= 参数），自动点击参与；"
+        "监控指定频道/群组消息中的 t.me 抽奖机器人链接（?start= 参数），自动点击参与；"
         "任务启动时可自动扫描历史消息（至参与上限或连续 5 条已开奖为止），"
         "也可随时手动扫描。同一抽奖链接每个账号只参与一次，"
         "记录持久化在工作目录，重启不重复参与。"
@@ -797,6 +788,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
     # —— 添加任务弹窗 ——
     with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl"):
+        add_dialog_close_button(add_dlg)
         ui.label("添加任务").classes("text-lg font-semibold")
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             session_dir_input = ui.input(
@@ -847,7 +839,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             channel_select = (
                 ui.select(
-                    label="选择监控频道（可多选，输入关键字过滤）",
+                    label="选择监控频道/群组（可混选，输入关键字过滤）",
                     options={},
                     multiple=True,
                 )

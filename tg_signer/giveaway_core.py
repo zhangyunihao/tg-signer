@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import random
@@ -65,6 +66,61 @@ RESCUE_MAX_FAILS = 3  # 连续失败达该轮数后熔断暂停补漏
 RESCUE_RESUME_COOLDOWN = 1800  # 熔断后的自动恢复等待（秒）
 RESCUE_FETCH_TIMEOUT = 60  # 单频道补漏拉取消息的超时（秒）
 SEEN_CAP_PER_CHAT = 500  # 每频道保留的已处理消息 id 上限
+
+# —— 网络调用统一超时 ——
+# 半开连接（手机切换网络/代理僵死）下 Pyrogram 请求可能永久挂起，导致引擎
+# 任务协程卡死、WebUI 状态永不收敛。所有经引擎客户端发出的请求统一加超时：
+# 单次请求超过 NET_CALL_TIMEOUT 秒按网络异常抛错，由各调用点的既有异常处理兜底。
+NET_CALL_TIMEOUT = 90
+
+
+async def _timeout_aiter(agen: Any, timeout: float, name: str = "") -> Any:
+    """包装异步迭代器（如 get_chat_history）：每一批拉取限时，防遍历永久卡住。"""
+    while True:
+        try:
+            item = await asyncio.wait_for(agen.__anext__(), timeout)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"网络请求 {name or '消息拉取'} 超时（{timeout:.0f} 秒，网络异常）"
+            ) from None
+        yield item
+
+
+class _TimeoutClient:
+    """Pyrogram 客户端代理：协程调用与异步迭代统一套 NET_CALL_TIMEOUT 超时。"""
+
+    def __init__(self, client: Any, timeout: float = NET_CALL_TIMEOUT) -> None:
+        self._raw = client
+        self._timeout = timeout
+
+    @property
+    def raw_client(self) -> Any:
+        return self._raw
+
+    def __getattr__(self, item: str) -> Any:
+        attr = getattr(self._raw, item)
+        if not callable(attr):
+            return attr
+
+        def method(*args: Any, **kwargs: Any) -> Any:
+            result = attr(*args, **kwargs)
+            if hasattr(result, "__anext__"):
+                return _timeout_aiter(result, self._timeout, item)
+            if inspect.isawaitable(result):
+                return self._bounded(result, item)
+            return result
+
+        return method
+
+    async def _bounded(self, coro: Any, name: str) -> Any:
+        try:
+            return await asyncio.wait_for(coro, self._timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"网络请求 {name} 超时（{self._timeout:.0f} 秒，网络异常）"
+            ) from None
 
 # URL 主体合法字符（不含空白与非西文字符）：链接紧贴中文/全角标点时在此截断
 _URL_BODY = r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*"
@@ -341,7 +397,13 @@ def message_requires_password(message: Any) -> bool:
 
 # bot 回复「抽奖活动已结束」类文案（活动可能提前结束）＝终态：
 # 跳过加入、重发、点按钮等一切后续跟进，避免对已结束的抽奖反复发 start
-ENDED_REPLY_RE = re.compile(r"抽奖活动已结束|活动已结束|抽奖已结束")
+# 中文与英文文案均覆盖（如 @Lottery8Bot 的 "The event has ended or does not exist"）
+ENDED_REPLY_RE = re.compile(
+    r"抽奖活动已结束|活动已结束|抽奖已结束"
+    r"|event\s+has\s+ended|giveaway\s+has\s+ended|lottery\s+has\s+ended"
+    r"|已过期",
+    re.IGNORECASE,
+)
 
 
 def reply_says_ended(message: Any) -> bool:
@@ -634,6 +696,10 @@ class GiveawayEngine:
             return "停止中"
         if self.scanning:
             return f"扫描中 {self.scan_text}".strip()
+        if self.rescue_interval > 0:
+            # 补漏开启时任务会常驻待命，明确展示等待语义，避免被误读为卡死
+            mins = max(1, round(self.rescue_interval / 60))
+            return f"常驻待命中（每{mins}分钟补漏扫描，已参与{self.joined}）"
         return f"运行中（已参与{self.joined}）"
 
     async def start(
@@ -736,8 +802,9 @@ class GiveawayEngine:
                     self.log(f"「{account}」会话未授权，已跳过")
                     await safe_disconnect(client)
                     return
-                # 连接成功即纳入账号表；昵称仅用于展示，获取失败不断开
-                self._clients[account] = client
+                # 连接成功即纳入账号表；昵称仅用于展示，获取失败不断开。
+                # 统一包一层网络超时代理，防半开连接永久挂起任务协程
+                self._clients[account] = _TimeoutClient(client)
                 self._locks[account] = asyncio.Lock()
                 try:
                     me = await asyncio.wait_for(
@@ -815,6 +882,8 @@ class GiveawayEngine:
                 for chat in self.chats:
                     if self._stop is not None and self._stop.is_set():
                         return
+                    # 监控对象成员检查：账号未加入该频道/群组时自动尝试加入
+                    await self._ensure_monitor_membership(account, client, chat)
                     done["n"] += 1
                     self.scan_text = f"({done['n']}/{total})"
                     expired_streak = 0
@@ -1434,6 +1503,59 @@ class GiveawayEngine:
             if "NOT_PARTICIPANT" in msg or "USER_NOT_PARTICIPANT" in msg:
                 return False
             return None  # 权限不足/无法解析等，交给 join 环节处理
+
+    async def _ensure_monitor_membership(
+        self, account: str, client: Any, chat: Any
+    ) -> None:
+        """任务监控对象成员检查：账号未加入该频道/群组时自动尝试加入。
+
+        每个账号 × 监控对象只尝试一次（_join_cache 去重，限流除外）；
+        数字 chat_id 在账号未加入的情况下无法解析，会以失败记录并提示。
+        """
+        key = f"{account}|monitor|{str(chat).lower()}"
+        if key in self._join_cache:
+            return
+        # 自动加入被限流暂停中：不消耗本次尝试机会，恢复后重试
+        if (
+            self._join_suspended_until is not None
+            and datetime.now() < self._join_suspended_until
+        ):
+            return
+        already = await self._is_member(client, chat)
+        if already is True:
+            self._join_cache.add(key)
+            return
+        try:
+            joined = await client.join_chat(chat)
+            title = str(getattr(joined, "title", "") or chat)
+            self._join_cache.add(key)
+            self.log(f"[{account}] 未加入监控对象「{title}」，已自动加入")
+        except Exception as exc:
+            msg = str(exc)
+            if "ALREADY_PARTICIPANT" in msg or "already" in msg.lower():
+                self._join_cache.add(key)
+            elif "INVITE_REQUEST_SENT" in msg:
+                self._join_cache.add(key)
+                self.log(
+                    f"[{account}] 已提交加入 {chat} 的申请（私有群/频道，待管理员审批）"
+                )
+            elif "FLOOD_WAIT" in msg:
+                wait = self._flood_seconds(exc) or 60
+                self._join_suspended_until = datetime.now() + timedelta(
+                    seconds=wait + 10
+                )
+                self._join_suspend_logged = False
+                self.log(
+                    f"[{account}] 加入监控对象 {chat} 触发限流（需等待 {wait} 秒），"
+                    f"自动加入暂停至 {self._join_suspended_until:%H:%M}"
+                )
+                self._join_cache.discard(key)  # 限流不消耗尝试机会，恢复后重试
+            else:
+                self._join_cache.add(key)
+                self.log(
+                    f"[{account}] 自动加入监控对象 {chat} 失败: {msg[:120]}"
+                    "（数字 chat_id 需账号已在会话中，建议改用 @username 或手动加入）"
+                )
 
     async def _click_confirm(
         self,

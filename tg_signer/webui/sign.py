@@ -25,6 +25,7 @@ from tg_signer.webui.combo import load_composite_tasks
 from tg_signer.webui.common import (
     SOURCE_ROOT,
     _assign_to_job,
+    add_dialog_close_button,
     notify_error,
     pretty_json,
     state,
@@ -664,6 +665,7 @@ class TaskRunnerBlock:
 
         # ---- 新增任务弹窗 ----
         with ui.dialog() as self.dialog, ui.card().classes("w-full max-w-2xl"):
+            add_dialog_close_button(self.dialog)
             ui.label("新增任务").classes("text-lg font-semibold")
             with ui.row().classes("items-end w-full gap-3 flex-wrap"):
                 self.type_select = ui.select(
@@ -1029,20 +1031,29 @@ class TaskRunnerBlock:
                 ui.notify("组合任务不存在或没有子任务", type="warning")
                 return False
             combo_subs = combo["subs"]
-            # 组合任务：不使用外部传入账号，各子任务使用其自身绑定的账号并集
-            sub_account_sets = [
-                _combo_sub_accounts(sub, state.workdir) for sub in combo_subs
-            ]
-            accounts = []
-            for accs in sub_account_sets:
-                for a in accs:
-                    if a and a not in accounts:
-                        accounts.append(a)
-            available = set(self._get_account_names())
-            accounts = [a for a in accounts if a in available]
-            if not accounts:
-                ui.notify("组合任务的子任务都没有绑定可用账号", type="warning")
-                return False
+            if accounts:
+                # 执行弹窗显式指定账号：所有子任务仅用所选账号（覆盖绑定账号）
+                available = set(self._get_account_names())
+                accounts = [a for a in accounts if a in available]
+                if not accounts:
+                    ui.notify("所选账号均不可用", type="warning")
+                    return False
+                sub_account_sets = [list(accounts) for _ in combo_subs]
+            else:
+                # 默认：各子任务使用其自身绑定的账号并集
+                sub_account_sets = [
+                    _combo_sub_accounts(sub, state.workdir) for sub in combo_subs
+                ]
+                accounts = []
+                for accs in sub_account_sets:
+                    for a in accs:
+                        if a and a not in accounts:
+                            accounts.append(a)
+                available = set(self._get_account_names())
+                accounts = [a for a in accounts if a in available]
+                if not accounts:
+                    ui.notify("组合任务的子任务都没有绑定可用账号", type="warning")
+                    return False
         # 多账号时打乱启动顺序，避免每次都按相同顺序发言
         accounts = [a for a in accounts if a]
         random.shuffle(accounts)
@@ -1355,6 +1366,7 @@ class TaskRunnerBlock:
             for acc in accounts
         }
         with ui.dialog() as dlg, ui.card().classes("w-full max-w-xl"):
+            add_dialog_close_button(dlg)
             ui.label(f"子任务明细 — {row.get('task', '')}").classes(
                 "text-lg font-semibold"
             )
@@ -1869,6 +1881,7 @@ def user_info_block() -> Callable[[], None]:
         login_btn.enable()
 
     with ui.dialog() as add_dlg, ui.card().classes("w-[520px] max-w-full"):
+        add_dialog_close_button(add_dlg)
         ui.label("增加账户（TG 登录）").classes("text-lg font-semibold")
         add_name = ui.input("账户名", placeholder="例如 my_account").classes("w-full")
         add_phone = ui.input(
@@ -1999,6 +2012,7 @@ def user_info_block() -> Callable[[], None]:
 
                     def delete_account(name: str) -> None:
                         with ui.dialog() as dlg, ui.card():
+                            add_dialog_close_button(dlg)
                             ui.label(f"确认删除账户 {name}？").classes(
                                 "text-lg font-semibold"
                             )
@@ -2041,6 +2055,7 @@ def user_info_block() -> Callable[[], None]:
                             ui.dialog() as dlg,
                             ui.card().classes("w-[420px] max-w-full"),
                         ):
+                            add_dialog_close_button(dlg)
                             ui.label(f"重命名账户 {name}").classes(
                                 "text-lg font-semibold"
                             )

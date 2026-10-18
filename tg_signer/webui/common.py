@@ -117,6 +117,21 @@ def notify_error(exc: Exception) -> None:
     ui.notify(f"{exc}", type="negative")
 
 
+def add_dialog_close_button(dlg: ui.dialog) -> None:
+    """在弹窗卡片右上角添加悬浮关闭按钮（移动端点 X 即可关闭，不占布局空间）。
+
+    需在弹窗卡片创建之后调用；样式 .dialog-close-fab 由 app.build_ui 注入。
+    """
+    for card in list(dlg.default_slot.children):
+        if not isinstance(card, ui.card):
+            continue
+        card.classes("relative")
+        with card:
+            ui.button(icon="close", on_click=dlg.close).props(
+                "flat round dense unelevated"
+            ).classes("dialog-close-fab")
+
+
 def copy_text_to_clipboard(text: str) -> None:
     """把文本复制到浏览器剪贴板（安全上下文用 Clipboard API，否则降级 execCommand）。"""
     if not text:

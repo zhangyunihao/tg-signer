@@ -19,7 +19,7 @@ from pyrogram.errors import FloodWait, RPCError
 
 from tg_signer.core import get_client, safe_disconnect
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.common import copy_text_to_clipboard
+from tg_signer.webui.common import add_dialog_close_button, copy_text_to_clipboard
 from tg_signer.webui.random_chat import (
     build_account_options,
     list_session_names,
@@ -369,6 +369,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             ui.notify("请先勾选要退出的对话", type="warning")
             return
         with ui.dialog() as dialog, ui.card():
+            add_dialog_close_button(dialog)
             ui.label(f"确认退出以下 {len(selected)} 个对话？").classes(
                 "text-lg font-semibold"
             )
@@ -429,6 +430,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             ui.notify("任务运行中，请先停止再删除", type="warning")
             return
         with ui.dialog() as dialog, ui.card():
+            add_dialog_close_button(dialog)
 
             def do_delete() -> None:
                 dialog.close()
@@ -453,6 +455,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             ui.dialog() as dialog,
             ui.card().classes("w-[520px] max-w-[96vw] max-h-[88vh] overflow-auto"),
         ):
+            add_dialog_close_button(dialog)
             ui.label("复制退频道任务" if prefill else "新建退频道任务").classes(
                 "text-lg font-semibold"
             )
