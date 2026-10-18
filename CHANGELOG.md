@@ -2,8 +2,14 @@
 
 ## 版本变动日志
 
+### 1.0.29
+- 自动抽奖并发模型重构：移除全局参与闸门与 per-bot 请求锁，改为「参与条数上限」同步名额预留（start 失败自动归还名额），随机延迟、加入后等待、确认核对等纯等待与 bot 请求全部不再互斥，多账号参与吞吐大幅提升
+- 随机发言任务新增运行硬上限：任务达到运行时长上限后自动强制终止（含网络异常卡死兜底），并给延迟撤回收尾预留时间
+- 日志「一键复制」逻辑抽取为 `webui/common.copy_text_to_clipboard` 公共函数，自动抽奖、批量退频道、随机发言三处复用
+- CLI：`tg-signer-plus` 不带子命令即等价于 `tg-signer-plus webgui`
+
 ### 1.0.28
-- 命令行精简：移除 `login`/`logout`/`run`/`run-once`/`automation`/`monitor`/`send-text` 等全部命令，仅保留启动命令 `tg-signer-plus webgui`，所有操作统一走 WebUI
+- 命令行精简：移除 `login`/`logout`/`run`/`run-once`/`automation`/`monitor`/`send-text` 等全部命令，仅保留启动命令，所有操作统一走 WebUI；`tg-signer-plus` 不带子命令即启动 WebUI（`webgui` 可省略）
 - WebUI 任务子进程改由内部模块 `tg_signer.task_runner` 承接（`python -m tg_signer.task_runner`），组合任务 `combo_runner` 同步切换，行为与原 CLI 调用完全一致
 - 移除 `click` 依赖，CLI 入口改为标准库 argparse 实现
 - 清理 `llm-config`、`migrate-sign-records` 相关提示文案（LLM 配置改走环境变量或 `<workdir>/.openai_config.json`）

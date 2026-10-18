@@ -13,17 +13,23 @@ def build_parser() -> argparse.ArgumentParser:
         prog="tg-signer-plus",
         description="tg-signer 命令行入口（仅保留启动命令，其余操作请在网页界面完成）",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
-    gui = sub.add_parser("webgui", help="启动 WebUI")
-    gui.add_argument("--host", "-H", default="127.0.0.1", help="监听地址")
-    gui.add_argument("--port", "-P", type=int, default=8080, help="监听端口")
-    gui.add_argument(
+    # 不带子命令时默认启动 WebUI，即 `tg-signer-plus` 等价于 `tg-signer-plus webgui`
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="webgui",
+        choices=["webgui"],
+        help="启动命令（默认 webgui，可省略）",
+    )
+    parser.add_argument("--host", "-H", default="127.0.0.1", help="监听地址")
+    parser.add_argument("--port", "-P", type=int, default=8080, help="监听端口")
+    parser.add_argument(
         "--storage-secret",
         "-S",
         default=None,
         help="存储密钥，若不输入则使用已持久化的密钥或每次启动随机生成",
     )
-    gui.add_argument(
+    parser.add_argument(
         "--auth-code",
         default=None,
         help="授权码，也可通过环境变量`TG_SIGNER_GUI_AUTHCODE`设置。若存在则访问界面时需要正确输入。",

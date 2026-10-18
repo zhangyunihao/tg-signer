@@ -13,7 +13,7 @@ from nicegui import app, ui
 from tg_signer import __version__
 from tg_signer.webui.auto_leave import auto_leave_block
 from tg_signer.webui.combo import combo_block
-from tg_signer.webui.common import notify_error, state
+from tg_signer.webui.common import copy_text_to_clipboard, notify_error, state
 from tg_signer.webui.data import (
     DEFAULT_LOG_FILE,
     DEFAULT_WORKDIR,
@@ -177,23 +177,7 @@ def log_block() -> Callable[[], None]:
             if not current_lines:
                 ui.notify("暂无可复制的日志", type="warning")
                 return
-            text = "\n".join(current_lines)
-            # json.dumps 产出合法的 JS 字符串字面量，换行/引号均已转义
-            payload = json.dumps(text, ensure_ascii=False)
-            ui.run_javascript(
-                "(async () => {"
-                f"const t = {payload};"
-                "try {"
-                "if (navigator.clipboard && window.isSecureContext) {"
-                "await navigator.clipboard.writeText(t); return;"
-                "}"
-                "} catch (e) {}"
-                "const ta = document.createElement('textarea');"
-                "ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';"
-                "document.body.appendChild(ta); ta.focus(); ta.select();"
-                "document.execCommand('copy'); ta.remove();"
-                "})()"
-            )
+            copy_text_to_clipboard("\n".join(current_lines))
             ui.notify(f"已复制 {len(current_lines)} 行日志", type="positive")
 
         with ui.row().classes("gap-2 mt-2 items-center justify-between"):

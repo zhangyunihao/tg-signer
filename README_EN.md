@@ -8,8 +8,8 @@ All operations (login, check-in, automation, monitoring, messaging) are done in 
 
 ```sh
 pip install "tg-signer-plus[gui]"
-tg-signer-plus webgui          # then open http://127.0.0.1:8080 in a browser
-# optional access password: tg-signer-plus webgui --auth-code <your-password>
+tg-signer-plus                 # then open http://127.0.0.1:8080 in a browser (equivalent to tg-signer-plus webgui)
+# optional access password: tg-signer-plus --auth-code <your-password>
 ```
 
 The program does not read the system proxy. If you need a proxy, set an environment variable first:
@@ -39,7 +39,7 @@ Start and keep it running in the background:
 ```sh
 termux-wake-lock                              # prevent the system from killing the process (important)
 export TG_PROXY=socks5://127.0.0.1:7877       # only needed if a proxy is used on the phone
-tg-signer-plus webgui
+tg-signer-plus
 ```
 
 Then open **http://127.0.0.1:8080** in the phone browser. The page is mobile-adapted; account login, config, and check-in work the same as on desktop.
@@ -48,7 +48,7 @@ Tips:
 
 - **Long-running background**: keep Termux in the foreground or the recent-apps list with `termux-wake-lock`; or install tmux (`pkg install tmux`) so tasks survive disconnects
 - **Autostart**: use the Termux:Boot plugin with a script under `~/.termux/boot/`
-- **Open the phone-hosted UI from a PC**: add listen options and always set an access password — `tg-signer-plus webgui --host 0.0.0.0 --auth-code <your-password>`, then visit `http://<phone-LAN-IP>:8080`
+- **Open the phone-hosted UI from a PC**: add listen options and always set an access password — `tg-signer-plus --host 0.0.0.0 --auth-code <your-password>`, then visit `http://<phone-LAN-IP>:8080`
 - **Battery optimization**: disable it for Termux in system settings, otherwise scheduled check-ins may be paused when the screen is off
 - Never run the same account's session on two devices at once, or Telegram revokes it with `AUTH_KEY_DUPLICATED`; stop tasks on the old device before switching
 

@@ -19,6 +19,7 @@ from pyrogram.errors import FloodWait, RPCError
 
 from tg_signer.core import get_client, safe_disconnect
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui.common import copy_text_to_clipboard
 from tg_signer.webui.random_chat import (
     build_account_options,
     list_session_names,
@@ -663,7 +664,19 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     list_container = ui.column().classes("w-full gap-2")
     render_list()
 
-    log_area = ui.log(max_lines=300).classes("w-full h-48 mt-2")
+    def copy_log() -> None:
+        if not log_lines:
+            ui.notify("暂无可复制的日志", type="warning")
+            return
+        copy_text_to_clipboard("\n".join(log_lines))
+        ui.notify(f"已复制 {len(log_lines)} 行日志", type="positive")
+
+    with ui.row().classes("w-full items-center justify-between mt-2"):
+        ui.label("运行日志").classes("font-semibold")
+        ui.button(icon="content_copy", on_click=copy_log).props(
+            "flat round dense"
+        ).tooltip("一键复制日志")
+    log_area = ui.log(max_lines=300).classes("w-full h-48")
     for line in log_lines:
         log_area.push(line)
 

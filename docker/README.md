@@ -6,7 +6,7 @@
 pip install -U tg-signer
 
 # WebUI 方式启动（推荐）
-tg-signer webgui --host 0.0.0.0 --auth-code change-me
+tg-signer webgui --host 0.0.0.0 --auth-code change-me  # 或省略 webgui：tg-signer --host 0.0.0.0 --auth-code change-me
 ```
 
 ## 使用预构建镜像

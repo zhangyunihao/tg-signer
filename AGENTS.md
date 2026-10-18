@@ -55,8 +55,9 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
   - Speedup: `python -m pip install -e ".[speedup]"`
 
 ## Common Commands
-- Start the WebUI (the only user-facing command):
-  - `tg-signer-plus webgui`
+- Start the WebUI (the only user-facing command; `tg-signer-plus` alone also works, `webgui` is optional):
+  - `tg-signer-plus`
+  - `tg-signer-plus webgui` (equivalent)
   - Optional: `--host`, `--port`, `--storage-secret`, `--auth-code` (or env `TG_SIGNER_GUI_AUTHCODE`)
 - Internal task subprocess entry (used by the WebUI/combo_runner, not for direct use):
   - `python -m tg_signer.task_runner -w <workdir> -a <account> run-once <task_name>`

@@ -115,3 +115,25 @@ def pretty_json(data: Dict[str, object]) -> str:
 
 def notify_error(exc: Exception) -> None:
     ui.notify(f"{exc}", type="negative")
+
+
+def copy_text_to_clipboard(text: str) -> None:
+    """把文本复制到浏览器剪贴板（安全上下文用 Clipboard API，否则降级 execCommand）。"""
+    if not text:
+        return
+    # json.dumps 产出合法的 JS 字符串字面量，换行/引号均已转义
+    payload = json.dumps(text, ensure_ascii=False)
+    ui.run_javascript(
+        "(async () => {"
+        f"const t = {payload};"
+        "try {"
+        "if (navigator.clipboard && window.isSecureContext) {"
+        "await navigator.clipboard.writeText(t); return;"
+        "}"
+        "} catch (e) {}"
+        "const ta = document.createElement('textarea');"
+        "ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';"
+        "document.body.appendChild(ta); ta.focus(); ta.select();"
+        "document.execCommand('copy'); ta.remove();"
+        "})()"
+    )

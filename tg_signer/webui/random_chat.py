@@ -8,6 +8,7 @@ import json
 import logging
 import random
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Union
@@ -17,6 +18,7 @@ from nicegui import ui
 from tg_signer.core import get_client, safe_disconnect
 from tg_signer.phrases import PHRASES, parse_custom_phrases, phrase_pool_label
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui.common import copy_text_to_clipboard
 from tg_signer.webui.data import (
     apply_account_order,
     load_disabled_accounts,
@@ -251,10 +253,15 @@ class RandomChatEngine:
     # 连接阶段的超时秒数，避免代理异常时卡住无法停止
     CONNECT_TIMEOUT = 30
 
+    # 任务运行硬上限（秒）：无论如何，任务运行达到该时长后自动终止
+    MAX_RUNTIME_SECONDS = 20 * 60
+
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
         self._stop: Optional[asyncio.Event] = None
         self._stopping: bool = False
+        # 运行截止时间（time.monotonic），start 时设置
+        self._deadline: float | None = None
         # 运行进度：{account: 已发送条数}，供任务表格状态列展示
         self.progress: Dict[str, int] = {}
         self._total_accounts: int = 0
@@ -299,6 +306,7 @@ class RandomChatEngine:
         self._total_count = total_count
         self.using_custom_pool = bool(phrases)
         self.pool = list(phrases) if phrases else list(PHRASES)
+        self._deadline = time.monotonic() + self.MAX_RUNTIME_SECONDS
         self._stop = asyncio.Event()
         self._task = asyncio.create_task(
             self._loop(
@@ -351,6 +359,13 @@ class RandomChatEngine:
         try:
             while not self._stop.is_set():
                 if total_count and sent >= total_count:
+                    break
+                if self._deadline is not None and time.monotonic() >= self._deadline:
+                    self._stop.set()
+                    log(
+                        f"{datetime.now():%H:%M:%S} [超时] {account} 任务运行达到 "
+                        f"{self.MAX_RUNTIME_SECONDS // 60} 分钟上限，自动停止发送"
+                    )
                     break
                 text = random.choice(self.pool)
                 try:
@@ -460,21 +475,61 @@ class RandomChatEngine:
             f"使用{pool_label}"
         )
         try:
-            await asyncio.gather(
-                *[
-                    self._account_loop(
-                        client,
-                        account,
-                        chat_id,
-                        interval,
-                        log,
-                        delete_after,
-                        total_count,
+            # 硬性兜底：即使账号循环因网络异常卡住，到期也强制取消，保证任务不超过上限
+            # 额外放宽 delete_after + 65，给停止后的延迟撤回收尾留足时间
+            if self._deadline is not None:
+                backstop = (
+                    max(self._deadline - time.monotonic(), 0)
+                    + interval
+                    + 10
+                    + delete_after
+                    + 65
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *[
+                                self._account_loop(
+                                    client,
+                                    account,
+                                    chat_id,
+                                    interval,
+                                    log,
+                                    delete_after,
+                                    total_count,
+                                )
+                                for account, client in clients.items()
+                            ]
+                        ),
+                        timeout=backstop,
                     )
-                    for account, client in clients.items()
-                ]
-            )
-            if total_count:
+                except asyncio.TimeoutError:
+                    self._stop.set()
+                    log(
+                        f"{datetime.now():%H:%M:%S} [超时] 任务达到 "
+                        f"{self.MAX_RUNTIME_SECONDS // 60} 分钟硬性上限，已强制终止"
+                    )
+            else:
+                await asyncio.gather(
+                    *[
+                        self._account_loop(
+                            client,
+                            account,
+                            chat_id,
+                            interval,
+                            log,
+                            delete_after,
+                            total_count,
+                        )
+                        for account, client in clients.items()
+                    ]
+                )
+            if self._deadline is not None and time.monotonic() >= self._deadline:
+                log(
+                    f"{datetime.now():%H:%M:%S} [超时] 任务运行达到 "
+                    f"{self.MAX_RUNTIME_SECONDS // 60} 分钟上限，自动结束"
+                )
+            elif total_count:
                 summary = ", ".join(f"{a}:{total_count}" for a in sorted(clients))
                 log(f"每个账号均已发满 {total_count} 条（{summary}），任务完成")
         finally:
@@ -989,11 +1044,22 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         _seen["n"] = len(log_buf)
         send_log.clear()
 
+    def copy_log() -> None:
+        if not log_buf:
+            ui.notify("暂无可复制的日志", type="warning")
+            return
+        copy_text_to_clipboard("\n".join(log_buf))
+        ui.notify(f"已复制 {len(log_buf)} 行日志", type="positive")
+
     with ui.row().classes("w-full items-center justify-between"):
         ui.label("共用日志（所有任务）").classes("font-semibold")
-        ui.button(icon="delete_outline", on_click=clear_log).props(
-            "flat round dense"
-        ).tooltip("清空日志")
+        with ui.row().classes("gap-1 items-center"):
+            ui.button(icon="content_copy", on_click=copy_log).props(
+                "flat round dense"
+            ).tooltip("一键复制日志")
+            ui.button(icon="delete_outline", on_click=clear_log).props(
+                "flat round dense"
+            ).tooltip("清空日志")
     send_log = ui.log(max_lines=300).classes("w-full h-40")
     log_buf = _GLOBAL_LOGS.setdefault(wd_key, [])
     _seen = {"n": len(log_buf)}

@@ -16,6 +16,7 @@ from nicegui import ui
 
 from tg_signer.giveaway_core import DEFAULT_KEYWORDS, GiveawayEngine, GiveawayState
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui.common import copy_text_to_clipboard
 from tg_signer.webui.data import load_two_way_accounts, load_user_infos
 from tg_signer.webui.random_chat import (
     build_account_options,
@@ -729,11 +730,22 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         _seen["n"] = len(log_buf)
         send_log.clear()
 
+    def copy_log() -> None:
+        if not log_buf:
+            ui.notify("暂无可复制的日志", type="warning")
+            return
+        copy_text_to_clipboard("\n".join(log_buf))
+        ui.notify(f"已复制 {len(log_buf)} 行日志", type="positive")
+
     with ui.row().classes("w-full items-center justify-between"):
         ui.label("共用日志（所有任务）").classes("font-semibold")
-        ui.button(icon="delete_outline", on_click=clear_log).props(
-            "flat round dense"
-        ).tooltip("清空日志")
+        with ui.row().classes("gap-1 items-center"):
+            ui.button(icon="content_copy", on_click=copy_log).props(
+                "flat round dense"
+            ).tooltip("一键复制日志")
+            ui.button(icon="delete_outline", on_click=clear_log).props(
+                "flat round dense"
+            ).tooltip("清空日志")
     send_log = ui.log(max_lines=300).classes("w-full h-40")
     log_buf = _GLOBAL_LOGS.setdefault(wd_key, [])
     _seen = {"n": len(log_buf)}

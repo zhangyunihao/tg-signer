@@ -6,8 +6,8 @@
 
 ```sh
 pip install "tg-signer-plus[gui]"
-tg-signer-plus webgui          # 启动后浏览器访问 http://127.0.0.1:8080
-# 可选访问密码：tg-signer-plus webgui --auth-code <你的密码>
+tg-signer-plus                 # 启动后浏览器访问 http://127.0.0.1:8080（等价于 tg-signer-plus webgui）
+# 可选访问密码：tg-signer-plus --auth-code <你的密码>
 ```
 
 程序不读取系统代理，需要代理时先设置环境变量：
@@ -37,7 +37,7 @@ pip install "tg-signer-plus[gui]"
 ```sh
 termux-wake-lock                              # 防止系统休眠杀进程（很重要）
 export TG_PROXY=socks5://127.0.0.1:7877       # 手机上挂了代理才需要，端口按实际改
-tg-signer-plus webgui
+tg-signer-plus
 ```
 
 然后用手机浏览器访问 **http://127.0.0.1:8080** 即可，页面已做移动端适配；账号登录、配置、签到等全部操作与电脑端一致。
@@ -46,7 +46,7 @@ tg-signer-plus webgui
 
 - **长时间后台运行**：保持 Termux 在前台或最近任务列表中，配合 `termux-wake-lock`；也可装 tmux（`pkg install tmux`）在会话内运行，断 SSH/切应用后任务不中断
 - **开机/后台自启**：可用 Termux:Boot 插件，在 `~/.termux/boot/` 下放启动脚本
-- **电脑访问手机上的界面**：启动时加监听参数并务必设置访问密码——`tg-signer-plus webgui --host 0.0.0.0 --auth-code <你的密码>`，电脑浏览器访问 `http://<手机局域网IP>:8080`
+- **电脑访问手机上的界面**：启动时加监听参数并务必设置访问密码——`tg-signer-plus --host 0.0.0.0 --auth-code <你的密码>`，电脑浏览器访问 `http://<手机局域网IP>:8080`
 - **省电策略**：在系统设置中关闭 Termux 的电池优化，否则息屏后定时签到可能被系统暂停
 - 手机与电脑**不要同时运行同一账号的 session**，否则会触发 `AUTH_KEY_DUPLICATED` 吊销会话；换机运行时请先停掉旧设备上的任务
 
