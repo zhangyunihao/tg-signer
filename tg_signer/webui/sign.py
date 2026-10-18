@@ -23,12 +23,15 @@ from tg_signer.webui.auto_leave import load_config as _load_leave_config
 from tg_signer.webui.auto_leave import load_leave_tasks as _load_leave_tasks
 from tg_signer.webui.combo import load_composite_tasks
 from tg_signer.webui.common import (
+    SELECT_ALL_KEY,
     SOURCE_ROOT,
     _assign_to_job,
     add_dialog_close_button,
+    attach_select_all,
     notify_error,
     pretty_json,
     state,
+    with_select_all,
 )
 from tg_signer.webui.data import (
     CONFIG_META,
@@ -691,6 +694,7 @@ class TaskRunnerBlock:
                     .classes("min-w-[240px]")
                     .props("use-chips")
                 )
+                attach_select_all(self.account_select)
             with ui.row().classes("items-center gap-2 w-full") as self.binding_row:
                 self.binding_label = ui.label("").classes("text-sm text-primary")
                 ui.button(
@@ -806,7 +810,7 @@ class TaskRunnerBlock:
 
     def _refresh_accounts(self) -> None:
         options = self._get_account_names()
-        self.account_select.options = options
+        self.account_select.options = with_select_all(options)
         if self.account_select.value:
             self.account_select.value = [
                 v for v in self.account_select.value if v in options
@@ -970,7 +974,11 @@ class TaskRunnerBlock:
             self.binding_row.set_visibility(False)
             self.account_select.set_visibility(True)
             if not self.account_select.value and self.account_select.options:
-                self.account_select.value = list(self.account_select.options)
+                self.account_select.value = [
+                    v
+                    for v in self.account_select.options
+                    if v != SELECT_ALL_KEY
+                ]
         self.account_select.update()
         self.binding_row.update()
 

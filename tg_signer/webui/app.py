@@ -696,6 +696,11 @@ def build_ui(auth_code: str = None) -> None:
                 background: rgba(0, 0, 0, 0.05) !important;
                 border-radius: 50% !important;
             }
+            /* 全局通知消息移到页面顶部：默认底部弹出会遮挡弹窗底部的「确定」按钮 */
+            .q-notifications__list--bottom {
+                top: 8px !important;
+                bottom: auto !important;
+            }
         </style>
         """
     )

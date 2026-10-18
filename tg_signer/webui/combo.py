@@ -12,7 +12,11 @@ from typing import Optional
 from nicegui import ui
 
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.common import add_dialog_close_button
+from tg_signer.webui.common import (
+    add_dialog_close_button,
+    attach_select_all,
+    with_select_all,
+)
 from tg_signer.webui.data import get_workdir
 
 COMPOSITE_TASKS_FILE = "webui_composite_tasks.json"
@@ -349,6 +353,7 @@ class ComboTaskBlock:
                 multiple=True,
                 on_change=None,
             ).classes("w-full")
+            attach_select_all(self.run_accounts_select)
             ui.label(
                 "留空：各子任务使用其绑定的账号执行（账号之间并行启动）。"
                 "选择账号后：所有子任务仅用所选账号执行。"
@@ -379,7 +384,7 @@ class ComboTaskBlock:
         self.run_subs_label.text = "\n".join(lines)
         # 刷新可选账号（仅活跃账号，按账户管理排序），并清空上次的选择
         options = {name: name for name in self.runner._get_account_names()}
-        self.run_accounts_select.options = options
+        self.run_accounts_select.options = with_select_all(options)
         self.run_accounts_select.update()
         self.run_accounts_select.set_value([])
         self._run_name = name

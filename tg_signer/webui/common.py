@@ -132,6 +132,34 @@ def add_dialog_close_button(dlg: ui.dialog) -> None:
             ).classes("dialog-close-fab")
 
 
+# 账号多选下拉的「全选」虚拟项：出现在选项最顶部，勾选后自动展开为全部账号
+SELECT_ALL_KEY = "__select_all__"
+
+
+def with_select_all(options):
+    """在账号多选选项最前面插入「全选」虚拟项（dict/list 两种选项格式均支持）。"""
+    if isinstance(options, dict):
+        return {SELECT_ALL_KEY: "全选", **options}
+    return [SELECT_ALL_KEY, *options]
+
+
+def attach_select_all(select: ui.select) -> None:
+    """给账号多选下拉附加「全选」展开逻辑（需在 select 创建后调用一次）。
+
+    勾选「全选」虚拟项后立即替换为全部真实账号，虚拟值不会残留在
+    select.value 中，任务提交侧拿到的永远是真实账号名。
+    """
+
+    def _handler(_e=None) -> None:
+        if SELECT_ALL_KEY not in (select.value or []):
+            return
+        options = select.options or {}
+        names = options.keys() if isinstance(options, dict) else options
+        select.set_value([k for k in names if k != SELECT_ALL_KEY])
+
+    select.on("update:model-value", _handler)
+
+
 def copy_text_to_clipboard(text: str) -> None:
     """把文本复制到浏览器剪贴板（安全上下文用 Clipboard API，否则降级 execCommand）。"""
     if not text:

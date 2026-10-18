@@ -1,6 +1,6 @@
 """自动抽奖标签页：监控指定频道中的 t.me/<bot>?start=<参数> 抽奖链接并自动参与。
 
-触发方式：任务启动时可自动扫描最近 N 条，也可随时手动扫描。
+触发方式：任务启动时自动扫描历史消息，开启补漏后按间隔周期性重拉最近消息。
 账号会话/授权检测/从 TG 更新对话列表等能力复用 random_chat 模块。
 """
 
@@ -16,8 +16,17 @@ from nicegui import ui
 
 from tg_signer.giveaway_core import DEFAULT_KEYWORDS, GiveawayEngine, GiveawayState
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.common import add_dialog_close_button, copy_text_to_clipboard
-from tg_signer.webui.data import load_two_way_accounts, load_user_infos
+from tg_signer.webui.common import (
+    add_dialog_close_button,
+    attach_select_all,
+    copy_text_to_clipboard,
+    with_select_all,
+)
+from tg_signer.webui.data import (
+    chat_username_map,
+    load_two_way_accounts,
+    load_user_infos,
+)
 from tg_signer.webui.random_chat import (
     build_account_options,
     list_session_names,
@@ -33,6 +42,43 @@ _GLOBAL_LOGS: Dict[str, List[str]] = {}
 _GLOBAL_STATUS_CBS: Dict[str, Callable[[bool], None]] = {}
 
 _TASKS_FILE = "giveaway_tasks.json"
+# 账号未加入监控对象且自动加入失败的提醒（持久化，加入成功后自动消除）
+JOIN_ALERTS_FILE = "webui_join_alerts.json"
+JOIN_ALERTS_MAX = 200
+
+
+def load_join_alerts(workdir) -> List[dict]:
+    path = Path(workdir) / JOIN_ALERTS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        alerts = data.get("alerts") if isinstance(data, dict) else None
+        return [a for a in (alerts or []) if isinstance(a, dict)]
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        logger.debug("读取加入失败提醒文件失败", exc_info=True)
+        return []
+
+
+def save_join_alerts(workdir, alerts: List[dict]) -> None:
+    try:
+        atomic_write_json(
+            Path(workdir) / JOIN_ALERTS_FILE, {"alerts": alerts[:JOIN_ALERTS_MAX]}
+        )
+    except OSError:
+        logger.debug("写入加入失败提醒文件失败", exc_info=True)
+
+
+def format_join_alert(a: dict, title_map: Dict[str, str]) -> str:
+    chat = str(a.get("chat") or "")
+    title = title_map.get(chat)
+    disp = f"{title} ({chat})" if title else chat
+    return (
+        f"账号 {a.get('account')} 未加入监控对象「{disp}」"
+        f"且自动加入失败：{a.get('error')}（{a.get('time')}）"
+    )
+
+
 # 任务配置字段 -> 默认值，加载旧配置时补齐缺失字段
 _CFG_FIELDS = {
     "accounts": list,
@@ -209,7 +255,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     def _set_account_options() -> None:
         session_dir = Path(session_dir_input.value or ".")
         names = list_session_names(session_dir, workdir)
-        account_select.options = build_account_options(session_dir, names)
+        account_select.options = with_select_all(
+            build_account_options(session_dir, names)
+        )
         account_select.update()
 
     def apply_channel_filter() -> None:
@@ -319,6 +367,43 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             if cb is not None:
                 _apply_status(cb, False)
 
+        def _on_event(ev: dict) -> None:
+            """账号未加入监控对象且加入失败 → 顶部通知 + 持久化；加入成功则消除"""
+            etype = ev.get("type")
+            if etype not in ("join_failed", "join_resolved"):
+                return
+            acct = str(ev.get("account") or "")
+            chat = str(ev.get("chat") or "")
+            if not acct or not chat:
+                return
+            kkey = f"{acct}|{chat}"
+            alerts = [
+                a
+                for a in load_join_alerts(workdir)
+                if f"{a.get('account')}|{a.get('chat')}" != kkey
+            ]
+            if etype == "join_failed":
+                alerts.insert(
+                    0,
+                    {
+                        "account": acct,
+                        "chat": chat,
+                        "error": str(ev.get("error") or "")[:200],
+                        "time": f"{datetime.now():%m-%d %H:%M:%S}",
+                    },
+                )
+            save_join_alerts(workdir, alerts)
+            try:
+                with client:
+                    if etype == "join_failed":
+                        ui.notify(
+                            format_join_alert(alerts[0], chat_title_map),
+                            type="warning",
+                            multi_line=True,
+                        )
+            except Exception:
+                logger.debug("推送加入失败通知失败", exc_info=True)
+
         engine = ensure_engine(name)
         started = await engine.start(
             accounts=list(cfg["accounts"]),
@@ -333,6 +418,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             auto_join=bool(cfg.get("auto_join", True)),
             ignore_history=bool(cfg.get("ignore_history", True)),
             two_way_accounts=sorted(load_two_way_accounts(workdir)),
+            chat_usernames=chat_username_map(workdir),
             max_joins=(int(cfg["max_joins"]) if cfg.get("max_joins") else None),
             delay_range=(
                 float(cfg.get("delay_min") or 0),
@@ -343,6 +429,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             rescue_limit=int(cfg.get("rescue_limit") or 10),
             state=giveaway_state,
             on_finish=_on_finish,
+            on_event=_on_event,
         )
         if started:
             set_status(True)
@@ -356,17 +443,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             await engine.stop()
         else:
             set_status(False)
-
-    async def scan_task(name: str) -> None:
-        engine = get_engine(name)
-        if engine is None or not engine.running:
-            ui.notify("任务未运行", type="warning")
-            return
-        if engine.scanning:
-            ui.notify("正在扫描中，请稍候", type="warning")
-            return
-        ui.notify("开始扫描（至参与上限或连续 5 条已开奖为止）", type="positive")
-        asyncio.create_task(engine.scan_now())
 
     def _apply_status(set_status: Callable[[bool], None], running: bool) -> None:
         try:
@@ -538,8 +614,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 'label="启动" @click="$parent.$emit(\'startTask\', props.row)" />'
                 f'<q-btn v-if="({running_expr})" flat dense color="negative" '
                 'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
-                f'<q-btn v-if="({running_expr})" flat dense color="primary" '
-                'label="扫描" @click="$parent.$emit(\'scanTask\', props.row)" />'
                 '<q-btn flat dense color="primary" '
                 'label="复制" @click="$parent.$emit(\'copyTask\', props.row)" />'
                 '<q-btn flat dense color="negative" '
@@ -588,11 +662,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     if n in tasks:
                         await stop_task(n, make_set_status(n))
 
-            async def on_scan_event(e) -> None:
-                row = e.args
-                if isinstance(row, dict) and row.get("name"):
-                    await scan_task(str(row["name"]))
-
             def on_copy_event(e) -> None:
                 row = e.args
                 if isinstance(row, dict) and row.get("name"):
@@ -605,7 +674,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
             table.on("startTask", on_start_event)
             table.on("stopTask", on_stop_event)
-            table.on("scanTask", on_scan_event)
             table.on("copyTask", on_copy_event)
             table.on("deleteTask", on_delete_event)
 
@@ -661,12 +729,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                         _card_stop(nn, cb)
                                     ),
                                 ).props("flat dense color=negative")
-                                ui.button(
-                                    "扫描",
-                                    on_click=lambda nn=n: asyncio.create_task(
-                                        scan_task(nn)
-                                    ),
-                                ).props("flat dense color=primary")
                             ui.button(
                                 "复制",
                                 on_click=lambda nn=n: duplicate_task(nn),
@@ -701,8 +763,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     ui.label("自动抽奖").classes("text-lg font-semibold")
     ui.label(
         "监控指定频道/群组消息中的 t.me 抽奖机器人链接（?start= 参数），自动点击参与；"
-        "任务启动时可自动扫描历史消息（至参与上限或连续 5 条已开奖为止），"
-        "也可随时手动扫描。同一抽奖链接每个账号只参与一次，"
+        "任务启动时可自动扫描历史消息（至参与上限或连续 5 条已开奖为止）。"
+        "同一抽奖链接每个账号只参与一次，"
         "记录持久化在工作目录，重启不重复参与。"
     ).classes("text-sm text-gray-500")
 
@@ -803,6 +865,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 .classes("min-w-[260px]")
                 .props("use-chips")
             )
+            attach_select_all(account_select)
             ui.button("刷新账号/频道", on_click=lambda: refresh_options()).props(
                 "outline"
             )
@@ -925,4 +988,17 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
     refresh_options()
     render_tasks()
+    # 回放持久化的「未加入监控对象且加入失败」提醒（加入成功后自动消除）
+    _persisted_alerts = load_join_alerts(workdir)
+    if _persisted_alerts:
+        try:
+            with client:
+                for a in reversed(_persisted_alerts[:10]):
+                    ui.notify(
+                        format_join_alert(a, chat_title_map),
+                        type="warning",
+                        multi_line=True,
+                    )
+        except Exception:
+            logger.debug("回放加入失败提醒失败", exc_info=True)
     return refresh_options

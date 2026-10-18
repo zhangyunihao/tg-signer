@@ -19,7 +19,12 @@ from pyrogram.errors import FloodWait, RPCError
 
 from tg_signer.core import get_client, safe_disconnect
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.common import add_dialog_close_button, copy_text_to_clipboard
+from tg_signer.webui.common import (
+    add_dialog_close_button,
+    attach_select_all,
+    copy_text_to_clipboard,
+    with_select_all,
+)
 from tg_signer.webui.random_chat import (
     build_account_options,
     list_session_names,
@@ -467,12 +472,13 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             name_input = ui.input("任务名称", value=default_name).classes("w-full")
             account_sel = ui.select(
                 label="账号（可多选）",
-                options=build_account_options(session_dir, names),
+                options=with_select_all(build_account_options(session_dir, names)),
                 multiple=True,
                 with_input=True,
                 value=[a for a in (prefill.get("accounts") or []) if a in names]
                 or None,
             ).classes("w-full")
+            attach_select_all(account_sel)
             with ui.row().classes("w-full items-end flex-wrap gap-2"):
                 days_input = ui.number(
                     label="不更新天数阈值",
@@ -561,6 +567,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                             "删除", on_click=lambda t=task["id"]: delete_task(t)
                         ).props("outline dense color=negative")
                 ui.label(
+                    f"任务ID：{task['id']}　"
                     f"账号：{'、'.join(task.get('accounts') or []) or '未选择'}　"
                     f"阈值：{task.get('days')} 天　"
                     f"{'含群组，' if task.get('include_groups') else ''}"

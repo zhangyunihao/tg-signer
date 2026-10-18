@@ -88,7 +88,7 @@ async def run_giveaway(spec: dict) -> int:
     if not account:
         print("缺少账号", flush=True)
         return 2
-    from tg_signer.webui.data import load_two_way_accounts
+    from tg_signer.webui.data import chat_username_map, load_two_way_accounts
     from tg_signer.webui.random_chat import parse_chat_id
 
     kwargs = engine_kwargs_from_spec(spec)
@@ -103,6 +103,7 @@ async def run_giveaway(spec: dict) -> int:
     kwargs["on_finish"] = finished.set
     started = await engine.start(
         two_way_accounts=sorted(load_two_way_accounts(workdir)),
+        chat_usernames=chat_username_map(workdir),
         **kwargs,
     )
     if not started:

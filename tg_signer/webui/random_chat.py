@@ -18,7 +18,12 @@ from nicegui import ui
 from tg_signer.core import get_client, safe_disconnect
 from tg_signer.phrases import PHRASES, parse_custom_phrases, phrase_pool_label
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.common import add_dialog_close_button, copy_text_to_clipboard
+from tg_signer.webui.common import (
+    add_dialog_close_button,
+    attach_select_all,
+    copy_text_to_clipboard,
+    with_select_all,
+)
 from tg_signer.webui.data import (
     apply_account_order,
     load_disabled_accounts,
@@ -602,7 +607,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
     def _set_account_options() -> None:
         session_dir = Path(session_dir_input.value or ".")
         names = list_session_names(session_dir, workdir)
-        account_select.options = build_account_options(session_dir, names)
+        account_select.options = with_select_all(
+            build_account_options(session_dir, names)
+        )
         account_select.update()
 
     def refresh_options() -> None:
@@ -1128,6 +1135,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 .classes("min-w-[260px]")
                 .props("use-chips")
             )
+            attach_select_all(account_select)
             ui.button("刷新账号/群组", on_click=lambda: refresh_options()).props(
                 "outline"
             )

@@ -364,10 +364,15 @@ class FakeClient:
         # search_messages(filter=PINNED) 返回的置顶消息列表（默认含最新置顶）
         self.pinned_list = []
         self.joined_targets = []
+        self.sent = []
 
     async def join_chat(self, target):
         self.joined_targets.append(target)
         return SimpleNamespace(title=f"chat-{target}")
+
+    async def send_message(self, chat_id, text):
+        self.sent.append((chat_id, text))
+        return SimpleNamespace(id=1)
 
     async def get_chat_member(self, target, user_id):
         raise RuntimeError(
@@ -434,6 +439,32 @@ def test_parse_draw_date_expired_and_future():
     # 无年份按当年理解：10 月看到「1月1日开奖」视为今年已开奖（跳过旧帖）
     assert parse_draw_date("1月1日开奖", now=now) == datetime(2026, 1, 1, 23, 59, 59)
     assert parse_draw_date("2027年1月1日8点开奖", now=now) == datetime(2027, 1, 1, 8, 0)
+
+
+def test_parse_draw_date_choujiangs_bot_sample():
+    """@choujiangs_bot 样本：说明段「3日后开奖了」先于「开奖时间」行出现，
+    第一个提示词窗口内无日期需继续向后尝试；奖品行「18.8」这类
+    非日期数字不得中断解析。"""
+    from datetime import datetime
+
+    now = datetime(2026, 10, 19, 10, 0, 0)
+    sample = (
+        "🎟️ 抽奖标题：福田 浅浅 @qianqian150\n\n"
+        "📪抽奖说明：中奖者机器人会发送中奖信息\n"
+        "本次抽奖活动3日后开奖了，中奖者联系老师兑奖，"
+        "有什么问题联系茶花汇管理员\n\n"
+        "🎫 参与条件: \n"
+        "🎫 加入-福田浅浅人工白虎天然🐻E（开课🀄️）✅\n"
+        "🎫 加入-深圳茶花汇✅\n"
+        "🎫 加入-深圳茶花汇 榜单✅\n"
+        "🎫 加入-深圳茶花汇抽奖活动规则✅\n\n"
+        "🎁 奖品内容: \n"
+        "💰️ 奶茶现金红包18.8 × 1\n"
+        "💰️ PP200优惠卷 × 10\n"
+        "💰️ P100优惠卷 × 10\n\n"
+        "📅 开奖时间：2026-09-30 12:00自动开奖"
+    )
+    assert parse_draw_date(sample, now=now) == datetime(2026, 9, 30, 12, 0)
 
 
 def test_engine_skips_expired_draw_message(tmp_path):
@@ -1141,6 +1172,153 @@ def test_click_confirm_still_clicks_callback_button(tmp_path, monkeypatch):
     assert any("确认按钮" in line for line in logs)
 
 
+def test_click_confirm_popup_ended_skips_verify(tmp_path, monkeypatch):
+    """@choujiangs_bot 类 bot：抽奖结束后点确认按钮只弹窗提示
+    （callback answer 携带文案），不发新消息。弹窗文案命中终态时
+    立即返回，不进入回复核对（避免误读旧消息）。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    class _PopupClient(_CallbackClient):
+        async def request_callback_answer(self, chat_id, message_id, callback_data):
+            self.callback_clicks.append((chat_id, message_id, callback_data))
+            return SimpleNamespace(text="本期抽奖已开奖")
+
+    client = _PopupClient(bot_users={"ChoujiangsBot"})
+    msg = _msg(
+        text="请点击按钮参与抽奖",
+        buttons=[[_btn("立刻参加抽奖", callback_data="join_1")]],
+    )
+    verify_calls: list = []
+
+    async def fake_verify(*a, **k):
+        verify_calls.append(1)
+
+    monkeypatch.setattr(engine, "_verify_after_click", fake_verify)
+    asyncio.run(engine._click_confirm("acc", client, "ChoujiangsBot", msg, "r1"))
+    assert client.callback_clicks == [("ChoujiangsBot", msg.id, "join_1")]
+    assert any("弹窗提示" in line and "已结束" in line for line in logs)
+    assert verify_calls == []
+
+
+def test_participate_ended_reply_marks_state_and_refunds_quota(tmp_path):
+    """@Lottery8Bot 类 bot：start 后直接回复 "The event has ended or does not
+    exist" ＝终态：不记已参与、归还参与名额，状态标记 ended 防止重试
+    （含 ignore_history 开启时）。"""
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    engine.max_joins = 5
+    logs: list = []
+    engine.log = logs.append
+
+    class EndedClient(FakeClient):
+        async def start_bot(self, username, param):
+            self.started.append((username, param))
+            return _msg(text="The event has ended or does not exist")
+
+    client = EndedClient(bot_users={"Lottery8Bot"})
+    message = _msg(text="抽奖 https://t.me/Lottery8Bot?start=dead1")
+    asyncio.run(_run_process(engine, client, "acc", message))
+
+    assert client.started == [("Lottery8Bot", "dead1")]
+    assert engine.joined == 0  # 名额已归还
+    assert not any("[已参与]" in line for line in logs)
+    assert any("[已结束]" in line and "Lottery8Bot" in line for line in logs)
+    assert state.is_ended("acc", "Lottery8Bot", "dead1")
+
+    # 同一链接即使开启忽略历史也不再重发 start
+    engine.ignore_history = True
+    asyncio.run(_run_process(engine, client, "acc", message))
+    assert client.started == [("Lottery8Bot", "dead1")]
+
+
+def test_ended_reply_breaks_bot_after_three_strikes(tmp_path):
+    """同一 bot 累计 3 次回复「已结束」：本轮熔断，后续新链接静默跳过。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    class EndedClient(FakeClient):
+        async def start_bot(self, username, param):
+            self.started.append((username, param))
+            return _msg(text="The event has ended or does not exist")
+
+    client = EndedClient(bot_users={"Lottery8Bot"})
+    for i in range(1, 5):
+        message = _msg(text=f"抽奖 https://t.me/Lottery8Bot?start=e{i}")
+        asyncio.run(_run_process(engine, client, "acc", message))
+
+    # 第 4 个链接被熔断跳过，不再发 start
+    assert client.started == [
+        ("Lottery8Bot", "e1"),
+        ("Lottery8Bot", "e2"),
+        ("Lottery8Bot", "e3"),
+    ]
+    assert any("本轮运行跳过该 bot" in line for line in logs)
+
+
+def test_click_confirm_poll_ended_checks_newest_only(tmp_path, monkeypatch):
+    """confirm_wait 轮询期间仅核对最新一条消息：会话中历史遗留的旧
+    「已结束」回复不误杀本次参与；最新回复命中「已结束」时终止并计数。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    engine.confirm_wait = 1
+
+    stale_ended = _msg(text="The event has ended or does not exist", id=1)
+    normal = _msg(
+        text="请点击按钮参与抽奖",
+        buttons=[[_btn("立刻参加抽奖", callback_data="join_1")]],
+        id=2,
+    )
+
+    # 旧「已结束」回复在历史里（非最新）：不终止，正常点击按钮
+    client = _CallbackClient(bot_users={"Lottery8Bot"})
+    client.history = [normal, stale_ended]
+    logs: list = []
+    engine.log = logs.append
+    asyncio.run(
+        engine._click_confirm(
+            "acc", client, "Lottery8Bot", _msg(text="/start", id=3), "r1"
+        )
+    )
+    assert client.callback_clicks == [("Lottery8Bot", normal.id, "join_1")]
+    assert not any("回复抽奖已结束" in line for line in logs)
+    assert engine._ended_counts == {}
+
+    # 最新回复即「已结束」：终止跟进并累计熔断计数
+    client2 = _CallbackClient(bot_users={"Lottery8Bot"})
+    client2.history = [stale_ended]
+    logs2: list = []
+    engine.log = logs2.append
+    asyncio.run(
+        engine._click_confirm(
+            "acc", client2, "Lottery8Bot", _msg(text="/start", id=3), "r1"
+        )
+    )
+    assert client2.callback_clicks == []
+    assert any("回复抽奖已结束" in line for line in logs2)
+    assert engine._ended_counts == {"acc|lottery8bot": 1}
+
+
 def test_engine_join_invite_request_sent_is_not_failure(tmp_path):
     """私有群审批制：INVITE_REQUEST_SENT 视为申请已提交，不算失败。"""
     import asyncio
@@ -1162,12 +1340,54 @@ def test_engine_join_invite_request_sent_is_not_failure(tmp_path):
     engine.log = logs.append
     client = RequestClient()
     msg = _msg(text="加入 https://t.me/+AbCdEfGh123 参与")
-    joined_any = asyncio.run(
-        engine._join_from_message("acc", client, "LotteryBot", msg)
-    )
+    joined_any = asyncio.run(engine._join_from_message("acc", client, "LotteryBot", msg))
     assert joined_any is True
     assert any("已提交加入" in line and "待管理员审批" in line for line in logs)
     assert not any("失败" in line for line in logs)
+
+
+def test_ensure_monitor_membership_emits_join_events(tmp_path):
+    """监控对象成员检查：加入失败发 join_failed 事件，已加入/加入成功发
+    join_resolved 事件（WebUI 据此通知+持久化/消除提醒）。"""
+    import asyncio
+
+    events: list = []
+    engine, _state = _engine(tmp_path)
+    engine.on_event = events.append
+    logs: list = []
+    engine.log = logs.append
+
+    # 已是成员 → join_resolved，无 join_chat 调用
+    client = JoinClient()
+    client.member_targets = {"chat1"}
+    asyncio.run(engine._ensure_monitor_membership("acc", client, "Chat1"))
+    assert client.joined == []
+    assert events == [
+        {"type": "join_resolved", "account": "acc", "chat": "Chat1"}
+    ]
+
+    # 未加入且加入失败 → join_failed（带错误原因）
+    events.clear()
+    client2 = JoinClient()
+
+    async def _boom(target):
+        raise RuntimeError("PEER_ID_INVALID")
+
+    client2.join_chat = _boom
+    asyncio.run(engine._ensure_monitor_membership("acc", client2, "Chat2"))
+    assert len(events) == 1
+    assert events[0]["type"] == "join_failed"
+    assert events[0]["account"] == "acc"
+    assert events[0]["chat"] == "Chat2"
+    assert "PEER_ID_INVALID" in events[0]["error"]
+    assert any("自动加入监控对象 Chat2 失败" in line for line in logs)
+
+    # 加入成功 → join_resolved
+    events.clear()
+    client3 = JoinClient()
+    asyncio.run(engine._ensure_monitor_membership("acc", client3, "Chat3"))
+    assert client3.joined == ["@Chat3", "Chat3"][:1] or client3.joined
+    assert events and events[0]["type"] == "join_resolved"
 
 
 def test_engine_join_flood_wait_suspends(tmp_path):
@@ -1475,6 +1695,93 @@ def test_extract_join_status_targets_pyrogram_text_link():
     assert extract_join_status_targets(msg) == ["some_channel_h"]
 
 
+SPEECH_TASK_REPLY = (
+    "您已成功报名抽奖（未达标β）\n"
+    "\n"
+    "您还需完成激活任务才能抽奖！\n"
+    "\n"
+    "🎰 某老师 半价票\n"
+    "🎫 已加入-某修车补习班免费上榜\n"
+    "└  🎟️ 发言数大于 30 条 ❌\n"
+    "\n"
+    "💁 参与情况：0达标 / 10报名\n"
+    "\n"
+    "📅 开奖日期：(北京时间)\n"
+    "2026年10月19日 14时48分00秒"
+)
+
+
+def test_extract_join_status_targets_speech_task_rows():
+    """发言数 ❌ 子行不是未加入频道行：已加入行 + 发言任务行的清单
+    整体提取不到任何加入目标。"""
+    from tg_signer.giveaway_core import extract_join_status_targets
+
+    msg = _status_message(
+        SPEECH_TASK_REPLY,
+        {"已加入-某修车补习班免费上榜": "https://t.me/some_group"},
+    )
+    # 已加入行（无 ❌）与发言任务子行（无「加入」）均不算未加入频道行
+    assert extract_join_status_targets(msg) == []
+
+
+def test_reply_says_signup_success():
+    """「已成功报名抽奖（未达标β）」「已获得抽奖资格」＝报名成功（已参与，
+    未达标仅剩发言数这类激活任务，系统标记为完成）。"""
+    from tg_signer.giveaway_core import reply_says_signup_success
+
+    assert reply_says_signup_success(_msg(text=SPEECH_TASK_REPLY))
+    assert reply_says_signup_success(
+        _msg(text="您已获得抽奖资格（已达标） 请耐心等待，中奖通知机器人会私发给您！")
+    )
+    # 未报名 / 需先加入类回复不算成功
+    assert not reply_says_signup_success(_msg(text="您未获得抽奖资格，请先加入频道"))
+    assert not reply_says_signup_success(_msg(text="您需加入指定的群组/频道"))
+    assert not reply_says_signup_success(_msg(text=STATUS_REPLY))
+
+
+def test_reply_says_ended():
+    """bot 回复「已结束/已经结束」类文案＝终态（如 @Lottery8Bot 的
+    「该活动已经结束或不存在」与英文 "The event has ended or does not exist"）。"""
+    from tg_signer.giveaway_core import reply_says_ended
+
+    # 中文变体（含「已经结束」，2026-10-19 修复前仅匹配「已结束」漏掉该文案）
+    assert reply_says_ended(_msg(text="该活动已经结束或不存在"))
+    assert reply_says_ended(_msg(text="该活动已结束或不存在"))
+    assert reply_says_ended(_msg(text="抽奖活动已结束"))
+    assert reply_says_ended(_msg(text="抽奖已结束，请关注下期"))
+    assert reply_says_ended(_msg(text="活动已过期"))
+    # 英文变体
+    assert reply_says_ended(_msg(text="The event has ended or does not exist"))
+    # 正常回复不算已结束
+    assert not reply_says_ended(_msg(text="您已成功报名抽奖（已达标）"))
+    assert not reply_says_ended(_msg(text="您需加入指定的群组/频道"))
+
+
+def test_engine_no_false_diagnostic_for_speech_task_rows(tmp_path):
+    """清单仅含「已加入行 + 发言数 ❌ 子行」时不报「未解析到链接」诊断；
+    存在真正的「加入-名称 ❌」行却解析不到链接时诊断仍输出。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = JoinClient()
+    client.member_targets.add("some_group")  # 已加入行链接按已加入处理
+    msg = _status_message(
+        SPEECH_TASK_REPLY,
+        {"已加入-某修车补习班免费上榜": "https://t.me/some_group"},
+    )
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBestBot", msg))
+    assert not any("清单含未加入" in line for line in logs)
+    # 真正的未加入行（加入+❌）链接为帖子路径无法加入 → 诊断仍然输出
+    bad = _status_message(
+        "您需加入指定的群组/频道\n🎫 加入-某测试频道D ❌",
+        {"某测试频道D": "https://t.me/some_chan/123"},
+    )
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBestBot", bad))
+    assert any("清单含未加入" in line for line in logs)
+
+
 def test_engine_joins_only_unjoined_status_targets(tmp_path):
     """LotteryBestBot 回复：只加入 ❌ 行目标；其他 bot 不解析该格式。"""
     import asyncio
@@ -1618,3 +1925,189 @@ def test_two_way_account_skips_password_post(tmp_path):
     asyncio.run(engine._process_message("普通号", client, msg))
     assert ("LotteryBot", "pw1") in client.started
     assert not any("口令要求" in line for line in logs)
+
+
+# ---------------- 口令任务解析与自动发送 ----------------
+
+PAOFU_POST = """🎰 上海泡芙半价券
+
+📮 参与条件：
+🌏️ 归属地 上海,江苏
+🪪 必须设置用户名
+🎫 加入-泡芙的频道
+🎫 加入-野寻·上海学生交流群
+└  🎟️ 发言数大于 6 条
+🎫 加入-野寻·上海打卡通告群
+└  🔑 发送口令﹝出击泡芙宝宝﹞
+🎫 加入-野寻·上海活动公告
+🎫 加入-野寻·上海修车档案
+
+❗ 口令提示：
+请先参与抽奖，再发送口令激活
+
+🎁 奖品内容：
+💰️ 泡芙P半价券 × 1
+
+📅 开奖日期：(北京时间)
+2026年10月21日 13时30分00秒"""
+
+
+def test_extract_password_tasks():
+    from tg_signer.giveaway_core import extract_password_tasks
+
+    # 帖内口令子行归属上方最近的「加入-」行
+    assert extract_password_tasks(_msg(text=PASSWORD_POST)) == [
+        ("野寻·上海打卡通告群", "出击婷婷宝宝")
+    ]
+    assert extract_password_tasks(_msg(text=PAOFU_POST)) == [
+        ("野寻·上海打卡通告群", "出击泡芙宝宝")
+    ]
+    # 多群组各带口令：逐个返回，支持「」/【】括号变体
+    multi = (
+        "🎫 加入-甲群\n"
+        "└  🔑 发送口令﹝口令甲﹞\n"
+        "🎫 加入-乙群\n"
+        "└  🔑 发送口令【口令乙】\n"
+    )
+    assert extract_password_tasks(_msg(text=multi)) == [
+        ("甲群", "口令甲"),
+        ("乙群", "口令乙"),
+    ]
+    # 无括号的「发送口令激活」不视为口令文本；普通帖返回空
+    assert extract_password_tasks(_msg(text="请先参与抽奖，再发送口令激活")) == []
+    assert (
+        extract_password_tasks(_msg(text="🎫 加入-上海某频道\n🎁 奖品：现金红包")) == []
+    )
+
+
+def test_extract_join_name_links():
+    from tg_signer.giveaway_core import extract_join_name_links
+
+    text = (
+        "您需加入指定的群组/频道\n"
+        "\n"
+        "🎫 加入-野寻·上海打卡通告群 ✅\n"
+        "🎫 加入-泡芙的频道 ❌\n"
+        "🎫 加入-私有口令群 ❌\n"
+    )
+    msg = _status_message(
+        text,
+        {
+            "野寻·上海打卡通告群": "https://t.me/daka_group",
+            "泡芙的频道": "https://t.me/paofu_channel",
+            "私有口令群": "https://t.me/+abc12345678",
+        },
+    )
+    # ❌/✅ 行均收集（口令群即使已加入也需定位目标才能发送口令）；
+    # 私有邀请链接整链保留
+    assert extract_join_name_links(msg) == [
+        ("野寻·上海打卡通告群", "daka_group"),
+        ("泡芙的频道", "paofu_channel"),
+        ("私有口令群", "https://t.me/+abc12345678"),
+    ]
+    # 无实体（原始帖只有群名没链接）/ 无「加入」行均返回空
+    assert extract_join_name_links(_msg(text=text)) == []
+    assert extract_join_name_links(_msg(text="普通消息")) == []
+
+
+def test_click_confirm_sends_password(tmp_path, monkeypatch):
+    """帖内口令任务：按 bot 清单定位口令群组 → 加入 → 发送口令 → 重发 start。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    checklist = _status_message(
+        "您需加入指定的群组/频道\n\n"
+        "🎫 加入-野寻·上海学生交流群 ❌\n"
+        "🎫 加入-野寻·上海打卡通告群 ❌",
+        {
+            "野寻·上海学生交流群": "https://t.me/stu_group",
+            "野寻·上海打卡通告群": "https://t.me/daka_group",
+        },
+    )
+    asyncio.run(
+        engine._click_confirm(
+            "acc",
+            client,
+            "LotteryBestBot",
+            checklist,
+            "r1",
+            source_message=_msg(text=PASSWORD_POST),
+        )
+    )
+    # 口令群已加入并发送口令；随后重发 start 让 bot 核验
+    assert "daka_group" in client.joined_targets
+    assert ("daka_group", "出击婷婷宝宝") in client.sent
+    assert any("发送口令" in line for line in logs)
+    assert ("LotteryBestBot", "r1") in client.started
+
+
+def test_click_confirm_password_group_missing(tmp_path, monkeypatch):
+    """清单中无口令群链接：跳过发送并记日志，不中断参与流程。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    checklist = _status_message(
+        STATUS_REPLY, {"某测试频道D": "https://t.me/test_channel_d"}
+    )
+    asyncio.run(
+        engine._click_confirm(
+            "acc",
+            client,
+            "LotteryBestBot",
+            checklist,
+            "r1",
+            source_message=_msg(text=PASSWORD_POST),
+        )
+    )
+    assert client.sent == []
+    assert any("未在清单中定位到链接" in line for line in logs)
+    # 参与流程不中断：重发 start 仍发生
+    assert ("LotteryBestBot", "r1") in client.started
+
+
+def test_send_password_tasks_dedup(tmp_path, monkeypatch):
+    """同一账号×bot×群组只发送一次口令，重复参与不重复发言。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    checklist = _status_message(
+        "您需加入指定的群组/频道\n\n🎫 加入-野寻·上海打卡通告群 ✅",
+        {"野寻·上海打卡通告群": "https://t.me/daka_group"},
+    )
+    for _ in range(2):
+        asyncio.run(
+            engine._send_password_tasks(
+                "acc", client, "LotteryBestBot", _msg(text=PASSWORD_POST), [checklist]
+            )
+        )
+    # ✅ 行（已加入）也参与定位：无需 join 直接发送；第二次调用去重
+    assert ("daka_group", "出击婷婷宝宝") in client.sent
+    assert len(client.sent) == 1
+    assert len([line for line in logs if "发送口令" in line]) == 1

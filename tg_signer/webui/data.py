@@ -174,6 +174,23 @@ def load_user_infos(workdir: Optional[Path | str] = None) -> List[UserInfo]:
     return entries
 
 
+def chat_username_map(workdir: Optional[Path | str] = None) -> Dict[str, str]:
+    """返回 {chat_id: username}（来自用户最近会话缓存）。
+
+    供自动抽奖引擎在账号未加入监控对象时按 @username 兜底加入
+    （数字 chat_id 对未加入账号不可解析，无法直接 join）。
+    """
+    mapping: Dict[str, str] = {}
+    for info in load_user_infos(workdir):
+        for chat in info.latest_chats or []:
+            cid = chat.get("id")
+            username = chat.get("username")
+            if cid is None or not username:
+                continue
+            mapping.setdefault(str(cid), str(username))
+    return mapping
+
+
 def _accounts_state_path(workdir: Optional[Path | str] = None) -> Path:
     return get_workdir(workdir) / "webui_accounts.json"
 
