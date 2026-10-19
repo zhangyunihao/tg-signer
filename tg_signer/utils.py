@@ -319,9 +319,6 @@ class UserInput:
     def incr(self, n: int = 1):
         self.index += n
 
-    def decr(self, n: int = 1):
-        self.index -= n
-
     @property
     def index_str(self):
         return f"{numbering(self.index, self.numbering_lang)}. "

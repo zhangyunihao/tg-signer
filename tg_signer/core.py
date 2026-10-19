@@ -27,7 +27,7 @@ from croniter import CroniterBadCronError, croniter
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pyrogram import Client as BaseClient
 from pyrogram import errors, filters
-from pyrogram.enums import ChatMembersFilter, ChatType
+from pyrogram.enums import ChatType
 from pyrogram.handlers import EditedMessageHandler, MessageHandler
 from pyrogram.methods.utilities.idle import idle
 from pyrogram.session import Session
@@ -417,7 +417,6 @@ class BaseUserWorker(Generic[ConfigT]):
         self.task_name = task_name or "my_task"
         self._session_dir = pathlib.Path(session_dir)
         self._account = account
-        self._proxy = proxy
         if workdir:
             self._workdir = pathlib.Path(workdir)
         self.app = get_client(
@@ -564,35 +563,6 @@ class BaseUserWorker(Generic[ConfigT]):
                 signs.append(d)
         return signs
 
-    def list_(self):
-        for d in self.get_task_list():
-            print_to_user(d)
-
-    async def list_folders(self):
-        self.log("开始获取对话 Folder...")
-        async with self.app:
-            folders = await self._call_telegram_api(
-                "messages.GetDialogFilters", self.app.get_folders
-            )
-
-        if not folders:
-            print_to_user("未找到普通 Folder。")
-            return folders
-
-        for folder in folders:
-            dynamic_rules = _folder_dynamic_rules(folder)
-            if dynamic_rules:
-                support = f"不支持动态规则: {'、'.join(dynamic_rules)}"
-                chat_count = "-"
-            else:
-                support = "支持"
-                chat_count = str(len(_explicit_folder_chats(folder)))
-            print_to_user(
-                f"id: {folder.id}, name: {folder.name}, "
-                f"chats: {chat_count}, mode: {support}"
-            )
-        return folders
-
     def set_me(self, user: User):
         self.user = user
         with open(
@@ -691,19 +661,6 @@ class BaseUserWorker(Generic[ConfigT]):
                 self.log("检测到同账号已完成登录初始化，复用已有会话信息")
             self.set_me(me)
 
-    async def logout(self):
-        self.log("开始登出...")
-        is_authorized = await self.app.connect()
-        if not is_authorized:
-            await self.app.storage.delete()
-            _LOGIN_USERS.pop(self.app.key, None)
-            self.user = None
-            return None
-        result = await self.app.log_out()
-        _LOGIN_USERS.pop(self.app.key, None)
-        self.user = None
-        return result
-
     async def send_message(
         self,
         chat_id: Union[int, str],
@@ -777,33 +734,6 @@ class BaseUserWorker(Generic[ConfigT]):
             self.log(f"Dice「{emoji}」 to {chat_id} deleted!")
         return message
 
-    async def search_members(
-        self, chat_id: Union[int, str], query: str, admin=False, limit=10
-    ):
-        filter_ = ChatMembersFilter.SEARCH
-        if admin:
-            filter_ = ChatMembersFilter.ADMINISTRATORS
-            query = ""
-        async for member in self.app.get_chat_members(
-            chat_id, query, limit=limit, filter=filter_
-        ):
-            yield member
-
-    async def list_members(
-        self, chat_id: Union[int, str], query: str = "", admin=False, limit=10
-    ):
-        async with self.app:
-            async for member in self.search_members(chat_id, query, admin, limit):
-                print_to_user(
-                    User(
-                        id=member.user.id,
-                        username=member.user.username,
-                        first_name=member.user.first_name,
-                        last_name=member.user.last_name,
-                        is_bot=member.user.is_bot,
-                    )
-                )
-
     async def get_forum_topics(self, chat_id: Union[int, str], limit: int = 20):
         topics = []
 
@@ -813,31 +743,6 @@ class BaseUserWorker(Generic[ConfigT]):
             return topics
 
         return await self._call_telegram_api("channels.GetForumTopics", _collect_topics)
-
-    async def list_topics(self, chat_id: Union[int, str], limit: int = 20):
-        if self.user is None:
-            await self.login(print_chat=False)
-        async with self.app:
-            try:
-                topics = await self.get_forum_topics(chat_id, limit=limit)
-            except errors.RPCError as e:
-                print_to_user(f"获取话题失败: {e}")
-                return []
-            if not topics:
-                print_to_user("未获取到话题，可能该聊天未开启话题或无权限。")
-                return []
-            for topic in topics:
-                print_to_user(readable_topic(topic))
-            return topics
-
-    def export(self):
-        with open(self.config_file, "r", encoding="utf-8") as fp:
-            data = fp.read()
-        return data
-
-    def import_(self, config_str: str):
-        with open(self.config_file, "w", encoding="utf-8") as fp:
-            fp.write(config_str)
 
     def ask_one(self):
         raise NotImplementedError
@@ -1311,25 +1216,6 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
             await self.send_message(
                 chat_id,
                 text,
-                delete_after,
-                message_thread_id=message_thread_id,
-                **kwargs,
-            )
-
-    async def send_dice_cli(
-        self,
-        chat_id: Union[str, int],
-        emoji: str = "🎲",
-        delete_after: int = None,
-        message_thread_id: Optional[int] = None,
-        **kwargs,
-    ):
-        if self.user is None:
-            await self.login(print_chat=False)
-        async with self.app:
-            await self.send_dice(
-                chat_id,
-                emoji,
                 delete_after,
                 message_thread_id=message_thread_id,
                 **kwargs,

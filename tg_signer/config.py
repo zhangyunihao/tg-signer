@@ -82,7 +82,6 @@ def pad_text_to_width(text: str, target_width: int, align: str = "left") -> str:
 class BaseJSONConfig(BaseModel):
     version: ClassVar[Union[str, int]] = 0
     olds: ClassVar[Optional[List[Type["BaseJSONConfig"]]]] = None
-    is_current: ClassVar[bool] = False
 
     @classmethod
     def valid(cls, d):
@@ -142,19 +141,10 @@ class SignChatV2(BaseJSONConfig):
     choose_option_by_image: bool = False  # 需要根据图片选择选项
     has_calculation_problem: bool = False  # 是否有计算题
 
-    @property
-    def need_response(self):
-        return (
-            bool(self.text_of_btn_to_click)
-            or self.choose_option_by_image
-            or self.has_calculation_problem
-        )
-
 
 class SignConfigV2(BaseJSONConfig):
     version: ClassVar = 2
     olds: ClassVar = [SignConfigV1]
-    is_current: ClassVar = False
 
     chats: List[SignChatV2]
     sign_at: str  # 签到时间，time或crontab表达式
@@ -363,7 +353,6 @@ class SignChatV3(BaseJSONConfig):
 class SignConfigV3(BaseJSONConfig):
     version: ClassVar = 3
     olds: ClassVar = [SignConfigV2]
-    is_current: ClassVar = True
 
     _version: Literal[3] = 3
     chats: List[SignChatV3]
@@ -541,7 +530,6 @@ class MonitorConfig(BaseJSONConfig):
     """监控配置"""
 
     version: ClassVar = 1
-    is_current: ClassVar = True
     match_cfgs: List[MatchConfig]
 
     @property
@@ -634,7 +622,6 @@ class RuleConfig(BaseModel):
 
 class AutomationConfig(BaseJSONConfig):
     version: ClassVar = 1
-    is_current: ClassVar = True
 
     rules: List[RuleConfig] = Field(default_factory=list)
 

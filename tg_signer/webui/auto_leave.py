@@ -9,8 +9,10 @@
 """
 
 import asyncio
+import html as html_lib
 import json
 import logging
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Dict, List
@@ -24,6 +26,7 @@ from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
     copy_text_to_clipboard,
+    format_duration,
     with_select_all,
 )
 from tg_signer.webui.random_chat import (
@@ -332,6 +335,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         st["selected"].clear()
         st["auto_left"] = 0
         st["status"] = "扫描中"
+        st["start_ts"] = time.time()
+        task["start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+        task["duration"] = ""
         render_list()
         log(
             f"[{task['name']}] 启动：{len(accounts)} 个账号，阈值 {task.get('days')} 天"
@@ -397,6 +403,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             # 终态与命中频道写回记录并持久化，刷新页面后仍可见
             task["status"] = st["status"]
             task["rows"] = [dict(r) for r in st["rows"]]
+            if st.get("start_ts"):
+                task["duration"] = format_duration(time.time() - st["start_ts"])
             save_leave_tasks(workdir, tasks)
             render_list()
 
@@ -716,17 +724,23 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             for row in shown:
                 with ui.card().classes("w-full mobile-list-card border"):
                     with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                        ui.label(f"任务 #{row['seq']}").classes(
-                            "text-base font-semibold"
-                        )
                         ui.badge(row["status"]).props(
                             f"color={_status_color(row['status'])}"
+                        )
+                        ui.label(f"任务 #{row['seq']}").classes(
+                            "text-base font-semibold"
                         )
                     ui.label(f"账号：{row['accounts']}").classes(
                         "text-xs text-gray-600"
                     )
-                    ui.label(row["result"]).classes("text-xs text-gray-700").style(
-                        "overflow-wrap: anywhere;"
+                    ui.label(
+                        f"执行时间：{row['start_time']}　执行时长：{row['duration']}"
+                    ).classes("text-xs text-gray-600")
+                    ui.html(
+                        '<div class="text-xs text-gray-700" '
+                        f'data-runres="{html_lib.escape(str(row["id"] or ""), quote=True)}" '
+                        'style="white-space: pre-line; overflow-wrap: anywhere;">'
+                        f'{html_lib.escape(str(row["result"] or ""))}</div>'
                     )
                     with ui.row().classes("w-full mobile-card-actions"):
                         ui.button(
@@ -740,7 +754,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                             ui.button(
                                 "停止",
                                 on_click=lambda r=row: stop_task(str(r["id"])),
-                            ).props("flat dense color=warning")
+                            ).props("flat dense color=negative")
                         ui.button(
                             "删除", on_click=lambda r=row: delete_task(str(r["id"]))
                         ).props("flat dense color=negative")
@@ -765,6 +779,12 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 {
                     "id": task["id"],
                     "seq": _seq_of(task["id"]),
+                    "start_time": str(task.get("start_time") or "") or "—",
+                    "duration": (
+                        format_duration(time.time() - st["start_ts"])
+                        if st.get("running") and st.get("start_ts")
+                        else (str(task.get("duration") or "") or "—")
+                    ),
                     "accounts": "、".join(str(a) for a in (task.get("accounts") or []))
                     or "未选择",
                     "status": _short_status(st),
@@ -821,6 +841,18 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     "align": "left",
                 },
                 {
+                    "name": "start_time",
+                    "label": "执行时间",
+                    "field": "start_time",
+                    "align": "left",
+                },
+                {
+                    "name": "duration",
+                    "label": "执行时长",
+                    "field": "duration",
+                    "align": "left",
+                },
+                {
                     "name": "accounts",
                     "label": "账号",
                     "field": "accounts",
@@ -872,7 +904,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         'label="复制" @click="$parent.$emit(\'leaveDup\', props.row)" />'
         '<q-btn flat dense color="grey-8" '
         'label="明细" @click="$parent.$emit(\'leaveDetail\', props.row)" />'
-        '<q-btn v-if="props.row.running" flat dense color="warning" '
+        '<q-btn v-if="props.row.running" flat dense color="negative" '
         'label="停止" @click="$parent.$emit(\'leaveStop\', props.row)" />'
         '<q-btn flat dense color="negative" '
         'label="删除" @click="$parent.$emit(\'leaveDel\', props.row)" />'

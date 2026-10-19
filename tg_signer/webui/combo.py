@@ -5,6 +5,8 @@
 """
 
 import json
+import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -15,9 +17,12 @@ from tg_signer.utils import atomic_write_json
 from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
+    format_duration,
     with_select_all,
 )
 from tg_signer.webui.data import get_workdir
+
+logger = logging.getLogger(__name__)
 
 COMPOSITE_TASKS_FILE = "webui_composite_tasks.json"
 
@@ -116,6 +121,7 @@ class ComboTaskBlock:
                 ui.label("当前没有运行中的组合任务").classes("text-sm text-gray-400")
             for rid, run in runs:
                 rec = run["record"]
+                elapsed = format_duration(max(0, time.time() - run["start_ts"]))
                 with ui.card().classes("w-full border"):
                     with ui.row().classes("w-full items-center gap-2 no-wrap"):
                         ui.badge("运行中").props("color=info")
@@ -130,10 +136,27 @@ class ComboTaskBlock:
                             "停止",
                             on_click=lambda r=rid: self._stop(r),
                         ).props("flat dense color=negative")
+                    ui.label(
+                        f"执行时间：{rec.get('start_time') or '—'}　"
+                        f"已运行：{elapsed}"
+                    ).classes("text-xs text-gray-600")
 
     def _render_list(self) -> None:
         self.list_container.clear()
         items = self._load()
+        # 从任务历史中找每个组合最近一次执行记录（避免与 sign.py 循环导入，延迟导入）
+        last_runs: dict[str, dict] = {}
+        try:
+            from tg_signer.webui.sign import load_task_history
+
+            for rec in reversed(load_task_history()):
+                if "组合" not in str(rec.get("task_type") or ""):
+                    continue
+                name = str(rec.get("task_name") or "")
+                if name and name not in last_runs:
+                    last_runs[name] = rec
+        except Exception:
+            logger.debug("读取任务历史失败", exc_info=True)
         with self.list_container:
             if not items:
                 ui.label("还没有组合任务，点击「新增组合任务」创建").classes(
@@ -161,6 +184,13 @@ class ComboTaskBlock:
                             ui.label(
                                 f"{i}. {s.get('type', '')} · {s.get('task', '')}"
                             ).classes("text-sm text-gray-700")
+                    last = last_runs.get(name)
+                    if last is not None:
+                        ui.label(
+                            f"执行时间：{last.get('start_time') or '—'}　"
+                            f"执行时长：{last.get('duration') or '—'}"
+                            f"　（{last.get('status') or '未知'}）"
+                        ).classes("text-xs text-gray-600")
                     created = str(c.get("created_at") or "")
                     if created:
                         ui.label(f"创建于 {created}").classes("text-xs text-gray-400")

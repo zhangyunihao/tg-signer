@@ -127,13 +127,6 @@ class UserAutomation(BaseUserWorker[AutomationConfig]):
         self.log(f"配置加载完成: rules={len(config.rules)}", level="INFO")
         return config
 
-    def export(self):  # type: ignore[override]
-        config_path = self._resolve_config_file()
-        if not config_path.exists():
-            raise FileNotFoundError(f"配置不存在: {config_path}")
-        with open(config_path, "r", encoding="utf-8") as fp:
-            return fp.read()
-
     def ask_for_config(self) -> AutomationConfig:
         return self.template_config()
 
@@ -336,17 +329,6 @@ class UserAutomation(BaseUserWorker[AutomationConfig]):
             f"消息已缓存: chat={chat_id}, message_id={message_id}, cached={len(cache)}",
             level="DEBUG",
         )
-
-    def get_cached_messages(
-        self, chat_id: int, limit: Optional[int] = None
-    ) -> List[Message]:
-        cache = self._message_cache.get(chat_id)
-        if not cache:
-            return []
-        messages = list(cache.values())
-        if limit is None or limit <= 0:
-            return messages
-        return messages[-limit:]
 
     def _trigger_id(self, rule: RuleConfig, trigger: TriggerConfig, index: int) -> str:
         return trigger.id or f"{rule.id}:{index}"

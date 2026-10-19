@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -21,6 +22,7 @@ from tg_signer.webui.common import (
     attach_select_all,
     build_debug_report,
     copy_text_to_clipboard,
+    format_duration,
     pretty_json,
     read_file_tail,
     with_select_all,
@@ -130,6 +132,8 @@ _CFG_FIELDS = {
     "max_joins": lambda: None,
     "rescue_interval_min": lambda: 0,  # 补漏扫描间隔（分钟），0=关闭（默认关闭）
     "rescue_limit": lambda: 10,  # 每次补漏每频道重拉条数
+    "last_joined": lambda: 0,  # 上次运行新参与抽奖总数
+    "last_joined_by_account": dict,  # 上次运行各账号新参与数 {account: count}
 }
 
 
@@ -245,6 +249,15 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "max_joins": (int(cfg["max_joins"]) if cfg.get("max_joins") else None),
                 "rescue_interval_min": max(0, int(cfg.get("rescue_interval_min") or 0)),
                 "rescue_limit": max(1, int(cfg.get("rescue_limit") or 10)),
+                # 上次执行的开始时间与时长（运行结束或停止时写入时长）
+                "last_start_time": str(cfg.get("last_start_time") or ""),
+                "last_duration": str(cfg.get("last_duration") or ""),
+                # 上次运行新参与抽奖总数与各账号分布
+                "last_joined": int(cfg.get("last_joined") or 0),
+                "last_joined_by_account": {
+                    str(k): int(v)
+                    for k, v in (cfg.get("last_joined_by_account") or {}).items()
+                },
             }
         save_task_store(workdir, {"seq": store["seq"], "tasks": clean})
 
@@ -337,6 +350,21 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             return "未运行"
         return engine.progress_text() or "运行中"
 
+    def joined_count(name: str) -> int:
+        """本次运行（运行中实时）或上次运行（结束后持久化）新参与抽奖总数"""
+        engine = get_engine(name)
+        if engine is not None and engine.running:
+            return int(engine.joined)
+        return int((tasks.get(name) or {}).get("last_joined") or 0)
+
+    def joined_by_account(name: str) -> Dict[str, int]:
+        """各账号新参与数：运行中取引擎实时值，结束后取持久化值"""
+        engine = get_engine(name)
+        if engine is not None and engine.running:
+            return {str(k): int(v) for k, v in engine.joined_by_account.items()}
+        raw = (tasks.get(name) or {}).get("last_joined_by_account") or {}
+        return {str(k): int(v) for k, v in raw.items()}
+
     def remove_task(name: str) -> None:
         if task_running(name):
             ui.notify(f"任务 #{name} 正在运行，请先停止再删除", type="warning")
@@ -400,6 +428,19 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 return
 
         def _on_finish(_n: str = name) -> None:
+            # 运行结束/停止：按启动时间计算执行时长并持久化，
+            # 同时保存本次新参与抽奖总数与各账号分布，供表格与明细展示
+            cfg_done = tasks.get(_n)
+            eng = get_engine(_n)
+            if cfg_done is not None:
+                if cfg_done.get("_start_ts"):
+                    cfg_done["last_duration"] = format_duration(
+                        time.time() - cfg_done["_start_ts"]
+                    )
+                if eng is not None:
+                    cfg_done["last_joined"] = int(eng.joined)
+                    cfg_done["last_joined_by_account"] = dict(eng.joined_by_account)
+                _persist()
             cb = _GLOBAL_STATUS_CBS.get(engine_key(_n))
             if cb is not None:
                 _apply_status(cb, False)
@@ -477,6 +518,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     save_speak_alerts(workdir, alerts)
 
         engine = ensure_engine(name)
+        start_ts = time.time()
         started = await engine.start(
             accounts=list(cfg["accounts"]),
             chats=[
@@ -504,6 +546,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             on_event=_on_event,
         )
         if started:
+            cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+            cfg["last_duration"] = ""
+            cfg["_start_ts"] = start_ts
+            _persist()
             set_status(True)
             ui.notify(f"任务 #{name} 已启动", type="positive")
         else:
@@ -619,6 +665,24 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     "align": "left",
                 },
                 {
+                    "name": "joined",
+                    "label": "新参加",
+                    "field": "joined",
+                    "align": "left",
+                },
+                {
+                    "name": "last_time",
+                    "label": "执行时间",
+                    "field": "last_time",
+                    "align": "left",
+                },
+                {
+                    "name": "duration",
+                    "label": "执行时长",
+                    "field": "duration",
+                    "align": "left",
+                },
+                {
                     "name": "status",
                     "label": "状态",
                     "field": "status",
@@ -641,6 +705,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             ):
                 cfg = tasks[name]
                 chat_names = [chat_display(c) for c in cfg["chats"]]
+                running_now = task_running(name)
+                start_ts = cfg.get("_start_ts")
+                duration_text = (
+                    format_duration(time.time() - start_ts)
+                    if running_now and start_ts
+                    else (str(cfg.get("last_duration") or "") or "—")
+                )
                 rows.append(
                     {
                         "name": str(name),
@@ -652,6 +723,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         "scan": "不限"
                         if not cfg.get("max_joins")
                         else str(cfg["max_joins"]),
+                        "joined": f"{joined_count(name)} 个",
+                        "last_time": str(cfg.get("last_start_time") or "") or "—",
+                        "duration": duration_text,
                         "status": _status_text(name),
                     }
                 )
@@ -687,6 +761,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 f'<q-btn v-if="({running_expr})" flat dense color="negative" '
                 'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
                 '<q-btn flat dense color="primary" '
+                'label="明细" @click="$parent.$emit(\'detailTask\', props.row)" />'
+                '<q-btn flat dense color="primary" '
                 'label="复制" @click="$parent.$emit(\'copyTask\', props.row)" />'
                 '<q-btn flat dense color="negative" '
                 'label="删除" @click="$parent.$emit(\'deleteTask\', props.row)" />'
@@ -701,9 +777,17 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     else:
                         engine = get_engine(n)
                         text = engine.progress_text() if engine else "运行中"
+                    cfg_now = tasks.get(n) or {}
+                    start_ts = cfg_now.get("_start_ts")
+                    dur = (
+                        format_duration(time.time() - start_ts)
+                        if running and start_ts
+                        else (str(cfg_now.get("last_duration") or "") or "—")
+                    )
                     for r in table.rows:
                         if r["name"] == str(n):
                             r["status"] = text
+                            r["duration"] = dur
                             try:
                                 table.update()
                             except Exception:
@@ -739,6 +823,11 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 if isinstance(row, dict) and row.get("name"):
                     duplicate_task(str(row["name"]))
 
+            def on_detail_event(e) -> None:
+                row = e.args
+                if isinstance(row, dict) and row.get("name"):
+                    open_detail(str(row["name"]))
+
             def on_delete_event(e) -> None:
                 row = e.args
                 if isinstance(row, dict) and row.get("name"):
@@ -747,6 +836,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             table.on("startTask", on_start_event)
             table.on("stopTask", on_stop_event)
             table.on("copyTask", on_copy_event)
+            table.on("detailTask", on_detail_event)
             table.on("deleteTask", on_delete_event)
 
             # —— 移动端卡片列表 ——
@@ -784,6 +874,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         ui.label(
                             f"关键词：{row['keywords']}　参与上限：{row['scan']}"
                         ).classes("text-xs text-gray-600")
+                        ui.label(
+                            f"新参加：{row['joined']}抽奖　"
+                            f"执行时间：{row['last_time']}　执行时长：{row['duration']}"
+                        ).classes("text-xs text-gray-600")
                         with ui.row().classes("w-full mobile-card-actions"):
                             if not running:
                                 ui.button(
@@ -801,6 +895,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                         _card_stop(nn, cb)
                                     ),
                                 ).props("flat dense color=negative")
+                            ui.button(
+                                "明细",
+                                on_click=lambda nn=n: open_detail(nn),
+                            ).props("flat dense color=primary")
                             ui.button(
                                 "复制",
                                 on_click=lambda nn=n: duplicate_task(nn),
@@ -952,6 +1050,17 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             if r.get("status") != new_status:
                                 r["status"] = new_status
                                 changed = True
+                            new_joined = f"{joined_count(n)} 个"
+                            if r.get("joined") != new_joined:
+                                r["joined"] = new_joined
+                                changed = True
+                            cfg_now = tasks[n]
+                            start_ts = cfg_now.get("_start_ts")
+                            if start_ts and task_running(n):
+                                dur = format_duration(time.time() - start_ts)
+                                if r.get("duration") != dur:
+                                    r["duration"] = dur
+                                    changed = True
                     if changed:
                         table.update()
                 except Exception:
@@ -973,6 +1082,31 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 return
 
     asyncio.create_task(_poll_loop())
+
+    # —— 参与明细弹窗：按用户显示本次/上次新参加的抽奖数 ——
+    with ui.dialog() as detail_dlg, ui.card().classes("w-full max-w-md"):
+        add_dialog_close_button(detail_dlg)
+        detail_title_label = ui.label("参与明细").classes("text-lg font-semibold")
+        detail_total_label = ui.label("").classes("text-sm text-gray-700")
+        detail_list = ui.column().classes("w-full gap-1")
+
+    def open_detail(name: str) -> None:
+        by_acct = joined_by_account(name)
+        total = joined_count(name)
+        engine = get_engine(name)
+        scope = "本次运行" if engine is not None and engine.running else "上次运行"
+        detail_title_label.text = f"任务 #{name} 参与明细"
+        detail_total_label.text = f"{scope}共新参加 {total} 个抽奖"
+        detail_list.clear()
+        with detail_list:
+            if not by_acct:
+                ui.label("暂无参与记录").classes("text-sm text-gray-400")
+            else:
+                for acct in sorted(by_acct, key=lambda a: by_acct[a], reverse=True):
+                    with ui.row().classes("w-full items-center justify-between"):
+                        ui.label(acct).classes("text-sm")
+                        ui.badge(f"{by_acct[acct]} 个抽奖", color="primary")
+        detail_dlg.open()
 
     # —— 添加任务弹窗 ——
     with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl"):

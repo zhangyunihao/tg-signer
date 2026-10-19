@@ -570,7 +570,7 @@ class TaskRunnerBlock:
                 columns=[
                     {
                         "name": "time",
-                        "label": "开始时间",
+                        "label": "执行时间",
                         "field": "time",
                         "align": "left",
                     },
@@ -596,6 +596,12 @@ class TaskRunnerBlock:
                         "name": "status",
                         "label": "状态",
                         "field": "status",
+                        "align": "left",
+                    },
+                    {
+                        "name": "duration",
+                        "label": "执行时长",
+                        "field": "duration",
                         "align": "left",
                     },
                     {
@@ -633,6 +639,12 @@ class TaskRunnerBlock:
             "props.row.status === '失败' ? 'negative' : "
             "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
             "{{ props.row.status }}</q-badge></q-td>",
+        )
+        # 执行时长列：运行中用 run_javascript 直接改写文本（data-rundur=<任务id>）
+        self.history_table.add_slot(
+            "body-cell-duration",
+            '<q-td :props="props">'
+            '<span :data-rundur="props.row.id">{{ props.row.duration }}</span></q-td>',
         )
         # 结果列：给文字一个固定 data-runres=<任务id>（桌面表格单元格与移动端卡片
         # 各有一份），运行中进度用 run_javascript 直接改写两处文本，
@@ -886,6 +898,7 @@ class TaskRunnerBlock:
                 "task": r.get("task_name", ""),
                 "accounts": r.get("accounts", ""),
                 "status": r.get("status", ""),
+                "duration": r.get("duration") or "—",
                 "result": r.get("result", ""),
             }
             for r in sorted(items, key=_id_key, reverse=True)
@@ -921,6 +934,9 @@ class TaskRunnerBlock:
                             "text-base font-semibold"
                         )
                     ui.label(row.get("time") or "").classes("text-xs text-gray-400")
+                    ui.label(f"执行时长：{row.get('duration') or '—'}").classes(
+                        "text-xs text-gray-600"
+                    )
                     ui.label(
                         f"类型：{row.get('type') or '-'}　账号：{row.get('accounts') or '-'}"
                     ).classes("text-xs text-gray-600")
@@ -1110,6 +1126,7 @@ class TaskRunnerBlock:
             "task_name": task_name,
             "accounts": ", ".join(accounts),
             "status": "运行中",
+            "duration": "",
             "result": "服务重启后自动恢复" if auto else "",
         }
         procs: list[dict] = []
@@ -1541,7 +1558,8 @@ class TaskRunnerBlock:
         record = run["record"]
         record["status"] = "已停止"
         record["details"] = list(run["details"])
-        record["result"] = f"手动停止，耗时 {self._format_duration_ts(run['start_ts'])}"
+        record["duration"] = self._format_duration_ts(run["start_ts"])
+        record["result"] = f"手动停止，耗时 {record['duration']}"
         update_task_history(record)
         self._refresh_history_table()
         self._update_status()
@@ -1551,17 +1569,27 @@ class TaskRunnerBlock:
         # 只同步内存行数据；进度文本用 JS 直接改写表格单元格与移动端卡片（固定
         # data-runres 属性，页面上有两份），不调用整表 update()，
         # 避免每 0.3s 重渲染导致「明细/停止」点击丢失
+        run = self.runs.get(record_id)
+        dur_text = (
+            self._format_duration_ts(run["start_ts"]) if run is not None else ""
+        )
         for row in self.history_table.rows:
             if row.get("id") == record_id:
                 row["result"] = result_text
+                row["duration"] = dur_text
                 break
         safe = (
             result_text.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
         )
+        safe_dur = dur_text.replace("\\", "\\\\").replace("'", "\\'")
         safe_id = str(record_id).replace("\\", "\\\\").replace('"', '\\"')
         ui.run_javascript(
             f"document.querySelectorAll('[data-runres=\"{safe_id}\"]').forEach("
             f"el => {{ el.textContent = '{safe}'; }});"
+        )
+        ui.run_javascript(
+            f"document.querySelectorAll('[data-rundur=\"{safe_id}\"]').forEach("
+            f"el => {{ el.textContent = '{safe_dur}'; }});"
         )
 
     def _close_pending_details(self, run: dict, default_status: str) -> None:
@@ -1586,12 +1614,13 @@ class TaskRunnerBlock:
         record = run["record"]
         record["status"] = "已完成" if ok else "失败"
         record["details"] = list(run["details"])
+        record["duration"] = self._format_duration_ts(run["start_ts"])
         progress = self._format_progress(run)
         parts = []
         if progress:
             parts.append(progress)
         parts.append(f"返回码: {rcs}")
-        parts.append(f"耗时 {self._format_duration_ts(run['start_ts'])}")
+        parts.append(f"耗时 {record['duration']}")
         record["result"] = "，".join(parts)
         update_task_history(record)
         self._refresh_history_table()

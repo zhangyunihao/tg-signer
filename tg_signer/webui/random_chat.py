@@ -22,6 +22,7 @@ from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
     copy_text_to_clipboard,
+    format_duration,
     with_select_all,
 )
 from tg_signer.webui.data import (
@@ -574,6 +575,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 "total_count": cfg["total_count"],
                 "session_dir": str(cfg["session_dir"]),
                 "custom_phrases": list(cfg.get("custom_phrases") or []),
+                # 上次执行的开始时间与时长（运行结束或停止时写入时长）
+                "last_start_time": str(cfg.get("last_start_time") or ""),
+                "last_duration": str(cfg.get("last_duration") or ""),
             }
         store["tasks"] = clean
         save_task_store(workdir, store)
@@ -695,6 +699,13 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 return
 
         def _on_finish(_n: str = name) -> None:
+            # 运行结束/停止：按启动时间计算执行时长并持久化
+            cfg_done = tasks.get(_n)
+            if cfg_done is not None and cfg_done.get("_start_ts"):
+                cfg_done["last_duration"] = format_duration(
+                    time.time() - cfg_done["_start_ts"]
+                )
+                _persist()
             cb = _GLOBAL_STATUS_CBS.get(engine_key(_n)) or tasks.get(_n, {}).get(
                 "_set_status"
             )
@@ -702,6 +713,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 _apply_status(cb, False)
 
         engine = ensure_engine(name)
+        start_ts = time.time()
         started = await engine.start(
             cfg["accounts"],
             cfg["chat_id"],
@@ -714,6 +726,10 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             phrases=list(cfg.get("custom_phrases") or []),
         )
         if started:
+            cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+            cfg["last_duration"] = ""
+            cfg["_start_ts"] = start_ts
+            _persist()
             set_status(True)
             ui.notify(f"任务 #{name} 已启动", type="positive")
         else:
@@ -813,6 +829,18 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                     "align": "left",
                 },
                 {
+                    "name": "last_time",
+                    "label": "执行时间",
+                    "field": "last_time",
+                    "align": "left",
+                },
+                {
+                    "name": "duration",
+                    "label": "执行时长",
+                    "field": "duration",
+                    "align": "left",
+                },
+                {
                     "name": "status",
                     "label": "状态",
                     "field": "status",
@@ -834,6 +862,13 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 reverse=True,
             ):
                 cfg = tasks[name]
+                running_now = task_running(name)
+                start_ts = cfg.get("_start_ts")
+                duration_text = (
+                    format_duration(time.time() - start_ts)
+                    if running_now and start_ts
+                    else (str(cfg.get("last_duration") or "") or "—")
+                )
                 rows.append(
                     {
                         "name": str(name),
@@ -849,6 +884,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                         if cfg["total_count"]
                         else "不限",
                         "phrases": phrase_pool_label(cfg),
+                        "last_time": str(cfg.get("last_start_time") or "") or "—",
+                        "duration": duration_text,
                         "status": _status_text(name),
                     }
                 )
@@ -890,9 +927,17 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             def make_set_status(n: str) -> Callable[[bool], None]:
                 def _set(running: bool) -> None:
                     text = "运行中" if running else "未运行"
+                    cfg_now = tasks.get(n) or {}
+                    start_ts = cfg_now.get("_start_ts")
+                    dur = (
+                        format_duration(time.time() - start_ts)
+                        if running and start_ts
+                        else (str(cfg_now.get("last_duration") or "") or "—")
+                    )
                     for r in table.rows:
                         if r["name"] == str(n):
                             r["status"] = text
+                            r["duration"] = dur
                             try:
                                 table.update()
                             except Exception:
@@ -975,6 +1020,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                         ).classes("text-xs text-gray-600")
                         ui.label(
                             f"每账号条数：{row['total']}　语库：{row['phrases']}"
+                        ).classes("text-xs text-gray-600")
+                        ui.label(
+                            f"执行时间：{row['last_time']}　执行时长：{row['duration']}"
                         ).classes("text-xs text-gray-600")
                         with ui.row().classes("w-full mobile-card-actions"):
                             if not running:
@@ -1106,7 +1154,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             await asyncio.sleep(1.0)
             if not client.has_socket_connection:
                 return
-            # 每秒刷新运行中任务的进度状态列（如 "运行中 (18/100)"）
+            # 每秒刷新运行中任务的进度状态列（如 "运行中 (18/100)"）与实时执行时长
             table = table_ref["table"]
             if table is not None:
                 try:
@@ -1118,6 +1166,13 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                             if r.get("status") != new_status:
                                 r["status"] = new_status
                                 changed = True
+                            cfg_now = tasks[n]
+                            start_ts = cfg_now.get("_start_ts")
+                            if start_ts and task_running(n):
+                                dur = format_duration(time.time() - start_ts)
+                                if r.get("duration") != dur:
+                                    r["duration"] = dur
+                                    changed = True
                     if changed:
                         table.update()
                 except Exception:

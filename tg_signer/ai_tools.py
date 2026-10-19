@@ -36,9 +36,6 @@ class OpenAIConfigManager:
     def has_env_config(self):
         return bool(os.environ.get("OPENAI_API_KEY"))
 
-    def has_config(self) -> bool:
-        return self.has_env_config() and bool(self.load_file_config())
-
     def load_file_config(self) -> Optional[dict]:
         config_file = self.get_config_file()
         if config_file.exists():

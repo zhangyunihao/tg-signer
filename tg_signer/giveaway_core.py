@@ -102,10 +102,6 @@ class _TimeoutClient:
         self._raw = client
         self._timeout = timeout
 
-    @property
-    def raw_client(self) -> Any:
-        return self._raw
-
     def __getattr__(self, item: str) -> Any:
         attr = getattr(self._raw, item)
         if not callable(attr):
@@ -817,6 +813,8 @@ class GiveawayEngine:
         self.on_event: Optional[Callable[[dict], None]] = None
         # 本轮运行统计
         self.joined = 0
+        # 本轮各账号新参与数：{account: count}，供明细展示
+        self.joined_by_account: Dict[str, int] = {}
         self.failed = 0
         self.scanning = False
         self.scan_text = ""
@@ -890,6 +888,7 @@ class GiveawayEngine:
         self.log = log
         self.on_event = on_event
         self.joined = 0
+        self.joined_by_account = {}
         self.failed = 0
         self.scan_text = ""
         self._stopping = False
@@ -1579,6 +1578,9 @@ class GiveawayEngine:
             self._state.save()
         if not reserved:  # 已设上限时名额在预留时计入
             self.joined += 1
+        self.joined_by_account[account] = (
+            self.joined_by_account.get(account, 0) + 1
+        )
         from_part = f"来自 {channel or '未知频道'}"
         if title:
             from_part += f"：{title}"

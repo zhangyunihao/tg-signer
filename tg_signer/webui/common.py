@@ -117,6 +117,18 @@ def pretty_json(data: Dict[str, object]) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+def format_duration(seconds: float) -> str:
+    """把秒数格式化为「X分Y秒 / Y秒」文本，供各任务列表展示执行时长。"""
+    seconds = max(0, int(seconds))
+    if seconds >= 3600:
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}小时{m}分{s}秒" if s else f"{h}小时{m}分"
+    if seconds >= 60:
+        return f"{seconds // 60}分{seconds % 60}秒"
+    return f"{seconds}秒"
+
+
 def notify_error(exc: Exception) -> None:
     ui.notify(f"{exc}", type="negative")
 
