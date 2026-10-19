@@ -403,11 +403,15 @@ class FakeClient:
         self.started.append((username, param))
         return None
 
-    def get_chat_history(self, chat, limit=None):
-        return self._history(limit)
+    def get_chat_history(self, chat, limit=None, offset_id=0):
+        return self._history(limit, offset_id)
 
-    async def _history(self, limit=None):
-        items = self.history if limit is None else self.history[:limit]
+    async def _history(self, limit=None, offset_id=0):
+        items = self.history
+        if offset_id:
+            items = [m for m in items if getattr(m, "id", 0) < offset_id]
+        if limit is not None:
+            items = items[:limit]
         for m in items:
             yield m
 
@@ -469,6 +473,48 @@ def test_parse_draw_date_choujiangs_bot_sample():
         "📅 开奖时间：2026-09-30 12:00自动开奖"
     )
     assert parse_draw_date(sample, now=now) == datetime(2026, 9, 30, 12, 0)
+
+
+def test_parse_draw_date_laomao_channel_sample():
+    """老猫福利榜样本：「📅 开奖日期:(UTC+8)⏎2026年10月26日 17时00分00秒」，
+    前缀「日期:(UTC+8)」+换行占掉十余字符，旧版 +20 窗口把「10月26日」
+    截成「10月2」误判为 2026-10-02 已开奖；先出现的「开奖后请24小时内
+    联系老师兑奖」窗口内无日期，需继续向后尝试。"""
+    from datetime import datetime
+
+    now = datetime(2026, 10, 20, 1, 30, 0)
+    sample = (
+        "🎰 浦东蜜桃老师优惠抽奖活动\n\n"
+        "📮 抽奖条件:\n"
+        "🎫 加入-蜜桃的秘密花园\n"
+        "🎫 加入-上海老猫修车闲聊(免费上榜)\n"
+        "🎫 加入-老猫福利榜【上海】\n\n"
+        "🎁 奖品内容:\n"
+        "单次半价券 × 1\n\n"
+        "💡 活动说明:\n"
+        "（1）中奖者7天内使用优惠卷，超时作废\n"
+        "（4）开奖后请24小时内联系老师兑奖 @mitaomeimei02\n"
+        "（5）提交评价报告联系老猫：@laomaoguanjia2_bot\n"
+        "（6）提交报告会获得相应积分 积分用处可在群聊查看\n\n"
+        "📅 开奖日期:(UTC+8)\n"
+        "2026年10月26日 17时00分00秒"
+    )
+    assert parse_draw_date(sample, now=now) == datetime(2026, 10, 26, 17, 0)
+
+
+def test_parse_draw_date_skips_window_edge_truncated_dates():
+    """窗口因 +80 上限截断时，贴窗口边界的残缺日期（如被截成
+    「2026年10月2」的「2026年10月26日」）不得参与判定。"""
+    from datetime import datetime
+
+    now = datetime(2026, 10, 20, 1, 30, 0)
+    # 日期起点在窗口内、终点越过 +80 边界：旧逻辑会解析出 2026-10-02
+    text = "开奖。" + "字" * 70 + "2026年10月26日 17时00分00秒，其余内容"
+    assert parse_draw_date(text, now=now) is None
+    # 提示词贴近文本末尾：窗口未被截断，贴边日期是完整的，正常解析
+    assert parse_draw_date(
+        "长文本" * 60 + "开奖 2026年10月26日 17时00分", now=now
+    ) == datetime(2026, 10, 26, 17, 0)
 
 
 def test_engine_skips_expired_draw_message(tmp_path):
@@ -1061,6 +1107,61 @@ def test_click_confirm_no_restart_without_join_targets(tmp_path, monkeypatch):
     assert not any("再次发送 start" in line for line in logs)
 
 
+def test_click_confirm_prefers_join_retry_button(tmp_path, monkeypatch):
+    """bot 提示「加入后需再点一次 我已加入 重试参与」且消息带该回调按钮：
+    优先点按钮完成重试，不再重发 start（少一轮防脚本验证）。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _CallbackClient(bot_users={"DbLotteryBot"})
+    msg = _msg(
+        text="请先加入 https://t.me/NeedJoinCh 后重试参与。"
+        "加入要求参与的频道或者群组后 需要再点一次 我已加入 重试参与",
+        buttons=[[_btn("✅ 我已加入 重试参与", callback_data="retry1")]],
+    )
+    asyncio.run(engine._click_confirm("acc", client, "DbLotteryBot", msg, "r1"))
+    # 点了重试按钮，没有重发 start
+    assert client.started == []
+    assert client.callback_clicks
+    assert any("重试按钮" in line and "我已加入" in line for line in logs)
+
+
+def test_click_confirm_retry_button_failure_falls_back_to_start(tmp_path, monkeypatch):
+    """重试按钮点击失败：兜底重发一次 start，不丢参与。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    class _BrokenCallbackClient(_CallbackClient):
+        async def request_callback_answer(self, chat_id, message_id, callback_data):
+            raise RuntimeError("button expired")
+
+    client = _BrokenCallbackClient(bot_users={"DbLotteryBot"})
+    msg = _msg(
+        text="请先加入 https://t.me/NeedJoinCh 后重试参与。",
+        buttons=[[_btn("✅ 我已加入 重试参与", callback_data="retry1")]],
+    )
+    asyncio.run(engine._click_confirm("acc", client, "DbLotteryBot", msg, "r1"))
+    assert client.started == [("DbLotteryBot", "r1")]
+    assert any("改用重发 start" in line for line in logs)
+
+
 class _CallbackClient(FakeClient):
     """带 callback 点击记录的客户端；bot 用户名的 get_chat 返回 BOT 类型。"""
 
@@ -1096,7 +1197,9 @@ def test_click_confirm_clicks_same_bot_url_button(tmp_path, monkeypatch):
     client = _CallbackClient(bot_users={"BaibaoxiangCjBot"})
     msg = _msg(
         text="您已获得抽奖资格（已达标）✅您已完成所有任务，请直接参与抽奖！",
-        buttons=[[_btn("🎟️ 点击参与抽奖", url="https://t.me/BaibaoxiangCjBot?start=q1")]],
+        buttons=[
+            [_btn("🎟️ 点击参与抽奖", url="https://t.me/BaibaoxiangCjBot?start=q1")]
+        ],
     )
     asyncio.run(engine._click_confirm("acc", client, "BaibaoxiangCjBot", msg, "r1"))
     assert client.started == [("BaibaoxiangCjBot", "q1")]
@@ -1171,6 +1274,40 @@ def test_click_confirm_still_clicks_callback_button(tmp_path, monkeypatch):
     assert client.callback_clicks == [("ConfirmBot", msg.id, "confirm_1")]
     assert client.started == []
     assert any("确认按钮" in line for line in logs)
+
+
+def test_click_confirm_rejoin_button_after_join_restart(tmp_path, monkeypatch):
+    """百宝箱式流程：bot 回复「必须先关注以下群组/频道…全部关注后请点击
+    重新参与抽奖」，链接在警示文本之后。加入频道并重发 start 后 bot 未再
+    回复带按钮的新消息时，原消息上的「重新参与抽奖」按钮仍要点到。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _CallbackClient(bot_users={"BaibaoxiangCjBot"})
+    msg = _msg(
+        text=(
+            "⚠️必须先关注以下群组/频道才能参加抽奖\n\n"
+            "⚠️全部关注后请点击 重新参与抽奖\n\n"
+            "📢 https://t.me/BBXNews\n📢 @BBXFun"
+        ),
+        buttons=[[_btn("🔄 重新参与抽奖", callback_data="rejoin")]],
+    )
+    asyncio.run(engine._click_confirm("acc", client, "BaibaoxiangCjBot", msg, "r1"))
+    # 链接位于警示文本之后，仍全部提取并加入
+    assert client.joined_targets == ["BBXNews", "BBXFun"]
+    # 加入完成后重发 start 完成重新参与
+    assert client.started == [("BaibaoxiangCjBot", "r1")]
+    # 重发后 bot 无新回复：原消息上的「重新参与抽奖」按钮被点击
+    assert client.callback_clicks == [("BaibaoxiangCjBot", msg.id, "rejoin")]
+    assert any("要求加入频道后重新参与" in line for line in logs)
 
 
 def test_click_confirm_popup_ended_skips_verify(tmp_path, monkeypatch):
@@ -1341,7 +1478,9 @@ def test_engine_join_invite_request_sent_is_not_failure(tmp_path):
     engine.log = logs.append
     client = RequestClient()
     msg = _msg(text="加入 https://t.me/+AbCdEfGh123 参与")
-    joined_any = asyncio.run(engine._join_from_message("acc", client, "LotteryBot", msg))
+    joined_any = asyncio.run(
+        engine._join_from_message("acc", client, "LotteryBot", msg)
+    )
     assert joined_any is True
     assert any("已提交加入" in line and "待管理员审批" in line for line in logs)
     assert not any("失败" in line for line in logs)
@@ -1363,9 +1502,7 @@ def test_ensure_monitor_membership_emits_join_events(tmp_path):
     client.member_targets = {"chat1"}
     asyncio.run(engine._ensure_monitor_membership("acc", client, "Chat1"))
     assert client.joined == []
-    assert events == [
-        {"type": "join_resolved", "account": "acc", "chat": "Chat1"}
-    ]
+    assert events == [{"type": "join_resolved", "account": "acc", "chat": "Chat1"}]
 
     # 未加入且加入失败 → join_failed（带错误原因）
     events.clear()
@@ -1865,7 +2002,9 @@ def test_lotterybest_restart_reply_participate_button_clicked(tmp_path, monkeypa
     checklist = _status_message(
         STATUS_REPLY, {"某测试频道D": "https://t.me/test_channel_d"}
     )
-    asyncio.run(engine._click_confirm("acc", client, "LotteryBestBot", checklist, "post1"))
+    asyncio.run(
+        engine._click_confirm("acc", client, "LotteryBestBot", checklist, "post1")
+    )
     assert "test_channel_d" in client.joined_targets
     # 第一次：原参数重发；第二次：点击参与按钮（链接参数）
     assert client.started == [
@@ -2180,7 +2319,9 @@ def test_extract_password_tasks_activation_reply():
     )
     assert extract_password_tasks(msg) == [("野寻·上海打卡通告群", "出击雾织星宝宝")]
     # ✅ 已完成行不产生口令任务
-    done = ACTIVATION_REPLY.replace("发送口令﹝出击雾织星宝宝﹞ ❌", "发送口令﹝出击雾织星宝宝﹞ ✅")
+    done = ACTIVATION_REPLY.replace(
+        "发送口令﹝出击雾织星宝宝﹞ ❌", "发送口令﹝出击雾织星宝宝﹞ ✅"
+    )
     assert extract_password_tasks(_msg(text=done)) == []
 
 
@@ -2208,10 +2349,10 @@ def test_verify_after_click_resends_pending_password(tmp_path, monkeypatch):
     )
     client.history = [activation]
     # 预发送阶段已发过同一口令（模拟 bot 未计入的场景）
-    engine._password_sent.add(
-        "acc|LotteryBestBot|野寻·上海打卡通告群|出击雾织星宝宝"
+    engine._password_sent.add("acc|LotteryBestBot|野寻·上海打卡通告群|出击雾织星宝宝")
+    asyncio.run(
+        engine._verify_after_click("acc", client, "LotteryBestBot", [activation])
     )
-    asyncio.run(engine._verify_after_click("acc", client, "LotteryBestBot", [activation]))
     assert ("daka_group2", "出击雾织星宝宝") in client.sent
     assert ("xuesheng_group", "发言数大于 6 条") not in client.sent
 
@@ -2241,7 +2382,9 @@ def test_verify_after_click_done_password_not_resent(tmp_path, monkeypatch):
         },
     )
     client.history = [activation]
-    asyncio.run(engine._verify_after_click("acc", client, "LotteryBestBot", [activation]))
+    asyncio.run(
+        engine._verify_after_click("acc", client, "LotteryBestBot", [activation])
+    )
     assert client.sent == []
 
 
@@ -2395,62 +2538,321 @@ def test_sweep_bot_wins_scans_known_bots_only(tmp_path):
     assert client2.forwarded == []
 
 
-def test_push_win_server_chan_optional(tmp_path, monkeypatch):
-    """配置 SendKey 时中奖消息走 Server酱推送；未配置时不推送。"""
+def test_sweep_bot_wins_incremental_watermark(tmp_path):
+    """中奖回扫水位线：首次按回扫条数建基线，之后只扫新消息并跨重启持久化。"""
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    state.add("acc", "LotteryBestBot", "p1")
+    state.save()
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    client.history = [
+        _msg(text="普通消息", id=12),
+        _msg(text="💐💐💐 中奖提醒 💐💐💐 恭喜您中奖了！", id=11),
+    ]
+    events: list = []
+    engine.on_event = events.append
+    asyncio.run(engine._sweep_bot_wins("acc", client))
+    assert len(events) == 1
+    assert state.win_watermark("acc", "LotteryBestBot") == 12
+
+    # 新消息到达后再次回扫：只处理比水位线新的消息
+    client.history.insert(0, _msg(text="💐💐💐 中奖提醒 💐💐💐 又中奖了！", id=14))
+    asyncio.run(engine._sweep_bot_wins("acc", client))
+    assert len(events) == 2
+    assert state.win_watermark("acc", "LotteryBestBot") == 14
+
+    # 水位线随状态文件跨引擎实例（重启）持久化，无新消息不重复推送
+    state2 = GiveawayState(tmp_path)
+    assert state2.win_watermark("acc", "LotteryBestBot") == 14
+    engine2 = GiveawayEngine(state=state2)
+    engine2.on_event = events.append
+    client2 = FakeClient(bot_users={"LotteryBestBot"})
+    client2.history = client.history
+    asyncio.run(engine2._sweep_bot_wins("acc", client2))
+    assert len(events) == 2
+
+
+def test_sweep_bot_wins_min_count_extends_past_watermark(tmp_path):
+    """回扫条数作为扫描量下限：水位线后新消息不足下限时向更旧消息补扫。"""
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    state.add("acc", "LotteryBestBot", "p1")
+    # 水位线=10，旧中奖消息 id=5 在基线之外（此前漏捡）
+    state.set_win_watermark("acc", "LotteryBestBot", 10)
+    state.save()
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    client.history = [
+        _msg(text="普通消息", id=11),
+        _msg(text="普通消息", id=10),
+        _msg(text="普通消息", id=9),
+        _msg(text="普通消息", id=8),
+        _msg(text="普通消息", id=7),
+        _msg(text="普通消息", id=6),
+        _msg(text="💐💐💐 中奖提醒 💐💐💐 恭喜您中奖了！", id=5),
+    ]
+    events: list = []
+    engine.on_event = events.append
+    asyncio.run(engine._sweep_bot_wins("acc", client))
+    # 水位线后仅 1 条新消息，不足回扫条数下限 → 越过水位线补扫到旧中奖消息
+    assert len(events) == 1
+    assert state.win_watermark("acc", "LotteryBestBot") == 11
+
+    # 再次回扫：已处理的旧消息被状态去重，不重复推送
+    asyncio.run(engine._sweep_bot_wins("acc", client))
+    assert len(events) == 1
+
+
+def test_win_forward_target_numeric_string_becomes_int(tmp_path):
+    """转发目标为数字（频道 id）时必须转为 int，避免被 Telethon 当手机号 resolve。"""
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    asyncio.run(
+        engine.start(
+            accounts=[],
+            chats=[],
+            session_dir=tmp_path,
+            log=lambda msg: None,
+            win_detect=True,
+            win_forward_target=["-1004324986564", "me", "@channel"],
+            state=state,
+        )
+    )
+    assert engine.win_forward_targets == [-1004324986564, "me", "@channel"]
+
+
+def test_win_settings_roundtrip(tmp_path):
+    """中奖消息转发目标（全局设置）：保存/读取往返；损坏文件回退收藏夹。"""
+    from tg_signer.webui.giveaway import (
+        load_win_forward_targets,
+        save_win_forward_targets,
+    )
+
+    assert load_win_forward_targets(tmp_path) == ["me"]  # 无配置文件 → 默认收藏夹
+    save_win_forward_targets(tmp_path, ["me", "-1001234567890", "me", " "])
+    assert load_win_forward_targets(tmp_path) == ["me", "-1001234567890"]
+
+    # 旧版单目标字符串配置：自动转为列表
+    (tmp_path / "webui_win_settings.json").write_text(
+        '{"win_forward_target": "-1004324986564"}', encoding="utf-8"
+    )
+    assert load_win_forward_targets(tmp_path) == ["-1004324986564"]
+
+    # 清空保存 → 回退收藏夹；损坏文件同样回退
+    save_win_forward_targets(tmp_path, [])
+    assert load_win_forward_targets(tmp_path) == ["me"]
+    (tmp_path / "webui_win_settings.json").write_text("{bad", encoding="utf-8")
+    assert load_win_forward_targets(tmp_path) == ["me"]
+
+
+# ---------------- 防脚本验证（按顺序点击 emoji） ----------------
+
+DBCHOUJIANG_VERIFY_TEXT = (
+    "🤖 防脚本验证\n请按顺序点击：【🎯、🐻、🐴】\n点错会冷却 30 秒。"
+)
+
+
+def test_extract_emoji_order_samples():
+    from tg_signer.giveaway_core import _extract_emoji_order
+
+    # @dbchoujiang123_bot 样本：顿号分隔
+    assert _extract_emoji_order(DBCHOUJIANG_VERIFY_TEXT) == ["🎯", "🐻", "🐴"]
+    # 无分隔连写
+    assert _extract_emoji_order("请按顺序点击：【🎯🐻🐴】") == ["🎯", "🐻", "🐴"]
+    # 逗号/空格分隔
+    assert _extract_emoji_order("【🎁, 🎈 🎉】") == ["🎁", "🎈", "🎉"]
+    # 变体选择符并入同一 token
+    assert _extract_emoji_order("【❤️、🎯】") == ["❤\ufe0f", "🎯"]
+    # 无【】括号 / 空括号
+    assert _extract_emoji_order("请按顺序点击 🎯 🐻") == []
+    assert _extract_emoji_order("【】") == []
+    assert _extract_emoji_order("") == []
+
+
+def test_is_emoji_verify_message():
+    from tg_signer.giveaway_core import is_emoji_verify_message
+
+    assert is_emoji_verify_message(_msg(text=DBCHOUJIANG_VERIFY_TEXT))
+    # 点错重试提示同样命中
+    assert is_emoji_verify_message(
+        _msg(text="❌ 点错了，冷却 30 秒\n请重新按顺序点击：【🎯、🐻、🐴】")
+    )
+    assert not is_emoji_verify_message(_msg(text="欢迎参加抽奖"))
+    assert not is_emoji_verify_message(_msg(caption=None, text=""))
+
+
+def _verify_msg(buttons=None):
+    return _msg(
+        id=10,
+        text=DBCHOUJIANG_VERIFY_TEXT,
+        buttons=buttons
+        if buttons is not None
+        else [
+            [
+                _btn("🎯", callback_data=b"v1"),
+                _btn("🐻", callback_data=b"v2"),
+                _btn("🐴", callback_data=b"v3"),
+            ]
+        ],
+    )
+
+
+def _click_recorder(client):
+    clicked: list = []
+
+    async def fake_answer(chat_id, message_id, callback_data):
+        clicked.append(callback_data)
+
+    client.request_callback_answer = fake_answer
+    return clicked
+
+
+def test_handle_emoji_verification_clicks_in_order(tmp_path, monkeypatch):
     import asyncio
 
     import tg_signer.giveaway_core as gc
 
-    calls: list = []
+    async def _nosleep(*a, **k):
+        pass
 
-    async def fake_sc_send(key, title, content):
-        calls.append((key, title, content))
-
-    monkeypatch.setattr(gc, "sc_send", fake_sc_send)
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
     engine, _state = _engine(tmp_path)
-    engine.server_chan_send_key = "SCT123"
-
-    async def _drive():
-        engine._push_win_server_chan("acc", "LotteryBestBot", WIN_SAMPLE)
-        await asyncio.sleep(0)  # 让 create_task 的推送协程执行
-
-    asyncio.run(_drive())
-    assert len(calls) == 1
-    assert calls[0][0] == "SCT123"
-    assert calls[0][1] == "中奖提醒"
-    assert "恭喜您中奖了" in calls[0][2]
-
-    # 未配置 SendKey：静默不推送
-    calls.clear()
-    engine2, _ = _engine(tmp_path)
-
-    async def _drive2():
-        engine2._push_win_server_chan("acc", "LotteryBestBot", WIN_SAMPLE)
-        await asyncio.sleep(0)
-
-    asyncio.run(_drive2())
-    assert calls == []
-
-
-def test_win_settings_roundtrip(tmp_path):
-    """中奖提醒全局设置（消息中心配置）：保存/读取往返；损坏文件返回空。"""
-    from tg_signer.webui.giveaway import load_win_settings, save_win_settings
-
-    assert load_win_settings(tmp_path) == {}  # 无配置文件 → 空
-    save_win_settings(
-        tmp_path,
-        {"win_forward_target": "-1001234567890", "server_chan_send_key": "SCT1"},
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"Dbchoujiang123Bot"})
+    clicked = _click_recorder(client)
+    handled = asyncio.run(
+        engine._handle_emoji_verification(
+            "acc", client, "Dbchoujiang123Bot", [_verify_msg()]
+        )
     )
-    settings = load_win_settings(tmp_path)
-    assert settings["win_forward_target"] == "-1001234567890"
-    assert settings["server_chan_send_key"] == "SCT1"
+    assert handled is True
+    # 按正文顺序点击（先全部校验按钮齐全，再逐个点击）
+    assert clicked == [b"v1", b"v2", b"v3"]
+    assert any("按顺序点击" in line for line in logs)
 
-    # 覆盖保存 + 空值回退默认
-    save_win_settings(tmp_path, {"win_forward_target": "", "server_chan_send_key": ""})
-    settings2 = load_win_settings(tmp_path)
-    assert settings2["win_forward_target"] == "me"
-    assert settings2["server_chan_send_key"] == ""
 
-    # 损坏的配置文件：静默返回空
-    (tmp_path / "webui_win_settings.json").write_text("{bad", encoding="utf-8")
-    assert load_win_settings(tmp_path) == {}
+def test_handle_emoji_verification_missing_button_no_click(tmp_path, monkeypatch):
+    """键盘缺目标按钮：不乱点（点错有冷却惩罚），只记日志。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"Dbchoujiang123Bot"})
+    clicked = _click_recorder(client)
+    message = _verify_msg(
+        buttons=[[_btn("🎯", callback_data=b"v1"), _btn("🐻", callback_data=b"v2")]]
+    )
+    handled = asyncio.run(
+        engine._handle_emoji_verification("acc", client, "Dbchoujiang123Bot", [message])
+    )
+    assert handled is True
+    assert clicked == []
+    assert any("不乱点" in line for line in logs)
+
+
+def test_handle_emoji_verification_unparseable_order(tmp_path, monkeypatch):
+    """验证消息解析不出【…】顺序：不点击，记日志。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"Dbchoujiang123Bot"})
+    clicked = _click_recorder(client)
+    message = _msg(
+        id=11,
+        text="🤖 防脚本验证\n请完成下方拼图后再试。",
+        buttons=[[_btn("开始拼图", callback_data=b"pz")]],
+    )
+    handled = asyncio.run(
+        engine._handle_emoji_verification("acc", client, "Dbchoujiang123Bot", [message])
+    )
+    assert handled is True
+    assert clicked == []
+    assert any("未能解析点击顺序" in line for line in logs)
+
+
+def test_handle_emoji_verification_dedup_same_message(tmp_path, monkeypatch):
+    """同一条验证消息进程内只点击一次（重发 start 后旧验证不重按）。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    client = FakeClient(bot_users={"Dbchoujiang123Bot"})
+    clicked = _click_recorder(client)
+    message = _verify_msg()
+    for _ in range(2):
+        asyncio.run(
+            engine._handle_emoji_verification(
+                "acc", client, "Dbchoujiang123Bot", [message]
+            )
+        )
+    assert clicked == [b"v1", b"v2", b"v3"]
+
+
+def test_handle_emoji_verification_ignores_plain_messages(tmp_path):
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    client = FakeClient(bot_users={"LotteryBot"})
+    clicked = _click_recorder(client)
+    handled = asyncio.run(
+        engine._handle_emoji_verification(
+            "acc", client, "LotteryBot", [_msg(text="点击按钮立即参与")]
+        )
+    )
+    assert handled is False
+    assert clicked == []
+
+
+def test_click_confirm_solves_verification_then_confirms(tmp_path, monkeypatch):
+    """start 回复防脚本验证：按序点完 emoji → 刷新候选 → 点击后续确认按钮。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"Dbchoujiang123Bot"})
+    clicked = _click_recorder(client)
+    # 验证通过后 bot 发出的参与消息（刷新候选时拉到）
+    client.history = [
+        _msg(
+            id=11,
+            text="验证通过，点击下方按钮立即参与抽奖",
+            buttons=[[_btn("立即参加", callback_data=b"go")]],
+        )
+    ]
+    asyncio.run(
+        engine._click_confirm("acc", client, "Dbchoujiang123Bot", _verify_msg(), "x1")
+    )
+    # 先按顺序完成验证，再点击确认按钮
+    assert clicked == [b"v1", b"v2", b"v3", b"go"]
+    assert any("防脚本验证" in line for line in logs)
+    assert any("已点击" in line for line in logs)

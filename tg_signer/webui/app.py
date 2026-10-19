@@ -30,7 +30,16 @@ from tg_signer.webui.data import (
     list_log_files,
     load_logs,
 )
-from tg_signer.webui.giveaway import giveaway_block
+from tg_signer.webui.giveaway import (
+    giveaway_block,
+    list_known_channels,
+    load_giveaway_timeout_min,
+    load_win_forward_targets,
+    load_win_sweep_limit,
+    save_giveaway_timeout_min,
+    save_win_forward_targets,
+    save_win_sweep_limit,
+)
 from tg_signer.webui.messages import message_center_button
 from tg_signer.webui.random_chat import random_chat_block
 from tg_signer.webui.sign import (
@@ -210,7 +219,9 @@ def log_block(card: Optional[ui.card] = None) -> Callable[[], None]:
             except (OSError, json.JSONDecodeError):
                 logger.debug("读取任务历史失败", exc_info=True)
             copy_text_to_clipboard(build_debug_report(state.workdir, sections))
-            ui.notify("已复制调试信息（含环境信息），粘贴给电脑即可排查", type="positive")
+            ui.notify(
+                "已复制调试信息（含环境信息），粘贴给电脑即可排查", type="positive"
+            )
 
         fullscreen_on = False
 
@@ -233,9 +244,9 @@ def log_block(card: Optional[ui.card] = None) -> Callable[[], None]:
             with ui.row().classes("gap-2 items-center flex-wrap"):
                 ui.button("刷新日志", on_click=refresh)
                 ui.button("一键复制日志", on_click=copy_logs).props("outline")
-                ui.button("复制调试信息", on_click=copy_debug_info).props("outline").tooltip(
-                    "复制环境信息+当前日志+任务历史，粘贴到电脑排查复现"
-                )
+                ui.button("复制调试信息", on_click=copy_debug_info).props(
+                    "outline"
+                ).tooltip("复制环境信息+当前日志+任务历史，粘贴到电脑排查复现")
                 if card is not None:
                     fullscreen_btn = ui.button(
                         "全屏显示", on_click=toggle_fullscreen
@@ -362,11 +373,63 @@ def _build_dashboard(container) -> None:
         def open_settings() -> None:
             with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
                 add_dialog_close_button(dialog)
-                ui.label("工作目录").classes("text-lg font-semibold")
+                ui.label("设置").classes("text-lg font-semibold")
                 workdir_input = ui.input(
                     label="工作目录",
                     value=str(state.workdir),
                     placeholder=".signer",
+                ).classes("w-full")
+                # 中奖消息转发目标（全局设置，对所有抽奖任务生效）：
+                # 多选，选项 = 收藏夹 + 各账号最近会话中的群组/频道
+                ui.label("中奖消息转发目标").classes("text-lg font-semibold mt-2")
+                ui.label(
+                    "抽奖引擎识别到中奖消息后，用各账号把中奖原消息转发到这里"
+                    "（可多选，需为该账号已加入的群组/频道），修改后新启动的任务生效。"
+                ).classes("text-xs text-gray-500")
+                target_options = {"me": "收藏夹 (me)"}
+                target_options.update(list_known_channels(state.workdir))
+                current_targets = load_win_forward_targets(state.workdir)
+                for tid in current_targets:
+                    if tid not in target_options:
+                        target_options[tid] = tid
+                target_select = (
+                    ui.select(
+                        target_options,
+                        value=current_targets,
+                        label="转发目标（可多选）",
+                        multiple=True,
+                        with_input=True,
+                    )
+                    .classes("w-full")
+                    .props("use-chips clearable")
+                )
+                # 中奖回扫条数：首次记录某 bot 时的初始基线，之后增量扫描
+                ui.label("中奖回扫条数").classes("text-lg font-semibold mt-2")
+                ui.label(
+                    "首次记录某个 bot 时回扫其私聊最近多少条消息找中奖通知"
+                    "（默认 50）；之后按水位线增量扫描，只处理新消息，"
+                    "该值不再参与日常回扫。"
+                ).classes("text-xs text-gray-500")
+                sweep_input = ui.number(
+                    label="回扫条数",
+                    value=load_win_sweep_limit(state.workdir),
+                    min=1,
+                    max=1000,
+                    precision=0,
+                ).classes("w-full")
+                # 抽奖任务超时（全局）：单独运行与组合子任务共用
+                ui.label("抽奖任务超时（分钟）").classes("text-lg font-semibold mt-2")
+                ui.label(
+                    "抽奖任务运行达到该时长后自动停止"
+                    "（单独运行的抽奖任务与组合任务中的抽奖子任务共用，"
+                    "0=不限，默认 10）。"
+                ).classes("text-xs text-gray-500")
+                timeout_input = ui.number(
+                    label="超时（分钟，0=不限）",
+                    value=load_giveaway_timeout_min(state.workdir),
+                    min=0,
+                    max=10080,
+                    precision=0,
                 ).classes("w-full")
                 with ui.row().classes("w-full justify-end gap-2"):
                     ui.button("取消", on_click=dialog.close).props("outline")
@@ -375,6 +438,16 @@ def _build_dashboard(container) -> None:
                         color="primary",
                         on_click=lambda: (
                             _apply_paths(workdir_input, refresh_all),
+                            save_win_forward_targets(
+                                state.workdir, list(target_select.value or [])
+                            ),
+                            save_win_sweep_limit(state.workdir, sweep_input.value),
+                            save_giveaway_timeout_min(
+                                state.workdir, timeout_input.value
+                            ),
+                            ui.notify(
+                                "设置已保存，新启动的抽奖任务生效", type="positive"
+                            ),
                             dialog.close(),
                         ),
                     )
@@ -422,7 +495,7 @@ def _build_dashboard(container) -> None:
                     "签到配置管理",
                     on_click=lambda: (_ensure_configs(), configs_dialog.open()),
                 )
-                ui.menu_item("工作目录", on_click=open_settings)
+                ui.menu_item("设置", on_click=open_settings)
                 ui.menu_item(
                     "用户信息", on_click=lambda: (_ensure_users(), users_dialog.open())
                 )

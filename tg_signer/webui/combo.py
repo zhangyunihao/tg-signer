@@ -21,7 +21,11 @@ from tg_signer.webui.common import (
     with_select_all,
 )
 from tg_signer.webui.data import get_workdir, load_config
-from tg_signer.webui.giveaway import channel_title_map, load_task_store
+from tg_signer.webui.giveaway import (
+    channel_title_map,
+    load_giveaway_timeout_min,
+    load_task_store,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +159,10 @@ def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | 
         ("补漏扫描间隔（分钟）", f"{rescue_min}（0=关闭）"),
         ("补漏重拉条数/频道", str(cfg.get("rescue_limit") or 0)),
         ("中奖识别", _fmt_param_value(cfg.get("win_detect", True))),
+        (
+            "超时（分钟，全局）",
+            f"{load_giveaway_timeout_min(workdir)}（0=不限）",
+        ),
     ]
 
 
@@ -242,6 +250,9 @@ class ComboTaskBlock:
         self._build_combo_dialog()
         self._build_run_dialog()
         self.refresh()
+        # 运行中组合任务的轮询刷新：每秒同步子任务进度与运行日志
+        self._last_tick_sig: tuple | None = None
+        ui.timer(1.0, self._tick)
 
     # ---- 数据 ----
 
@@ -263,33 +274,238 @@ class ComboTaskBlock:
     def _render_running(self) -> None:
         self.running_container.clear()
         with self.running_container:
-            runs = [
-                (rid, run)
-                for rid, run in self.runner.runs.items()
-                if "组合" in str(run["record"].get("task_type") or "")
-            ]
+            runs = self._combo_runs()
             if not runs:
                 ui.label("当前没有运行中的组合任务").classes("text-sm text-gray-400")
             for rid, run in runs:
-                rec = run["record"]
-                elapsed = format_duration(max(0, time.time() - run["start_ts"]))
-                with ui.card().classes("w-full border"):
-                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                        ui.badge("运行中").props("color=info")
-                        ui.label(rec.get("task_name") or "-").classes(
-                            "text-base font-semibold"
-                        )
-                        ui.label(f"账号: {rec.get('accounts', '')}").classes(
+                self._render_running_card(rid, run)
+
+    def _combo_runs(self) -> list[tuple[str, dict]]:
+        return [
+            (rid, run)
+            for rid, run in self.runner.runs.items()
+            if "组合" in str(run["record"].get("task_type") or "")
+        ]
+
+    def _run_subs(self, run: dict) -> list[dict]:
+        """本次实际执行的子任务列表；旧启动（无 combo_subs）回退读已保存组合。"""
+        subs = run.get("combo_subs")
+        if subs is not None:
+            return subs
+        name = str(run["record"].get("task_name") or "")
+        combo = next((c for c in self._load() if c.get("name") == name), None)
+        return (combo or {}).get("subs") or []
+
+    def _sub_run_status(self, sub: dict, run: dict) -> str:
+        """聚合各账号进程的明细，得到一个子任务的整体状态。"""
+        label = f"{sub.get('type')} · {sub.get('task')}"
+        rows = [d for d in run["details"] if d.get("chat") == label]
+        procs = run.get("procs") or []
+        expected = sum(1 for p in procs if label in (p.get("sub_labels") or []))
+        if not expected:
+            # 旧版本启动的运行：按明细里出现过的账号数估计
+            expected = len({d.get("account") for d in rows if d.get("account")})
+        ok = sum(1 for d in rows if d.get("status") == "成功")
+        bad = sum(1 for d in rows if d.get("status") == "失败")
+        if expected and ok + bad >= expected:
+            return "失败" if bad else "成功"
+        if any(d.get("status") == "进行中" for d in rows) or ok or bad:
+            return "进行中"
+        return "等待"
+
+    def _sub_accounts_text(self, sub: dict) -> str:
+        from tg_signer.webui.data import apply_account_order
+        from tg_signer.webui.sign import _combo_sub_accounts
+
+        try:
+            accs = apply_account_order(_combo_sub_accounts(sub, self.workdir), self.workdir)
+        except Exception:
+            accs = []
+        return "、".join(accs) if accs else "未绑定"
+
+    @staticmethod
+    def _account_progress(
+        run: dict, combo_subs: list[dict]
+    ) -> list[tuple[str, str]]:
+        """按账号汇总进度：(账号, 当前进行到哪步的描述)。
+
+        组合任务按账号串行执行子任务，明细行的 chat 即子任务标签。
+        """
+        labels = [f"{s.get('type')} · {s.get('task')}" for s in combo_subs]
+        idx = {label: i for i, label in enumerate(labels)}
+        by_acc: dict[str, dict[int, str]] = {}
+        for d in run["details"]:
+            acc = str(d.get("account") or "")
+            i = idx.get(str(d.get("chat") or ""))
+            if acc and i is not None:
+                by_acc.setdefault(acc, {})[i] = str(d.get("status") or "")
+        accounts = [str(p.get("account") or "") for p in (run.get("procs") or [])]
+        # 兼容旧版启动的运行（procs 无 sub_labels 时仍以明细里的账号兜底）
+        for acc in by_acc:
+            if acc not in accounts:
+                accounts.append(acc)
+        total = len(combo_subs)
+        result = []
+        for acc in accounts:
+            per = by_acc.get(acc) or {}
+            cur = next((i for i in sorted(per) if per[i] == "进行中"), None)
+            if cur is not None:
+                text = f"第 {cur + 1}/{total} 个 {labels[cur]}（进行中）"
+            else:
+                done = [i for i in sorted(per) if per[i] in ("成功", "失败")]
+                if total and len(done) >= total:
+                    bad = sum(1 for i in done if per[i] == "失败")
+                    text = "已完成" + ("（有失败）" if bad else "")
+                elif done:
+                    last = done[-1]
+                    text = f"第 {last + 1}/{total} 个 {labels[last]} 已结束，准备下一个"
+                else:
+                    text = "未开始"
+            result.append((acc, text))
+        return result
+
+    def _render_running_card(self, rid: str, run: dict) -> None:
+        rec = run["record"]
+        elapsed = format_duration(max(0, time.time() - run["start_ts"]))
+        combo_subs = self._run_subs(run)
+        subs_status = [self._sub_run_status(s, run) for s in combo_subs]
+        with ui.card().classes("w-full border"):
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                ui.badge("运行中").props("color=info")
+                ui.label(rec.get("task_name") or "-").classes("text-base font-semibold")
+                ui.label(f"账号: {rec.get('accounts', '')}").classes(
+                    "text-xs text-gray-600"
+                )
+                ui.space()
+                ui.button("停止", on_click=lambda r=rid: self._stop(r)).props(
+                    "flat dense color=negative"
+                )
+            ui.label(
+                f"执行时间：{rec.get('start_time') or '—'}　已运行：{elapsed}"
+            ).classes("text-xs text-gray-600")
+            # 进度行：带序号显示当前进行到哪个子任务
+            counts = {
+                k: subs_status.count(k) for k in ("成功", "失败", "进行中", "等待")
+            }
+            parts = [
+                f"{k} {counts[k]}"
+                for k in ("进行中", "成功", "失败", "等待")
+                if counts[k]
+            ]
+            text = f"子任务进度（{len(combo_subs)} 个）：{' · '.join(parts) or '—'}"
+            ui.label(text).classes("text-sm text-gray-800 font-medium")
+            # 按账号展示各账号进行到哪一步（组合任务按账号串行执行子任务）
+            for acc, txt in self._account_progress(run, combo_subs):
+                with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    ui.badge(acc).props("outline color=primary dense")
+                    ui.label(txt).classes("text-xs text-gray-700")
+            # 每个子任务一张子卡片：状态 + 账号 + 与原类别一致的完整配置参数
+            status_color = {
+                "成功": "positive",
+                "失败": "negative",
+                "进行中": "info",
+                "等待": "grey-6",
+            }
+            with ui.column().classes("w-full gap-2 mt-1"):
+                for i, (sub, status) in enumerate(
+                    zip(combo_subs, subs_status, strict=True), 1
+                ):
+                    with (
+                        ui.card()
+                        .classes("w-full border gap-1")
+                        .style("background: #fafafa")
+                    ):
+                        with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                            ui.badge(str(i)).props(
+                                "color=positive"
+                                if status == "成功"
+                                else (
+                                    "color=negative"
+                                    if status == "失败"
+                                    else "color=primary"
+                                )
+                            )
+                            ui.label(f"{sub.get('type')} · {sub.get('task')}").classes(
+                                "text-sm font-medium"
+                            )
+                            ui.space()
+                            ui.badge(status).props(
+                                f"color={status_color.get(status, 'grey-6')} outline"
+                            )
+                        ui.label(f"账号：{self._sub_accounts_text(sub)}").classes(
                             "text-xs text-gray-600"
                         )
-                        ui.space()
-                        ui.button(
-                            "停止",
-                            on_click=lambda r=rid: self._stop(r),
-                        ).props("flat dense color=negative")
-                    ui.label(
-                        f"执行时间：{rec.get('start_time') or '—'}　已运行：{elapsed}"
-                    ).classes("text-xs text-gray-600")
+                        try:
+                            params = _sub_config_params(sub, self.workdir)
+                        except Exception:
+                            params = []
+                        if params:
+                            with ui.column().classes("w-full gap-0 mt-1"):
+                                for lbl, val in params:
+                                    with ui.row().classes(
+                                        "w-full items-start gap-3 no-wrap"
+                                    ):
+                                        ui.label(lbl).classes(
+                                            "text-xs text-gray-500 shrink-0 min-w-[130px] max-w-[200px]"
+                                        )
+                                        ui.label(val).classes(
+                                            "text-xs text-gray-800 whitespace-pre-line flex-grow"
+                                        )
+                        else:
+                            ui.label(
+                                "未找到该任务的配置参数（任务可能已被删除）"
+                            ).classes("text-xs text-gray-500")
+            # 运行日志区：只显示本组合任务的输出行
+            with ui.row().classes("w-full items-center justify-between mt-1"):
+                ui.label("运行日志").classes("text-xs font-semibold text-gray-600")
+            with (
+                ui.scroll_area()
+                .classes("w-full bg-gray-50 rounded-lg border border-gray-200")
+                .style("max-height: 220px")
+            ):
+                with (
+                    ui.column()
+                    .classes("w-full gap-0 p-2 font-mono text-xs")
+                    .style("white-space: pre;")
+                ):
+                    prefix = f"[{rec.get('task_name') or ''}:"
+                    lines = [
+                        line
+                        for line in self.runner.output_lines
+                        if line.startswith(prefix)
+                    ]
+                    if not lines:
+                        ui.label("暂无日志输出").classes("text-xs text-gray-400")
+                    for line in lines[-200:]:
+                        ui.label(line).classes("w-full").style("white-space: pre;")
+
+    def _tick(self) -> None:
+        """每秒轮询：有运行中的组合任务时同步子任务进度与日志。"""
+        if not self._combo_runs():
+            if self._last_tick_sig is not None:
+                # 最后一个组合已结束，刷新一次清掉运行中卡片
+                self._last_tick_sig = None
+                self._render_running()
+            return
+        sig = tuple(
+            (
+                rid,
+                len(run["details"]),
+                tuple(self._sub_run_status(s, run) for s in self._run_subs(run)),
+                len(
+                    [
+                        line
+                        for line in self.runner.output_lines
+                        if line.startswith(f"[{run['record'].get('task_name') or ''}:")
+                    ]
+                ),
+                int(time.time() - run["start_ts"]),
+            )
+            for rid, run in self._combo_runs()
+        )
+        if sig != self._last_tick_sig:
+            self._last_tick_sig = sig
+            self._render_running()
 
     def _render_list(self) -> None:
         self.list_container.clear()

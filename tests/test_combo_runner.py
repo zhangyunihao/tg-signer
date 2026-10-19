@@ -18,11 +18,11 @@ def test_combo_runner_runs_subs_sequentially(monkeypatch):
     """子任务按顺序执行，整体退出码取所有子任务的成败。"""
     calls = []
 
-    def fake_call(cmd):
+    def fake_run(cmd, timeout=None):
         calls.append(cmd[-1])  # 最后一个参数代表子任务标识
         return 0
 
-    monkeypatch.setattr(combo_runner.subprocess, "call", fake_call)
+    monkeypatch.setattr(combo_runner, "_run_with_timeout", fake_run)
     monkeypatch.setattr(
         combo_runner.sys,
         "argv",
@@ -48,7 +48,7 @@ def test_combo_runner_runs_subs_sequentially(monkeypatch):
 
 
 def test_combo_runner_failed_sub_makes_exit_code_1(monkeypatch):
-    monkeypatch.setattr(combo_runner.subprocess, "call", lambda cmd: 1)
+    monkeypatch.setattr(combo_runner, "_run_with_timeout", lambda cmd, timeout=None: 1)
     monkeypatch.setattr(
         combo_runner.sys,
         "argv",
@@ -70,14 +70,23 @@ def test_combo_runner_module_sub(monkeypatch):
     """module 型子任务（自动抽奖/批量退频道）以 python -m <module> <spec> 执行。"""
     calls = []
 
-    def fake_call(cmd):
+    def fake_run(cmd, timeout=None):
         calls.append(cmd)
         return 0
 
-    monkeypatch.setattr(combo_runner.subprocess, "call", fake_call)
-    spec = {"subs": [{"label": "抽奖 · 1", "module": "tg_signer.giveaway_runner",
-                      "spec": {"account": "a", "workdir": "."}}]}
-    monkeypatch.setattr(combo_runner.sys, "argv", ["combo_runner", json.dumps(spec, ensure_ascii=False)])
+    monkeypatch.setattr(combo_runner, "_run_with_timeout", fake_run)
+    spec = {
+        "subs": [
+            {
+                "label": "抽奖 · 1",
+                "module": "tg_signer.giveaway_runner",
+                "spec": {"account": "a", "workdir": "."},
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        combo_runner.sys, "argv", ["combo_runner", json.dumps(spec, ensure_ascii=False)]
+    )
     with pytest.raises(SystemExit) as exc:
         combo_runner.main()
     assert exc.value.code == 0

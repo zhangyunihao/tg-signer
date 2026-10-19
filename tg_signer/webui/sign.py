@@ -60,6 +60,9 @@ from tg_signer.webui.giveaway import (
     channel_title_map as _chat_title_map,
 )
 from tg_signer.webui.giveaway import (
+    load_giveaway_timeout_min,
+)
+from tg_signer.webui.giveaway import (
     load_task_store as _load_giveaway_store,
 )
 from tg_signer.webui.interactive import InteractiveSignerConfig
@@ -72,9 +75,7 @@ logger = logging.getLogger(__name__)
 ACCOUNT_STAGGER_SPREAD = 300
 
 
-def build_combo_sub_spec(
-    account: str, sub: dict, workdir
-) -> Optional[dict]:
+def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
     """把组合任务的一个子任务配置构建为可执行的子任务 spec。
 
     返回 {"label", "args"}（CLI 型）或 {"label", "module", "spec"}（内置
@@ -87,11 +88,7 @@ def build_combo_sub_spec(
         # 按名称选择退频道任务（任务列表模式）；「默认配置」或找不到时
         # 回退旧版全局配置，兼容历史保存的组合
         leave_task = next(
-            (
-                t
-                for t in _load_leave_tasks(workdir)
-                if str(t.get("name")) == task_name
-            ),
+            (t for t in _load_leave_tasks(workdir) if str(t.get("name")) == task_name),
             None,
         )
         if leave_task is not None:
@@ -151,6 +148,8 @@ def build_combo_sub_spec(
                 "rescue_interval_min": int(gcfg.get("rescue_interval_min") or 0),
                 "rescue_limit": int(gcfg.get("rescue_limit") or 10),
                 "win_detect": bool(gcfg.get("win_detect", True)),
+                # 超时（分钟→秒，全局设置）：0=不限
+                "timeout": load_giveaway_timeout_min(workdir) * 60,
             },
         }
     if "run-once" in sub_type:
@@ -182,19 +181,13 @@ def _combo_sub_accounts(sub: dict, workdir) -> list[str]:
         return [str(a) for a in (gcfg.get("accounts") or []) if a]
     if "退频道" in sub_type:
         leave_task = next(
-            (
-                t
-                for t in _load_leave_tasks(workdir)
-                if str(t.get("name")) == task_name
-            ),
+            (t for t in _load_leave_tasks(workdir) if str(t.get("name")) == task_name),
             None,
         )
         if leave_task is not None:
             return [str(a) for a in (leave_task.get("accounts") or []) if a]
         return [
-            str(a)
-            for a in (_load_leave_config(workdir).get("accounts") or [])
-            if a
+            str(a) for a in (_load_leave_config(workdir).get("accounts") or []) if a
         ]
     if "run-once" in sub_type:
         bound = load_task_accounts().get(f"{sub_type}|{task_name}", [])
@@ -736,13 +729,13 @@ class TaskRunnerBlock:
                 attach_select_all(self.account_select)
             with ui.row().classes("items-center gap-2 w-full") as self.binding_row:
                 self.binding_label = ui.label("").classes("text-sm text-primary")
-                ui.button(
-                    "更改账号", on_click=self._show_account_select
-                ).props("flat dense")
+                ui.button("更改账号", on_click=self._show_account_select).props(
+                    "flat dense"
+                )
             self.binding_row.set_visibility(False)
-            ui.label("账号来自 *.session 文件；多选时每个账号各启动一个进程。首次执行后账号与任务绑定，后续执行无需再选。").classes(
-                "text-xs text-gray-500"
-            )
+            ui.label(
+                "账号来自 *.session 文件；多选时每个账号各启动一个进程。首次执行后账号与任务绑定，后续执行无需再选。"
+            ).classes("text-xs text-gray-500")
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=self.dialog.close).props("outline")
                 ui.button("执行", color="primary", on_click=self.start_task)
@@ -826,7 +819,9 @@ class TaskRunnerBlock:
                         chats_text += f" 等{len(labels)}个"
                 except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
                     logger.debug("读取签到任务配置失败：%s", name, exc_info=True)
-                names[name] = f"{name}｜账号：{accounts or '未绑定'}｜频道：{chats_text or '未设置'}"
+                names[name] = (
+                    f"{name}｜账号：{accounts or '未绑定'}｜频道：{chats_text or '未设置'}"
+                )
             return names
         if "抽奖" in task_type:
             store = _load_giveaway_store(state.workdir)
@@ -850,17 +845,16 @@ class TaskRunnerBlock:
                 )
             return opts
         if "退频道" in task_type:
-            # 批量退频道为任务列表模式：列出全部退频道任务（含仅扫描任务，
-            # 标注「仅扫描」），按创建时间倒序，避免下拉选项为空
+            # 批量退频道为任务列表模式：仅列出「自动退出」任务（排除仅扫描任务），
+            # 按创建时间倒序
             opts = {}
             for t in reversed(_load_leave_tasks(state.workdir)):
                 name = str(t.get("name") or "")
-                if not name:
+                if not name or not t.get("auto_leave"):
                     continue
                 accs = "、".join(str(a) for a in (t.get("accounts") or []))
-                mode = "自动退出" if t.get("auto_leave") else "仅扫描"
                 opts[name] = (
-                    f"{name}（{t.get('days')}天｜{mode}｜账号：{accs or '未设置'}）"
+                    f"{name}（{t.get('days')}天｜自动退出｜账号：{accs or '未设置'}）"
                 )
             return opts
         return self._get_task_names(task_type)
@@ -1048,9 +1042,7 @@ class TaskRunnerBlock:
             self.account_select.set_visibility(True)
             if not self.account_select.value and self.account_select.options:
                 self.account_select.value = [
-                    v
-                    for v in self.account_select.options
-                    if v != SELECT_ALL_KEY
+                    v for v in self.account_select.options if v != SELECT_ALL_KEY
                 ]
         self.account_select.update()
         self.binding_row.update()
@@ -1180,14 +1172,10 @@ class TaskRunnerBlock:
             if is_combo:
                 # 组合任务：每账号一个进程，进程内按顺序执行该账号参与的全部子任务
                 spec_subs = []
-                for sub, sub_accs in zip(
-                    combo_subs, sub_account_sets, strict=True
-                ):
+                for sub, sub_accs in zip(combo_subs, sub_account_sets, strict=True):
                     if account not in sub_accs:
                         continue
-                    built = build_combo_sub_spec(
-                        account, sub, state.workdir
-                    )
+                    built = build_combo_sub_spec(account, sub, state.workdir)
                     if built:
                         spec_subs.append(built)
                 if not spec_subs:
@@ -1251,7 +1239,19 @@ class TaskRunnerBlock:
             )
             reader.start()
             procs.append(
-                {"proc": proc, "reader": reader, "account": account, "stats": stats}
+                {
+                    "proc": proc,
+                    "reader": reader,
+                    "account": account,
+                    "stats": stats,
+                    # 组合任务：该账号进程将执行的子任务标签（与明细行 chat 对应），
+                    # 用于判断每个子任务涉及几个账号，从而聚合出整体状态
+                    "sub_labels": (
+                        [str(s.get("label") or "") for s in spec_subs]
+                        if is_combo
+                        else []
+                    ),
+                }
             )
         if not procs:
             ui.notify("未能启动任务", type="negative")
@@ -1265,6 +1265,9 @@ class TaskRunnerBlock:
             "start_ts": time.time(),
             "total_chats": total_units,
             "details": detail_rows,
+            # 组合任务：本次实际执行的子任务列表（已按勾选过滤），
+            # 「组合任务」tab 据此渲染子任务进度卡片
+            "combo_subs": [dict(s) for s in combo_subs] if is_combo else [],
         }
         append_task_history(record)
         self._refresh_history_table()
@@ -1293,11 +1296,15 @@ class TaskRunnerBlock:
             stripped = line.lstrip()
             # 组合任务：combo_runner 输出的「>>> 子任务开始/结束」标记行，
             # 每个子任务对应一条明细（开始=进行中，结束按退出码定成败）
-            if combo and stripped.startswith(">>> 子任务开始:"):
+            if combo and stripped.startswith(">>> 子任务开始"):
                 pos = stats["current_pos"]
                 if pos is not None and detail_rows[pos]["status"] == "进行中":
                     detail_rows[pos]["status"] = "成功"
-                label = stripped.split(">>> 子任务开始:", 1)[1].strip()
+                # 格式：>>> 子任务开始 [i/total]: 标签（兼容旧格式 开始: 标签）
+                if "]:" in stripped:
+                    label = stripped.split("]:", 1)[1].strip()
+                else:
+                    label = stripped.split(">>> 子任务开始:", 1)[1].strip()
                 detail_rows.append(
                     {"account": account, "chat": label, "status": "进行中"}
                 )
@@ -1613,9 +1620,7 @@ class TaskRunnerBlock:
         # data-runres 属性，页面上有两份），不调用整表 update()，
         # 避免每 0.3s 重渲染导致「明细/停止」点击丢失
         run = self.runs.get(record_id)
-        dur_text = (
-            self._format_duration_ts(run["start_ts"]) if run is not None else ""
-        )
+        dur_text = self._format_duration_ts(run["start_ts"]) if run is not None else ""
         for row in self.history_table.rows:
             if row.get("id") == record_id:
                 row["result"] = result_text
@@ -1776,20 +1781,32 @@ class TaskRunnerBlock:
         sections: list[tuple[str, str]] = []
         if TaskRunnerBlock.output_lines:
             sections.append(
-                ("本次运行输出（最近300行）", "\n".join(TaskRunnerBlock.output_lines[-300:]))
+                (
+                    "本次运行输出（最近300行）",
+                    "\n".join(TaskRunnerBlock.output_lines[-300:]),
+                )
             )
         history_tail = self._load_task_history_tail(15)
         if history_tail:
             sections.append(("任务历史（最近15条）", history_tail))
         # 子进程日志相对服务进程 cwd 与工作目录都可能落盘，两处都尝试
         sections.append(
-            ("logs/tg-signer.log（工作目录）最近200行", read_file_tail(wd / "logs" / "tg-signer.log"))
+            (
+                "logs/tg-signer.log（工作目录）最近200行",
+                read_file_tail(wd / "logs" / "tg-signer.log"),
+            )
         )
         sections.append(
-            ("logs/tg-signer.log（服务进程目录）最近200行", read_file_tail(Path("logs") / "tg-signer.log"))
+            (
+                "logs/tg-signer.log（服务进程目录）最近200行",
+                read_file_tail(Path("logs") / "tg-signer.log"),
+            )
         )
         copy_text_to_clipboard(build_debug_report(wd, sections))
-        ui.notify("已复制调试日志（含环境信息与任务历史），粘贴给电脑即可排查", type="positive")
+        ui.notify(
+            "已复制调试日志（含环境信息与任务历史），粘贴给电脑即可排查",
+            type="positive",
+        )
 
     @staticmethod
     def _classify_line(line: str) -> str:

@@ -31,16 +31,12 @@ from tg_signer.core import get_client, safe_disconnect
 from tg_signer.webui.auto_leave import _scan_types_of, leave_one, scan_stale_chats
 
 
-def filter_candidates(
-    rows: List[Dict], exclude_keywords: List[str]
-) -> List[Dict]:
+def filter_candidates(rows: List[Dict], exclude_keywords: List[str]) -> List[Dict]:
     """按标题关键字过滤扫描结果（命中即排除，防止误退）。"""
     kws = [str(k) for k in (exclude_keywords or []) if k]
     if not kws:
         return list(rows)
-    return [
-        r for r in rows if not any(k in str(r.get("title") or "") for k in kws)
-    ]
+    return [r for r in rows if not any(k in str(r.get("title") or "") for k in kws)]
 
 
 async def run_leave(spec: dict) -> int:
@@ -98,9 +94,7 @@ async def run_leave(spec: dict) -> int:
 
         async def _do_leave(row: Dict) -> None:
             async with sem:
-                success = await leave_one(
-                    client, row["chat_id"], row["title"], log
-                )
+                success = await leave_one(client, row["chat_id"], row["title"], log)
                 if success:
                     async with done_lock:
                         done_keys.add(row["key"])

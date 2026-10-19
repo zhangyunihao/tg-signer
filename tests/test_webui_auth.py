@@ -109,9 +109,7 @@ def patched(monkeypatch):
     """替换 app 模块的 ui / app 符号，返回 (FakeUI, storage dict)。"""
     fake_ui = FakeUI()
     storage_user = {}
-    fake_app = types.SimpleNamespace(
-        storage=types.SimpleNamespace(user=storage_user)
-    )
+    fake_app = types.SimpleNamespace(storage=types.SimpleNamespace(user=storage_user))
     monkeypatch.setattr(app_mod, "ui", fake_ui)
     monkeypatch.setattr(app_mod, "app", fake_app)
     return fake_ui, storage_user

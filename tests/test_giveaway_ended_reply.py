@@ -42,9 +42,7 @@ def test_click_confirm_returns_on_ended_start_reply(monkeypatch):
         calls.append("start_bot")
         return _Msg("ok")
 
-    monkeypatch.setattr(
-        types.SimpleNamespace(), "x", 1, raising=False
-    )  # 占位，无需
+    monkeypatch.setattr(types.SimpleNamespace(), "x", 1, raising=False)  # 占位，无需
     asyncio.run(
         engine._click_confirm("u1", types.SimpleNamespace(), "somebot", start_reply, "")
     )

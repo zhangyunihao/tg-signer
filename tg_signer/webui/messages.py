@@ -28,8 +28,6 @@ from tg_signer.webui.giveaway import (
     load_join_alerts,
     load_speak_alerts,
     load_win_alerts,
-    load_win_settings,
-    save_win_settings,
 )
 
 logger = logging.getLogger(__name__)
@@ -136,41 +134,6 @@ def message_center_button() -> Callable[[], None]:
         refresh_badge()
         render_list()
 
-    def render_settings() -> None:
-        """中奖提醒全局设置（所有抽奖任务共用）：转发目标 + Server酱 SendKey。"""
-        settings = load_win_settings(state.workdir)
-        settings_container.clear()
-        with settings_container:
-            ui.label("中奖提醒设置").classes("text-sm font-semibold mt-2")
-            ui.label(
-                "抽奖引擎识别到中奖消息后的转发/推送目标，对所有抽奖任务生效，"
-                "修改后新启动的任务生效。me=收藏夹，或填 @用户名 / 群组 chat_id"
-                "（如 -100xxxxxxxxxx，各账号需已加入该群）。"
-            ).classes("text-xs text-gray-500")
-            target_input = ui.input(
-                label="中奖消息转发目标",
-                value=str(settings.get("win_forward_target") or "me"),
-                placeholder="me=收藏夹，或 @用户名 / chat_id",
-            ).classes("w-full")
-            sc_input = ui.input(
-                label="Server酱 SendKey（可选，微信推送中奖）",
-                value=str(settings.get("server_chan_send_key") or ""),
-                placeholder="留空=不推送微信",
-            ).classes("w-full")
-
-            def _save() -> None:
-                save_win_settings(
-                    state.workdir,
-                    {
-                        "win_forward_target": str(target_input.value or "me").strip(),
-                        "server_chan_send_key": str(sc_input.value or "").strip(),
-                    },
-                )
-                ui.notify("中奖提醒设置已保存", type="positive")
-
-            with ui.row().classes("w-full justify-end"):
-                ui.button("保存设置", on_click=_save).props("outline dense")
-
     def render_list() -> None:
         list_container.clear()
         messages = collect_messages(state.workdir)
@@ -216,13 +179,13 @@ def message_center_button() -> Callable[[], None]:
         ui.label("消息中心").classes("text-lg font-semibold")
         ui.label(
             "汇总抽奖中奖提醒、监控对象加入失败提醒与抽奖过程中未完成的发言任务"
-            "（口令发送失败，发送成功后自动消除），点击消息标记为已读；"
-            "底部为中奖提醒全局设置（转发目标/微信推送），对所有抽奖任务生效。"
+            "（口令发送失败，发送成功后自动消除），点击消息标记为已读。"
         ).classes("text-xs text-gray-500")
         with ui.row().classes("w-full justify-end"):
             ui.button("全部已读", on_click=mark_all_read).props("outline dense")
-        list_container = ui.column().classes("w-full gap-2 max-h-[50vh] overflow-y-auto")
-        settings_container = ui.column().classes("w-full gap-1 border-t pt-2")
+        list_container = ui.column().classes(
+            "w-full gap-2 max-h-[50vh] overflow-y-auto"
+        )
 
     def refresh_badge() -> None:
         messages = collect_messages(state.workdir)
@@ -232,7 +195,6 @@ def message_center_button() -> Callable[[], None]:
 
     def open_center() -> None:
         render_list()
-        render_settings()
         msg_dialog.open()
 
     msg_btn.on_click(open_center)

@@ -641,9 +641,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 reverse=True,
             )
             for group in ordered:
-                group.sort(
-                    key=lambda r: (-r["age_days"], str(r["account"]))
-                )
+                group.sort(key=lambda r: (-r["age_days"], str(r["account"])))
                 head = group[0]
                 group_keys = {r["key"] for r in group}
                 group_days = max(r["age_days"] for r in group)
@@ -661,22 +659,24 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
 
                 with ui.column().classes("w-full gap-1 p-2 rounded border"):
                     with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                        ui.checkbox(
-                            value=all_on, on_change=_toggle_group
-                        ).props("dense")
+                        ui.checkbox(value=all_on, on_change=_toggle_group).props(
+                            "dense"
+                        )
                         with ui.column().classes("gap-0 min-w-0"):
                             ui.label(str(head["title"])).classes(
                                 "text-sm font-semibold"
                             ).style("overflow-wrap: anywhere;")
                             ui.label(
                                 f"{head['type']}　{len(group)} 个账号"
-                                + ("" if len(group) == 1 else f"　最多 {group_days} 天未更新")
+                                + (
+                                    ""
+                                    if len(group) == 1
+                                    else f"　最多 {group_days} 天未更新"
+                                )
                             ).classes("text-xs text-gray-500")
                     for row in group:
                         key = row["key"]
-                        with ui.row().classes(
-                            "w-full items-center gap-2 no-wrap pl-6"
-                        ):
+                        with ui.row().classes("w-full items-center gap-2 no-wrap pl-6"):
                             ui.checkbox(
                                 value=key in st["selected"],
                                 on_change=lambda e, k=key, t=task_id: _detail_on_toggle(
@@ -740,7 +740,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                         '<div class="text-xs text-gray-700" '
                         f'data-runres="{html_lib.escape(str(row["id"] or ""), quote=True)}" '
                         'style="white-space: pre-line; overflow-wrap: anywhere;">'
-                        f'{html_lib.escape(str(row["result"] or ""))}</div>'
+                        f"{html_lib.escape(str(row['result'] or ''))}</div>"
                     )
                     with ui.row().classes("w-full mobile-card-actions"):
                         ui.button(

@@ -52,7 +52,5 @@ def test_click_confirm_without_source_keeps_old_behavior(monkeypatch):
     monkeypatch.setattr(engine, "_join_from_message", fake_join)
 
     client = type("C", (), {})()
-    asyncio.run(
-        engine._click_confirm("u1", client, "some_bot", start_reply, "")
-    )
+    asyncio.run(engine._click_confirm("u1", client, "some_bot", start_reply, ""))
     assert seen_messages == [start_reply]

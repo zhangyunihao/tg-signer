@@ -26,7 +26,6 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from tg_signer.core import get_client, safe_disconnect
-from tg_signer.notification.server_chan import sc_send
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +43,10 @@ DEFAULT_CONFIRM_KEYWORDS = (
     "签到",
 )
 DEFAULT_KEYWORDS = ("上海", "现金", "红包")
+# 「加入频道后重试参与」类按钮关键词：bot 明确提示「加入后需再点一次
+# 我已加入 重试参与」时，优先点该按钮而不是重发 start——少触发一轮
+# 防脚本验证、少消耗一条 start 消息（降低 FLOOD_WAIT 概率）
+JOIN_RETRY_BUTTON_KEYWORDS = ("我已加入", "重试参与")
 STATE_FILE = "giveaway_state.json"
 # 每个账号最多保留的去重记录数，超出丢弃最旧的
 MAX_STATE_PER_ACCOUNT = 1000
@@ -80,8 +83,11 @@ SEEN_CAP_PER_CHAT = 500  # 每频道保留的已处理消息 id 上限
 # 「💐💐💐 中奖提醒 💐💐💐」，正文有「恭喜您中奖了！」与「🔖 防伪编号：H…」；
 # 三个特征均只出现在中奖消息里，参与清单/抽奖说明类回复不会误命中）
 WIN_MESSAGE_RE = re.compile(r"中奖提醒|恭喜.{0,8}中奖|防伪编号")
-# 启动回扫/补漏轮每 bot 私聊回看的消息条数
+# 首次记录某 bot 时的回看消息条数（初始基线）；之后按水位线增量扫描，
+# 只处理比上次扫到的消息 id 更新的消息，该值不再参与日常回扫
 WIN_SWEEP_LIMIT = 50
+WIN_SWEEP_PAGE = 100  # 增量回扫单页拉取的消息条数
+WIN_SWEEP_PAGE_MAX = 20  # 增量回扫最多翻页数（防水位线异常时无限翻页）
 
 # —— 网络调用统一超时 ——
 # 半开连接（手机切换网络/代理僵死）下 Pyrogram 请求可能永久挂起，导致引擎
@@ -179,15 +185,26 @@ def parse_draw_date(text: str, now: Optional[datetime] = None) -> Optional[datet
     「开奖时间：2026-09-30 12:00」在后）：逐个提示词位置尝试解析，
     取第一个能解析出的日期；窗口内无法构成合法日期的数字
     （如奖品行「18.8」）跳过继续，不中断整体解析。
+
+    窗口向后取 80 字符（老猫福利榜帖「📅 开奖日期:(UTC+8)⏎2026年10月26日…」
+    的前缀「日期:(UTC+8)」+换行恰好吃掉 13 字符，旧版 +20 窗口把
+    「10月26日」截成「10月2」误判为已开奖）；窗口因长度上限被截断时，
+    贴边（起止顶到窗口边界）的匹配视为残缺日期跳过，不参与判定。
     """
     if not text or not _DRAW_HINT_RE.search(text):
         return None
     now = now or datetime.now()
     for hint in _DRAW_HINT_RE.finditer(text):
         start = max(0, hint.start() - 20)
-        end = min(len(text), hint.end() + 20)
+        end = min(len(text), hint.end() + 80)
+        # 窗口是否因 +80 上限被截断（截断时贴边匹配不可信）
+        truncated = end < len(text)
         window = text[start:end]
         for dm in _DATE_YMD_RE.finditer(window):
+            if truncated and (
+                dm.end() == len(window) or (dm.start() == 0 and start > 0)
+            ):
+                continue  # 贴窗口边界的日期可能被截断，宁可不判不误判
             year = int(dm.group("y")) if dm.group("y") else now.year
             try:
                 dt = datetime(year, int(dm.group("m")), int(dm.group("d")))
@@ -558,6 +575,50 @@ def reply_says_signup_success(message: Any) -> bool:
     return bool(SIGNUP_SUCCESS_RE.search(_message_text(message) or ""))
 
 
+# —— 防脚本验证（按顺序点击 emoji，如 @dbchoujiang123_bot）——
+# start 后 bot 回复「🤖 防脚本验证\n请按顺序点击：【🎯、🐻、🐴】\n
+# 点错会冷却 30 秒。」，需按正文给出的顺序依次点击该消息内联键盘上的
+# 对应 emoji 回调按钮；点错有冷却惩罚，解析不出顺序或缺按钮时不乱点。
+EMOJI_VERIFY_RE = re.compile(r"防脚本验证|按顺序点击")
+# 点击顺序写在【…】内
+EMOJI_ORDER_RE = re.compile(r"【([^】]+)】")
+# emoji 主体字符（符号区 + 补充符号区）与修饰符（变体选择符/ZWJ/肤色/键帽）
+_EMOJI_BASE_RE = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF]")
+_EMOJI_MOD_RE = re.compile(r"[\uFE0F\u200D\U0001F3FB-\U0001F3FF\u20E3]")
+
+
+def _extract_emoji_order(text: str) -> List[str]:
+    """从「请按顺序点击：【🎯、🐻、🐴】」提取需按序点击的 emoji 列表。
+
+    支持 、，, 空格等分隔，也支持无分隔连写；无【】括号返回空列表。
+    """
+    if not text:
+        return []
+    m = EMOJI_ORDER_RE.search(text)
+    if not m:
+        return []
+    order: List[str] = []
+    for part in re.split(r"[、，,\s|·•/]+", m.group(1)):
+        cur = ""
+        for ch in part:
+            if _EMOJI_BASE_RE.match(ch):
+                # ZWJ 连接的复合 emoji（当前 token 以 ZWJ 结尾）并入 token
+                if cur and not cur.endswith("\u200d"):
+                    order.append(cur)
+                    cur = ""
+                cur += ch
+            elif cur and _EMOJI_MOD_RE.match(ch):
+                cur += ch
+        if cur:
+            order.append(cur)
+    return order
+
+
+def is_emoji_verify_message(message: Any) -> bool:
+    """bot 回复是否为「防脚本验证」（要求按顺序点击 emoji 按钮）。"""
+    return bool(EMOJI_VERIFY_RE.search(_message_text(message) or ""))
+
+
 # —— LotteryBestBot 式回复解析 ——
 # start 后不满足条件时 bot 回复「您需加入指定的群组/频道」，逐行列出
 # 「🎫 加入-名称 ❌/✅」，名称是带 TEXT_URL 隐藏链接的文本。只提取
@@ -671,11 +732,15 @@ def extract_channel_targets(message: Any) -> List[str]:
 
 
 class GiveawayState:
-    """按账号持久化已参与记录：{accounts: {account: {"bot|param": record}}}"""
+    """按账号持久化已参与记录：{accounts: {account: {"bot|param": record}}}。
+
+    另持久化中奖回扫水位线 {win_watermarks: {account: {bot_lower: msg_id}}}。
+    """
 
     def __init__(self, workdir) -> None:
         self.path = Path(workdir) / STATE_FILE
         self._data: Dict[str, Dict[str, dict]] = {}
+        self._win_wm: Dict[str, Dict[str, int]] = {}
         self._dirty = False
         self.load()
 
@@ -689,16 +754,65 @@ class GiveawayState:
                 self._data = {
                     str(k): dict(v) for k, v in accounts.items() if isinstance(v, dict)
                 }
+            wm = data.get("win_watermarks")
+            if isinstance(wm, dict):
+                parsed: Dict[str, Dict[str, int]] = {}
+                for acc, sub in wm.items():
+                    if not isinstance(sub, dict):
+                        continue
+                    bot_map: Dict[str, int] = {}
+                    for bot, mid in sub.items():
+                        try:
+                            bot_map[str(bot)] = int(mid)
+                        except (TypeError, ValueError):
+                            continue
+                    if bot_map:
+                        parsed[str(acc)] = bot_map
+                self._win_wm = parsed
         except (OSError, json.JSONDecodeError):
             self._data = {}
+            self._win_wm = {}
+
+    def _merge_from_disk(self) -> None:
+        """落盘前重读磁盘并合并，防止并发覆盖（多任务并发运行时各自持有
+        独立的 GiveawayState 实例，save 整文件写入会让旧快照冲掉他处
+        新写入的参与/去重记录）：
+
+        - 本地没有的账号/键 → 从磁盘补进来
+        - 同键都存在 → 保留 ts 较新的一条
+        """
+        if not self.path.is_file():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        accounts = data.get("accounts")
+        if not isinstance(accounts, dict):
+            return
+        for account, bucket in accounts.items():
+            if not isinstance(bucket, dict):
+                continue
+            local = self._data.setdefault(str(account), {})
+            for key, rec in bucket.items():
+                if not isinstance(rec, dict):
+                    continue
+                cur = local.get(key)
+                if cur is None or str(rec.get("ts") or "") > str(cur.get("ts") or ""):
+                    local[key] = rec
 
     def save(self, force: bool = False) -> None:
         if not self._dirty and not force:
             return
+        self._merge_from_disk()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(
-            json.dumps({"accounts": self._data}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {"accounts": self._data, "win_watermarks": self._win_wm},
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
         tmp.replace(self.path)
@@ -764,10 +878,21 @@ class GiveawayState:
         return sum(len(v) for v in self._data.values())
 
     def clear(self) -> int:
-        """清空所有账号的已参与记录并立即落盘，返回清除的记录条数"""
+        """清空所有账号的已参与记录（含中奖消息去重与回扫水位线）并立即落盘。
+
+        返回清除的参与记录条数。win: 去重记录存于 _data 一并清除；
+        回扫水位线（每账号 × bot 扫到的位置）同步重置，下轮回扫从
+        新基线（回扫条数）重建。
+        """
         total = self.count()
         self._data = {}
+        self._win_wm = {}
         self._dirty = True
+        # save 会从磁盘合并回来，先删文件确保清空真正生效
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
         self.save(force=True)
         return total
 
@@ -788,8 +913,23 @@ class GiveawayState:
                 latest[lower] = (ts, bot)
         return [
             bot
-            for _, bot in sorted(latest.values(), key=lambda pair: pair[0], reverse=True)
+            for _, bot in sorted(
+                latest.values(), key=lambda pair: pair[0], reverse=True
+            )
         ]
+
+    def win_watermark(self, account: str, bot: str) -> Optional[int]:
+        """该账号 × bot 上次中奖回扫扫到的消息 id，从未扫过返回 None。"""
+        return self._win_wm.get(account, {}).get(bot.lower())
+
+    def set_win_watermark(self, account: str, bot: str, msg_id: int) -> None:
+        """推进中奖回扫水位线到 msg_id（仅前进不后退）。"""
+        bot_map = self._win_wm.setdefault(account, {})
+        old = bot_map.get(bot.lower())
+        if old is not None and int(msg_id) <= old:
+            return
+        bot_map[bot.lower()] = int(msg_id)
+        self._dirty = True
 
 
 class GiveawayEngine:
@@ -810,6 +950,9 @@ class GiveawayEngine:
         self._join_cache: set = set()
         # 已发送过口令的群组：{account|bot|群名_lower}，重复参与不重复发言
         self._password_sent: set = set()
+        # 已处理过点击的防脚本验证消息：{account|bot|msg_id}，进程内去重
+        # （重发 start 后旧验证消息仍在候选里，避免误点过期验证按钮）
+        self._emoji_verify_handled: set = set()
         # 自动加入频道的限流暂停（JoinChannel FLOOD_WAIT 后暂停一段时间再恢复）
         self._join_suspended_until: Optional[datetime] = None
         self._join_suspend_logged = False
@@ -836,8 +979,9 @@ class GiveawayEngine:
         self.ignore_history = False
         # 中奖识别：bot 私聊消息命中关键词时转发提醒（默认开启，转发到收藏夹）
         self.win_detect = True
-        self.win_forward_target: str = "me"
-        self.server_chan_send_key: Optional[str] = None
+        self.win_forward_targets: List[Any] = ["me"]
+        # 中奖回扫条数：每次回扫各 bot 私聊最近多少条消息找中奖通知
+        self.win_sweep_limit = WIN_SWEEP_LIMIT
         # 已处理的中奖消息：{account|bot|msg_id}，进程内去重（跨重启靠状态文件）
         self._win_handled: set = set()
         # 标记为「双向」的账户集合：发言数要求类抽奖自动跳过
@@ -902,8 +1046,8 @@ class GiveawayEngine:
         confirm_keywords: Optional[Iterable[str]] = None,
         ignore_history: bool = False,
         win_detect: bool = True,
-        win_forward_target: str = "me",
-        server_chan_send_key: Optional[str] = None,
+        win_forward_target=None,
+        win_sweep_limit: Optional[int] = None,
         two_way_accounts: Optional[Iterable[str]] = None,
         chat_usernames: Optional[Dict[str, str]] = None,
         state: Optional[GiveawayState] = None,
@@ -923,12 +1067,28 @@ class GiveawayEngine:
         self.auto_join = bool(auto_join)
         # 忽略历史成功记录：开启后已参与过的抽奖链接允许重新参与
         self.ignore_history = bool(ignore_history)
-        # 中奖识别配置：转发目标 "me" = 收藏夹（Saved Messages）
+        # 中奖识别配置：转发目标列表，"me" = 收藏夹（Saved Messages），
+        # 兼容旧的单目标字符串配置
         self.win_detect = bool(win_detect)
-        target = str(win_forward_target or "me").strip() or "me"
-        self.win_forward_target = target
-        self.server_chan_send_key = (
-            str(server_chan_send_key).strip() if server_chan_send_key else None
+        raw_targets = win_forward_target or "me"
+        if isinstance(raw_targets, str):
+            raw_targets = [raw_targets]
+        targets = []
+        for item in raw_targets:
+            # 数字目标（如 -100xxx 频道 id）必须保留为 int：字符串形式的
+            # 数字会被 Telethon 当作手机号 resolve 而报 PHONE_NOT_OCCUPIED
+            if isinstance(item, int):
+                target: Any = item
+            else:
+                target = str(item).strip()
+                if target and re.fullmatch(r"-?\d+", target):
+                    target = int(target)
+            if target and target not in targets:
+                targets.append(target)
+        self.win_forward_targets = targets or ["me"]
+        # 中奖回扫条数：0/None/非法值回退默认
+        self.win_sweep_limit = (
+            max(1, int(win_sweep_limit)) if win_sweep_limit else WIN_SWEEP_LIMIT
         )
         self._win_handled.clear()
         # 双向账户集合：发言数要求类抽奖自动跳过
@@ -1063,6 +1223,14 @@ class GiveawayEngine:
                 )
             if auto_scan and not self._stop.is_set():
                 await self.scan_now()
+                # 首扫后新增参与的 bot 需建回扫基线（清除记录后启动回扫无目标）
+                if not self._stop.is_set():
+                    await asyncio.gather(
+                        *[
+                            self._sweep_bot_wins(account, client)
+                            for account, client in list(self._clients.items())
+                        ]
+                    )
             if self.rescue_interval > 0:
                 await self._rescue_loop()
             elif not self._stop.is_set():
@@ -1231,13 +1399,132 @@ class GiveawayEngine:
             if self._stop is not None and self._stop.is_set():
                 break
             if not self._mark_seen(account, str(chat), getattr(msg, "id", None)):
+                self.log(
+                    f"[{account}] 置顶消息 {getattr(msg, 'id', '?')} 本轮已处理过，跳过"
+                )
                 continue  # 本轮会话中已处理过
             try:
                 await self._process_message(
-                    account, client, msg, skip_keywords=True
-                )  # 仅群组走此路径：置顶不受关键词过滤
+                    account,
+                    client,
+                    msg,
+                    skip_keywords=True,
+                    log_skips=True,
+                )  # 仅群组走此路径：置顶不受关键词过滤，且逐条打印跳过原因
             except Exception as exc:
                 self.log(f"[{account}] 处理 {chat} 置顶消息失败: {exc}")
+
+    async def _participate_via_source_button(
+        self, account: str, client: Any, message: Any
+    ) -> None:
+        """群组置顶的「按钮型」抽奖：帖上「参与抽奖」按钮就在群聊消息里，
+        直接点击源帖按钮完成参与（无需向任何 bot 发 start）。
+
+        callback 按钮发送 callback 并读取弹窗文案（终态弹窗＝抽奖已结束）；
+        URL 按钮若解析为 bot start 深度链接（非黑名单 bot）则走常规
+        _participate 流程。以 source_btn|chat|msg_id 持久化去重，
+        避免每轮扫描重复点击同一帖。
+        """
+        if self._stop is not None and self._stop.is_set():
+            return
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+        msg_id = getattr(message, "id", None)
+        if chat_id is None or msg_id is None:
+            return
+        state_key = f"{chat_id}|{msg_id}"
+        if self._state is not None and (
+            self._state.has(account, "source_btn", state_key)
+            or self._state.is_ended(account, "source_btn", state_key)
+        ):
+            return
+        if self.max_joins is not None and self.joined >= self.max_joins:
+            return
+        btn = self._find_confirm_button(message)
+        if btn is None:
+            return
+        channel = self._chat_title(message)
+        title = _giveaway_title(message)
+        # URL 按钮：解析为 bot start 链接则等同普通链接参与
+        url = str(getattr(btn, "url", "") or "").strip()
+        if url and not getattr(btn, "callback_data", None):
+            link = parse_bot_start_link(url)
+            if link is not None and link[0].lower() not in BLOCKED_BOTS:
+                await self._participate(
+                    account,
+                    client,
+                    link[0],
+                    link[1],
+                    channel,
+                    title,
+                    source_message=message,
+                )
+            return
+        # 模拟人工点击节奏，避免连点触发风控
+        lo, hi = self.delay_range
+        if hi > 0:
+            await asyncio.sleep(random.uniform(lo, max(lo, hi)))
+        if self._stop is not None and self._stop.is_set():
+            return
+        # 同步预留参与名额（与 _participate 同口径），失败时归还
+        reserved = False
+        if self.max_joins is not None:
+            self.joined += 1
+            reserved = True
+        try:
+            answer = await client.request_callback_answer(
+                chat_id=chat_id,
+                message_id=msg_id,
+                callback_data=btn.callback_data,
+            )
+        except Exception as exc:
+            if reserved:
+                self.joined -= 1
+            self.failed += 1
+            self.log(f"[{account}] 点击置顶抽奖帖「{btn.text}」按钮失败: {exc}")
+            return
+        popup = str(getattr(answer, "text", "") or "").strip()
+        if popup and _POPUP_ENDED_RE.search(popup):
+            if reserved:
+                self.joined -= 1
+            if self._state is not None:
+                self._state.add(
+                    account, "source_btn", state_key, channel=channel, note="ended"
+                )
+                self._state.save()
+            self.log(
+                f"[{account}] 置顶抽奖帖「{btn.text}」弹窗提示「{popup[:40]}」，"
+                "抽奖已结束，跳过"
+            )
+            return
+        if self._state is not None:
+            self._state.add(
+                account,
+                "source_btn",
+                state_key,
+                channel=channel,
+                note="btn_joined",
+            )
+            self._state.save()
+        if not reserved:  # 已设上限时名额在预留时计入
+            self.joined += 1
+        self.joined_by_account[account] = self.joined_by_account.get(account, 0) + 1
+        chat_counts = self.joined_by_account_chat.setdefault(account, {})
+        chat_key = channel or "未知频道"
+        chat_counts[chat_key] = chat_counts.get(chat_key, 0) + 1
+        popup_part = f"，弹窗：{popup[:40]}" if popup else ""
+        self.log(
+            f"{datetime.now():%H:%M:%S} [已参与] {account} -> 置顶抽奖帖"
+            f"「{btn.text}」按钮（来自 {channel or '未知频道'}{popup_part}）"
+        )
+        self._emit(
+            {
+                "account": account,
+                "bot": "source_button",
+                "channel": channel,
+                "title": title,
+                "ok": True,
+            }
+        )
 
     def _mark_seen(self, account: str, chat_key: str, message_id: int) -> bool:
         """记录消息已处理（水位线）。返回 False 表示此前已见过，补漏时应跳过。"""
@@ -1388,7 +1675,9 @@ class GiveawayEngine:
         if not text or not WIN_MESSAGE_RE.search(text):
             return
         mid = getattr(message, "id", None)
-        dedup_key = f"{account}|{bot_username.lower()}|{mid if mid is not None else hash(text)}"
+        dedup_key = (
+            f"{account}|{bot_username.lower()}|{mid if mid is not None else hash(text)}"
+        )
         if dedup_key in self._win_handled:
             return
         if (
@@ -1406,22 +1695,26 @@ class GiveawayEngine:
         if len(summary) > 80:
             summary = summary[:80] + "…"
         self.log(f"[{account}] 检测到中奖消息（@{bot_username}）：{summary}")
-        # 转发原消息到转发目标（默认收藏夹），失败不阻断后续提醒
+        # 转发原消息到各转发目标（默认收藏夹），单个失败不阻断其余目标与提醒
         chat_id = getattr(getattr(message, "chat", None), "id", None) or bot_username
         if mid is not None:
-            try:
-                await client.forward_messages(
-                    chat_id=self.win_forward_target,
-                    from_chat_id=chat_id,
-                    message_ids=[mid],
-                )
-                self.log(
-                    f"[{account}] 中奖消息已转发到 "
-                    f"{'收藏夹' if self.win_forward_target == 'me' else self.win_forward_target}"
-                )
-            except Exception as exc:
-                self.log(f"[{account}] 中奖消息转发失败: {exc}")
-                logger.debug("中奖消息转发失败", exc_info=True)
+            for target in self.win_forward_targets:
+                try:
+                    await client.forward_messages(
+                        chat_id=target,
+                        from_chat_id=chat_id,
+                        message_ids=[mid],
+                    )
+                    self.log(
+                        f"[{account}] 中奖消息已转发到 "
+                        f"{'收藏夹' if target == 'me' else target}"
+                    )
+                except Exception as exc:
+                    self.log(
+                        f"[{account}] 中奖消息转发到 "
+                        f"{'收藏夹' if target == 'me' else target} 失败: {exc}"
+                    )
+                    logger.debug("中奖消息转发失败", exc_info=True)
         self._emit(
             {
                 "type": "win",
@@ -1430,47 +1723,101 @@ class GiveawayEngine:
                 "text": text[:300],
             }
         )
-        self._push_win_server_chan(account, bot_username, text)
-
-    def _push_win_server_chan(self, account: str, bot_username: str, text: str) -> None:
-        """中奖消息可选 Server酱微信推送（未配置 SendKey 时静默跳过）。"""
-        if not self.server_chan_send_key:
-            return
-
-        async def _push() -> None:
-            try:
-                await sc_send(
-                    self.server_chan_send_key,
-                    "中奖提醒",
-                    f"账号 {account}（@{bot_username}）\n\n{text[:600]}",
-                )
-                self.log(f"[{account}] 中奖消息已通过 Server酱推送")
-            except Exception:
-                logger.debug("中奖消息 Server酱推送失败", exc_info=True)
-                self.log(f"[{account}] 中奖消息 Server酱推送失败（详见调试日志）")
-
-        try:
-            asyncio.create_task(_push())
-        except RuntimeError:
-            logger.debug("创建 Server酱推送任务失败（无事件循环）", exc_info=True)
 
     async def _sweep_bot_wins(self, account: str, client: Any) -> None:
-        """回扫该账号全部已知 bot 的私聊最近消息，补捡停机期间的中奖通知。
+        """增量回扫该账号全部已知 bot 的私聊消息，补捡错过的中奖通知。
 
         在任务启动时与每个补漏轮执行：开奖常在参与后数日，中奖私信到达时
-        任务可能早已结束，靠回扫兜底。bot 从未开过会话/已失效等拉取失败
-        静默跳过（调试日志），不影响其他 bot。
+        任务可能早已结束，靠回扫兜底。每账号 × bot 持久化水位线（上次扫到
+        的消息 id），本轮只处理比水位线新的消息并推进水位线；首次见到某
+        bot（无水位线）时才用回扫条数 win_sweep_limit 做初始基线。回扫条
+        数同时作为每轮扫描量下限：水位线后新消息不足下限时继续向更旧消息
+        补扫（已处理过的中奖消息靠状态去重）。bot 从未开过会话/已失效等
+        拉取失败静默跳过（调试日志），不影响其他 bot。
         """
         if not self.win_detect or self._state is None:
             return
-        for bot in self._state.bots_for(account):
+        bots = self._state.bots_for(account)
+        if not bots:
+            # 清除参与记录后 bot 列表为空，等账号重新参与后重建回扫目标
+            self.log(f"[{account}] 回扫：暂无 bot 记录（等待账号参与后重建）")
+            return
+        for bot in bots:
             if self._stop is not None and self._stop.is_set():
                 return
+            watermark = self._state.win_watermark(account, bot)
             try:
-                async for message in client.get_chat_history(bot, limit=WIN_SWEEP_LIMIT):
+                if watermark is None:
+                    # 首次见到该 bot：按回扫条数建初始基线
+                    batch: List[Any] = []
+                    async for message in client.get_chat_history(
+                        bot, limit=self.win_sweep_limit
+                    ):
+                        batch.append(message)
+                else:
+                    batch = await self._fetch_newer_bot_messages(
+                        client, bot, watermark, min_count=self.win_sweep_limit
+                    )
+                # batch 从新到旧，按时间正序处理
+                for message in reversed(batch):
                     await self._check_win_message(account, client, bot, message)
+                # 回扫本身静默，记一行结果便于确认扫描在按配置执行
+                new_n = (
+                    len(batch)
+                    if watermark is None
+                    else sum(1 for m in batch if (getattr(m, "id", 0) or 0) > watermark)
+                )
+                self.log(
+                    f"[{account}] 回扫 @{bot} 私聊：扫描 {len(batch)} 条"
+                    + (
+                        f"（新 {new_n} 条）"
+                        if watermark is not None
+                        else "（首次建基线）"
+                    )
+                )
+                newest = getattr(batch[0], "id", None) if batch else None
+                if newest is not None:
+                    self._state.set_win_watermark(account, bot, newest)
+                    # 立即落盘：处理中奖消息时会顺带 save 旧水位线
+                    self._state.save()
             except Exception:
                 logger.debug(f"回扫 @{bot} 私聊中奖消息失败", exc_info=True)
+
+    async def _fetch_newer_bot_messages(
+        self, client: Any, bot: str, watermark: int, min_count: int = 0
+    ) -> List[Any]:
+        """拉取 bot 私聊中比水位线新的消息（返回结果从新到旧）。
+
+        get_chat_history 只能从新到旧翻页：逐页向后翻，遇到不新于水位线
+        的消息且累计扫描量已达 min_count 时停。min_count 为本轮扫描量
+        下限（即回扫条数 win_sweep_limit）：水位线后新消息不足下限时
+        越过水位线继续向更旧消息补扫，旧消息靠状态去重不会重复提醒；
+        最多翻 WIN_SWEEP_PAGE_MAX 页兜底（防水位线异常时无限翻页）。
+        """
+        batch: List[Any] = []
+        offset_id = 0
+        reached = False
+        for _ in range(WIN_SWEEP_PAGE_MAX):
+            page: List[Any] = []
+            async for message in client.get_chat_history(
+                bot, offset_id=offset_id, limit=WIN_SWEEP_PAGE
+            ):
+                page.append(message)
+            if not page:
+                break
+            for message in page:
+                mid = getattr(message, "id", None)
+                if not reached and mid is not None and mid <= watermark:
+                    reached = True
+                    if len(batch) >= min_count:
+                        break
+                batch.append(message)
+            if reached and len(batch) >= min_count:
+                break
+            offset_id = getattr(page[-1], "id", 0) or 0
+            if offset_id <= 0:
+                break
+        return batch
 
     async def _resolve_join_target_type(
         self, client: Any, target: str
@@ -1495,35 +1842,71 @@ class GiveawayEngine:
         return str(getattr(chat, "title", "") or getattr(chat, "id", "") or "")
 
     async def _process_message(
-        self, account: str, client: Any, message: Any, skip_keywords: bool = False
+        self,
+        account: str,
+        client: Any,
+        message: Any,
+        skip_keywords: bool = False,
+        log_skips: bool = False,
     ) -> Optional[str]:
         """处理单条消息。返回 "joined"（本次有参与）/"expired"（已开奖跳过）/None。
 
         skip_keywords=True 时跳过关键词过滤（用于群组置顶消息：不受关键词影响）。
+        log_skips=True 时逐条打印跳过原因（用于置顶消息排查，历史扫描仍静默）；
+        例外：已开奖跳过始终记录诊断日志（带解析出的开奖时间），用于排查
+        「连续已开奖止损」是否漏扫未开奖旧帖。
         """
         if self._stop is not None and self._stop.is_set():
             return None
+        text = " ".join((_message_text(message) or "").split())
+        mid = getattr(message, "id", None)
+        # 置顶路径标「置顶消息」，历史扫描标「消息」，便于区分日志来源
+        tag = (
+            ("置顶消息 " if skip_keywords else "消息 ")
+            + (str(mid) if mid is not None else "?")
+            + (
+                f"「{text[:30]}…」"
+                if len(text) > 30
+                else (f"「{text}」" if text else "")
+            )
+        )
         links = extract_bot_links(message)
         # 黑名单 bot 的链接不作为抽奖链接（整条消息无可用链接时直接跳过）
         links = [ln for ln in links if ln[0].lower() not in BLOCKED_BOTS]
         if not links:
+            if log_skips:
+                self.log(f"[{account}] {tag} 无可用抽奖 bot 链接，跳过")
+            if skip_keywords:
+                # 群组置顶的「按钮型」抽奖：帖内无可 start 的 bot 链接
+                # （或仅剩黑名单推广链接），但帖上带「参与抽奖」按钮，
+                # 直接点击源帖按钮完成参与
+                await self._participate_via_source_button(account, client, message)
             return None
         if not skip_keywords and not message_matches_keywords(message, self.keywords):
             # 消息含 bot 链接但关键词未命中：静默跳过（日志逐条刷屏，不再打印）
             return None
         # 归属地限制过滤：仅参与无地区限制或含白名单地区的抽奖（对群组置顶同样生效）
         if not message_region_allowed(message):
+            if log_skips:
+                self.log(f"[{account}] {tag} 含地区限制，跳过")
             return None
         # 发言数要求/口令要求 + 双向账户：无法达标，自动跳过（对群组置顶同样生效）
         if account in self.two_way_accounts and (
             message_requires_speech(message) or message_requires_password(message)
         ):
+            if log_skips:
+                self.log(f"[{account}] {tag} 需发言数/口令，双向账户无法达标，跳过")
             return None
         channel = self._chat_title(message)
         title = _giveaway_title(message)
-        # 开奖日期早于当前时间：自动跳过（静默，不打印逐条日志）
+        # 开奖日期早于当前时间：自动跳过（始终带诊断日志，见下方注释）
         draw_dt = parse_draw_date(_message_text(message))
         if draw_dt is not None and draw_dt < datetime.now():
+            # 已开奖跳过始终记录（不收 log_skips 门控）：排查止损漏扫问题
+            self.log(
+                f"[{account}] {tag} 开奖时间已过"
+                f"（{draw_dt.strftime('%Y-%m-%d %H:%M')}），跳过"
+            )
             return "expired"
         # 参与条数上限（None = 不限），达到后本轮不再参与
         if self.max_joins is not None and self.joined >= self.max_joins:
@@ -1563,6 +1946,11 @@ class GiveawayEngine:
                 continue  # 已结束回复熔断的 bot，静默跳过
             actionable.append((username, param))
         if not actionable:
+            if log_skips:
+                self.log(
+                    f"[{account}] {tag} 命中 {len(links)} 个链接但均不可参与"
+                    "（已参与过/已结束/限流熔断），跳过"
+                )
             return "joined" if participated else None
         # 命中多少个抽奖入口一目了然
         self.log(
@@ -1744,9 +2132,7 @@ class GiveawayEngine:
             self._state.save()
         if not reserved:  # 已设上限时名额在预留时计入
             self.joined += 1
-        self.joined_by_account[account] = (
-            self.joined_by_account.get(account, 0) + 1
-        )
+        self.joined_by_account[account] = self.joined_by_account.get(account, 0) + 1
         chat_counts = self.joined_by_account_chat.setdefault(account, {})
         chat_key = channel or "未知频道"
         chat_counts[chat_key] = chat_counts.get(chat_key, 0) + 1
@@ -2135,6 +2521,142 @@ class GiveawayEngine:
             }
         )
 
+    async def _append_recent_bot_messages(
+        self, account: str, client: Any, username: str, candidates: List[Any]
+    ) -> None:
+        """拉取 bot 最新 4 条消息并入候选尾部（失败仅 debug 日志）。"""
+        try:
+            async for recent in client.get_chat_history(username, limit=4):
+                candidates.append(recent)
+                await self._check_win_message(account, client, username, recent)
+        except Exception:
+            logger.debug("拉取 bot 最新消息失败", exc_info=True)
+
+    async def _handle_emoji_verification(
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        messages: List[Any],
+    ) -> bool:
+        """处理 bot 的「防脚本验证」（按正文顺序点击 emoji 回调按钮）。
+
+        返回是否命中验证消息。按候选中最新一条验证消息的按钮顺序点击；
+        解析不出顺序或缺按钮时不乱点（点错有冷却惩罚），只记日志。
+        同一条验证消息进程内只点击一次，防止重发 start 后误点旧验证。
+        """
+        verify_msgs = [m for m in messages if is_emoji_verify_message(m)]
+        if not verify_msgs:
+            return False
+        # 防脚本验证响应的是本次 start：取候选里最新一条，避免点到旧验证
+        message = max(verify_msgs, key=lambda m: getattr(m, "id", 0) or 0)
+        msg_key = f"{account}|{username}|{getattr(message, 'id', 0)}"
+        if msg_key in self._emoji_verify_handled:
+            return True
+        self._emoji_verify_handled.add(msg_key)
+        order = _extract_emoji_order(_message_text(message) or "")
+        if not order:
+            self.log(f"[{account}] @{username} 防脚本验证：未能解析点击顺序，跳过")
+            return True
+        all_btns: List[Any] = []
+        markup = getattr(message, "reply_markup", None)
+        for row in getattr(markup, "inline_keyboard", None) or []:
+            all_btns.extend(row or [])
+        targets: List[Tuple[str, Any]] = []
+        for emoji in order:
+            match = next(
+                (
+                    btn
+                    for btn in all_btns
+                    if emoji in str(getattr(btn, "text", "") or "")
+                    and getattr(btn, "callback_data", None)
+                ),
+                None,
+            )
+            if match is None:
+                self.log(
+                    f"[{account}] @{username} 防脚本验证：键盘上没有「{emoji}」按钮，"
+                    "不乱点（点错会冷却），跳过"
+                )
+                return True
+            targets.append((emoji, match))
+        self.log(f"[{account}] @{username} 防脚本验证：按顺序点击 {' → '.join(order)}")
+        for emoji, btn in targets:
+            if self._stop is not None and self._stop.is_set():
+                return True
+            try:
+                await client.request_callback_answer(
+                    chat_id=username,
+                    message_id=getattr(message, "id", None),
+                    callback_data=btn.callback_data,
+                )
+            except Exception as exc:
+                self.log(f"[{account}] @{username} 点击验证按钮「{emoji}」失败: {exc}")
+                return True
+            # 模拟人工点击节奏，避免过快触发风控
+            await asyncio.sleep(random.uniform(0.8, 1.6))
+        return True
+
+    async def _click_join_retry_button(
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        candidates: List[Any],
+    ) -> bool:
+        """优先点击「我已加入/重试参与」按钮完成重试参与。
+
+        部分抽奖 bot（如 @dbchoujiang123_bot）在要求加入频道后提示
+        「需要再点一次 我已加入 重试参与」：这是 bot 设计的重试入口，
+        点击比重发 start 少触发一轮防脚本验证。取候选中最新一条带该
+        按钮的消息点击（callback 按钮），点击后刷新候选并核对回复。
+
+        返回是否已点击（True＝无需再重发 start；点击失败返回 False，
+        由调用方兜底重发 start）。
+        """
+        for message in reversed(candidates):
+            markup = getattr(message, "reply_markup", None)
+            for row in getattr(markup, "inline_keyboard", None) or []:
+                for btn in row or []:
+                    text = str(getattr(btn, "text", "") or "")
+                    if not any(kw in text for kw in JOIN_RETRY_BUTTON_KEYWORDS):
+                        continue
+                    if not getattr(btn, "callback_data", None):
+                        continue
+                    try:
+                        answer = await client.request_callback_answer(
+                            chat_id=username,
+                            message_id=getattr(message, "id", None),
+                            callback_data=btn.callback_data,
+                        )
+                        # 弹窗提示终态（抽奖已结束）＝不再跟进
+                        popup = str(getattr(answer, "text", "") or "").strip()
+                        if popup and _POPUP_ENDED_RE.search(popup):
+                            self._note_ended(account, username)
+                            self.log(
+                                f"[{account}] @{username} 弹窗提示「{popup[:40]}」，"
+                                "抽奖已结束，跳过后续跟进"
+                            )
+                            return True
+                        self.log(
+                            f"[{account}] 已点击 @{username} 的重试按钮「{text}」"
+                            "（我已加入，重试参与）"
+                        )
+                        await asyncio.sleep(2)
+                        await self._append_recent_bot_messages(
+                            account, client, username, candidates
+                        )
+                        await self._verify_after_click(
+                            account, client, username, candidates
+                        )
+                        return True
+                    except Exception as exc:
+                        self.log(
+                            f"点击 @{username} 重试按钮失败，改用重发 start: {exc}"
+                        )
+                        return False
+        return False
+
     async def _click_confirm(
         self,
         account: str,
@@ -2166,9 +2688,7 @@ class GiveawayEngine:
                 try:
                     async for recent in client.get_chat_history(username, limit=4):
                         fresh.append(recent)
-                        await self._check_win_message(
-                            account, client, username, recent
-                        )
+                        await self._check_win_message(account, client, username, recent)
                 except Exception:
                     logger.debug("轮询拉取 bot 最新消息失败", exc_info=True)
                 candidates.extend(fresh)
@@ -2180,6 +2700,16 @@ class GiveawayEngine:
                     return
                 if any(self._find_confirm_button(m) is not None for m in candidates):
                     break
+                # 防脚本验证消息没有确认按钮：提前结束轮询交给验证处理
+                if any(is_emoji_verify_message(m) for m in candidates):
+                    break
+        # 「防脚本验证」（如 @dbchoujiang123_bot）：按正文顺序点击 emoji 按钮
+        # 完成人机校验，再刷新候选，让后续加入/确认流程看到验证后的消息
+        if await self._handle_emoji_verification(account, client, username, candidates):
+            await asyncio.sleep(2)
+            await self._append_recent_bot_messages(
+                account, client, username, candidates
+            )
         if self.auto_join:
             did_join = False
             had_join_targets = False
@@ -2204,9 +2734,7 @@ class GiveawayEngine:
                 try:
                     async for recent in client.get_chat_history(username, limit=4):
                         candidates.append(recent)
-                        await self._check_win_message(
-                            account, client, username, recent
-                        )
+                        await self._check_win_message(account, client, username, recent)
                 except Exception:
                     logger.debug("加入频道后拉取 bot 最新消息失败", exc_info=True)
             # 帖内口令任务：加入完成后按 bot 清单定位口令群组并发送口令，
@@ -2215,9 +2743,15 @@ class GiveawayEngine:
                 account, client, username, source_message, candidates
             )
             # 通用策略：多数抽奖 bot 要求「先加入频道再点一次抽奖」——
-            # bot 消息里出现过加入要求时，加入校验完成后重发一次 start
-            # 完成参与（此前可能已全部加入过，不必本次有新加入）
+            # bot 消息里出现过加入要求时，加入校验完成后优先点
+            # 「我已加入/重试参与」按钮完成重试（bot 设计的重试入口）；
+            # 没有该按钮时兜底重发一次 start 完成参与（此前可能已全部
+            # 加入过，不必本次有新加入）
             if had_join_targets:
+                if await self._click_join_retry_button(
+                    account, client, username, candidates
+                ):
+                    return
                 self.log(
                     f"[{account}] @{username} 要求加入频道后重新参与，再次发送 start"
                 )
@@ -2230,12 +2764,24 @@ class GiveawayEngine:
                             f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进"
                         )
                         return
+                    # 重发 start 后：新回复与最新历史优先；重发前的消息保留在
+                    # 候选末尾兜底——部分 bot（如百宝箱抽奖「全部关注后请点击
+                    # 重新参与抽奖」）对重复 start 不再回复带按钮的新消息，
+                    # 只有原消息上的「重新参与抽奖」按钮可点
+                    pre_restart = candidates
                     candidates = [restart_msg] if restart_msg is not None else []
                     await asyncio.sleep(2)
                     async for recent in client.get_chat_history(username, limit=4):
                         candidates.append(recent)
-                        await self._check_win_message(
-                            account, client, username, recent
+                        await self._check_win_message(account, client, username, recent)
+                    candidates.extend(pre_restart)
+                    # 重发 start 可能再次触发防脚本验证：完成后刷新候选
+                    if await self._handle_emoji_verification(
+                        account, client, username, candidates
+                    ):
+                        await asyncio.sleep(2)
+                        await self._append_recent_bot_messages(
+                            account, client, username, candidates
                         )
                 except Exception as exc:
                     self.log(f"重新参与 @{username} 失败: {exc}")
@@ -2250,12 +2796,20 @@ class GiveawayEngine:
                             f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进"
                         )
                         return
+                    pre_restart = candidates
                     candidates = [restart_msg] if restart_msg is not None else []
                     await asyncio.sleep(2)
                     async for recent in client.get_chat_history(username, limit=4):
                         candidates.append(recent)
-                        await self._check_win_message(
-                            account, client, username, recent
+                        await self._check_win_message(account, client, username, recent)
+                    candidates.extend(pre_restart)
+                    # 重发 start 可能再次触发防脚本验证：完成后刷新候选
+                    if await self._handle_emoji_verification(
+                        account, client, username, candidates
+                    ):
+                        await asyncio.sleep(2)
+                        await self._append_recent_bot_messages(
+                            account, client, username, candidates
                         )
                 except Exception as exc:
                     self.log(f"重新参与 @{username} 失败: {exc}")

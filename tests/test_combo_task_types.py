@@ -138,8 +138,7 @@ def test_build_combo_sub_spec_cli_types(tmp_path):
         "args": ["-w", str(tmp_path), "-a", "bob", "run-once", "任务A"],
     }
     assert (
-        build_combo_sub_spec("bob", {"type": "未知类型", "task": "x"}, tmp_path)
-        is None
+        build_combo_sub_spec("bob", {"type": "未知类型", "task": "x"}, tmp_path) is None
     )
 
 
@@ -220,7 +219,7 @@ def test_combo_runonce_lists_history_tasks(monkeypatch):
     names = blk._get_combo_task_names("签到 (run-once)")
     assert names["my-sign"].endswith("频道：未设置")
 
-    # 退频道类型：任务列表模式，列出全部退频道任务（含仅扫描，标注模式）
+    # 退频道类型：任务列表模式，仅列出「自动退出」任务（排除仅扫描任务）
     monkeypatch.setattr(
         sign_mod,
         "_load_leave_tasks",
@@ -244,8 +243,7 @@ def test_combo_runonce_lists_history_tasks(monkeypatch):
     opts = blk._get_combo_task_names("批量退频道 (auto leave)")
     assert opts == {
         "自动退任务": "自动退任务（14天｜自动退出｜账号：bob）",
-        "夜世轩任务": "夜世轩任务（30天｜仅扫描｜账号：alice）",
-    }  # 全部任务列出（含仅扫描），避免下拉选项为空
+    }  # 仅自动退出任务列出，仅扫描任务被排除
     # 无任务时返回空（无兜底项）
     monkeypatch.setattr(sign_mod, "_load_leave_tasks", lambda _wd: [])
     assert blk._get_combo_task_names("批量退频道 (auto leave)") == {}
@@ -353,9 +351,7 @@ def test_combo_sub_accounts_resolution(monkeypatch):
     ) == ["carol", "dave"]
     # 完全无来源 → 空
     assert (
-        sign_mod._combo_sub_accounts(
-            {"type": "签到 (run-once)", "task": "任务C"}, None
-        )
+        sign_mod._combo_sub_accounts({"type": "签到 (run-once)", "task": "任务C"}, None)
         == []
     )
 

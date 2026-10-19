@@ -15,7 +15,12 @@ from typing import Callable, Dict, List, Optional
 
 from nicegui import ui
 
-from tg_signer.giveaway_core import DEFAULT_KEYWORDS, GiveawayEngine, GiveawayState
+from tg_signer.giveaway_core import (
+    DEFAULT_KEYWORDS,
+    WIN_SWEEP_LIMIT,
+    GiveawayEngine,
+    GiveawayState,
+)
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.common import (
     add_dialog_close_button,
@@ -150,34 +155,116 @@ def format_win_alert(a: dict) -> str:
     return f"账号 {a.get('account')} 中奖（@{a.get('bot')}）：{text}（{a.get('time')}）"
 
 
-def load_win_settings(workdir) -> dict:
-    """中奖提醒全局设置：{win_forward_target, server_chan_send_key}，无配置返回空。"""
+def load_win_forward_targets(workdir) -> List[str]:
+    """中奖消息转发目标列表（全局设置），无配置/非法值返回 ["me"]。
+
+    兼容旧配置：单目标字符串（或逗号分隔）自动转为列表。
+    """
     path = Path(workdir) / WIN_SETTINGS_FILE
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
     except FileNotFoundError:
-        return {}
+        return ["me"]
     except (OSError, ValueError):
-        logger.debug("读取中奖提醒全局设置失败", exc_info=True)
-        return {}
+        logger.debug("读取中奖消息转发目标失败", exc_info=True)
+        return ["me"]
+    raw = data.get("win_forward_target") if isinstance(data, dict) else None
+    if raw is None:
+        return ["me"]
+    if isinstance(raw, str):
+        raw = [p.strip() for p in re.split(r"[,，\s]+", raw) if p.strip()]
+    targets: List[str] = []
+    for item in raw:
+        target = str(item).strip()
+        if target and target not in targets:
+            targets.append(target)
+    return targets or ["me"]
 
 
-def save_win_settings(workdir, settings: dict) -> None:
+def save_win_forward_targets(workdir, targets) -> None:
+    """保存中奖消息转发目标，保留文件中其他键（回扫条数等）。"""
+    cleaned: List[str] = []
+    for item in targets or []:
+        target = str(item).strip()
+        if target and target not in cleaned:
+            cleaned.append(target)
+    path = Path(workdir) / WIN_SETTINGS_FILE
     try:
-        atomic_write_json(
-            Path(workdir) / WIN_SETTINGS_FILE,
-            {
-                "win_forward_target": str(
-                    settings.get("win_forward_target") or "me"
-                ),
-                "server_chan_send_key": str(
-                    settings.get("server_chan_send_key") or ""
-                ),
-            },
-        )
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    try:
+        data["win_forward_target"] = cleaned or ["me"]
+        atomic_write_json(path, data)
     except OSError:
-        logger.debug("写入中奖提醒全局设置失败", exc_info=True)
+        logger.debug("写入中奖消息转发目标失败", exc_info=True)
+
+
+def load_win_sweep_limit(workdir) -> int:
+    """中奖回扫条数（全局设置），无配置/非法值回退默认 WIN_SWEEP_LIMIT。"""
+    path = Path(workdir) / WIN_SETTINGS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        logger.debug("读取中奖回扫条数失败", exc_info=True)
+        return WIN_SWEEP_LIMIT
+    try:
+        limit = int(data.get("win_sweep_limit"))  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return WIN_SWEEP_LIMIT
+    return limit if limit > 0 else WIN_SWEEP_LIMIT
+
+
+def save_win_sweep_limit(workdir, limit) -> None:
+    """保存中奖回扫条数，保留文件中其他键（转发目标等）。"""
+    path = Path(workdir) / WIN_SETTINGS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    try:
+        data["win_sweep_limit"] = max(1, int(limit))
+        atomic_write_json(path, data)
+    except (OSError, ValueError):
+        logger.debug("写入中奖回扫条数失败", exc_info=True)
+
+
+# 抽奖任务超时默认值（分钟）：单独运行与组合子任务共用，0=不限
+GIVEAWAY_TIMEOUT_MIN = 10
+
+
+def load_giveaway_timeout_min(workdir) -> int:
+    """抽奖任务超时（分钟，全局设置）：单独运行与组合子任务共用，0=不限。"""
+    path = Path(workdir) / WIN_SETTINGS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return GIVEAWAY_TIMEOUT_MIN
+    try:
+        val = int(data.get("giveaway_timeout_min"))  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return GIVEAWAY_TIMEOUT_MIN
+    return max(0, val)
+
+
+def save_giveaway_timeout_min(workdir, val) -> None:
+    """保存抽奖任务超时（分钟），保留文件中其他键。"""
+    path = Path(workdir) / WIN_SETTINGS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    try:
+        data["giveaway_timeout_min"] = max(0, int(val))
+        atomic_write_json(path, data)
+    except (OSError, ValueError):
+        logger.debug("写入抽奖任务超时失败", exc_info=True)
 
 
 # 任务配置字段 -> 默认值，加载旧配置时补齐缺失字段
@@ -439,9 +526,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         """各账号按来源频道/群组的新参与数：运行中取实时值，结束后取持久化值"""
         engine = get_engine(name)
         if engine is not None and engine.running:
-            return {
-                str(k): dict(v) for k, v in engine.joined_by_account_chat.items()
-            }
+            return {str(k): dict(v) for k, v in engine.joined_by_account_chat.items()}
         raw = (tasks.get(name) or {}).get("last_joined_by_account_chat") or {}
         return {str(k): dict(v) for k, v in raw.items()}
 
@@ -495,6 +580,23 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         add_dlg.open()
 
     async def start_task(name: str, set_status: Callable[[bool], None]) -> None:
+        async def _auto_stop_later(_n: str, _mins: int, _ts: float) -> None:
+            """最长运行时长到点自动停止；手动停止或重启后旧定时器失效。"""
+            await asyncio.sleep(_mins * 60)
+            cfg_late = tasks.get(_n)
+            if cfg_late is None or cfg_late.get("_start_ts") != _ts:
+                return
+            eng = get_engine(_n)
+            if eng is not None and eng.running:
+                try:
+                    await eng.stop()
+                except Exception:
+                    logger.debug("任务运行超时自动停止失败", exc_info=True)
+                ui.notify(
+                    f"任务 #{_n} 已达最长运行时长 {_mins} 分钟，自动停止",
+                    type="warning",
+                )
+
         cfg = tasks[name]
         for other, ocfg in tasks.items():
             if (
@@ -631,8 +733,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
         engine = ensure_engine(name)
         start_ts = time.time()
-        # 中奖提醒全局设置（消息中心配置）：转发目标 + Server酱 SendKey
-        win_settings = load_win_settings(workdir)
         started = await engine.start(
             accounts=list(cfg["accounts"]),
             chats=[
@@ -656,9 +756,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             rescue_interval=(int(cfg.get("rescue_interval_min") or 0) * 60),
             rescue_limit=int(cfg.get("rescue_limit") or 10),
             win_detect=bool(cfg.get("win_detect", True)),
-            win_forward_target=str(win_settings.get("win_forward_target") or "me"),
-            server_chan_send_key=str(win_settings.get("server_chan_send_key") or "")
-            or None,
+            win_forward_target=load_win_forward_targets(workdir),
+            win_sweep_limit=load_win_sweep_limit(workdir),
             state=giveaway_state,
             on_finish=_on_finish,
             on_event=_on_event,
@@ -670,6 +769,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             _persist()
             set_status(True)
             ui.notify(f"任务 #{name} 已启动", type="positive")
+            # 超时自动停止：全局设置「抽奖任务超时」（分钟，0=不限）
+            runtime_min = load_giveaway_timeout_min(workdir)
+            if runtime_min > 0:
+                asyncio.create_task(_auto_stop_later(name, runtime_min, start_ts))
         else:
             ui.notify(f"任务 #{name} 正在运行或收尾中，请稍后再试", type="warning")
 
@@ -1065,7 +1168,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         total = giveaway_state.count()
         clear_count_label.text = (
             f"当前共 {total} 条已参与记录（覆盖所有账号）。"
-            "清除后，相同抽奖链接对所有账号都视为未参与，下次扫描将重新参与。"
+            "清除后，相同抽奖链接对所有账号都视为未参与，下次扫描将重新参与；"
+            "中奖消息去重记录与各账号 × bot 的回扫进度（水位线）也一并清除，"
+            "回扫目标会在账号重新参与后重建。"
             "此操作不可恢复，确定清除？"
         )
         clear_records_dlg.open()
@@ -1097,7 +1202,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 icon="delete_sweep",
                 on_click=open_clear_records_dlg,
             ).props("outline color=negative").tooltip(
-                "删除所有账号的已参与抽奖记录，清除后相同链接可再次参与"
+                "删除所有账号的已参与抽奖记录、中奖消息去重记录与回扫进度，"
+                "清除后相同链接可再次参与"
             )
             ui.button("添加任务", icon="add", on_click=lambda: add_dlg.open()).props(
                 "outline"
@@ -1138,10 +1244,16 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         except (OSError, json.JSONDecodeError):
             logger.debug("读取任务历史失败", exc_info=True)
         sections.append(
-            ("logs/giveaway.log 最近200行", read_file_tail(wd / "logs" / "giveaway.log"))
+            (
+                "logs/giveaway.log 最近200行",
+                read_file_tail(wd / "logs" / "giveaway.log"),
+            )
         )
         copy_text_to_clipboard(build_debug_report(wd, sections))
-        ui.notify("已复制调试日志（含环境信息与任务配置），粘贴给电脑即可排查", type="positive")
+        ui.notify(
+            "已复制调试日志（含环境信息与任务配置），粘贴给电脑即可排查",
+            type="positive",
+        )
 
     fullscreen_on = False
 
@@ -1161,11 +1273,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     with ui.row().classes("w-full items-center justify-between"):
         ui.label("共用日志（所有任务）").classes("font-semibold")
         with ui.row().classes("gap-1 items-center"):
-            ui.button(
-                "复制调试日志", icon="bug_report", on_click=copy_debug_log
-            ).props("flat dense").tooltip(
-                "复制环境信息+任务配置+任务历史+日志文件，粘贴到电脑排查复现"
-            )
+            ui.button("复制调试日志", icon="bug_report", on_click=copy_debug_log).props(
+                "flat dense"
+            ).tooltip("复制环境信息+任务配置+任务历史+日志文件，粘贴到电脑排查复现")
             ui.button(icon="content_copy", on_click=copy_log).props(
                 "flat round dense"
             ).tooltip("一键复制日志")
@@ -1278,9 +1388,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             with ui.row().classes(
                                 "w-full items-center justify-between pl-4"
                             ):
-                                ui.label(f"└ {shown}").classes(
-                                    "text-xs text-gray-600"
-                                )
+                                ui.label(f"└ {shown}").classes("text-xs text-gray-600")
                                 ui.badge(f"{chats[chat_name]} 个", color="grey")
         detail_dlg.open()
 
@@ -1377,7 +1485,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "忽略历史成功记录（允许重复参与）", value=True
             ).classes("pt-6")
             rescue_switch = ui.switch(
-                "启用历史补漏扫描", value=False, on_change=lambda: _apply_rescue_visibility()
+                "启用历史补漏扫描",
+                value=False,
+                on_change=lambda: _apply_rescue_visibility(),
             ).classes("pt-6")
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
@@ -1405,7 +1515,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             win_switch = ui.switch(
-                "中奖识别（检测到中奖消息自动提醒；转发目标在右上角消息中心设置）",
+                "中奖识别（检测到中奖消息自动提醒；转发目标在右上角菜单「设置」）",
                 value=True,
             )
 

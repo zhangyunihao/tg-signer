@@ -198,7 +198,9 @@ def copy_text_to_clipboard(text: str) -> None:
     )
 
 
-def read_file_tail(path: Path | str, max_lines: int = 200, max_bytes: int = 512_000) -> str:
+def read_file_tail(
+    path: Path | str, max_lines: int = 200, max_bytes: int = 512_000
+) -> str:
     """读取文本文件最后 max_lines 行（最多回读 max_bytes，避免大文件占用过多内存）。
 
     文件不存在或读取失败返回空字符串；被截断时丢弃可能不完整的首行。

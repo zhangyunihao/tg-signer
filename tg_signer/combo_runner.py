@@ -23,6 +23,32 @@ import subprocess
 import sys
 
 
+def _run_with_timeout(cmd: list[str], timeout: int | None) -> int:
+    """运行子进程并等待退出；timeout（秒）为空/<=0 时不限时长。
+
+    超时强杀整个进程树（子任务进程及其子进程），返回 124 作为超时退出码。
+    """
+    proc = subprocess.Popen(cmd)
+    try:
+        if timeout and timeout > 0:
+            return proc.wait(timeout=timeout)
+        return proc.wait()
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name == "nt":
+                subprocess.call(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                proc.kill()
+        except OSError:
+            proc.kill()
+        proc.wait()
+        return 124
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("缺少组合任务参数", flush=True)
@@ -49,8 +75,19 @@ def main() -> None:
             cmd = [sys.executable, "-m", "tg_signer.task_runner"] + list(
                 sub.get("args") or []
             )
-        code = subprocess.call(cmd)
+        # 子任务可选超时（秒）：仅对配置了 timeout 的子任务生效（如自动抽奖），
+        # 超时强杀并记为失败（退出码 124），后续子任务继续执行
+        raw_timeout = sub.get("timeout")
+        try:
+            timeout = int(raw_timeout) if raw_timeout else None
+        except (TypeError, ValueError):
+            timeout = None
+        if timeout and timeout > 0:
+            print(f"    子任务超时限制：{timeout} 秒", flush=True)
+        code = _run_with_timeout(cmd, timeout)
         codes.append(code)
+        if code == 124:
+            print(f">>> 子任务超时 [{i}/{total}] 已达 {timeout} 秒强制退出", flush=True)
         # 多账号错峰延迟只对首个子任务生效，避免后续串行子任务重复等待
         if i == 1:
             os.environ.pop("TG_SIGNER_START_DELAY", None)
