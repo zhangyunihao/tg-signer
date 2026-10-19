@@ -1795,6 +1795,16 @@ class GiveawayEngine:
                     f"[{account}] 口令群「{group_name}」未在清单中定位到链接，"
                     "跳过发送口令"
                 )
+                # 记录未完成发言任务（消息中心展示，发送成功后自动消除）
+                self._emit(
+                    {
+                        "type": "speak_failed",
+                        "account": account,
+                        "group": group_name,
+                        "password": password,
+                        "error": "未在清单中定位到口令群组链接",
+                    }
+                )
                 continue
             already = await self._is_member(client, target)
             if already is False:
@@ -1808,6 +1818,15 @@ class GiveawayEngine:
                         f"[{account}] 加入口令群「{group_name}」失败，"
                         f"无法发送口令: {str(exc)[:120]}"
                     )
+                    self._emit(
+                        {
+                            "type": "speak_failed",
+                            "account": account,
+                            "group": group_name,
+                            "password": password,
+                            "error": f"加入口令群失败: {str(exc)[:120]}",
+                        }
+                    )
                     continue
             try:
                 # 随机延迟错峰：多账号不在同一时刻向同群发言
@@ -1818,8 +1837,25 @@ class GiveawayEngine:
                     f"[{account}] 已在「{group_name}」发送口令"
                     f"（@{username} 要求：{password}）"
                 )
+                self._emit(
+                    {
+                        "type": "speak_done",
+                        "account": account,
+                        "group": group_name,
+                        "password": password,
+                    }
+                )
             except Exception as exc:
                 self.log(f"[{account}] 发送口令失败（{group_name}）: {str(exc)[:120]}")
+                self._emit(
+                    {
+                        "type": "speak_failed",
+                        "account": account,
+                        "group": group_name,
+                        "password": password,
+                        "error": str(exc)[:120],
+                    }
+                )
 
     async def _is_member(self, client: Any, target: str) -> Optional[bool]:
         """检查当前账号是否已是 target 的成员。

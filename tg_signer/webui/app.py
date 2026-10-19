@@ -765,6 +765,29 @@ def build_ui(auth_code: str = None) -> None:
                 height: auto !important;
                 max-height: none !important;
             }
+            /* 页面内嵌日志区（自动抽奖共用日志）全屏态：fixed 铺满视口 */
+            .tgs-page-log-fullscreen {
+                position: fixed !important;
+                inset: 12px !important;
+                width: calc(100vw - 24px) !important;
+                height: calc(100vh - 24px) !important;
+                max-height: none !important;
+                z-index: 9000;
+                background: #ffffff;
+                border: 1px solid #e5e7eb;
+                border-radius: 12px;
+                box-shadow: 0 4px 24px rgba(0, 0, 0, 0.18);
+                padding: 8px;
+            }
+            /* 退出全屏悬浮按钮：默认隐藏，全屏时显示在视口右上角 */
+            .tgs-log-exit-full { display: none !important; }
+            .tgs-log-exit-full.tgs-log-exit-visible {
+                display: inline-flex !important;
+                position: fixed;
+                top: 16px;
+                right: 16px;
+                z-index: 9001;
+            }
             /* 全局通知消息移到页面顶部：默认底部弹出会遮挡弹窗底部的「确定」按钮 */
             .q-notifications__list--bottom {
                 top: 8px !important;
@@ -824,6 +847,13 @@ def build_ui(auth_code: str = None) -> None:
                 }
                 /* 签到实时日志区压缩高度，把屏幕优先让给任务历史表格 */
                 .sign-log-area { max-height: 220px !important; }
+                /* 页面内嵌日志区全屏态在移动端解除 sign-log-area 等限高（本查询内规则
+                   源码顺序在后，可覆盖第一段样式块中的同权重规则） */
+                .tgs-page-log-fullscreen {
+                    width: calc(100vw - 24px) !important;
+                    height: calc(100vh - 24px) !important;
+                    max-height: none !important;
+                }
                 /* 批量退频道工具栏：天数框收窄，争取与两个复选项排在同一行 */
                 .leave-days { width: 104px; min-width: 104px; }
                 /* 表格底部分页栏字号略缩，避免拥挤 */

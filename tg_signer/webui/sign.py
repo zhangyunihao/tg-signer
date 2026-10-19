@@ -658,6 +658,12 @@ class TaskRunnerBlock:
         self.history_table.on("duplicateTask", self._on_duplicate_event)
         self.history_table.on("detailTask", self._on_detail_event)
 
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label("实时输出").classes("text-md font-semibold")
+            ui.button(icon="fullscreen", on_click=self._toggle_log_fullscreen).props(
+                "flat round dense"
+            ).tooltip("全屏显示")
+
         self.log_area = ui.scroll_area().classes(
             "w-full bg-gray-50 rounded-lg border border-gray-200 sign-log-area"
         )
@@ -668,6 +674,12 @@ class TaskRunnerBlock:
                 .classes("w-full gap-0 p-3 font-mono text-sm")
                 .style("white-space: pre;")
             )
+        # 退出全屏悬浮按钮：仅全屏时 fixed 显示在视口右上角，平时不占布局
+        self._log_exit_btn = (
+            ui.button(icon="close", on_click=self._toggle_log_fullscreen)
+            .props("flat round dense unelevated")
+            .classes("tgs-log-exit-full")
+        )
 
         # 轮询改用独立 asyncio 循环而非 ui.timer：页面重建（root.clear）会删除
         # timer 的父 slot，ui.timer 内部访问已删 slot 会抛 RuntimeError 并可能
@@ -1654,6 +1666,18 @@ class TaskRunnerBlock:
         TaskRunnerBlock.output_lines.clear()
         self.log_list.clear()
         self.log_list.update()
+
+    def _toggle_log_fullscreen(self) -> None:
+        """切换实时输出全屏态：日志区 fixed 铺满视口，右上角显示退出按钮。"""
+        self._log_full = not getattr(self, "_log_full", False)
+        if self._log_full:
+            self.log_area.classes(add="tgs-page-log-fullscreen")
+            self._log_exit_btn.classes(add="tgs-log-exit-visible")
+        else:
+            self.log_area.classes(remove="tgs-page-log-fullscreen")
+            self._log_exit_btn.classes(remove="tgs-log-exit-visible")
+        self.log_area.update()
+        self._log_exit_btn.update()
 
     def _load_task_history_tail(self, limit: int) -> str:
         """读取任务历史文件尾部记录（读取失败返回空串，不打扰用户）。"""

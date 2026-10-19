@@ -288,6 +288,12 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     def find_task(task_id: str) -> Dict | None:
         return next((t for t in tasks if t["id"] == task_id), None)
 
+    def _seq_of(task_id: str) -> int:
+        # 序号按创建顺序编号（最早的任务为 1，与发言任务一致）
+        return next(
+            (idx for idx, t in enumerate(tasks, start=1) if t["id"] == task_id), 0
+        )
+
     def _kw_hit(task: Dict, title: str) -> bool:
         return any(kw in str(title or "") for kw in (task.get("keywords") or []))
 
@@ -437,7 +443,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             return
         # 填充页面级持久确认弹窗（不在事件槽位里动态创建弹窗）
         delete_state["task_id"] = task_id
-        delete_label.text = f"确认删除任务「{task['name']}」？"
+        delete_label.text = f"确认删除任务 #{_seq_of(task['id'])}？"
         delete_dialog.open()
 
     def _do_delete() -> None:
@@ -446,12 +452,13 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         delete_dialog.close()
         if not task:
             return
+        seq = _seq_of(task["id"])
         tasks.remove(task)
         task_states.pop(task["id"], None)
         if detail_refs.get("task_id") == task["id"]:
             detail_refs.update({"task_id": None, "body": None, "count": None})
         save_leave_tasks(workdir, tasks)
-        log(f"已删除任务：{task['name']}")
+        log(f"已删除任务 #{seq}")
         render_list()
 
     def open_create_dialog(prefill: Dict | None = None) -> None:
@@ -459,11 +466,6 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         names = list_session_names(session_dir, workdir)
         # 填充页面级持久新建/复制弹窗（不在事件槽位里动态创建弹窗）
         create_title.text = "复制退频道任务" if prefill else "新建退频道任务"
-        name_input.value = (
-            f"{prefill.get('name', '')} 副本"
-            if prefill
-            else f"退频道任务 {datetime.now():%m-%d %H:%M}"
-        )
         account_sel.options = with_select_all(build_account_options(session_dir, names))
         account_sel.value = [
             a for a in (prefill.get("accounts") or []) if a in names
@@ -483,7 +485,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             return
         task = {
             "id": f"leave_{datetime.now():%Y%m%d%H%M%S%f}",
-            "name": str(name_input.value or "").strip() or "退频道任务",
+            "name": f"退频道任务 {datetime.now():%m-%d %H:%M}",
             "accounts": accounts,
             "days": max(1, int(days_input.value or 7)),
             "include_groups": bool(ig.value),
@@ -585,25 +587,61 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 detail_refs["count"] = ui.label(
                     f"已选 {len(st['selected'])}/{len(rows)}"
                 ).classes("text-xs text-gray-500 ml-auto")
+            # 按频道聚合（chat_id 跨账号相同），组间按未更新天数由大到小排序
+            groups: Dict = {}
             for row in rows:
-                key = row["key"]
-                with ui.row().classes(
-                    "w-full items-start gap-2 no-wrap p-2 rounded border"
-                ):
-                    ui.checkbox(
-                        value=key in st["selected"],
-                        on_change=lambda e, k=key, t=task_id: _detail_on_toggle(
-                            e, k, t
-                        ),
-                    ).props("dense").classes("mt-0.5")
-                    with ui.column().classes("gap-0 min-w-0"):
-                        ui.label(str(row["title"])).classes(
-                            "text-sm font-semibold"
-                        ).style("overflow-wrap: anywhere;")
-                        ui.label(
-                            f"账号：{row['account']}　类型：{row['type']}　"
-                            f"未更新 {row['age_days']} 天"
-                        ).classes("text-xs text-gray-500")
+                groups.setdefault(row.get("chat_id", row["key"]), []).append(row)
+            ordered = sorted(
+                groups.values(),
+                key=lambda g: max(r["age_days"] for r in g),
+                reverse=True,
+            )
+            for group in ordered:
+                group.sort(
+                    key=lambda r: (-r["age_days"], str(r["account"]))
+                )
+                head = group[0]
+                group_keys = {r["key"] for r in group}
+                group_days = max(r["age_days"] for r in group)
+                all_on = group_keys <= st["selected"]
+
+                def _toggle_group(e, keys=group_keys, t=task_id) -> None:
+                    sts = task_states.get(t)
+                    if not sts:
+                        return
+                    if e.value:
+                        sts["selected"].update(keys)
+                    else:
+                        sts["selected"].difference_update(keys)
+                    render_detail_rows(t)
+
+                with ui.column().classes("w-full gap-1 p-2 rounded border"):
+                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        ui.checkbox(
+                            value=all_on, on_change=_toggle_group
+                        ).props("dense")
+                        with ui.column().classes("gap-0 min-w-0"):
+                            ui.label(str(head["title"])).classes(
+                                "text-sm font-semibold"
+                            ).style("overflow-wrap: anywhere;")
+                            ui.label(
+                                f"{head['type']}　{len(group)} 个账号"
+                                + ("" if len(group) == 1 else f"　最多 {group_days} 天未更新")
+                            ).classes("text-xs text-gray-500")
+                    for row in group:
+                        key = row["key"]
+                        with ui.row().classes(
+                            "w-full items-center gap-2 no-wrap pl-6"
+                        ):
+                            ui.checkbox(
+                                value=key in st["selected"],
+                                on_change=lambda e, k=key, t=task_id: _detail_on_toggle(
+                                    e, k, t
+                                ),
+                            ).props("dense")
+                            ui.label(
+                                f"{row['account']}（{row['age_days']}天未更新）"
+                            ).classes("text-xs").style("overflow-wrap: anywhere;")
             ui.label("退出不可撤销，请仔细核对").classes("text-xs text-gray-500")
 
     def open_detail_dialog(task_id: str) -> None:
@@ -615,7 +653,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         # 填充页面级持久明细弹窗（不在事件槽位里动态创建弹窗）
         detail_refs["task_id"] = task_id
         detail_refs["body"] = detail_body
-        detail_title.text = f"任务明细 — {task['name']}"
+        detail_title.text = f"任务明细 — #{_seq_of(task['id'])}"
         render_detail_rows(task_id)
         detail_dialog.open()
 
@@ -642,11 +680,12 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             for row in shown:
                 with ui.card().classes("w-full mobile-list-card border"):
                     with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        ui.label(f"任务 #{row['seq']}").classes(
+                            "text-base font-semibold"
+                        )
                         ui.badge(row["status"]).props(
                             f"color={_status_color(row['status'])}"
                         )
-                        ui.label(row["name"]).classes("text-base font-semibold")
-                    ui.label(f"任务ID：{row['id']}").classes("text-xs text-gray-400")
                     ui.label(f"账号：{row['accounts']}").classes(
                         "text-xs text-gray-600"
                     )
@@ -680,7 +719,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 ).classes("w-full")
 
     def render_list() -> None:
-        # 最新执行的记录显示在最上方
+        # 最新执行的记录显示在最上方；序号按创建顺序编号（最早的任务为 1，与发言任务一致）
         rows = []
         for task in reversed(tasks):
             if task["id"] not in task_states:
@@ -689,7 +728,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             rows.append(
                 {
                     "id": task["id"],
-                    "name": str(task.get("name") or ""),
+                    "seq": _seq_of(task["id"]),
                     "accounts": "、".join(str(a) for a in (task.get("accounts") or []))
                     or "未选择",
                     "status": _short_status(st),
@@ -740,15 +779,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         ui.table(
             columns=[
                 {
-                    "name": "name",
-                    "label": "任务名",
-                    "field": "name",
-                    "align": "left",
-                },
-                {
-                    "name": "id",
-                    "label": "任务ID",
-                    "field": "id",
+                    "name": "seq",
+                    "label": "序号",
+                    "field": "seq",
                     "align": "left",
                 },
                 {
@@ -826,7 +859,6 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     ):
         add_dialog_close_button(create_dialog)
         create_title = ui.label("新建退频道任务").classes("text-lg font-semibold")
-        name_input = ui.input("任务名称").classes("w-full")
         account_sel = ui.select(
             label="账号（可多选）", options=[], multiple=True, with_input=True
         ).classes("w-full")
@@ -885,14 +917,39 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         copy_text_to_clipboard("\n".join(log_lines))
         ui.notify(f"已复制 {len(log_lines)} 行日志", type="positive")
 
+    fullscreen_on = False
+
+    def toggle_fullscreen() -> None:
+        """切换运行日志全屏态：日志区 fixed 铺满视口，右上角显示退出按钮。"""
+        nonlocal fullscreen_on
+        fullscreen_on = not fullscreen_on
+        if fullscreen_on:
+            log_area.classes(add="tgs-page-log-fullscreen")
+            exit_full_btn.classes(add="tgs-log-exit-visible")
+        else:
+            log_area.classes(remove="tgs-page-log-fullscreen")
+            exit_full_btn.classes(remove="tgs-log-exit-visible")
+        log_area.update()
+        exit_full_btn.update()
+
     with ui.row().classes("w-full items-center justify-between mt-2"):
         ui.label("运行日志").classes("font-semibold")
-        ui.button(icon="content_copy", on_click=copy_log).props(
-            "flat round dense"
-        ).tooltip("一键复制日志")
+        with ui.row().classes("gap-1 items-center"):
+            ui.button(icon="content_copy", on_click=copy_log).props(
+                "flat round dense"
+            ).tooltip("一键复制日志")
+            ui.button(icon="fullscreen", on_click=toggle_fullscreen).props(
+                "flat round dense"
+            ).tooltip("全屏显示")
     log_area = ui.log(max_lines=300).classes("w-full h-48")
     for line in log_lines:
         log_area.push(line)
+    # 退出全屏悬浮按钮：仅全屏时 fixed 显示在视口右上角，平时不占布局
+    exit_full_btn = (
+        ui.button(icon="close", on_click=toggle_fullscreen)
+        .props("flat round dense unelevated")
+        .classes("tgs-log-exit-full")
+    )
 
     def refresh() -> None:
         render_list()

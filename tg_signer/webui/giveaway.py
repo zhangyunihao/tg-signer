@@ -48,6 +48,9 @@ _TASKS_FILE = "giveaway_tasks.json"
 # 账号未加入监控对象且自动加入失败的提醒（持久化，加入成功后自动消除）
 JOIN_ALERTS_FILE = "webui_join_alerts.json"
 JOIN_ALERTS_MAX = 200
+# 抽奖过程中记录的未完成口令发言任务（持久化，口令发送成功后自动消除）
+SPEAK_ALERTS_FILE = "webui_speak_alerts.json"
+SPEAK_ALERTS_MAX = 200
 
 
 def load_join_alerts(workdir) -> List[dict]:
@@ -79,6 +82,37 @@ def format_join_alert(a: dict, title_map: Dict[str, str]) -> str:
     return (
         f"账号 {a.get('account')} 未加入监控对象「{disp}」"
         f"且自动加入失败：{a.get('error')}（{a.get('time')}）"
+    )
+
+
+def load_speak_alerts(workdir) -> List[dict]:
+    path = Path(workdir) / SPEAK_ALERTS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        alerts = data.get("alerts") if isinstance(data, dict) else None
+        return [a for a in (alerts or []) if isinstance(a, dict)]
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        logger.debug("读取未完成发言任务文件失败", exc_info=True)
+        return []
+
+
+def save_speak_alerts(workdir, alerts: List[dict]) -> None:
+    try:
+        atomic_write_json(
+            Path(workdir) / SPEAK_ALERTS_FILE, {"alerts": alerts[:SPEAK_ALERTS_MAX]}
+        )
+    except OSError:
+        logger.debug("写入未完成发言任务文件失败", exc_info=True)
+
+
+def format_speak_alert(a: dict) -> str:
+    password = str(a.get("password") or "")
+    pwd_disp = f"「{password}」" if password else ""
+    return (
+        f"账号 {a.get('account')} 口令发言未完成：群组「{a.get('group')}」"
+        f"需发送口令{pwd_disp}，原因：{a.get('error')}（{a.get('time')}）"
     )
 
 
@@ -371,41 +405,76 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 _apply_status(cb, False)
 
         def _on_event(ev: dict) -> None:
-            """账号未加入监控对象且加入失败 → 顶部通知 + 持久化；加入成功则消除"""
+            """加入失败/未完成发言 → 顶部通知 + 持久化；加入成功/口令已发则消除"""
             etype = ev.get("type")
-            if etype not in ("join_failed", "join_resolved"):
-                return
-            acct = str(ev.get("account") or "")
-            chat = str(ev.get("chat") or "")
-            if not acct or not chat:
-                return
-            kkey = f"{acct}|{chat}"
-            alerts = [
-                a
-                for a in load_join_alerts(workdir)
-                if f"{a.get('account')}|{a.get('chat')}" != kkey
-            ]
-            if etype == "join_failed":
-                alerts.insert(
-                    0,
-                    {
-                        "account": acct,
-                        "chat": chat,
-                        "error": str(ev.get("error") or "")[:200],
-                        "time": f"{datetime.now():%m-%d %H:%M:%S}",
-                    },
-                )
-            save_join_alerts(workdir, alerts)
-            try:
-                with client:
-                    if etype == "join_failed":
-                        ui.notify(
-                            format_join_alert(alerts[0], chat_title_map),
-                            type="warning",
-                            multi_line=True,
-                        )
-            except Exception:
-                logger.debug("推送加入失败通知失败", exc_info=True)
+            if etype in ("join_failed", "join_resolved"):
+                acct = str(ev.get("account") or "")
+                chat = str(ev.get("chat") or "")
+                if not acct or not chat:
+                    return
+                kkey = f"{acct}|{chat}"
+                alerts = [
+                    a
+                    for a in load_join_alerts(workdir)
+                    if f"{a.get('account')}|{a.get('chat')}" != kkey
+                ]
+                if etype == "join_failed":
+                    alerts.insert(
+                        0,
+                        {
+                            "account": acct,
+                            "chat": chat,
+                            "error": str(ev.get("error") or "")[:200],
+                            "time": f"{datetime.now():%m-%d %H:%M:%S}",
+                        },
+                    )
+                save_join_alerts(workdir, alerts)
+                try:
+                    with client:
+                        if etype == "join_failed":
+                            ui.notify(
+                                format_join_alert(alerts[0], chat_title_map),
+                                type="warning",
+                                multi_line=True,
+                            )
+                except Exception:
+                    logger.debug("推送加入失败通知失败", exc_info=True)
+            elif etype in ("speak_failed", "speak_done"):
+                acct = str(ev.get("account") or "")
+                group = str(ev.get("group") or "")
+                password = str(ev.get("password") or "")
+                if not acct or not group:
+                    return
+                skey = f"{acct}|{group}|{password}"
+                alerts = [
+                    a
+                    for a in load_speak_alerts(workdir)
+                    if f"{a.get('account')}|{a.get('group')}|{a.get('password')}"
+                    != skey
+                ]
+                if etype == "speak_failed":
+                    alerts.insert(
+                        0,
+                        {
+                            "account": acct,
+                            "group": group,
+                            "password": password,
+                            "error": str(ev.get("error") or "")[:200],
+                            "time": f"{datetime.now():%m-%d %H:%M:%S}",
+                        },
+                    )
+                    save_speak_alerts(workdir, alerts)
+                    try:
+                        with client:
+                            ui.notify(
+                                format_speak_alert(alerts[0]),
+                                type="warning",
+                                multi_line=True,
+                            )
+                    except Exception:
+                        logger.debug("推送发言任务通知失败", exc_info=True)
+                else:
+                    save_speak_alerts(workdir, alerts)
 
         engine = ensure_engine(name)
         started = await engine.start(
@@ -817,6 +886,21 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         copy_text_to_clipboard(build_debug_report(wd, sections))
         ui.notify("已复制调试日志（含环境信息与任务配置），粘贴给电脑即可排查", type="positive")
 
+    fullscreen_on = False
+
+    def toggle_fullscreen() -> None:
+        """切换共用日志全屏态：日志区 fixed 铺满视口，右上角显示退出按钮。"""
+        nonlocal fullscreen_on
+        fullscreen_on = not fullscreen_on
+        if fullscreen_on:
+            send_log.classes(add="tgs-page-log-fullscreen")
+            exit_full_btn.classes(add="tgs-log-exit-visible")
+        else:
+            send_log.classes(remove="tgs-page-log-fullscreen")
+            exit_full_btn.classes(remove="tgs-log-exit-visible")
+        send_log.update()
+        exit_full_btn.update()
+
     with ui.row().classes("w-full items-center justify-between"):
         ui.label("共用日志（所有任务）").classes("font-semibold")
         with ui.row().classes("gap-1 items-center"):
@@ -831,6 +915,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             ui.button(icon="delete_outline", on_click=clear_log).props(
                 "flat round dense"
             ).tooltip("清空日志")
+            ui.button(icon="fullscreen", on_click=toggle_fullscreen).props(
+                "flat round dense"
+            ).tooltip("全屏显示")
     send_log = ui.log(max_lines=300).classes("w-full h-40")
     log_buf = _GLOBAL_LOGS.setdefault(wd_key, [])
     _seen = {"n": len(log_buf)}
@@ -839,6 +926,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             send_log.push(line)
         except Exception:
             logger.debug("回放历史日志到界面日志区失败", exc_info=True)
+
+    # 退出全屏的悬浮按钮：仅全屏时 fixed 显示在视口右上角，平时不占布局
+    exit_full_btn = (
+        ui.button(icon="close", on_click=toggle_fullscreen)
+        .props("flat round dense unelevated")
+        .classes("tgs-log-exit-full")
+    )
 
     client = ui.context.client
 

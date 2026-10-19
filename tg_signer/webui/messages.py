@@ -1,8 +1,9 @@
-"""右上角消息中心：汇总抽奖任务加入失败提醒与待完成的发言任务。
+"""右上角消息中心：汇总抽奖任务加入失败提醒与未完成的发言任务。
 
 消息来源（均从工作目录持久化文件实时汇总）：
 - 抽奖任务监控对象加入失败提醒：webui_join_alerts.json（加入成功后由任务自动消除）
-- 随机发言任务待完成：random_chat_tasks.json 中未运行且未标记完成的任务
+- 抽奖过程中记录的未完成发言任务（口令发送失败）：webui_speak_alerts.json
+  （口令发送成功后由任务自动消除）
 
 已读状态按消息键持久化在工作目录 webui_message_read.json，
 刷新页面、重启服务、更换浏览器后依然保留。
@@ -21,12 +22,9 @@ from tg_signer.webui.common import add_dialog_close_button, state
 from tg_signer.webui.giveaway import (
     channel_title_map,
     format_join_alert,
+    format_speak_alert,
     load_join_alerts,
-)
-from tg_signer.webui.random_chat import (
-    chat_titles,
-    load_task_store,
-    speak_task_running,
+    load_speak_alerts,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,7 +61,7 @@ def save_read_keys(workdir, keys: Set[str]) -> None:
 
 
 def collect_messages(workdir) -> List[dict]:
-    """汇总全部消息：加入失败提醒在前（最新在前），待完成发言任务按编号倒序在后。"""
+    """汇总全部消息：加入失败提醒在前（最新在前），未完成发言任务随后。"""
     wd = Path(workdir)
     messages: List[dict] = []
     # 1) 抽奖任务：监控对象加入失败（文件内已按最新在前排序）
@@ -80,28 +78,18 @@ def collect_messages(workdir) -> List[dict]:
                 "text": format_join_alert(a, title_map),
             }
         )
-    # 2) 随机发言：未运行且未标记完成的任务视为「待完成」
-    titles = chat_titles(wd)
-    tasks = load_task_store(wd).get("tasks") or {}
-    for name in sorted(
-        tasks, key=lambda n: int(n) if str(n).isdigit() else 0, reverse=True
-    ):
-        cfg = tasks.get(name) or {}
-        if cfg.get("done") or speak_task_running(wd, name):
-            continue
-        accounts = list(cfg.get("accounts") or [])
-        chat_disp = titles.get(str(cfg.get("chat_id")), str(cfg.get("chat_id")))
-        total = cfg.get("total_count")
-        text = (
-            f"发言任务 #{name} 待完成：{len(accounts)} 个账号 → {chat_disp}"
-            + (f"，每账号 {total} 条" if total else "")
-        )
+    # 2) 抽奖过程记录的未完成发言任务（口令发送失败，发送成功后自动消除）
+    for a in load_speak_alerts(wd):
+        acct = str(a.get("account") or "")
+        group = str(a.get("group") or "")
+        password = str(a.get("password") or "")
+        time_str = str(a.get("time") or "")
         messages.append(
             {
-                "key": f"speak_pending|{name}",
+                "key": f"speak_failed|{acct}|{group}|{password}|{time_str}",
                 "tag": "发言任务",
-                "color": "primary",
-                "text": text,
+                "color": "orange",
+                "text": format_speak_alert(a),
             }
         )
     return messages
@@ -115,22 +103,20 @@ def message_center_button() -> Callable[[], None]:
     client = ui.context.client
     read_keys: Set[str] = load_read_keys(state.workdir)
 
-    with ui.button(icon="notifications").props("flat round dense") as msg_btn:
-        badge = ui.badge("0").props("floating color=red").classes("text-[10px]")
+    def mark_one(key: str) -> None:
+        if key in read_keys:
+            return
+        read_keys.add(key)
+        save_read_keys(state.workdir, read_keys)
+        refresh_badge()
+        render_list()
 
-    with ui.dialog() as msg_dialog, ui.card().classes("w-full max-w-2xl"):
-        add_dialog_close_button(msg_dialog)
-        ui.label("消息中心").classes("text-lg font-semibold")
-        ui.label(
-            "汇总抽奖任务监控对象加入失败提醒与待完成的发言任务，点击消息标记为已读。"
-        ).classes("text-xs text-gray-500")
-        list_container = ui.column().classes("w-full gap-2 max-h-[60vh] overflow-y-auto")
-
-    def refresh_badge() -> None:
-        messages = collect_messages(state.workdir)
-        count = sum(1 for m in messages if m["key"] not in read_keys)
-        badge.set_text(str(count))
-        badge.set_visibility(count > 0)
+    def mark_all_read() -> None:
+        for m in collect_messages(state.workdir):
+            read_keys.add(m["key"])
+        save_read_keys(state.workdir, read_keys)
+        refresh_badge()
+        render_list()
 
     def render_list() -> None:
         list_container.clear()
@@ -169,20 +155,25 @@ def message_center_button() -> Callable[[], None]:
                         + ("text-gray-900" if unread else "text-gray-500")
                     )
 
-    def mark_one(key: str) -> None:
-        if key in read_keys:
-            return
-        read_keys.add(key)
-        save_read_keys(state.workdir, read_keys)
-        refresh_badge()
-        render_list()
+    with ui.button(icon="notifications").props("flat round dense") as msg_btn:
+        badge = ui.badge("0").props("floating color=red").classes("text-[10px]")
 
-    def mark_all_read() -> None:
-        for m in collect_messages(state.workdir):
-            read_keys.add(m["key"])
-        save_read_keys(state.workdir, read_keys)
-        refresh_badge()
-        render_list()
+    with ui.dialog() as msg_dialog, ui.card().classes("w-full max-w-2xl"):
+        add_dialog_close_button(msg_dialog)
+        ui.label("消息中心").classes("text-lg font-semibold")
+        ui.label(
+            "汇总抽奖任务监控对象加入失败提醒与抽奖过程中未完成的发言任务"
+            "（口令发送失败，发送成功后自动消除），点击消息标记为已读。"
+        ).classes("text-xs text-gray-500")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("全部已读", on_click=mark_all_read).props("outline dense")
+        list_container = ui.column().classes("w-full gap-2 max-h-[60vh] overflow-y-auto")
+
+    def refresh_badge() -> None:
+        messages = collect_messages(state.workdir)
+        count = sum(1 for m in messages if m["key"] not in read_keys)
+        badge.set_text(str(count))
+        badge.set_visibility(count > 0)
 
     def open_center() -> None:
         render_list()
