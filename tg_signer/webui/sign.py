@@ -19,6 +19,7 @@ from pydantic import TypeAdapter
 from tg_signer.core import get_api_config, get_proxy, safe_disconnect
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.auto_leave import UNSELECT_KEYWORDS as _LEAVE_EXCLUDE_KEYWORDS
+from tg_signer.webui.auto_leave import _scan_types_of as _leave_scan_types
 from tg_signer.webui.auto_leave import load_config as _load_leave_config
 from tg_signer.webui.auto_leave import load_leave_tasks as _load_leave_tasks
 from tg_signer.webui.combo import load_composite_tasks
@@ -101,11 +102,13 @@ def build_combo_sub_spec(
                     "account": account,
                     "session_dir": str(workdir),
                     "days": int(leave_task.get("days") or 7),
+                    "scan_types": _leave_scan_types(leave_task),
                     "include_groups": bool(leave_task.get("include_groups")),
                     "skip_pinned": bool(leave_task.get("skip_pinned", True)),
                     "exclude_keywords": list(
                         leave_task.get("keywords") or _LEAVE_EXCLUDE_KEYWORDS
                     ),
+                    "include_keywords": list(leave_task.get("include_keywords") or []),
                     "auto_leave": bool(leave_task.get("auto_leave", False)),
                 },
             }
@@ -117,6 +120,7 @@ def build_combo_sub_spec(
                 "account": account,
                 "session_dir": str(workdir),
                 "days": int(cfg.get("days") or 7),
+                "scan_types": _leave_scan_types(cfg),
                 "include_groups": bool(cfg.get("include_groups")),
                 "skip_pinned": bool(cfg.get("skip_pinned", True)),
                 "exclude_keywords": list(_LEAVE_EXCLUDE_KEYWORDS),

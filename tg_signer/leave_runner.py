@@ -7,11 +7,16 @@
 spec 格式::
 
     {"account": "账号名", "session_dir": "工作目录",
-     "days": 7, "include_groups": false, "skip_pinned": true,
-     "exclude_keywords": ["抽奖", ...], "auto_leave": true}
+     "days": 7, "scan_types": "both", "skip_pinned": true,
+     "include_keywords": ["签到", ...], "exclude_keywords": ["抽奖", ...],
+     "auto_leave": true}
 
-行为与「批量退频道」tab 一致但非交互：扫描超过 N 天未更新的频道/群组
-（始终跳过自己是创建者、置顶对话），排除命中关键字的对话后全部自动退出
+scan_types 扫描范围："channel" 仅频道 / "group" 仅群组 / "both" 频道+群组
+（缺省时按旧字段 include_groups 推导，True→both、False→channel）。
+
+行为与「批量退频道」tab 一致但非交互：按扫描范围遍历超过 N 天未更新的
+频道/群组（始终跳过自己是创建者、置顶对话），先按包含关键字过滤（非空时
+仅保留标题命中的对话），再排除命中保护关键字的对话后全部自动退出
 （并发 8）；auto_leave=false 时仅扫描不退出。日志输出到 stdout 由
 WebUI 组合任务采集。
 """
@@ -23,7 +28,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from tg_signer.core import get_client, safe_disconnect
-from tg_signer.webui.auto_leave import leave_one, scan_stale_chats
+from tg_signer.webui.auto_leave import _scan_types_of, leave_one, scan_stale_chats
 
 
 def filter_candidates(
@@ -51,11 +56,21 @@ async def run_leave(spec: dict) -> int:
         account,
         Path(str(spec.get("session_dir") or ".")),
         max(1, int(spec.get("days") or 7)),
-        bool(spec.get("include_groups")),
+        _scan_types_of(spec),
         bool(spec.get("skip_pinned", True)),
         log,
     )
-    if not bool(spec.get("auto_leave", True)):
+    inc_kws = [str(k) for k in (spec.get("include_keywords") or []) if k]
+    if inc_kws:
+        before = len(rows)
+        rows = [r for r in rows if any(k in str(r["title"]) for k in inc_kws)]
+        log(f"[{account}] 包含关键字过滤：{before} -> {len(rows)} 个候选")
+    auto = bool(spec.get("auto_leave", True))
+    if auto and _scan_types_of(spec) != "channel":
+        # 扫描范围包含群组时不允许自动退出（仅频道可自动退出）
+        log(f"[{account}] 扫描范围包含群组，自动退出不可用，仅扫描记录")
+        auto = False
+    if not auto:
         # 任务未开启「自动退出未命中关键字的频道」：组合场景无法手动确认，
         # 仅扫描记录，不做任何退出
         log(f"[{account}] 任务未开启自动退出，仅扫描：共 {len(rows)} 个超期对话")

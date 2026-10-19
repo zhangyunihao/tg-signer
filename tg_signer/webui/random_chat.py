@@ -768,8 +768,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         _persist()
         render_tasks()
         add_dlg.close()
-        ui.notify(f"任务 #{name} 已添加，正在启动...", type="positive")
-        asyncio.create_task(start_task(name, tasks[name]["_set_status"]))
+        ui.notify(f"任务 #{name} 已添加，可手动点击「启动」开始运行", type="positive")
 
     def render_tasks() -> None:
         task_list_container.clear()

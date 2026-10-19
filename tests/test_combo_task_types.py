@@ -59,9 +59,22 @@ def test_build_combo_sub_spec_leave(tmp_path):
     inner = spec["spec"]
     assert inner["days"] == 30
     assert inner["include_groups"] is False
+    assert inner["scan_types"] == "channel"  # 旧任务 include_groups=False → 仅频道
+    assert inner["include_keywords"] == []
     assert inner["skip_pinned"] is True
     assert inner["exclude_keywords"] == ["抽奖", "榜"]
     assert inner["auto_leave"] is False  # 仅扫描，不自动退出
+
+
+def test_scan_types_of_mapping():
+    """扫描范围推导：显式 scan_types 优先；旧 include_groups 布尔回退推导。"""
+    from tg_signer.webui.auto_leave import _scan_types_of
+
+    assert _scan_types_of({"scan_types": "group"}) == "group"
+    assert _scan_types_of({"scan_types": "both", "include_groups": False}) == "both"
+    assert _scan_types_of({"include_groups": True}) == "both"
+    assert _scan_types_of({}) == "channel"
+    assert _scan_types_of({"scan_types": "非法值"}) == "channel"
 
 
 def test_build_combo_sub_spec_giveaway(tmp_path):
