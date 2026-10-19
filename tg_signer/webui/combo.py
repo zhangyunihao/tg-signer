@@ -9,18 +9,19 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from nicegui import ui
 
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui.auto_leave import load_leave_tasks
 from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
     format_duration,
     with_select_all,
 )
-from tg_signer.webui.data import get_workdir
+from tg_signer.webui.data import get_workdir, load_config
+from tg_signer.webui.giveaway import channel_title_map, load_task_store
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +38,11 @@ COMBO_SUB_TYPES = [
 ]
 
 
-def _composite_tasks_path(workdir: Optional[Path | str] = None) -> Path:
+def _composite_tasks_path(workdir: Path | str | None = None) -> Path:
     return get_workdir(workdir) / COMPOSITE_TASKS_FILE
 
 
-def load_composite_tasks(workdir: Optional[Path | str] = None) -> list[dict]:
+def load_composite_tasks(workdir: Path | str | None = None) -> list[dict]:
     path = _composite_tasks_path(workdir)
     if not path.is_file():
         return []
@@ -53,19 +54,168 @@ def load_composite_tasks(workdir: Optional[Path | str] = None) -> list[dict]:
         return []
 
 
-def save_composite_tasks(
-    items: list[dict], workdir: Optional[Path | str] = None
-) -> None:
+def save_composite_tasks(items: list[dict], workdir: Path | str | None = None) -> None:
     atomic_write_json(_composite_tasks_path(workdir), items)
+
+
+# 签到动作代码 -> 描述（见 tg_signer.config.SupportAction）
+SIGN_ACTION_DESC = {
+    1: "发送普通文本",
+    2: "发送Dice emoji",
+    3: "点击键盘按钮",
+    4: "图片选择选项",
+    5: "回复计算题",
+}
+SCAN_TYPE_DESC = {"channel": "仅频道", "group": "仅群组", "both": "频道+群组"}
+
+
+def _fmt_param_value(value) -> str:
+    """把配置值格式化为可读文本；None/空列表显示为 —，布尔显示为 是/否。"""
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "—"
+        if all(isinstance(x, (str, int, float)) for x in value):
+            return "、".join(str(x) for x in value)
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _fmt_sign_action(action: dict) -> str:
+    desc = SIGN_ACTION_DESC.get(action.get("action"), "未知动作")
+    extra = ""
+    if action.get("text") is not None:
+        extra = f"「{action['text']}」"
+    elif action.get("dice") is not None:
+        extra = f"「{action['dice']}」"
+    return f"{desc}{extra}"
+
+
+def _sign_config_params(task_name: str, workdir) -> list[tuple[str, str]] | None:
+    """签到 (run-once)：signs/<task>/config.json 全部参数。"""
+    try:
+        payload = load_config("signer", task_name, workdir).payload
+    except (FileNotFoundError, ValueError):
+        return None
+    rows: list[tuple[str, str]] = [
+        ("签到时间", str(payload.get("sign_at") or "—")),
+        ("随机偏移（秒）", str(payload.get("random_seconds") or 0)),
+        ("连续签到间隔（秒）", str(payload.get("sign_interval") or 1)),
+    ]
+    chats = payload.get("chats") or []
+    rows.append(("签到频道数", str(len(chats))))
+    titles = channel_title_map(workdir)
+    for i, chat in enumerate(chats, 1):
+        chat_id = chat.get("chat_id")
+        title = titles.get(str(chat_id)) or str(chat.get("name") or "")
+        actions = (
+            " → ".join(_fmt_sign_action(a) for a in (chat.get("actions") or [])) or "—"
+        )
+        delete_after = chat.get("delete_after")
+        lines = [
+            f"chat_id: {chat_id}",
+            f"动作: {actions}",
+            f"动作间隔: {chat.get('action_interval')} 秒",
+            f"话题 ID: {chat.get('message_thread_id') or '—'}",
+            f"发送后删除: {f'{delete_after} 秒' if delete_after else '—'}",
+        ]
+        rows.append((f"频道{i}" + (f"·{title}" if title else ""), "\n".join(lines)))
+    return rows
+
+
+def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | None:
+    """自动抽奖：giveaway_tasks.json 里对应任务的全部参数。"""
+    store = load_task_store(workdir)
+    cfg = (store.get("tasks") or {}).get(str(task_name))
+    if not isinstance(cfg, dict):
+        return None
+    titles = channel_title_map(workdir)
+    chats = [str(c) for c in (cfg.get("chats") or [])]
+    chats_text = "\n".join(
+        f"{titles.get(cid)} ({cid})" if titles.get(cid) else cid for cid in chats
+    )
+    max_joins = cfg.get("max_joins")
+    rescue_min = int(cfg.get("rescue_interval_min") or 0)
+    return [
+        ("账号", _fmt_param_value(cfg.get("accounts"))),
+        ("监控频道/群组", chats_text or "—"),
+        ("会话目录", str(cfg.get("session_dir") or ".")),
+        ("消息关键词", _fmt_param_value(cfg.get("keywords"))),
+        ("启动时自动扫描", _fmt_param_value(cfg.get("auto_scan"))),
+        ("自动加入频道链接", _fmt_param_value(cfg.get("auto_join"))),
+        ("参与前随机延迟下限（秒）", str(cfg.get("delay_min") or 0)),
+        ("参与前随机延迟上限（秒）", str(cfg.get("delay_max") or 0)),
+        ("确认等待（秒）", str(cfg.get("confirm_wait") or 0)),
+        ("参与条数上限", str(max_joins) if max_joins else "不限"),
+        ("补漏扫描间隔（分钟）", f"{rescue_min}（0=关闭）"),
+        ("补漏重拉条数/频道", str(cfg.get("rescue_limit") or 0)),
+    ]
+
+
+def _leave_config_params(task_name: str, workdir) -> list[tuple[str, str]] | None:
+    """批量退频道：webui_leave_tasks.json 里对应任务的全部参数。"""
+    task = next(
+        (t for t in load_leave_tasks(workdir) if str(t.get("name")) == task_name),
+        None,
+    )
+    if task is None:
+        return None
+    scan = str(task.get("scan_types") or "")
+    return [
+        ("账号", _fmt_param_value(task.get("accounts"))),
+        ("不更新天数阈值", str(task.get("days") or "—")),
+        ("扫描范围", SCAN_TYPE_DESC.get(scan, scan or "—")),
+        ("跳过置顶对话", _fmt_param_value(task.get("skip_pinned", True))),
+        ("包含关键字", _fmt_param_value(task.get("include_keywords"))),
+        ("保护关键字", _fmt_param_value(task.get("keywords"))),
+        ("自动退出未命中保护项", _fmt_param_value(task.get("auto_leave"))),
+    ]
+
+
+def _sub_config_params(sub: dict, workdir) -> list[tuple[str, str]] | None:
+    """按子任务类型加载其绑定任务的完整配置参数；找不到配置时返回 None。"""
+    sub_type = str(sub.get("type") or "")
+    task_name = str(sub.get("task") or "")
+    if "run-once" in sub_type:
+        return _sign_config_params(task_name, workdir)
+    if "抽奖" in sub_type:
+        return _giveaway_config_params(task_name, workdir)
+    if "退频道" in sub_type:
+        return _leave_config_params(task_name, workdir)
+    return None
+
+
+def giveaway_chats_text(task_name, workdir: Path | str | None = None) -> str:
+    """自动抽奖任务的监控对象文案：优先显示频道/群组名称，未缓存的保留原 id。
+
+    最多展示 5 个，超出时以「等N个」收尾，与「自动抽奖」tab 的展示一致。
+    """
+    wd = get_workdir(workdir)
+    store = load_task_store(wd)
+    gcfg = store["tasks"].get(str(task_name)) or {}
+    chats = [str(c) for c in (gcfg.get("chats") or []) if c]
+    if not chats:
+        return ""
+    title_map = channel_title_map(wd)
+    labels = [title_map.get(c, c) for c in chats]
+    text = "、".join(labels[:5])
+    if len(labels) > 5:
+        text += f" 等{len(labels)}个"
+    return text
 
 
 class ComboTaskBlock:
     """组合任务 tab 面板：组合列表、创建/编辑弹窗、执行弹窗、运行中状态。"""
 
-    def __init__(self, runner, workdir: Optional[Path | str] = None) -> None:
+    def __init__(self, runner, workdir: Path | str | None = None) -> None:
         self.runner = runner  # TaskRunnerBlock 实例：复用 _launch/_stop_run/账号发现
         self.workdir = workdir
-        self._editing_name: Optional[str] = None  # 非 None 表示正在编辑该组合
+        self._editing_name: str | None = None  # 非 None 表示正在编辑该组合
 
         ui.label("组合任务").classes("text-lg font-semibold")
         ui.label(
@@ -137,8 +287,7 @@ class ComboTaskBlock:
                             on_click=lambda r=rid: self._stop(r),
                         ).props("flat dense color=negative")
                     ui.label(
-                        f"执行时间：{rec.get('start_time') or '—'}　"
-                        f"已运行：{elapsed}"
+                        f"执行时间：{rec.get('start_time') or '—'}　已运行：{elapsed}"
                     ).classes("text-xs text-gray-600")
 
     def _render_list(self) -> None:
@@ -181,9 +330,14 @@ class ComboTaskBlock:
                         ).props("flat dense color=negative")
                     with ui.column().classes("w-full gap-0 mt-1"):
                         for i, s in enumerate(subs, 1):
-                            ui.label(
-                                f"{i}. {s.get('type', '')} · {s.get('task', '')}"
-                            ).classes("text-sm text-gray-700")
+                            text = f"{i}. {s.get('type', '')} · {s.get('task', '')}"
+                            if "抽奖" in str(s.get("type") or ""):
+                                chats_text = giveaway_chats_text(
+                                    s.get("task"), self.workdir
+                                )
+                                if chats_text:
+                                    text += f"｜监控对象：{chats_text}"
+                            ui.label(text).classes("text-sm text-gray-700")
                     last = last_runs.get(name)
                     if last is not None:
                         ui.label(
@@ -244,7 +398,7 @@ class ComboTaskBlock:
                 ui.button("取消", on_click=self.combo_dialog.close).props("outline")
                 ui.button("保存", color="primary", on_click=self._save_combo)
 
-    def open_combo_dialog(self, combo: Optional[dict] = None) -> None:
+    def open_combo_dialog(self, combo: dict | None = None) -> None:
         """打开创建（combo=None）或编辑（传入已有组合）弹窗。"""
         self._editing_name = str(combo.get("name")) if combo else None
         self.combo_title.text = (
@@ -373,9 +527,8 @@ class ComboTaskBlock:
         with ui.dialog() as self.run_dialog, ui.card().classes("w-full max-w-xl"):
             add_dialog_close_button(self.run_dialog)
             self.run_title = ui.label("执行组合任务").classes("text-lg font-semibold")
-            self.run_subs_label = ui.label("").classes(
-                "text-xs text-gray-600 whitespace-pre-line"
-            )
+            ui.label("点击子任务可查看其全部配置参数").classes("text-xs text-gray-500")
+            self.run_subs_container = ui.column().classes("w-full gap-1")
             # 可选账号覆盖：留空走各子任务绑定账号，选了则全部子任务仅用所选账号
             self.run_accounts_select = ui.select(
                 label="指定账号（可选，选了则全部子任务仅用所选账号）",
@@ -391,27 +544,88 @@ class ComboTaskBlock:
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=self.run_dialog.close).props("outline")
                 ui.button("执行", color="primary", on_click=self._start_run)
+        self._build_sub_detail_dialog()
+
+    def _render_run_subs(self) -> None:
+        """执行弹窗的子任务列表；每行可点击查看该子任务的全部配置参数。"""
+        from tg_signer.webui.data import apply_account_order
+        from tg_signer.webui.sign import _combo_sub_accounts
+
+        self.run_subs_container.clear()
+        with self.run_subs_container:
+            for i, sub in enumerate(self._run_combo["subs"], 1):
+                accs = apply_account_order(
+                    _combo_sub_accounts(sub, self.workdir), self.workdir
+                )
+                acc_text = "、".join(accs) if accs else "未绑定"
+                chats_part = ""
+                if "抽奖" in str(sub.get("type") or ""):
+                    chats_text = giveaway_chats_text(sub.get("task"), self.workdir)
+                    if chats_text:
+                        chats_part = f"｜监控对象：{chats_text}"
+                with (
+                    ui.button(
+                        on_click=lambda s=sub, a=acc_text: self._open_sub_detail(s, a)
+                    )
+                    .props("flat no-caps color=grey-9")
+                    .classes("w-full border rounded-lg")
+                    .tooltip("点击查看全部配置参数"),
+                    ui.row().classes("w-full items-center gap-2 no-wrap"),
+                ):
+                    ui.badge(str(i)).props("color=primary")
+                    ui.label(
+                        f"{sub.get('type')} · {sub.get('task')}{chats_part}"
+                    ).classes("text-sm")
+                    ui.space()
+                    ui.label(f"账号：{acc_text}").classes(
+                        "text-xs text-gray-500 whitespace-nowrap"
+                    )
+                    ui.icon("chevron_right").classes("text-gray-400")
+
+    def _build_sub_detail_dialog(self) -> None:
+        with (
+            ui.dialog() as self.sub_detail_dialog,
+            ui.card().classes("w-full max-w-2xl"),
+        ):
+            add_dialog_close_button(self.sub_detail_dialog)
+            self.sub_detail_title = ui.label("子任务配置参数").classes(
+                "text-lg font-semibold"
+            )
+            self.sub_detail_summary = ui.label("").classes(
+                "text-xs text-gray-600 whitespace-pre-line"
+            )
+            with ui.scroll_area().classes("w-full max-h-[60vh] border-t pt-2"):
+                self.sub_detail_container = ui.column().classes("w-full gap-1")
+
+    def _open_sub_detail(self, sub: dict, accounts_text: str) -> None:
+        """弹窗展示子任务绑定任务的全部配置参数。"""
+        sub_type = str(sub.get("type") or "")
+        task_name = str(sub.get("task") or "")
+        self.sub_detail_title.text = f"子任务配置参数：{sub_type} · {task_name}"
+        self.sub_detail_summary.text = f"绑定账号：{accounts_text}"
+        self.sub_detail_container.clear()
+        with self.sub_detail_container:
+            params = _sub_config_params(sub, self.workdir)
+            if not params:
+                ui.label("未找到该任务的配置参数（任务可能已被删除）").classes(
+                    "text-sm text-gray-500"
+                )
+            for label, value in params or []:
+                with ui.row().classes("w-full items-start gap-3 no-wrap"):
+                    ui.label(label).classes(
+                        "text-xs text-gray-500 shrink-0 min-w-[150px] max-w-[240px]"
+                    )
+                    ui.label(value).classes("text-sm whitespace-pre-line flex-grow")
+        self.sub_detail_dialog.open()
 
     def open_run_dialog(self, name: str) -> None:
         combo = next((c for c in self._load() if c.get("name") == name), None)
         if not combo or not combo.get("subs"):
             ui.notify("组合任务不存在或没有子任务", type="warning")
             return
-        # 延迟导入避免循环依赖（sign.py 在模块级导入 combo.py）
-        from tg_signer.webui.data import apply_account_order
-        from tg_signer.webui.sign import _combo_sub_accounts
-
         self.run_title.text = f"执行组合任务: {name}"
-        lines = []
-        for i, sub in enumerate(combo["subs"], 1):
-            accs = apply_account_order(
-                _combo_sub_accounts(sub, self.workdir), self.workdir
-            )
-            lines.append(
-                f"{i}. {sub.get('type')} · {sub.get('task')}"
-                f"｜账号：{'、'.join(accs) if accs else '未绑定'}"
-            )
-        self.run_subs_label.text = "\n".join(lines)
+        self._run_combo = combo
+        self._render_run_subs()
         # 刷新可选账号（仅活跃账号，按账户管理排序），并清空上次的选择
         options = {name: name for name in self.runner._get_account_names()}
         self.run_accounts_select.options = with_select_all(options)
@@ -427,6 +641,6 @@ class ComboTaskBlock:
             self._render_running()
 
 
-def combo_block(runner, workdir: Optional[Path | str] = None) -> ComboTaskBlock:
+def combo_block(runner, workdir: Path | str | None = None) -> ComboTaskBlock:
     """构建「组合任务」tab 面板；runner 为 TaskRunnerBlock 实例。"""
     return ComboTaskBlock(runner, workdir)

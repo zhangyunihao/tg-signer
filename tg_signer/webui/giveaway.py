@@ -134,6 +134,7 @@ _CFG_FIELDS = {
     "rescue_limit": lambda: 10,  # 每次补漏每频道重拉条数
     "last_joined": lambda: 0,  # 上次运行新参与抽奖总数
     "last_joined_by_account": dict,  # 上次运行各账号新参与数 {account: count}
+    "last_joined_by_account_chat": dict,  # 上次运行各账号按来源频道/群组分布 {account: {chat: count}}
 }
 
 
@@ -258,6 +259,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     str(k): int(v)
                     for k, v in (cfg.get("last_joined_by_account") or {}).items()
                 },
+                "last_joined_by_account_chat": {
+                    str(k): {str(ck): int(cv) for ck, cv in (v or {}).items()}
+                    for k, v in (cfg.get("last_joined_by_account_chat") or {}).items()
+                },
             }
         save_task_store(workdir, {"seq": store["seq"], "tasks": clean})
 
@@ -365,6 +370,16 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         raw = (tasks.get(name) or {}).get("last_joined_by_account") or {}
         return {str(k): int(v) for k, v in raw.items()}
 
+    def joined_by_account_chat(name: str) -> Dict[str, Dict[str, int]]:
+        """各账号按来源频道/群组的新参与数：运行中取实时值，结束后取持久化值"""
+        engine = get_engine(name)
+        if engine is not None and engine.running:
+            return {
+                str(k): dict(v) for k, v in engine.joined_by_account_chat.items()
+            }
+        raw = (tasks.get(name) or {}).get("last_joined_by_account_chat") or {}
+        return {str(k): dict(v) for k, v in raw.items()}
+
     def remove_task(name: str) -> None:
         if task_running(name):
             ui.notify(f"任务 #{name} 正在运行，请先停止再删除", type="warning")
@@ -440,6 +455,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 if eng is not None:
                     cfg_done["last_joined"] = int(eng.joined)
                     cfg_done["last_joined_by_account"] = dict(eng.joined_by_account)
+                    cfg_done["last_joined_by_account_chat"] = {
+                        k: dict(v) for k, v in eng.joined_by_account_chat.items()
+                    }
                 _persist()
             cb = _GLOBAL_STATUS_CBS.get(engine_key(_n))
             if cb is not None:
@@ -938,11 +956,51 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         "记录持久化在工作目录，重启不重复参与。"
     ).classes("text-sm text-gray-500")
 
+    # —— 清除所有已参与抽奖记录 ——
+    def open_clear_records_dlg() -> None:
+        if any(task_running(n) for n in tasks):
+            ui.notify("有任务正在运行，请先停止再清除参与记录", type="warning")
+            return
+        total = giveaway_state.count()
+        clear_count_label.text = (
+            f"当前共 {total} 条已参与记录（覆盖所有账号）。"
+            "清除后，相同抽奖链接对所有账号都视为未参与，下次扫描将重新参与。"
+            "此操作不可恢复，确定清除？"
+        )
+        clear_records_dlg.open()
+
+    def do_clear_records() -> None:
+        total = giveaway_state.clear()
+        clear_records_dlg.close()
+        if total:
+            log_buf.append(
+                f"{datetime.now():%H:%M:%S} 已清除所有账号的 {total} 条已参与抽奖记录"
+            )
+            ui.notify(f"已清除 {total} 条已参与记录", type="positive")
+        else:
+            ui.notify("当前没有已参与记录", type="info")
+
+    with ui.dialog() as clear_records_dlg, ui.card().classes("w-full max-w-md"):
+        add_dialog_close_button(clear_records_dlg)
+        ui.label("清除所有已参与抽奖记录").classes("text-lg font-semibold")
+        clear_count_label = ui.label("").classes("text-sm text-gray-700")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("取消", on_click=clear_records_dlg.close).props("flat")
+            ui.button("确认清除", color="negative", on_click=do_clear_records)
+
     with ui.row().classes("w-full items-center justify-between"):
         ui.label("任务列表").classes("font-semibold")
-        ui.button("添加任务", icon="add", on_click=lambda: add_dlg.open()).props(
-            "outline"
-        )
+        with ui.row().classes("gap-2 items-center"):
+            ui.button(
+                "清除参与记录",
+                icon="delete_sweep",
+                on_click=open_clear_records_dlg,
+            ).props("outline color=negative").tooltip(
+                "删除所有账号的已参与抽奖记录，清除后相同链接可再次参与"
+            )
+            ui.button("添加任务", icon="add", on_click=lambda: add_dlg.open()).props(
+                "outline"
+            )
     task_list_container = ui.column().classes("w-full gap-2")
     mobile_state = {"show_all": False}
 
@@ -1092,6 +1150,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
     def open_detail(name: str) -> None:
         by_acct = joined_by_account(name)
+        by_acct_chat = joined_by_account_chat(name)
         total = joined_count(name)
         engine = get_engine(name)
         scope = "本次运行" if engine is not None and engine.running else "上次运行"
@@ -1103,9 +1162,25 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 ui.label("暂无参与记录").classes("text-sm text-gray-400")
             else:
                 for acct in sorted(by_acct, key=lambda a: by_acct[a], reverse=True):
-                    with ui.row().classes("w-full items-center justify-between"):
-                        ui.label(acct).classes("text-sm")
-                        ui.badge(f"{by_acct[acct]} 个抽奖", color="primary")
+                    with ui.column().classes("w-full gap-0.5"):
+                        with ui.row().classes("w-full items-center justify-between"):
+                            ui.label(acct).classes("text-sm font-medium")
+                            ui.badge(f"{by_acct[acct]} 个抽奖", color="primary")
+                        # 该账号在每个来源频道/群组新参与的抽奖数
+                        chats = by_acct_chat.get(acct) or {}
+                        for chat_name in sorted(
+                            chats, key=lambda c: chats[c], reverse=True
+                        ):
+                            shown = str(chat_name)
+                            if len(shown) > 24:
+                                shown = shown[:24] + "…"
+                            with ui.row().classes(
+                                "w-full items-center justify-between pl-4"
+                            ):
+                                ui.label(f"└ {shown}").classes(
+                                    "text-xs text-gray-600"
+                                )
+                                ui.badge(f"{chats[chat_name]} 个", color="grey")
         detail_dlg.open()
 
     # —— 添加任务弹窗 ——

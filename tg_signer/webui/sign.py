@@ -775,18 +775,43 @@ class TaskRunnerBlock:
         return []
 
     def _get_combo_task_names(self, task_type: str) -> list[str] | dict[str, str]:
-        """组合任务弹窗的任务下拉：签到 (run-once) 列出历史上执行过的任务名
-        （而非 signs/ 下的任务配置），并附「账号｜频道」摘要；自动抽奖列出
-        「编号｜账号｜监控对象」；其余类型沿用 _get_task_names。"""
+        """组合任务弹窗的任务下拉：签到 (run-once) 列出 signs/ 下所有签到任务
+        （含从未执行过的），并合并历史上执行过的任务名，附「账号｜频道」摘要；
+        自动抽奖列出「编号｜账号｜监控对象」；其余类型沿用 _get_task_names。
+        各类型均按创建时间倒序（最新的在前）。"""
         if "run-once" in task_type:
-            names: dict[str, str] = {}
+            history_accounts: dict[str, str] = {}
             for r in reversed(load_task_history()):
                 if "签到 (run-once)" not in str(r.get("task_type") or ""):
                     continue
                 name = str(r.get("task_name") or "")
-                if not name or name in names:
-                    continue
-                accounts = str(r.get("accounts") or "").strip()
+                if name and name not in history_accounts:
+                    history_accounts[name] = str(r.get("accounts") or "").strip()
+            bound = load_task_accounts()
+            # 签到任务按创建时间倒序：signs/ 目录创建时间新的在前
+            signs_root = get_workdir(state.workdir) / CONFIG_META["signer"][0]
+            config_names = sorted(
+                list_task_names("signer", state.workdir),
+                key=lambda n: (
+                    (signs_root / n).stat().st_ctime
+                    if (signs_root / n).is_dir()
+                    else 0.0
+                ),
+                reverse=True,
+            )
+            ordered = config_names + [
+                n for n in history_accounts if n not in set(config_names)
+            ]
+            names: dict[str, str] = {}
+            for name in ordered:
+                bound_accs = [
+                    str(a) for a in bound.get(f"签到 (run-once)|{name}", []) if a
+                ]
+                accounts = (
+                    "、".join(bound_accs)
+                    if bound_accs
+                    else history_accounts.get(name, "")
+                )
                 chats_text = ""
                 try:
                     entry = load_config("signer", name, state.workdir)
@@ -807,7 +832,9 @@ class TaskRunnerBlock:
             title_map = _chat_title_map(state.workdir)
             opts: dict[str, str] = {}
             for tid in sorted(
-                store["tasks"].keys(), key=lambda k: int(k) if str(k).isdigit() else 0
+                store["tasks"].keys(),
+                key=lambda k: int(k) if str(k).isdigit() else 0,
+                reverse=True,  # 创建时间倒序：编号大的（新建的）在前
             ):
                 cfg = store["tasks"][tid] or {}
                 accounts = "、".join(str(a) for a in (cfg.get("accounts") or []))
@@ -822,15 +849,18 @@ class TaskRunnerBlock:
                 )
             return opts
         if "退频道" in task_type:
-            # 批量退频道为任务列表模式：仅列出开启了「自动退出未命中关键字的
-            # 频道」的任务（组合执行无人工确认环节，仅扫描任务在组合中无意义）
+            # 批量退频道为任务列表模式：列出全部退频道任务（含仅扫描任务，
+            # 标注「仅扫描」），按创建时间倒序，避免下拉选项为空
             opts = {}
-            for t in _load_leave_tasks(state.workdir):
+            for t in reversed(_load_leave_tasks(state.workdir)):
                 name = str(t.get("name") or "")
-                if not name or not t.get("auto_leave"):
+                if not name:
                     continue
                 accs = "、".join(str(a) for a in (t.get("accounts") or []))
-                opts[name] = f"{name}（{t.get('days')}天｜自动退出｜账号：{accs or '未设置'}）"
+                mode = "自动退出" if t.get("auto_leave") else "仅扫描"
+                opts[name] = (
+                    f"{name}（{t.get('days')}天｜{mode}｜账号：{accs or '未设置'}）"
+                )
             return opts
         return self._get_task_names(task_type)
 

@@ -754,6 +754,14 @@ class GiveawayState:
             return len(self._data.get(account, {}))
         return sum(len(v) for v in self._data.values())
 
+    def clear(self) -> int:
+        """清空所有账号的已参与记录并立即落盘，返回清除的记录条数"""
+        total = self.count()
+        self._data = {}
+        self._dirty = True
+        self.save(force=True)
+        return total
+
 
 class GiveawayEngine:
     """自动抽奖后台引擎：每账号一个常驻连接，手动/启动时历史扫描并自动参与。"""
@@ -815,6 +823,8 @@ class GiveawayEngine:
         self.joined = 0
         # 本轮各账号新参与数：{account: count}，供明细展示
         self.joined_by_account: Dict[str, int] = {}
+        # 本轮各账号按来源频道/群组的新参与数：{account: {chat标题: count}}
+        self.joined_by_account_chat: Dict[str, Dict[str, int]] = {}
         self.failed = 0
         self.scanning = False
         self.scan_text = ""
@@ -1581,6 +1591,9 @@ class GiveawayEngine:
         self.joined_by_account[account] = (
             self.joined_by_account.get(account, 0) + 1
         )
+        chat_counts = self.joined_by_account_chat.setdefault(account, {})
+        chat_key = channel or "未知频道"
+        chat_counts[chat_key] = chat_counts.get(chat_key, 0) + 1
         from_part = f"来自 {channel or '未知频道'}"
         if title:
             from_part += f"：{title}"

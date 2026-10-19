@@ -788,9 +788,11 @@ def build_ui(auth_code: str = None) -> None:
                 right: 16px;
                 z-index: 9001;
             }
-            /* 全局通知消息移到页面顶部：默认底部弹出会遮挡弹窗底部的「确定」按钮 */
+            /* 全局通知消息固定在顶部 tab 栏下方：默认底部弹出会遮挡弹窗底部的「确定」按钮；
+               tab 栏底部位置 = 页面内容内边距（桌面 16px / 移动端 8px）+ tab 高度 48px，
+               取 72px 保证两端都在 tab 下方且留出间距，不再遮挡 tab */
             .q-notifications__list--bottom {
-                top: 8px !important;
+                top: 72px !important;
                 bottom: auto !important;
             }
         </style>

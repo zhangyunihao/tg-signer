@@ -157,7 +157,8 @@ def test_leave_runner_filter_candidates():
 
 
 def test_combo_runonce_lists_history_tasks(monkeypatch):
-    """签到 (run-once) 的组合任务下拉应列出历史执行过的任务名并附账号/频道摘要。"""
+    """签到 (run-once) 的组合任务下拉应列出 signs/ 下所有签到任务（含从未执行过的），
+    并合并历史执行过的任务名，附账号/频道摘要。"""
     monkeypatch.setattr(
         sign_mod,
         "load_task_history",
@@ -177,6 +178,10 @@ def test_combo_runonce_lists_history_tasks(monkeypatch):
             },
         ],
     )
+    monkeypatch.setattr(sign_mod, "load_task_accounts", dict)
+    monkeypatch.setattr(
+        sign_mod, "list_task_names", lambda kind, wd: ["my-sign", "new-task"]
+    )
 
     class _FakeEntry:
         payload = {
@@ -193,9 +198,19 @@ def test_combo_runonce_lists_history_tasks(monkeypatch):
 
     names = blk._get_combo_task_names("签到 (run-once)")
     assert names == {
-        "旧任务": "旧任务｜账号：alice, bob｜频道：频道A、-100123",
         "my-sign": "my-sign｜账号：未绑定｜频道：频道A、-100123",
-    }  # 最新执行的任务排最前
+        "new-task": "new-task｜账号：未绑定｜频道：频道A、-100123",
+        "旧任务": "旧任务｜账号：alice, bob｜频道：频道A、-100123",
+    }  # 配置里的任务按名称排序在前，仅出现在历史中的任务排后
+
+    # 有账号绑定的任务优先显示绑定账号（而非历史执行账号）
+    monkeypatch.setattr(
+        sign_mod,
+        "load_task_accounts",
+        lambda: {"签到 (run-once)|my-sign": ["alice"]},
+    )
+    names = blk._get_combo_task_names("签到 (run-once)")
+    assert names["my-sign"].startswith("my-sign｜账号：alice")
 
     # 配置读取失败时频道显示「未设置」，不影响任务列出
     def _boom(*a, **k):
@@ -205,7 +220,7 @@ def test_combo_runonce_lists_history_tasks(monkeypatch):
     names = blk._get_combo_task_names("签到 (run-once)")
     assert names["my-sign"].endswith("频道：未设置")
 
-    # 退频道类型：仅列出开启「自动退出」的任务（仅扫描任务在组合中无意义）
+    # 退频道类型：任务列表模式，列出全部退频道任务（含仅扫描，标注模式）
     monkeypatch.setattr(
         sign_mod,
         "_load_leave_tasks",
@@ -227,8 +242,11 @@ def test_combo_runonce_lists_history_tasks(monkeypatch):
         ],
     )
     opts = blk._get_combo_task_names("批量退频道 (auto leave)")
-    assert opts == {"自动退任务": "自动退任务（14天｜自动退出｜账号：bob）"}
-    # 无符合条件任务时返回空（无兜底项）
+    assert opts == {
+        "自动退任务": "自动退任务（14天｜自动退出｜账号：bob）",
+        "夜世轩任务": "夜世轩任务（30天｜仅扫描｜账号：alice）",
+    }  # 全部任务列出（含仅扫描），避免下拉选项为空
+    # 无任务时返回空（无兜底项）
     monkeypatch.setattr(sign_mod, "_load_leave_tasks", lambda _wd: [])
     assert blk._get_combo_task_names("批量退频道 (auto leave)") == {}
 
