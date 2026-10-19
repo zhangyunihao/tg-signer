@@ -10,7 +10,11 @@ spec 为所选抽奖任务配置加上账号与工作目录::
      "session_dir": ".", "chats": [...], "keywords": [...],
      "auto_scan": true, "auto_join": true, "ignore_history": true,
      "max_joins": null, "delay_min": 3, "delay_max": 10,
-     "confirm_wait": 8, "rescue_interval_min": 0, "rescue_limit": 10}
+     "confirm_wait": 8, "rescue_interval_min": 0, "rescue_limit": 10,
+     "win_detect": true}
+
+中奖提醒转发目标与 Server酱 SendKey 为全局设置（工作目录
+webui_win_settings.json，消息中心配置），启动时统一读取，不随任务配置传递。
 
 加载任务配置后运行 GiveawayEngine 至自然结束（补漏关闭时首轮扫描完成
 即结束），日志输出到 stdout 并同步落盘到工作目录 logs/giveaway.log。
@@ -59,6 +63,7 @@ def engine_kwargs_from_spec(spec: dict) -> Dict[str, Any]:
             if spec.get("rescue_limit") is not None
             else 10
         ),
+        "win_detect": bool(spec.get("win_detect", True)),
     }
 
 
@@ -89,6 +94,7 @@ async def run_giveaway(spec: dict) -> int:
         print("缺少账号", flush=True)
         return 2
     from tg_signer.webui.data import chat_username_map, load_two_way_accounts
+    from tg_signer.webui.giveaway import load_win_settings
     from tg_signer.webui.random_chat import parse_chat_id
 
     kwargs = engine_kwargs_from_spec(spec)
@@ -96,6 +102,14 @@ async def run_giveaway(spec: dict) -> int:
         parse_chat_id(c) if parse_chat_id(c) is not None else c
         for c in kwargs["chats"]
     ]
+    # 中奖提醒全局设置（消息中心配置）：转发目标 + Server酱 SendKey
+    win_settings = load_win_settings(workdir)
+    kwargs["win_forward_target"] = str(
+        win_settings.get("win_forward_target") or "me"
+    )
+    kwargs["server_chan_send_key"] = (
+        str(win_settings.get("server_chan_send_key") or "") or None
+    )
     engine = GiveawayEngine()
     finished = asyncio.Event()
     kwargs["state"] = GiveawayState(workdir)

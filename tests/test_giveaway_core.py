@@ -365,10 +365,14 @@ class FakeClient:
         self.pinned_list = []
         self.joined_targets = []
         self.sent = []
+        self.forwarded = []
 
     async def join_chat(self, target):
         self.joined_targets.append(target)
         return SimpleNamespace(title=f"chat-{target}")
+
+    async def forward_messages(self, chat_id, from_chat_id, message_ids):
+        self.forwarded.append((chat_id, from_chat_id, tuple(message_ids)))
 
     async def send_message(self, chat_id, text):
         self.sent.append((chat_id, text))
@@ -2239,3 +2243,214 @@ def test_verify_after_click_done_password_not_resent(tmp_path, monkeypatch):
     client.history = [activation]
     asyncio.run(engine._verify_after_click("acc", client, "LotteryBestBot", [activation]))
     assert client.sent == []
+
+
+# ---------------- 中奖识别（win detect） ----------------
+
+
+WIN_SAMPLE = (
+    "💐💐💐 中奖提醒 💐💐💐\n\n"
+    "🔖 防伪编号：H179190232717\n\n"
+    "🎰 【上海栖心地】 徐汇奶霸 @fhurdvjj 福利\n\n"
+    "🎊 江澈 恭喜您中奖了！\n\n"
+    "💁 参与人数：79人\n\n"
+    "💰️ 获得奖品：p-100\n🎅 联系领奖：@fhurdvjj\n\n"
+    "幸运时刻已开启, 中奖只是开始！"
+)
+
+
+def test_win_regex_matches_real_bot_samples():
+    """真实 bot 中奖私信样本均命中识别正则；参与类消息不误报。"""
+    from tg_signer.giveaway_core import WIN_MESSAGE_RE
+
+    # @LotteryBestBot：标题行 + 正文恭喜 + 防伪编号
+    assert WIN_MESSAGE_RE.search(WIN_SAMPLE)
+    # @BaibaoxiangCjBot：无「中奖提醒」标题、无防伪编号，仅正文恭喜
+    baibao = (
+        "🎉 恭喜您，您中奖啦！\n\n"
+        "👥 中奖群组：上海艺术展览会备用群\n\n"
+        "🎁 中得奖品：2次优惠300\n\n"
+        "📜 抽奖说明：\n中奖者截图发给老师兑换 @mitai113"
+    )
+    assert WIN_MESSAGE_RE.search(baibao)
+    # @RealSaberBot：仅正文「恭喜您中奖了」+ 校验码
+    saber = (
+        "🎉🎊 恭喜您中奖了 🎊🎉\n\n"
+        "👑 中奖人：林叙\n🆔 ID：8216950628\n\n"
+        "🔑 校验码：dXFKQFL07KsODbbzJDVQRWxN"
+    )
+    assert WIN_MESSAGE_RE.search(saber)
+    # 参与清单/规则说明类消息不误报
+    assert not WIN_MESSAGE_RE.search("🎫 加入-某频道 ❌\n└  🔑 发送口令﹝出击宝宝﹞")
+    assert not WIN_MESSAGE_RE.search("📜 抽奖说明：中奖者联系老师兑奖")
+
+
+def test_state_bots_for_orders_by_recency(tmp_path):
+    """bots_for：按最近交互时间倒序返回账号参与过的 bot，大小写去重。"""
+    state = GiveawayState(tmp_path)
+    state.add("acc", "BotAAA", "p1")
+    state.add("acc", "BotBBB", "p2")
+    state.add("acc", "BotAAA", "p3")
+    # 直接改 ts 模拟时间先后：p3(AAA) 最旧，BBB 居中，p1(AAA) 最新
+    state._data["acc"]["botaaa|p3"]["ts"] = "2026-10-01T10:00:00"
+    state._data["acc"]["botbbb|p2"]["ts"] = "2026-10-03T10:00:00"
+    state._data["acc"]["botaaa|p1"]["ts"] = "2026-10-05T10:00:00"
+    assert state.bots_for("acc") == ["BotAAA", "BotBBB"]
+    assert state.bots_for("other") == []
+
+
+def test_check_win_message_forwards_emits_and_dedups(tmp_path):
+    """中奖消息：转发到收藏夹 + 发 win 事件 + 状态记录；同实例重复检测不重复转发。"""
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    events: list = []
+    engine.on_event = events.append
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    win = _msg(text=WIN_SAMPLE, id=7)
+    asyncio.run(engine._check_win_message("acc", client, "LotteryBestBot", win))
+    assert client.forwarded == [("me", -1001234567890, (7,))]
+    assert len(events) == 1
+    assert events[0]["type"] == "win"
+    assert events[0]["account"] == "acc"
+    assert events[0]["bot"] == "LotteryBestBot"
+    assert state.has("acc", "LotteryBestBot", "win:7")
+    assert any("检测到中奖消息" in line for line in logs)
+    assert any("已转发到 收藏夹" in line for line in logs)
+
+    # 同一引擎实例重复检测：不重复转发/发事件
+    asyncio.run(engine._check_win_message("acc", client, "LotteryBestBot", win))
+    assert client.forwarded == [("me", -1001234567890, (7,))]
+    assert len(events) == 1
+
+
+def test_check_win_message_dedups_across_restart(tmp_path):
+    """跨重启去重：状态文件里已记录 win:<id> 的新引擎实例不再转发。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    win = _msg(text=WIN_SAMPLE, id=9)
+    asyncio.run(engine._check_win_message("acc", client, "LotteryBestBot", win))
+    assert len(client.forwarded) == 1
+
+    engine2, _ = _engine(tmp_path)
+    events2: list = []
+    engine2.on_event = events2.append
+    asyncio.run(engine2._check_win_message("acc", client, "LotteryBestBot", win))
+    # 未新增转发，也未重复发事件
+    assert client.forwarded == [("me", -1001234567890, (9,))]
+    assert events2 == []
+
+
+def test_check_win_message_ignores_non_win_and_disabled(tmp_path):
+    """参与清单类消息不误报；开关关闭时不检测。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    asyncio.run(
+        engine._check_win_message(
+            "acc",
+            client,
+            "LotteryBestBot",
+            _msg(text="🎫 加入-某频道 ❌\n└  🔑 发送口令﹝出击宝宝﹞", id=1),
+        )
+    )
+    assert client.forwarded == []
+
+    engine.win_detect = False
+    asyncio.run(
+        engine._check_win_message(
+            "acc", client, "LotteryBestBot", _msg(text=WIN_SAMPLE, id=2)
+        )
+    )
+    assert client.forwarded == []
+
+
+def test_sweep_bot_wins_scans_known_bots_only(tmp_path):
+    """启动回扫：只扫状态里交互过的 bot；扫到中奖消息即转发+发事件。"""
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    state.add("acc", "LotteryBestBot", "p1")
+    state.save()
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    client.history = [
+        _msg(text="请点击按钮参与抽奖", id=12),
+        _msg(text="💐💐💐 中奖提醒 💐💐💐 恭喜您中奖了！", id=11),
+    ]
+    events: list = []
+    engine.on_event = events.append
+    asyncio.run(engine._sweep_bot_wins("acc", client))
+    assert client.forwarded == [("me", -1001234567890, (11,))]
+    assert len(events) == 1
+
+    # 无交互记录的账号：不扫任何 bot
+    client2 = FakeClient(bot_users={"LotteryBestBot"})
+    client2.history = [_msg(text=WIN_SAMPLE, id=13)]
+    asyncio.run(engine._sweep_bot_wins("other", client2))
+    assert client2.forwarded == []
+
+
+def test_push_win_server_chan_optional(tmp_path, monkeypatch):
+    """配置 SendKey 时中奖消息走 Server酱推送；未配置时不推送。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    calls: list = []
+
+    async def fake_sc_send(key, title, content):
+        calls.append((key, title, content))
+
+    monkeypatch.setattr(gc, "sc_send", fake_sc_send)
+    engine, _state = _engine(tmp_path)
+    engine.server_chan_send_key = "SCT123"
+
+    async def _drive():
+        engine._push_win_server_chan("acc", "LotteryBestBot", WIN_SAMPLE)
+        await asyncio.sleep(0)  # 让 create_task 的推送协程执行
+
+    asyncio.run(_drive())
+    assert len(calls) == 1
+    assert calls[0][0] == "SCT123"
+    assert calls[0][1] == "中奖提醒"
+    assert "恭喜您中奖了" in calls[0][2]
+
+    # 未配置 SendKey：静默不推送
+    calls.clear()
+    engine2, _ = _engine(tmp_path)
+
+    async def _drive2():
+        engine2._push_win_server_chan("acc", "LotteryBestBot", WIN_SAMPLE)
+        await asyncio.sleep(0)
+
+    asyncio.run(_drive2())
+    assert calls == []
+
+
+def test_win_settings_roundtrip(tmp_path):
+    """中奖提醒全局设置（消息中心配置）：保存/读取往返；损坏文件返回空。"""
+    from tg_signer.webui.giveaway import load_win_settings, save_win_settings
+
+    assert load_win_settings(tmp_path) == {}  # 无配置文件 → 空
+    save_win_settings(
+        tmp_path,
+        {"win_forward_target": "-1001234567890", "server_chan_send_key": "SCT1"},
+    )
+    settings = load_win_settings(tmp_path)
+    assert settings["win_forward_target"] == "-1001234567890"
+    assert settings["server_chan_send_key"] == "SCT1"
+
+    # 覆盖保存 + 空值回退默认
+    save_win_settings(tmp_path, {"win_forward_target": "", "server_chan_send_key": ""})
+    settings2 = load_win_settings(tmp_path)
+    assert settings2["win_forward_target"] == "me"
+    assert settings2["server_chan_send_key"] == ""
+
+    # 损坏的配置文件：静默返回空
+    (tmp_path / "webui_win_settings.json").write_text("{bad", encoding="utf-8")
+    assert load_win_settings(tmp_path) == {}

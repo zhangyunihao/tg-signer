@@ -860,6 +860,34 @@ def build_ui(auth_code: str = None) -> None:
                 .leave-days { width: 104px; min-width: 104px; }
                 /* 表格底部分页栏字号略缩，避免拥挤 */
                 .q-table__bottom { font-size: 13px; }
+                /* 执行组合任务弹窗：子任务行改两行显示——标题占满首行可换行，
+                   账号独立一行（与标题左对齐），避免「标题+账号」单行挤压溢出；
+                   右箭头在触屏上无意义一并隐藏 */
+                .tgs-run-sub-inner { flex-wrap: wrap !important; }
+                .tgs-run-sub-space { display: none !important; }
+                .tgs-run-sub-title {
+                    flex: 1 1 0 !important;
+                    min-width: 0 !important;
+                    overflow-wrap: anywhere;
+                }
+                .tgs-run-sub-accs {
+                    flex: 0 0 100% !important;
+                    white-space: normal !important;
+                    padding-left: 28px;
+                }
+                .tgs-run-sub-chev { display: none !important; }
+                /* 子任务配置参数弹窗：参数名与值改为上下两行（解除 150px 固定标签宽），
+                   长参数值可断行，避免窄屏横向溢出 */
+                .tgs-sub-detail-row { flex-wrap: wrap !important; }
+                .tgs-sub-detail-label {
+                    flex: 0 0 100% !important;
+                    min-width: 0 !important;
+                    max-width: 100% !important;
+                }
+                .tgs-sub-detail-value {
+                    flex: 1 1 100% !important;
+                    overflow-wrap: anywhere;
+                }
             }
         </style>
         """

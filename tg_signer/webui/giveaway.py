@@ -53,6 +53,11 @@ JOIN_ALERTS_MAX = 200
 # 抽奖过程中记录的未完成口令发言任务（持久化，口令发送成功后自动消除）
 SPEAK_ALERTS_FILE = "webui_speak_alerts.json"
 SPEAK_ALERTS_MAX = 200
+# 中奖提醒（bot 私聊识别到中奖消息，持久化，不清除仅限量）
+WIN_ALERTS_FILE = "webui_win_alerts.json"
+WIN_ALERTS_MAX = 200
+# 中奖提醒全局设置（消息中心配置，所有任务共用）：转发目标 + Server酱 SendKey
+WIN_SETTINGS_FILE = "webui_win_settings.json"
 
 
 def load_join_alerts(workdir) -> List[dict]:
@@ -118,6 +123,63 @@ def format_speak_alert(a: dict) -> str:
     )
 
 
+def load_win_alerts(workdir) -> List[dict]:
+    path = Path(workdir) / WIN_ALERTS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        alerts = data.get("alerts") if isinstance(data, dict) else None
+        return [a for a in (alerts or []) if isinstance(a, dict)]
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        logger.debug("读取中奖提醒文件失败", exc_info=True)
+        return []
+
+
+def save_win_alerts(workdir, alerts: List[dict]) -> None:
+    try:
+        atomic_write_json(
+            Path(workdir) / WIN_ALERTS_FILE, {"alerts": alerts[:WIN_ALERTS_MAX]}
+        )
+    except OSError:
+        logger.debug("写入中奖提醒文件失败", exc_info=True)
+
+
+def format_win_alert(a: dict) -> str:
+    text = str(a.get("text") or "").replace("\n", " ")
+    return f"账号 {a.get('account')} 中奖（@{a.get('bot')}）：{text}（{a.get('time')}）"
+
+
+def load_win_settings(workdir) -> dict:
+    """中奖提醒全局设置：{win_forward_target, server_chan_send_key}，无配置返回空。"""
+    path = Path(workdir) / WIN_SETTINGS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        logger.debug("读取中奖提醒全局设置失败", exc_info=True)
+        return {}
+
+
+def save_win_settings(workdir, settings: dict) -> None:
+    try:
+        atomic_write_json(
+            Path(workdir) / WIN_SETTINGS_FILE,
+            {
+                "win_forward_target": str(
+                    settings.get("win_forward_target") or "me"
+                ),
+                "server_chan_send_key": str(
+                    settings.get("server_chan_send_key") or ""
+                ),
+            },
+        )
+    except OSError:
+        logger.debug("写入中奖提醒全局设置失败", exc_info=True)
+
+
 # 任务配置字段 -> 默认值，加载旧配置时补齐缺失字段
 _CFG_FIELDS = {
     "accounts": list,
@@ -132,6 +194,7 @@ _CFG_FIELDS = {
     "max_joins": lambda: None,
     "rescue_interval_min": lambda: 0,  # 补漏扫描间隔（分钟），0=关闭（默认关闭）
     "rescue_limit": lambda: 10,  # 每次补漏每频道重拉条数
+    "win_detect": lambda: True,  # 中奖识别：bot 私聊命中关键词时转发提醒
     "last_joined": lambda: 0,  # 上次运行新参与抽奖总数
     "last_joined_by_account": dict,  # 上次运行各账号新参与数 {account: count}
     "last_joined_by_account_chat": dict,  # 上次运行各账号按来源频道/群组分布 {account: {chat: count}}
@@ -250,6 +313,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "max_joins": (int(cfg["max_joins"]) if cfg.get("max_joins") else None),
                 "rescue_interval_min": max(0, int(cfg.get("rescue_interval_min") or 0)),
                 "rescue_limit": max(1, int(cfg.get("rescue_limit") or 10)),
+                # 中奖识别配置（转发目标/Server酱为消息中心全局设置）
+                "win_detect": bool(cfg.get("win_detect", True)),
                 # 上次执行的开始时间与时长（运行结束或停止时写入时长）
                 "last_start_time": str(cfg.get("last_start_time") or ""),
                 "last_duration": str(cfg.get("last_duration") or ""),
@@ -407,6 +472,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         rescue_interval_input.value = cfg.get("rescue_interval_min") or 30
         rescue_limit_input.value = cfg.get("rescue_limit") or 10
         rescue_switch.value = bool(cfg.get("rescue_interval_min"))
+        win_switch.value = bool(cfg.get("win_detect", True))
         _apply_rescue_visibility()
         for el in (
             session_dir_input,
@@ -422,6 +488,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             delay_max_input,
             rescue_interval_input,
             rescue_limit_input,
+            win_switch,
         ):
             el.update()
         ui.notify("已复制任务参数，可修改后点击「确定添加」", type="positive")
@@ -466,6 +533,33 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         def _on_event(ev: dict) -> None:
             """加入失败/未完成发言 → 顶部通知 + 持久化；加入成功/口令已发则消除"""
             etype = ev.get("type")
+            if etype == "win":
+                # 中奖提醒：持久化 + 顶部弹窗（好消息，绿色通知）
+                acct = str(ev.get("account") or "")
+                bot = str(ev.get("bot") or "")
+                if not acct or not bot:
+                    return
+                alerts = load_win_alerts(workdir)
+                alerts.insert(
+                    0,
+                    {
+                        "account": acct,
+                        "bot": bot,
+                        "text": str(ev.get("text") or "")[:300],
+                        "time": f"{datetime.now():%m-%d %H:%M:%S}",
+                    },
+                )
+                save_win_alerts(workdir, alerts)
+                try:
+                    with client:
+                        ui.notify(
+                            format_win_alert(alerts[0]),
+                            type="positive",
+                            multi_line=True,
+                        )
+                except Exception:
+                    logger.debug("推送中奖提醒失败", exc_info=True)
+                return
             if etype in ("join_failed", "join_resolved"):
                 acct = str(ev.get("account") or "")
                 chat = str(ev.get("chat") or "")
@@ -537,6 +631,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
         engine = ensure_engine(name)
         start_ts = time.time()
+        # 中奖提醒全局设置（消息中心配置）：转发目标 + Server酱 SendKey
+        win_settings = load_win_settings(workdir)
         started = await engine.start(
             accounts=list(cfg["accounts"]),
             chats=[
@@ -559,6 +655,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             confirm_wait=int(cfg.get("confirm_wait") or 8),
             rescue_interval=(int(cfg.get("rescue_interval_min") or 0) * 60),
             rescue_limit=int(cfg.get("rescue_limit") or 10),
+            win_detect=bool(cfg.get("win_detect", True)),
+            win_forward_target=str(win_settings.get("win_forward_target") or "me"),
+            server_chan_send_key=str(win_settings.get("server_chan_send_key") or "")
+            or None,
             state=giveaway_state,
             on_finish=_on_finish,
             on_event=_on_event,
@@ -639,6 +739,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "confirm_wait": 8,
             "rescue_interval_min": rescue_interval_min,
             "rescue_limit": rescue_limit,
+            "win_detect": bool(win_switch.value),
         }
         ensure_engine(name)
         _persist()
@@ -1302,6 +1403,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 format="%d",
             ).classes("w-44")
 
+        with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+            win_switch = ui.switch(
+                "中奖识别（检测到中奖消息自动提醒；转发目标在右上角消息中心设置）",
+                value=True,
+            )
+
         def _apply_rescue_visibility() -> None:
             visible = bool(rescue_switch.value)
             rescue_interval_input.visible = visible
@@ -1315,6 +1422,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "机器人回复消息中出现的频道/群组链接会被逐一加入（激进模式，可能误加）。"
             "补漏扫描会按设定间隔重拉各频道最近若干条消息，"
             "捞回此前因网络异常/中断漏掉的抽奖帖，连续多轮拉取失败会自动暂停一段时间。"
+            "中奖识别会在 bot 私聊出现中奖消息时转发提醒并写入消息中心，"
+            "转发目标与微信推送（Server酱）在右上角消息中心统一设置，"
+            "任务启动与每轮补漏时也会回扫各 bot 私聊，补捡停机期间的中奖通知。"
             "请确保账号已加入所监控的频道。"
         ).classes("text-xs text-amber-600")
         with ui.row().classes("w-full justify-end"):

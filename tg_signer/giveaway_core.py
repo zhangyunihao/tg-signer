@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from tg_signer.core import get_client, safe_disconnect
+from tg_signer.notification.server_chan import sc_send
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,14 @@ RESCUE_MAX_FAILS = 3  # 连续失败达该轮数后熔断暂停补漏
 RESCUE_RESUME_COOLDOWN = 1800  # 熔断后的自动恢复等待（秒）
 RESCUE_FETCH_TIMEOUT = 60  # 单频道补漏拉取消息的超时（秒）
 SEEN_CAP_PER_CHAT = 500  # 每频道保留的已处理消息 id 上限
+
+# —— 中奖识别 ——
+# bot 私聊中奖消息的默认识别正则（样本来自 @LotteryBestBot：标题行为
+# 「💐💐💐 中奖提醒 💐💐💐」，正文有「恭喜您中奖了！」与「🔖 防伪编号：H…」；
+# 三个特征均只出现在中奖消息里，参与清单/抽奖说明类回复不会误命中）
+WIN_MESSAGE_RE = re.compile(r"中奖提醒|恭喜.{0,8}中奖|防伪编号")
+# 启动回扫/补漏轮每 bot 私聊回看的消息条数
+WIN_SWEEP_LIMIT = 50
 
 # —— 网络调用统一超时 ——
 # 半开连接（手机切换网络/代理僵死）下 Pyrogram 请求可能永久挂起，导致引擎
@@ -762,6 +771,26 @@ class GiveawayState:
         self.save(force=True)
         return total
 
+    def bots_for(self, account: str) -> List[str]:
+        """该账号有过交互记录的全部 bot 用户名（按最近交互时间倒序）。
+
+        中奖回扫用：账号参与过的 bot 才可能发来中奖私信。
+        """
+        bucket = self._data.get(account, {})
+        latest: Dict[str, tuple] = {}  # lower -> (ts, 原始用户名)
+        for key, rec in bucket.items():
+            bot = str((rec or {}).get("bot") or key.split("|", 1)[0]).strip()
+            if not bot:
+                continue
+            lower = bot.lower()
+            ts = str((rec or {}).get("ts") or "")
+            if lower not in latest or ts > latest[lower][0]:
+                latest[lower] = (ts, bot)
+        return [
+            bot
+            for _, bot in sorted(latest.values(), key=lambda pair: pair[0], reverse=True)
+        ]
+
 
 class GiveawayEngine:
     """自动抽奖后台引擎：每账号一个常驻连接，手动/启动时历史扫描并自动参与。"""
@@ -805,6 +834,12 @@ class GiveawayEngine:
         self._join_target_types: Dict[str, Optional[str]] = {}
         # 忽略历史成功记录（start 时可覆盖）：默认遵循去重记录
         self.ignore_history = False
+        # 中奖识别：bot 私聊消息命中关键词时转发提醒（默认开启，转发到收藏夹）
+        self.win_detect = True
+        self.win_forward_target: str = "me"
+        self.server_chan_send_key: Optional[str] = None
+        # 已处理的中奖消息：{account|bot|msg_id}，进程内去重（跨重启靠状态文件）
+        self._win_handled: set = set()
         # 标记为「双向」的账户集合：发言数要求类抽奖自动跳过
         self.two_way_accounts: set = set()
         self.chats: List = []
@@ -866,6 +901,9 @@ class GiveawayEngine:
         confirm_wait: int = 8,
         confirm_keywords: Optional[Iterable[str]] = None,
         ignore_history: bool = False,
+        win_detect: bool = True,
+        win_forward_target: str = "me",
+        server_chan_send_key: Optional[str] = None,
         two_way_accounts: Optional[Iterable[str]] = None,
         chat_usernames: Optional[Dict[str, str]] = None,
         state: Optional[GiveawayState] = None,
@@ -885,6 +923,14 @@ class GiveawayEngine:
         self.auto_join = bool(auto_join)
         # 忽略历史成功记录：开启后已参与过的抽奖链接允许重新参与
         self.ignore_history = bool(ignore_history)
+        # 中奖识别配置：转发目标 "me" = 收藏夹（Saved Messages）
+        self.win_detect = bool(win_detect)
+        target = str(win_forward_target or "me").strip() or "me"
+        self.win_forward_target = target
+        self.server_chan_send_key = (
+            str(server_chan_send_key).strip() if server_chan_send_key else None
+        )
+        self._win_handled.clear()
         # 双向账户集合：发言数要求类抽奖自动跳过
         self.two_way_accounts = {str(a) for a in (two_way_accounts or ())}
         self.max_joins = max(0, int(max_joins)) if max_joins else None
@@ -1007,6 +1053,14 @@ class GiveawayEngine:
                 f"任务已启动：{len(self._clients)} 个账号、{len(self.chats)} 个监控对象，"
                 f"关键词：{mode_kw}"
             )
+            # 中奖回扫：开奖常在参与后数日，先补捡停机期间 bot 私聊的中奖通知
+            if not self._stop.is_set():
+                await asyncio.gather(
+                    *[
+                        self._sweep_bot_wins(account, client)
+                        for account, client in list(self._clients.items())
+                    ]
+                )
             if auto_scan and not self._stop.is_set():
                 await self.scan_now()
             if self.rescue_interval > 0:
@@ -1250,6 +1304,8 @@ class GiveawayEngine:
                 except Exception as exc:
                     self.log(f"[{account}] 补漏 {chat} 失败: {exc}")
                     failures["n"] += 1
+            # 补漏轮顺带回扫 bot 私聊中奖消息（不依赖监控对象配置）
+            await self._sweep_bot_wins(account, client)
 
         try:
             await asyncio.gather(
@@ -1315,6 +1371,106 @@ class GiveawayEngine:
             return  # 置顶未变化，此前已处理过
         # 群组置顶不受关键词影响
         await self._process_message(account, client, pinned, skip_keywords=True)
+
+    # —— 中奖识别 ——
+
+    async def _check_win_message(
+        self, account: str, client: Any, bot_username: str, message: Any
+    ) -> None:
+        """中奖识别：bot 私聊消息命中关键词时转发提醒并推送到消息中心。
+
+        去重两级：进程内 _win_handled（同一消息重复轮询只处理一次）+
+        状态文件 win:<msg_id> 记录（跨重启不重复转发/推送）。
+        """
+        if not self.win_detect:
+            return
+        text = _message_text(message)
+        if not text or not WIN_MESSAGE_RE.search(text):
+            return
+        mid = getattr(message, "id", None)
+        dedup_key = f"{account}|{bot_username.lower()}|{mid if mid is not None else hash(text)}"
+        if dedup_key in self._win_handled:
+            return
+        if (
+            mid is not None
+            and self._state is not None
+            and self._state.has(account, bot_username, f"win:{mid}")
+        ):
+            self._win_handled.add(dedup_key)
+            return
+        self._win_handled.add(dedup_key)
+        if mid is not None and self._state is not None:
+            self._state.add(account, bot_username, f"win:{mid}", note="win")
+            self._state.save()
+        summary = " ".join(text.split())
+        if len(summary) > 80:
+            summary = summary[:80] + "…"
+        self.log(f"[{account}] 检测到中奖消息（@{bot_username}）：{summary}")
+        # 转发原消息到转发目标（默认收藏夹），失败不阻断后续提醒
+        chat_id = getattr(getattr(message, "chat", None), "id", None) or bot_username
+        if mid is not None:
+            try:
+                await client.forward_messages(
+                    chat_id=self.win_forward_target,
+                    from_chat_id=chat_id,
+                    message_ids=[mid],
+                )
+                self.log(
+                    f"[{account}] 中奖消息已转发到 "
+                    f"{'收藏夹' if self.win_forward_target == 'me' else self.win_forward_target}"
+                )
+            except Exception as exc:
+                self.log(f"[{account}] 中奖消息转发失败: {exc}")
+                logger.debug("中奖消息转发失败", exc_info=True)
+        self._emit(
+            {
+                "type": "win",
+                "account": account,
+                "bot": bot_username,
+                "text": text[:300],
+            }
+        )
+        self._push_win_server_chan(account, bot_username, text)
+
+    def _push_win_server_chan(self, account: str, bot_username: str, text: str) -> None:
+        """中奖消息可选 Server酱微信推送（未配置 SendKey 时静默跳过）。"""
+        if not self.server_chan_send_key:
+            return
+
+        async def _push() -> None:
+            try:
+                await sc_send(
+                    self.server_chan_send_key,
+                    "中奖提醒",
+                    f"账号 {account}（@{bot_username}）\n\n{text[:600]}",
+                )
+                self.log(f"[{account}] 中奖消息已通过 Server酱推送")
+            except Exception:
+                logger.debug("中奖消息 Server酱推送失败", exc_info=True)
+                self.log(f"[{account}] 中奖消息 Server酱推送失败（详见调试日志）")
+
+        try:
+            asyncio.create_task(_push())
+        except RuntimeError:
+            logger.debug("创建 Server酱推送任务失败（无事件循环）", exc_info=True)
+
+    async def _sweep_bot_wins(self, account: str, client: Any) -> None:
+        """回扫该账号全部已知 bot 的私聊最近消息，补捡停机期间的中奖通知。
+
+        在任务启动时与每个补漏轮执行：开奖常在参与后数日，中奖私信到达时
+        任务可能早已结束，靠回扫兜底。bot 从未开过会话/已失效等拉取失败
+        静默跳过（调试日志），不影响其他 bot。
+        """
+        if not self.win_detect or self._state is None:
+            return
+        for bot in self._state.bots_for(account):
+            if self._stop is not None and self._stop.is_set():
+                return
+            try:
+                async for message in client.get_chat_history(bot, limit=WIN_SWEEP_LIMIT):
+                    await self._check_win_message(account, client, bot, message)
+            except Exception:
+                logger.debug(f"回扫 @{bot} 私聊中奖消息失败", exc_info=True)
 
     async def _resolve_join_target_type(
         self, client: Any, target: str
@@ -2010,6 +2166,9 @@ class GiveawayEngine:
                 try:
                     async for recent in client.get_chat_history(username, limit=4):
                         fresh.append(recent)
+                        await self._check_win_message(
+                            account, client, username, recent
+                        )
                 except Exception:
                     logger.debug("轮询拉取 bot 最新消息失败", exc_info=True)
                 candidates.extend(fresh)
@@ -2045,6 +2204,9 @@ class GiveawayEngine:
                 try:
                     async for recent in client.get_chat_history(username, limit=4):
                         candidates.append(recent)
+                        await self._check_win_message(
+                            account, client, username, recent
+                        )
                 except Exception:
                     logger.debug("加入频道后拉取 bot 最新消息失败", exc_info=True)
             # 帖内口令任务：加入完成后按 bot 清单定位口令群组并发送口令，
@@ -2072,6 +2234,9 @@ class GiveawayEngine:
                     await asyncio.sleep(2)
                     async for recent in client.get_chat_history(username, limit=4):
                         candidates.append(recent)
+                        await self._check_win_message(
+                            account, client, username, recent
+                        )
                 except Exception as exc:
                     self.log(f"重新参与 @{username} 失败: {exc}")
             elif username.lower() in BOTS_RESTART_AFTER_JOIN:
@@ -2089,6 +2254,9 @@ class GiveawayEngine:
                     await asyncio.sleep(2)
                     async for recent in client.get_chat_history(username, limit=4):
                         candidates.append(recent)
+                        await self._check_win_message(
+                            account, client, username, recent
+                        )
                 except Exception as exc:
                     self.log(f"重新参与 @{username} 失败: {exc}")
 
@@ -2174,6 +2342,7 @@ class GiveawayEngine:
             if self._stop is not None and self._stop.is_set():
                 return
             async for msg in client.get_chat_history(username, limit=1):
+                await self._check_win_message(account, client, username, msg)
                 text = (_message_text(msg) or "").strip()
                 if not text:
                     return

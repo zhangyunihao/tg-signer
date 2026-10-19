@@ -154,6 +154,7 @@ def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | 
         ("参与条数上限", str(max_joins) if max_joins else "不限"),
         ("补漏扫描间隔（分钟）", f"{rescue_min}（0=关闭）"),
         ("补漏重拉条数/频道", str(cfg.get("rescue_limit") or 0)),
+        ("中奖识别", _fmt_param_value(cfg.get("win_detect", True))),
     ]
 
 
@@ -524,10 +525,13 @@ class ComboTaskBlock:
     # ---- 执行弹窗 ----
 
     def _build_run_dialog(self) -> None:
+        self._run_sub_checks: list = []
         with ui.dialog() as self.run_dialog, ui.card().classes("w-full max-w-xl"):
             add_dialog_close_button(self.run_dialog)
             self.run_title = ui.label("执行组合任务").classes("text-lg font-semibold")
-            ui.label("点击子任务可查看其全部配置参数").classes("text-xs text-gray-500")
+            ui.label(
+                "勾选要执行的子任务（默认全选）；点击子任务可查看其全部配置参数"
+            ).classes("text-xs text-gray-500")
             self.run_subs_container = ui.column().classes("w-full gap-1")
             # 可选账号覆盖：留空走各子任务绑定账号，选了则全部子任务仅用所选账号
             self.run_accounts_select = ui.select(
@@ -547,11 +551,12 @@ class ComboTaskBlock:
         self._build_sub_detail_dialog()
 
     def _render_run_subs(self) -> None:
-        """执行弹窗的子任务列表；每行可点击查看该子任务的全部配置参数。"""
+        """执行弹窗的子任务列表；每行带勾选框（默认勾选），点击可查看配置参数。"""
         from tg_signer.webui.data import apply_account_order
         from tg_signer.webui.sign import _combo_sub_accounts
 
         self.run_subs_container.clear()
+        self._run_sub_checks = []
         with self.run_subs_container:
             for i, sub in enumerate(self._run_combo["subs"], 1):
                 accs = apply_account_order(
@@ -563,24 +568,37 @@ class ComboTaskBlock:
                     chats_text = giveaway_chats_text(sub.get("task"), self.workdir)
                     if chats_text:
                         chats_part = f"｜监控对象：{chats_text}"
-                with (
-                    ui.button(
-                        on_click=lambda s=sub, a=acc_text: self._open_sub_detail(s, a)
+                with ui.row().classes("w-full items-center gap-1 no-wrap"):
+                    check = (
+                        ui.checkbox(value=True)
+                        .props("dense")
+                        .tooltip("取消勾选则本次执行跳过该子任务")
                     )
-                    .props("flat no-caps color=grey-9")
-                    .classes("w-full border rounded-lg")
-                    .tooltip("点击查看全部配置参数"),
-                    ui.row().classes("w-full items-center gap-2 no-wrap"),
-                ):
-                    ui.badge(str(i)).props("color=primary")
-                    ui.label(
-                        f"{sub.get('type')} · {sub.get('task')}{chats_part}"
-                    ).classes("text-sm")
-                    ui.space()
-                    ui.label(f"账号：{acc_text}").classes(
-                        "text-xs text-gray-500 whitespace-nowrap"
-                    )
-                    ui.icon("chevron_right").classes("text-gray-400")
+                    self._run_sub_checks.append(check)
+                    with (
+                        ui.button(
+                            on_click=lambda s=sub, a=acc_text: self._open_sub_detail(
+                                s, a
+                            )
+                        )
+                        .props("flat no-caps color=grey-9")
+                        .classes("flex-grow border rounded-lg")
+                        .tooltip("点击查看全部配置参数"),
+                        ui.row().classes(
+                            "tgs-run-sub-inner w-full items-center gap-2 no-wrap"
+                        ),
+                    ):
+                        ui.badge(str(i)).props("color=primary")
+                        ui.label(
+                            f"{sub.get('type')} · {sub.get('task')}{chats_part}"
+                        ).classes("tgs-run-sub-title text-sm")
+                        ui.space().classes("tgs-run-sub-space")
+                        ui.label(f"账号：{acc_text}").classes(
+                            "tgs-run-sub-accs text-xs text-gray-500 whitespace-nowrap"
+                        )
+                        ui.icon("chevron_right").classes(
+                            "tgs-run-sub-chev text-gray-400"
+                        )
 
     def _build_sub_detail_dialog(self) -> None:
         with (
@@ -611,11 +629,15 @@ class ComboTaskBlock:
                     "text-sm text-gray-500"
                 )
             for label, value in params or []:
-                with ui.row().classes("w-full items-start gap-3 no-wrap"):
+                with ui.row().classes(
+                    "tgs-sub-detail-row w-full items-start gap-3 no-wrap"
+                ):
                     ui.label(label).classes(
-                        "text-xs text-gray-500 shrink-0 min-w-[150px] max-w-[240px]"
+                        "tgs-sub-detail-label text-xs text-gray-500 shrink-0 min-w-[150px] max-w-[240px]"
                     )
-                    ui.label(value).classes("text-sm whitespace-pre-line flex-grow")
+                    ui.label(value).classes(
+                        "tgs-sub-detail-value text-sm whitespace-pre-line flex-grow"
+                    )
         self.sub_detail_dialog.open()
 
     def open_run_dialog(self, name: str) -> None:
@@ -636,7 +658,10 @@ class ComboTaskBlock:
 
     def _start_run(self) -> None:
         selected = list(self.run_accounts_select.value or [])
-        if self.runner._launch("组合任务", self._run_name, selected):
+        sub_indexes = [i for i, check in enumerate(self._run_sub_checks) if check.value]
+        if self.runner._launch(
+            "组合任务", self._run_name, selected, sub_indexes=sub_indexes
+        ):
             self.run_dialog.close()
             self._render_running()
 

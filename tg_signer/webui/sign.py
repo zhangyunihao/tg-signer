@@ -150,6 +150,7 @@ def build_combo_sub_spec(
                 "confirm_wait": int(gcfg.get("confirm_wait") or 8),
                 "rescue_interval_min": int(gcfg.get("rescue_interval_min") or 0),
                 "rescue_limit": int(gcfg.get("rescue_limit") or 10),
+                "win_detect": bool(gcfg.get("win_detect", True)),
             },
         }
     if "run-once" in sub_type:
@@ -1093,8 +1094,13 @@ class TaskRunnerBlock:
         task_name: str,
         accounts: list[str],
         auto: bool = False,
+        sub_indexes: list[int] | None = None,
     ) -> bool:
-        """启动一个任务（每账号一个子进程）。auto=True 表示服务重启后的自动恢复。"""
+        """启动一个任务（每账号一个子进程）。auto=True 表示服务重启后的自动恢复。
+
+        组合任务可通过 ``sub_indexes``（子任务下标，0 起）只执行勾选的子任务，
+        None 表示全部执行。
+        """
         is_combo = "组合" in task_type
         combo_subs: list[dict] = []
         sub_account_sets: list[list[str]] = []
@@ -1111,6 +1117,13 @@ class TaskRunnerBlock:
                 ui.notify("组合任务不存在或没有子任务", type="warning")
                 return False
             combo_subs = combo["subs"]
+            if sub_indexes is not None:
+                combo_subs = [
+                    sub for i, sub in enumerate(combo_subs) if i in set(sub_indexes)
+                ]
+                if not combo_subs:
+                    ui.notify("请至少勾选一个子任务", type="warning")
+                    return False
             if accounts:
                 # 执行弹窗显式指定账号：所有子任务仅用所选账号（覆盖绑定账号）
                 available = set(self._get_account_names())
