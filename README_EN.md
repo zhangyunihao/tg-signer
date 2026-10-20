@@ -2,7 +2,7 @@
 
 A fork of [amchii/tg-signer](https://github.com/amchii/tg-signer), published on PyPI as `tg-signer-plus`. It provides a graphical WebUI for multi-account scheduled check-ins, random chat messages, bulk channel leaving, and config management — fully usable from a mobile browser.
 
-All operations (login, check-in, automation, monitoring, messaging) are done in the WebUI. The command line only exposes the start command.
+All operations (login, check-in, automation, messaging) are done in the WebUI. The command line only exposes the start command.
 
 ## Start
 
@@ -78,7 +78,7 @@ The same menu also contains: **Work Directory** (switch/view the `.signer` data 
 - "新增任务" picks a task type and accounts (multi-select); the start order of multiple accounts and each account's chat order are shuffled:
   - **Check-in (run-once)**: run once immediately, even if already signed in today
   - **Check-in (run scheduled)**: long-running process that checks in daily at the configured time (`HH:MM:SS` or a crontab expression) plus a random jitter
-  - **Automation / Monitor**: run automation / monitor configs
+  - **Automation**: run automation configs
 - The output area streams each account's log in real time; task history supports "stop / copy args / details", with per-account × per-chat success/failure breakdown
 - Running scheduled tasks show elapsed time, last run, and next expected run
 - Scheduled semantics: if today's check-in time has not come yet, it waits until then; if the time has passed and today is unsigned, it signs in immediately; no duplicate runs
@@ -106,6 +106,6 @@ The same menu also contains: **Work Directory** (switch/view the `.signer` data 
 
 ![Config](./assets/webui_config.png)
 
-- View / edit / delete signer and monitor configs (JSON) online; the first config loads by default
-- "导出全部配置" downloads a ZIP backup: check-in/monitor configs, account status and order, recent-chat/user-info caches, bulk-leave config; **excludes** session credentials, random-chat tasks, and task history
+- View / edit / delete signer configs (JSON) online; the first config loads by default
+- "导出全部配置" downloads a ZIP backup: check-in configs, account status and order, recent-chat/user-info caches, bulk-leave config; **excludes** session credentials, random-chat tasks, and task history
 - "导入配置" accepts ZIP backups and JSON configs; same-name configs are overwritten; session files must be copied separately when migrating devices

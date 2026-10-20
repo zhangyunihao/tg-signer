@@ -12,7 +12,6 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, Literal, Optional
 from pyrogram.types import Message
 
 from tg_signer.config import HttpCallback, UDPForward
-from tg_signer.core import UserMonitor
 from tg_signer.notification.server_chan import sc_send
 
 from .models import AutomationContext, Event
@@ -33,6 +32,49 @@ _REGISTRY: Dict[str, HandlerFn] = {}
 class SafeFormatDict(dict):
     def __missing__(self, key):
         return "{" + key + "}"
+
+
+class _UDPProtocol(asyncio.DatagramProtocol):
+    """外部转发 UDP 使用的内部协议处理类"""
+
+    def __init__(self):
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        pass  # 不需要处理接收的数据
+
+    def error_received(self, exc):
+        print(f"UDP error received: {exc}")
+
+
+async def udp_forward(f: UDPForward, message: Message) -> None:
+    data = str(message).encode("utf-8")
+    loop = asyncio.get_running_loop()
+    transport, protocol = await loop.create_datagram_endpoint(
+        lambda: _UDPProtocol(), remote_addr=(f.host, f.port)
+    )
+    try:
+        transport.sendto(data)
+    finally:
+        transport.close()
+
+
+async def http_api_callback(f: HttpCallback, message: Message) -> None:
+    import httpx
+
+    headers = f.headers or {}
+    headers.update({"Content-Type": "application/json"})
+    content = str(message).encode("utf-8")
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            str(f.url),
+            content=content,
+            headers=headers,
+            timeout=10,
+        )
 
 
 def render_template(text: Any, event: Event, ctx: AutomationContext) -> Any:
@@ -435,7 +477,7 @@ async def external_forward(
             except Exception:  # noqa: BLE001
                 ctx.log("external_forward: UDP配置无效", level="WARNING")
                 continue
-            await UserMonitor.udp_forward(cfg, event.message)
+            await udp_forward(cfg, event.message)
             success_count += 1
         elif t_type == "http":
             try:
@@ -443,7 +485,7 @@ async def external_forward(
             except Exception:  # noqa: BLE001
                 ctx.log("external_forward: HTTP配置无效", level="WARNING")
                 continue
-            await UserMonitor.http_api_callback(cfg, event.message)
+            await http_api_callback(cfg, event.message)
             success_count += 1
         else:
             ctx.log(f"external_forward: 未知目标类型 {t_type}", level="DEBUG")

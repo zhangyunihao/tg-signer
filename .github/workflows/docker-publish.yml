@@ -97,7 +97,7 @@ jobs:
           tags: ${{ steps.prep.outputs.tags }}
           labels: |
             org.opencontainers.image.title=tg-signer
-            org.opencontainers.image.description=Automated Telegram tasks with check-ins, monitoring, forwarding, and auto replies.
+            org.opencontainers.image.description=Automated Telegram tasks with check-ins, automation rules, forwarding, and auto replies.
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.prep.outputs.version_tag }}

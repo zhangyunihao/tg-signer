@@ -13,6 +13,7 @@
 import asyncio
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Set
 
@@ -63,8 +64,27 @@ def save_read_keys(workdir, keys: Set[str]) -> None:
         logger.debug("写入消息已读状态失败", exc_info=True)
 
 
+def _time_sort_value(m: dict) -> int:
+    """把消息时间（%m-%d %H:%M:%S）转为可比较整数，便于跨分类按新旧排序。"""
+    time_str = str(m.get("time") or "")
+    try:
+        dt = datetime.strptime(time_str, "%m-%d %H:%M:%S")
+    except ValueError:
+        return 0
+    return (
+        ((dt.month * 100 + dt.day) * 100 + dt.hour) * 10000
+        + dt.minute * 100
+        + dt.second
+    )
+
+
+def message_sort_key(m: dict) -> tuple:
+    """排序规则：中奖消息最优先，同一优先级内新消息在前。"""
+    return (0 if m["tag"] == "中奖" else 1, -_time_sort_value(m))
+
+
 def collect_messages(workdir) -> List[dict]:
-    """汇总全部消息：中奖提醒最前，加入失败提醒次之，未完成发言任务随后。"""
+    """汇总全部消息：中奖提醒、加入失败提醒与未完成发言任务（排序见 message_sort_key）。"""
     wd = Path(workdir)
     messages: List[dict] = []
     # 0) 中奖提醒（最重要，置顶展示）
@@ -77,6 +97,7 @@ def collect_messages(workdir) -> List[dict]:
                 "key": f"win|{acct}|{bot}|{time_str}",
                 "tag": "中奖",
                 "color": "green",
+                "time": time_str,
                 "text": format_win_alert(a),
             }
         )
@@ -91,6 +112,7 @@ def collect_messages(workdir) -> List[dict]:
                 "key": f"join_failed|{acct}|{chat}|{time_str}",
                 "tag": "加入失败",
                 "color": "red",
+                "time": time_str,
                 "text": format_join_alert(a, title_map),
             }
         )
@@ -105,6 +127,7 @@ def collect_messages(workdir) -> List[dict]:
                 "key": f"speak_failed|{acct}|{group}|{password}|{time_str}",
                 "tag": "发言任务",
                 "color": "orange",
+                "time": time_str,
                 "text": format_speak_alert(a),
             }
         )
@@ -137,8 +160,8 @@ def message_center_button() -> Callable[[], None]:
     def render_list() -> None:
         list_container.clear()
         messages = collect_messages(state.workdir)
-        # 未读排在前（稳定排序，组内保持原顺序）
-        messages.sort(key=lambda m: m["key"] in read_keys)
+        # 中奖消息置顶，其余按新消息优先（时间倒序）
+        messages.sort(key=message_sort_key)
         with list_container:
             if not messages:
                 ui.label("暂无消息").classes("text-sm text-gray-400")
@@ -189,9 +212,16 @@ def message_center_button() -> Callable[[], None]:
 
     def refresh_badge() -> None:
         messages = collect_messages(state.workdir)
-        count = sum(1 for m in messages if m["key"] not in read_keys)
+        unread = [m for m in messages if m["key"] not in read_keys]
+        count = len(unread)
+        has_unread_win = any(m["tag"] == "中奖" for m in unread)
         badge.set_text(str(count))
         badge.set_visibility(count > 0)
+        # 有未读中奖消息时，铃铛换成绿色奖杯以示区分
+        msg_btn.props(
+            f"icon={'emoji_events' if has_unread_win else 'notifications'}"
+            f", color={'green' if has_unread_win else 'primary'}"
+        )
 
     def open_center() -> None:
         render_list()

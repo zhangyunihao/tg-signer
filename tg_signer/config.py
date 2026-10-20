@@ -1,4 +1,3 @@
-import re
 from datetime import time
 from enum import Enum
 from typing import (
@@ -22,15 +21,9 @@ from pydantic import (
     ValidationError,
     field_validator,
 )
-from pyrogram.types import Chat, Message
 from typing_extensions import Self, TypeAlias
 
 ChatId: TypeAlias = Union[int, str]
-
-
-class SafeFormatDict(dict):
-    def __missing__(self, key):
-        return "{" + key + "}"
 
 
 def normalize_chat_username(value: str) -> str:
@@ -365,9 +358,6 @@ class SignConfigV3(BaseJSONConfig):
         return any(chat.requires_ai for chat in self.chats)
 
 
-MatchRuleT: TypeAlias = Literal["exact", "contains", "regex", "all"]
-
-
 class UDPForward(BaseModel):
     type: Literal["udp"] = "udp"
     host: str
@@ -381,167 +371,7 @@ class HttpCallback(BaseModel):
     method: Literal["post"] = "post"
 
 
-class MatchConfig(BaseJSONConfig):
-    chat_id: ChatId  # 聊天id或username
-    rule: MatchRuleT = "exact"  # 匹配规则
-    rule_value: Optional[str] = None  # 规则值
-    from_user_ids: Optional[List[ChatId]] = (
-        None  # 发送者id或username，为空时，匹配所有人
-    )
-    always_ignore_me: bool = False  # 总是忽略自己发送的消息
-    default_send_text: Optional[str] = None  # 默认发送内容
-    ai_reply: bool = False  # 是否使用AI回复
-    ai_prompt: Optional[str] = None
-    send_text_search_regex: Optional[str] = None  # 用正则表达式从消息中提取发送内容
-    send_text_template: Optional[str] = None  # 提取发送内容后的文本模板
-    delete_after: Optional[int] = None
-    ignore_case: bool = True  # 忽略大小写
-    forward_to_chat_id: Optional[ChatId] = None  # 转发消息到该聊天，默认为消息来源
-    external_forwards: Optional[List[Union[UDPForward, HttpCallback]]] = (
-        None  # 转发到外部
-    )
-    push_via_server_chan: bool = False  # 将消息通过server酱推送
-    server_chan_send_key: Optional[str] = None  # server酱的sendkey
-
-    @field_validator("chat_id", mode="before")
-    @classmethod
-    def _parse_chat_id(cls, value):
-        return parse_chat_id_or_username(value)
-
-    @field_validator("forward_to_chat_id", mode="before")
-    @classmethod
-    def _parse_optional_chat_id(cls, value):
-        if value is None:
-            return None
-        return parse_chat_id_or_username(value)
-
-    def __str__(self):
-        return (
-            f"{self.__class__.__name__}(chat_id={self.chat_id}, rule={self.rule}, rule_value={self.rule_value}),"
-            f" default_send_text={self.default_send_text}, send_text_search_regex={self.send_text_search_regex},"
-            f" send_text_template={self.send_text_template}"
-        )
-
-    @property
-    def from_user_set(self):
-        return {
-            (
-                "me"
-                if u in ["me", "self"]
-                else normalize_chat_username(u)
-                if isinstance(u, str)
-                else u
-            )
-            for u in self.from_user_ids
-        }
-
-    def match_user(self, message: "Message"):
-        if not message.from_user:
-            return True
-        if self.always_ignore_me and message.from_user.is_self:
-            return False
-        if not self.from_user_ids:
-            return True
-        return (
-            message.from_user.id in self.from_user_set
-            or (
-                message.from_user.username
-                and message.from_user.username.lower() in self.from_user_set
-            )
-            or ("me" in self.from_user_set and message.from_user.is_self)
-        )
-
-    def match_text(self, text: str) -> bool:
-        """
-        根据`rule`校验`text`是否匹配
-        """
-        rule_value = self.rule_value
-        if self.rule == "all":
-            return True
-        if self.rule == "exact":
-            if self.ignore_case:
-                return rule_value.lower() == text.lower()
-            return rule_value == text
-        elif self.rule == "contains":
-            if self.ignore_case:
-                return rule_value.lower() in text.lower()
-            return rule_value in text
-        elif self.rule == "regex":
-            flags = re.IGNORECASE if self.ignore_case else 0
-            return bool(re.search(rule_value, text, flags=flags))
-        return False
-
-    def match_chat(self, chat: "Chat"):
-        if isinstance(self.chat_id, int):
-            return self.chat_id == chat.id
-        if not chat.username:
-            return False
-        return normalize_chat_username(self.chat_id) == normalize_chat_username(
-            chat.username
-        )
-
-    def match(self, message: "Message"):
-        return self.match_chat(message.chat) and bool(
-            self.match_user(message) and self.match_text(message.text)
-        )
-
-    def _render_send_text_template(self, text: str, match: Optional[re.Match]) -> str:
-        mapping: dict[str, Any] = SafeFormatDict(
-            {
-                "message_text": text,
-                "text": text,
-            }
-        )
-        if match:
-            mapping["match"] = match.group(0)
-            mapping["group0"] = match.group(0)
-            for index, value in enumerate(match.groups(), start=1):
-                mapping[f"group{index}"] = value or ""
-            mapping.update(
-                {key: value or "" for key, value in match.groupdict().items()}
-            )
-            mapping["extracted"] = mapping.get("group1", "")
-        return self.send_text_template.format_map(mapping)
-
-    def get_send_text(self, text: str) -> str:
-        send_text = self.default_send_text
-        if self.send_text_search_regex:
-            m = re.search(self.send_text_search_regex, text)
-            if not m:
-                return send_text
-            if self.send_text_template:
-                return self._render_send_text_template(text, m)
-            try:
-                send_text = m.group(1)
-            except IndexError as e:
-                raise ValueError(
-                    f"{self}: 消息文本: 「{text}」匹配成功但未能捕获关键词, 请检查正则表达式"
-                ) from e
-        elif self.send_text_template:
-            send_text = self._render_send_text_template(text, None)
-        return send_text
-
-    @property
-    def requires_ai(self) -> bool:
-        return bool(self.ai_reply and self.ai_prompt)
-
-
-class MonitorConfig(BaseJSONConfig):
-    """监控配置"""
-
-    version: ClassVar = 1
-    match_cfgs: List[MatchConfig]
-
-    @property
-    def chat_ids(self):
-        return [cfg.chat_id for cfg in self.match_cfgs]
-
-    @property
-    def requires_ai(self) -> bool:
-        return any(cfg.requires_ai for cfg in self.match_cfgs)
-
-
-TextRuleT: TypeAlias = MatchRuleT
+TextRuleT: TypeAlias = Literal["exact", "contains", "regex", "all"]
 
 
 class MessageTriggerParams(BaseModel):

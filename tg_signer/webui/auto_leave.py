@@ -273,6 +273,10 @@ def _split_keywords(text: str) -> List[str]:
     ]
 
 
+def _kw_hit(task: Dict, title: str) -> bool:
+    return any(kw in str(title or "") for kw in (task.get("keywords") or []))
+
+
 def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], None]:
     """构建「批量退频道」标签页内容，返回刷新函数以纳入全局刷新。"""
     session_dir = Path(default_session_dir or ".")
@@ -283,11 +287,15 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     # 每个任务（执行记录）的运行时状态：running/stop/rows/selected/status/auto_left
     # rows（命中/待确认频道）从任务记录恢复，任务完成后重新打开仍可见
     def _default_state(task: Dict) -> Dict:
+        rows = [dict(r) for r in (task.get("rows") or []) if isinstance(r, dict)]
         return {
             "running": False,
             "stop": False,
-            "rows": [dict(r) for r in (task.get("rows") or []) if isinstance(r, dict)],
-            "selected": set(),
+            "rows": rows,
+            # 未命中保护关键字的对话默认勾选，命中的保持不勾等手动确认
+            "selected": {
+                r["key"] for r in rows if not _kw_hit(task, str(r.get("title") or ""))
+            },
             "status": str(task.get("status") or "—"),
             "auto_left": 0,
         }
@@ -318,9 +326,6 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         return next(
             (idx for idx, t in enumerate(tasks, start=1) if t["id"] == task_id), 0
         )
-
-    def _kw_hit(task: Dict, title: str) -> bool:
-        return any(kw in str(title or "") for kw in (task.get("keywords") or []))
 
     async def run_task(task_id: str) -> None:
         task = find_task(task_id)
@@ -396,6 +401,12 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     st["rows"].extend(kept)
                 else:
                     st["rows"].extend(found)
+                    # 不自动退出时，未命中保护关键字的对话默认勾选，命中关键字的不勾
+                    st["selected"].update(
+                        r["key"]
+                        for r in found
+                        if not _kw_hit(task, str(r.get("title") or ""))
+                    )
                 render_list()
             if st["stop"]:
                 st["status"] = "已停止"
@@ -871,6 +882,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     "label": "账号",
                     "field": "accounts",
                     "align": "left",
+                    "style": "max-width: 180px;",
                 },
                 {
                     "name": "status",
@@ -909,6 +921,13 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         "props.row.status === '失败' ? 'negative' : "
         "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
         "{{ props.row.status }}</q-badge></q-td>",
+    )
+    # 账号列限宽：超长账号列表单行省略号截断，悬停显示完整内容
+    leave_table.add_slot(
+        "body-cell-accounts",
+        '<q-td :props="props" style="max-width: 180px;">'
+        '<div class="ellipsis" style="max-width: 180px;" :title="props.row.accounts">'
+        "{{ props.row.accounts }}</div></q-td>",
     )
     # 操作列：复制 / 明细（命中频道）/ 停止（运行中）/ 删除
     leave_table.add_slot(
@@ -1000,8 +1019,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         add_dialog_close_button(detail_dialog)
         detail_title = ui.label("任务明细").classes("text-lg font-semibold")
         ui.label(
-            "以下频道不会被自动退出（命中保护关键字或未开启自动退出），"
-            "可勾选后手动退出。明细已持久化，任务完成后重新打开仍可见。"
+            "未命中保护关键字的对话已默认勾选，命中关键字的保持不勾；"
+            "核对后点「退出所选」手动退出。明细已持久化，任务完成后重新打开仍可见。"
         ).classes("text-xs text-gray-500")
         detail_body = ui.column().classes("w-full gap-2")
 

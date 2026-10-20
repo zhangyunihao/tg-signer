@@ -11,6 +11,7 @@ from typing import Callable, Optional
 from nicegui import app, ui
 
 from tg_signer import __version__
+from tg_signer.core import get_proxy
 from tg_signer.webui.auto_leave import auto_leave_block
 from tg_signer.webui.combo import combo_block
 from tg_signer.webui.common import (
@@ -43,9 +44,7 @@ from tg_signer.webui.giveaway import (
 from tg_signer.webui.messages import message_center_button
 from tg_signer.webui.random_chat import random_chat_block
 from tg_signer.webui.sign import (
-    MONITOR_TEMPLATE,
     SIGNER_TEMPLATE,
-    MonitorBlock,
     SignerBlock,
     SignRecordBlock,
     TaskRunnerBlock,
@@ -304,7 +303,7 @@ def _build_dashboard(container) -> None:
 
         with (
             ui.dialog() as configs_dialog,
-            ui.card().classes("w-full max-w-4xl") as configs_card,
+            ui.card().classes("w-full max-w-4xl tgs-dialog-flex") as configs_card,
         ):
             pass
         add_dialog_close_button(configs_dialog)
@@ -630,9 +629,9 @@ def _build_dashboard(container) -> None:
             _configs_built = True
             with configs_card:
                 ui.label("签到配置管理").classes("text-lg font-semibold")
-                ui.label(
-                    "管理 signer 和 monitor 的配置文件，支持查看、编辑和删除。"
-                ).classes("text-gray-600")
+                ui.label("管理 signer 的配置文件，支持查看、编辑和删除。").classes(
+                    "text-gray-600"
+                )
 
                 # ---- 配置导入导出（用于备份或迁移到其他设备） ----
                 def export_configs() -> None:
@@ -659,8 +658,9 @@ def _build_dashboard(container) -> None:
                         notify_error(exc)
                         return
                     ui.notify(
-                        "导入完成：签到配置 {signer} 个、监控配置 {monitor} 个、"
-                        "数据文件 {signer_data_files} 个".format(**counts),
+                        "导入完成：签到配置 {signer} 个、数据文件 {signer_data_files} 个".format(
+                            **counts
+                        ),
                         type="positive",
                     )
                     try:
@@ -696,16 +696,10 @@ def _build_dashboard(container) -> None:
                     with ui.row().classes("w-full justify-end"):
                         ui.button("关闭", on_click=import_dlg.close).props("outline")
 
-                with ui.tabs().classes("mt-2") as sub_tabs:
-                    tab_signer = ui.tab("Signer")
-                    tab_monitor = ui.tab("Monitor")
-                with ui.tab_panels(sub_tabs, value=tab_signer).classes("w-full"):
-                    with ui.tab_panel(tab_signer):
-                        refreshers.append(
-                            SignerBlock(SIGNER_TEMPLATE, goto_records=goto_records)
-                        )
-                    with ui.tab_panel(tab_monitor):
-                        refreshers.append(MonitorBlock(MONITOR_TEMPLATE))
+                signer_block = SignerBlock(SIGNER_TEMPLATE, goto_records=goto_records)
+                refreshers.append(signer_block)
+                # 块本身只创建空容器并返回 refresh，需立即调用一次填充配置列表
+                signer_block()
 
                 with ui.row().classes("w-full justify-end"):
                     ui.button("关闭", on_click=configs_dialog.close).props("outline")
@@ -748,6 +742,69 @@ def _check_auth_code(input_code: str, auth_code: str) -> tuple[bool, str]:
     if code != auth_code:
         return False, "授权码错误，请重试"
     return True, ""
+
+
+# —— 页面初始化科学上网检查 ——
+# 所有任务功能（签到/自动化/监控/抽奖等）都依赖能连上 Telegram，
+# 页面初始化时通过 TG_PROXY（未配置则直连）对 Telegram DC 做一次 TCP 握手验证。
+_TELEGRAM_DC_HOST = "149.154.167.51"
+_TELEGRAM_DC_PORT = 443
+_NETWORK_CHECK_TIMEOUT = 8.0
+
+
+async def _probe_telegram_connectivity() -> None:
+    """通过当前代理配置连一次 Telegram DC，失败时在页面顶部弹出持久报错。"""
+    proxy = get_proxy()
+    dest = f"{_TELEGRAM_DC_HOST}:{_TELEGRAM_DC_PORT}"
+    logger.info(
+        "网络自检开始（目标 %s，代理 %s）",
+        dest,
+        f"{proxy.get('scheme')}://{proxy.get('hostname')}:{proxy.get('port')}"
+        if proxy
+        else "未配置（直连）",
+    )
+    try:
+        if proxy and proxy.get("scheme") in ("socks5", "socks4", "http"):
+            from urllib.parse import quote
+
+            from python_socks.async_.asyncio import Proxy as SocksProxy
+
+            auth = ""
+            if proxy.get("username"):
+                auth = f"{quote(str(proxy['username']))}:{quote(str(proxy['password'] or ''))}@"
+            proxy_url = f"{proxy['scheme']}://{auth}{proxy['hostname']}:{proxy['port']}"
+            sock = await asyncio.wait_for(
+                SocksProxy.from_url(proxy_url).connect(
+                    dest_host=_TELEGRAM_DC_HOST, dest_port=_TELEGRAM_DC_PORT
+                ),
+                timeout=_NETWORK_CHECK_TIMEOUT,
+            )
+            sock.close()
+        else:
+            writer = None
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(_TELEGRAM_DC_HOST, _TELEGRAM_DC_PORT),
+                    timeout=_NETWORK_CHECK_TIMEOUT,
+                )
+            finally:
+                if writer is not None:
+                    writer.close()
+    except Exception as exc:
+        reason = f"通过代理 {proxy['hostname']}:{proxy['port']}" if proxy else "直连"
+        logger.warning(
+            "网络自检失败（%s 连 Telegram）：(%s) %s", reason, type(exc).__name__, exc
+        )
+        ui.notify(
+            f"科学上网不可用：{reason}连接 Telegram 失败（{_NETWORK_CHECK_TIMEOUT:.0f} 秒内未握手成功）。"
+            "所有任务功能都无法正常使用，请检查代理/VPN 后刷新页面重试。",
+            type="negative",
+            position="top",
+            timeout=0,
+            close_button="知道了",
+        )
+        return
+    logger.info("网络自检通过：可连上 Telegram（%s）", dest)
 
 
 def _auth_gate(container, auth_code: str, on_success: Callable[[], None]) -> None:
@@ -868,6 +925,42 @@ def build_ui(auth_code: str = None) -> None:
                 top: 72px !important;
                 bottom: auto !important;
             }
+            /* 弹窗整卡限高可滚动：桌面端内容超高的弹窗（如签到配置管理里的
+               JSON 编辑器）会溢出视口且无法滚动，统一限高在视口内并允许滚动；
+               移动端媒体查询里有更细的规则（宽度/内边距/安全区），此处不重复 */
+            .q-dialog__inner {
+                max-height: 100dvh;
+            }
+            .q-dialog .q-card {
+                max-height: calc(100dvh - 32px);
+                overflow-y: auto;
+                -webkit-overflow-scrolling: touch;
+            }
+            /* 内含 tab 面板的弹窗（如签到配置管理）：卡片 flex 列布局并让
+               tab 面板占据剩余高度，内部 .q-panel.scroll 才能在限高内滚动。
+               否则面板高度会被内容撑开（数千 px），外层卡片滚不动 */
+            .tgs-dialog-flex {
+                display: flex;
+                flex-direction: column;
+            }
+            .tgs-dialog-flex .q-tab-panels {
+                flex: 1 1 auto;
+                min-height: 0;
+            }
+            /* 桌面端（>640px）：所有列表最右的「操作」列固定在右侧（粘性列），
+               横向滚动时始终可见。移动端表格整体隐藏改用卡片列表，无需生效；
+               th/td 均需不透明底色，否则横向滚动时下层单元格内容会透出来，
+               左侧投影用于提示该列右侧还有被遮挡的内容 */
+            @media (min-width: 641px) {
+                .tgs-desktop-table th.col-actions,
+                .tgs-desktop-table td.col-actions {
+                    position: sticky;
+                    right: 0;
+                    z-index: 1;
+                    background: #ffffff;
+                    box-shadow: -6px 0 6px -6px rgba(0, 0, 0, 0.25);
+                }
+            }
         </style>
         """
     )
@@ -967,6 +1060,8 @@ def build_ui(auth_code: str = None) -> None:
     )
     ui.page_title("TG Signer Web 控制台")
     root = ui.column().classes("w-full gap-3")
+    # 页面初始化即检测科学上网连通性（后台执行不阻塞首屏，失败弹持久报错）
+    ui.timer(0.5, _probe_telegram_connectivity, once=True)
 
     def render_dashboard() -> None:
         root.clear()

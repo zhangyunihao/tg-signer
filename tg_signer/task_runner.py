@@ -5,7 +5,6 @@
     python -m tg_signer.task_runner -w <workdir> -a <account> run-once <task>
     python -m tg_signer.task_runner -w <workdir> -a <account> run <task> [task...]
     python -m tg_signer.task_runner -w <workdir> -a <account> automation run <task>
-    python -m tg_signer.task_runner -w <workdir> -a <account> monitor run <task>
 
 执行逻辑与原 CLI 对应命令完全一致：日志写入 stdout 由 WebUI 解析，
 任一异常以非 0 退出码结束。
@@ -37,13 +36,8 @@ def _parse(argv: list[str]) -> tuple[str, str, list[str]]:
         else:
             break
     rest = argv[i:]
-    # "automation run" / "monitor run" 两段式动作归一为单段
-    if (
-        rest
-        and rest[0] in ("automation", "monitor")
-        and len(rest) >= 2
-        and rest[1] == "run"
-    ):
+    # "automation run" 两段式动作归一为单段
+    if rest and rest[0] == "automation" and len(rest) >= 2 and rest[1] == "run":
         rest = [f"{rest[0]}-run", *rest[2:]]
     return workdir, account, rest
 
@@ -74,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     workdir, account, rest = _parse(list(sys.argv[1:] if argv is None else argv))
     if not rest:
         print(
-            "缺少任务动作参数（run-once / run / automation run / monitor run）",
+            "缺少任务动作参数（run-once / run / automation run）",
             file=sys.stderr,
             flush=True,
         )
@@ -120,11 +114,6 @@ def main(argv: list[str] | None = None) -> int:
 
             automation = UserAutomation(task_name=task_names[0], **kwargs)
             automation.app_run(automation.run())
-        elif action == "monitor-run":
-            from tg_signer.core import UserMonitor
-
-            monitor = UserMonitor(task_name=task_names[0], **kwargs)
-            monitor.app_run(monitor.run())
         else:
             print(f"未知任务动作: {action}", file=sys.stderr, flush=True)
             return 2

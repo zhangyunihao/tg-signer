@@ -2,6 +2,13 @@
 
 ## 版本变动日志
 
+### 1.0.43
+- 移除遗留的监控（monitor）模块：删除 `UserMonitor`、`MonitorConfig`、`MatchConfig` 及 WebUI 的 Monitor 配置标签页与「监控 (monitor run)」任务类型，内部任务入口 `task_runner` 不再支持 `monitor run`；消息监听类能力请改用自动化（automation）规则引擎（转发、AI 回复、正则提取、Server酱推送、外部转发均有对应 handler）
+- 兼容性说明：存量 `<workdir>/monitors/` 目录与旧备份中的 monitor 配置会被静默忽略，其余功能不受影响；automation 的 `external_forward` 所需的 UDP/HTTP 转发实现已内联至 `tg_signer/automation/handlers.py`，行为不变
+- 页面初始化新增科学上网连通性自检：通过当前代理配置（TG_PROXY，未配置则直连）对 Telegram DC 做一次 TCP 握手，失败时页面顶部弹持久报错，不阻塞首屏
+- 批量退频道：扫描完成后未命中保护关键字的对话默认勾选、命中的保持不勾等手动确认；账号列增加最大宽度避免窄屏溢出
+- 消息中心排序优化：中奖消息最优先，同一优先级内按消息时间新在前
+
 ### 1.0.42
 - 「忽略历史成功记录」选项直观化：去重判断收敛为引擎统一方法 `_participated_before()`（正向语义"已参与过则跳过"，消除扫描与参与两处双重否定）；引擎默认值与 WebUI/runner 统一为 True（开关默认勾选）
 - WebUI 文案改为正向表述：新增任务弹窗开关「允许重复参与（忽略历史成功记录）」、任务列表列「允许重复参与」、移动端详情行同步更新；配置键与取值极性不变，旧任务数据完全兼容

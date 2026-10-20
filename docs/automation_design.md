@@ -242,7 +242,7 @@ HANDLERS = {"my_hello": hello}
 
 ## 9. 兼容性与演进建议
 
-- 新增自动化能力优先放在 `automation` 子系统，而不是 legacy `monitor`。
+- 新增自动化能力一律放在 `automation` 子系统（legacy `monitor` 模块已移除，勿再引用）。
 - 配置模型变更必须保证向后兼容（或提供自动迁移）。
 - 涉及 Telegram 调用节流/FloodWait 时，复用已有 API 调用封装，避免旁路调用。
 - 新增 handler 时建议同时补充：

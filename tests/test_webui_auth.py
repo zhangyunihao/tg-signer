@@ -89,6 +89,9 @@ class FakeUI:
     def page_title(self, *args, **kwargs):
         return FakeEl(*args, **kwargs)
 
+    def timer(self, *args, **kwargs):
+        return FakeEl(*args, **kwargs)
+
 
 class FakeContainer:
     def __init__(self):

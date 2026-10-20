@@ -66,7 +66,6 @@ from tg_signer.webui.giveaway import (
     load_task_store as _load_giveaway_store,
 )
 from tg_signer.webui.interactive import InteractiveSignerConfig
-from tg_signer.webui.schema_utils import clean_schema
 
 logger = logging.getLogger(__name__)
 
@@ -162,8 +161,6 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
         args = ["-w", str(workdir), "-a", account, "run", task_name]
     elif "自动化" in sub_type:
         args = ["-w", str(workdir), "-a", account, "automation", "run", task_name]
-    elif "监控" in sub_type:
-        args = ["-w", str(workdir), "-a", account, "monitor", "run", task_name]
     else:
         return None
     return {"label": label, "args": args}
@@ -223,29 +220,6 @@ SIGNER_TEMPLATE: Dict[str, object] = {
     "sign_interval": 1,
 }
 
-MONITOR_TEMPLATE: Dict[str, object] = {
-    "match_cfgs": [
-        {
-            "chat_id": "@channel_or_user",
-            "rule": "contains",
-            "rule_value": "关键词",
-            "from_user_ids": None,
-            "always_ignore_me": False,
-            "default_send_text": "自动回复",
-            "ai_reply": False,
-            "ai_prompt": None,
-            "send_text_search_regex": None,
-            "send_text_template": None,
-            "delete_after": None,
-            "ignore_case": True,
-            "forward_to_chat_id": None,
-            "external_forwards": None,
-            "push_via_server_chan": False,
-            "server_chan_send_key": None,
-        }
-    ]
-}
-
 
 class BaseConfigBlock:
     def __init__(
@@ -255,7 +229,7 @@ class BaseConfigBlock:
     ):
         self.kind = kind
         self.template = template
-        self.title = "签到配置 (signer)" if kind == "signer" else "监控配置 (monitor)"
+        self.title = "签到配置 (signer)"
         self.root_dir, self.cfg_cls = CONFIG_META[kind]
         ui.label(self.title).classes("text-lg font-semibold")
         ui.label(f"目录: {self.root_dir}/<name>/config.json").classes(
@@ -276,11 +250,7 @@ class BaseConfigBlock:
             ui.button("使用示例", on_click=self.fill_template)
             self.setup_toolbar()
 
-        # MonitorConfig schema causes json_editor to fail rendering due to "format": "uri" etc.
-        # We need to clean the schema before passing it to the editor.
         schema = TypeAdapter(self.cfg_cls | None).json_schema()
-        if self.kind == "monitor":
-            schema = clean_schema(schema)
 
         def on_change(e):
             self.editor.properties["content"] = e.content
@@ -443,11 +413,6 @@ class SignerBlock(BaseConfigBlock):
         wizard.open()
 
 
-class MonitorBlock(BaseConfigBlock):
-    def __init__(self, template: Dict[str, object]):
-        super().__init__("monitor", template)
-
-
 TASK_HISTORY_FILE = "webui_task_history.json"
 TASK_HISTORY_LIMIT = 100
 
@@ -517,13 +482,12 @@ def update_task_history(record: dict) -> None:
 
 
 class TaskRunnerBlock:
-    """执行任务面板：从 WebUI 直接运行签到/自动化/监控/组合任务"""
+    """执行任务面板：从 WebUI 直接运行签到/自动化/组合任务"""
 
     TASK_TYPES = [
         "签到 (run-once)",
         "签到 (run 定时)",
         "自动化 (automation run)",
-        "监控 (monitor run)",
         "组合任务",
     ]
 
@@ -755,8 +719,6 @@ class TaskRunnerBlock:
             if not root.is_dir():
                 return []
             return sorted(p.name for p in root.iterdir() if p.is_dir())
-        elif "监控" in task_type:
-            return list_task_names("monitor", workdir)
         elif "抽奖" in task_type:
             store = _load_giveaway_store(state.workdir)
             return sorted(
@@ -1066,8 +1028,6 @@ class TaskRunnerBlock:
             return ["-w", workdir, "-a", account, "run", task_name]
         elif "自动化" in task_type:
             return ["-w", workdir, "-a", account, "automation", "run", task_name]
-        elif "监控" in task_type:
-            return ["-w", workdir, "-a", account, "monitor", "run", task_name]
         return []
 
     def start_task(self) -> None:

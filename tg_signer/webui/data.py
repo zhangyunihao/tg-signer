@@ -7,17 +7,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
-from tg_signer.config import BaseJSONConfig, MonitorConfig, SignConfigV3
+from tg_signer.config import BaseJSONConfig, SignConfigV3
 from tg_signer.sign_record_store import SignRecordStore
 from tg_signer.utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
-ConfigKind = Literal["signer", "monitor"]
+ConfigKind = Literal["signer"]
 
 CONFIG_META: dict[ConfigKind, Tuple[str, type[BaseJSONConfig]]] = {
     "signer": ("signs", SignConfigV3),
-    "monitor": ("monitors", MonitorConfig),
 }
 
 DEFAULT_WORKDIR = Path(os.environ.get("TG_SIGNER_WORKDIR", ".signer"))
@@ -341,7 +340,7 @@ EXPORT_FORMAT_VERSION = 1
 
 
 def export_all_configs(workdir: Optional[Path | str] = None) -> bytes:
-    """导出全部 WebUI 可迁移配置（签到/监控配置、账户状态）为 JSON 字节。
+    """导出全部 WebUI 可迁移配置（签到配置、账户状态）为 JSON 字节。
 
     任务历史（随机发言任务列表）不参与导出：历史任务绑定具体设备，无需随备份迁移。
     """
@@ -351,9 +350,8 @@ def export_all_configs(workdir: Optional[Path | str] = None) -> bytes:
         "version": EXPORT_FORMAT_VERSION,
         "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "signer": {},
-        "monitor": {},
     }
-    for kind in ("signer", "monitor"):
+    for kind in ("signer",):
         for name in list_task_names(kind, base):
             try:
                 entry = load_config(kind, name, workdir=base)
@@ -390,8 +388,8 @@ def import_all_configs(
     if not isinstance(data, dict) or data.get("format") != "tg-signer-plus-configs":
         raise ValueError("文件格式不正确：不是 tg-signer-plus 导出的配置文件")
 
-    counts: Dict[str, int] = {"signer": 0, "monitor": 0, "random_chat_tasks": 0}
-    for kind in ("signer", "monitor"):
+    counts: Dict[str, int] = {"signer": 0, "random_chat_tasks": 0}
+    for kind in ("signer",):
         items = data.get(kind)
         if not isinstance(items, dict):
             continue
@@ -418,7 +416,7 @@ def import_all_configs(
 def export_backup(workdir: Optional[Path | str] = None) -> bytes:
     """导出备份 ZIP（不含 session 登录凭据，迁移账号需另行复制 session 文件）。
 
-    - configs.json：签到/监控配置、随机发言任务、账户状态（导入时走合并逻辑）
+    - configs.json：签到配置、随机发言任务、账户状态（导入时走合并逻辑）
     - signer_data/：users 缓存（me.json / latest_chats.json）+ 批量退频道配置
     """
     import io
@@ -461,7 +459,6 @@ def import_backup(raw: bytes, workdir: Optional[Path | str] = None) -> Dict[str,
 
     counts: Dict[str, int] = {
         "signer": 0,
-        "monitor": 0,
         "random_chat_tasks": 0,
         "session_files": 0,
         "signer_data_files": 0,
