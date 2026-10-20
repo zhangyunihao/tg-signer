@@ -975,8 +975,8 @@ class GiveawayEngine:
         self.chat_usernames: Dict[str, str] = {}
         # 加入目标的类型缓存 {target_lower: 类型名/None}：过滤个人用户与失效目标
         self._join_target_types: Dict[str, Optional[str]] = {}
-        # 忽略历史成功记录（start 时可覆盖）：默认遵循去重记录
-        self.ignore_history = False
+        # 忽略历史成功记录（start 时可覆盖）：默认 True＝已参与过的链接允许重新参与
+        self.ignore_history = True
         # 中奖识别：bot 私聊消息命中关键词时转发提醒（默认开启，转发到收藏夹）
         self.win_detect = True
         self.win_forward_targets: List[Any] = ["me"]
@@ -1044,7 +1044,7 @@ class GiveawayEngine:
         delay_range: Tuple[float, float] = (3.0, 10.0),
         confirm_wait: int = 8,
         confirm_keywords: Optional[Iterable[str]] = None,
-        ignore_history: bool = False,
+        ignore_history: bool = True,
         win_detect: bool = True,
         win_forward_target=None,
         win_sweep_limit: Optional[int] = None,
@@ -1930,12 +1930,8 @@ class GiveawayEngine:
                 account, username, param
             ):
                 continue  # bot 曾回复「已结束」＝终态，静默跳过
-            if (
-                self._state is not None
-                and not self.ignore_history
-                and self._state.has(account, username, param)
-            ):
-                continue
+            if self._participated_before(account, username, param):
+                continue  # 已参与过且未忽略历史，静默跳过
             if self._state is not None and self._state.is_blocked(
                 account, username, param
             ):
@@ -1993,6 +1989,17 @@ class GiveawayEngine:
     def _flood_key(account: str, username: str) -> str:
         return f"{account}|{username.lower()}"
 
+    def _participated_before(self, account: str, username: str, param: str) -> bool:
+        """该链接是否视为「已参与过」需要跳过。
+
+        历史成功记录默认生效（参与过即跳过）；开启 ignore_history
+        （忽略历史成功记录）后不再视为已参与，允许重复参与。
+        bot 回复「已结束」的终态记录不受该开关影响，由 is_ended 单独判断。
+        """
+        if self._state is None or self.ignore_history:
+            return False
+        return self._state.has(account, username, param)
+
     def _note_ended(self, account: str, username: str) -> None:
         """记录 bot 一次「已结束」回复；累计达上限后本轮运行熔断该 bot。
 
@@ -2031,11 +2038,7 @@ class GiveawayEngine:
         title: str = "",
         source_message: Any = None,
     ) -> None:
-        if (
-            self._state is not None
-            and not self.ignore_history
-            and self._state.has(account, username, param)
-        ):
+        if self._participated_before(account, username, param):
             return
         if self._state is not None and self._state.is_ended(account, username, param):
             # bot 曾回复「已结束」＝终态，无论是否忽略历史都不再发 start

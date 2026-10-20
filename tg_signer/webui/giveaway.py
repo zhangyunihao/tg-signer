@@ -888,7 +888,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 },
                 {
                     "name": "ignore_hist",
-                    "label": "忽略历史成功",
+                    "label": "允许重复参与",
                     "field": "ignore_hist",
                     "align": "left",
                 },
@@ -1104,7 +1104,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         )
                         ui.label(
                             f"关键词：{row['keywords']}　参与上限：{row['scan']}　"
-                            f"忽略历史成功：{row['ignore_hist']}"
+                            f"允许重复参与：{row['ignore_hist']}"
                         ).classes("text-xs text-gray-600")
                         ui.label(
                             f"新参加：{row['joined']}抽奖　"
@@ -1492,7 +1492,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "自动加入抽奖要求的频道/群组", value=True
             ).classes("pt-6")
             ignore_hist_switch = ui.switch(
-                "忽略历史成功记录（允许重复参与）", value=True
+                "允许重复参与（忽略历史成功记录）", value=True
             ).classes("pt-6")
             rescue_switch = ui.switch(
                 "启用历史补漏扫描",

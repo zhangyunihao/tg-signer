@@ -559,15 +559,16 @@ def _expired_msg(days_ago: int, idx: int):
 
 
 def test_engine_ignore_history_allows_repeat(tmp_path):
-    """忽略历史成功记录：已参与过的链接允许重新参与；默认仍去重。"""
+    """忽略历史成功记录：关闭时已参与过的链接去重跳过，开启后允许重新参与。"""
     import asyncio
 
     engine, state = _engine(tmp_path)
+    engine.ignore_history = False
     client = FakeClient(bot_users={"LotteryBot"})
     message = _msg(text="抽奖 https://t.me/LotteryBot?start=dup1")
     asyncio.run(_run_process(engine, client, "acc1", message))
     assert len(client.started) == 1
-    # 默认：同链接去重跳过
+    # 开关关闭：同链接去重跳过
     asyncio.run(_run_process(engine, client, "acc1", message))
     assert len(client.started) == 1
     # 开启忽略历史后：重新参与
@@ -797,6 +798,7 @@ def test_rescue_group_rechecks_pinned_only(tmp_path):
     import asyncio
 
     engine, _state = _engine(tmp_path)
+    engine.ignore_history = False  # 显式关闭忽略历史，验证已参与链接去重
     engine.chats = [123]
     client = FakeClient(bot_users={"LotteryBot"})
     engine._clients = {"acc": client}
@@ -840,6 +842,7 @@ def test_engine_participates_and_dedups(tmp_path):
     import asyncio
 
     engine, state = _engine(tmp_path)
+    engine.ignore_history = False  # 显式关闭忽略历史，验证已参与链接去重
     client = FakeClient(bot_users={"LotteryBot", "OtherBot"})
 
     message = _msg(
