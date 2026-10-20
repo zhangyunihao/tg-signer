@@ -2289,6 +2289,138 @@ def test_send_password_tasks_dedup_per_password(tmp_path, monkeypatch):
     assert ("daka_group", "出击雾织星宝宝") in client.sent
 
 
+def test_send_password_tasks_private_invite_link(tmp_path, monkeypatch):
+    """口令群为私有邀请链接：先解析成真实 chat id 再发送，不再把
+    t.me/+hash 整串当用户名走 contacts.ResolveUsername（USERNAME_INVALID）。"""
+    import asyncio
+    from types import SimpleNamespace
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    class InviteClient(FakeClient):
+        def __init__(self):
+            super().__init__(bot_users={"BaibaoxiangCjBot"})
+            self.invocations = []
+
+        async def invoke(self, query):
+            self.invocations.append(query)
+            # CheckChatInvite：已是成员，返回带 chat 的结果
+            from pyrogram import raw
+
+            return SimpleNamespace(
+                chat=raw.types.Channel(
+                    id=2651731839,
+                    title="野寻·上海打卡通告群",
+                    photo=raw.types.ChatPhotoEmpty(),
+                    date=0,
+                )
+            )
+
+    client = InviteClient()
+    checklist = _status_message(
+        "您需加入指定的群组/频道\n\n🎫 加入-野寻·上海打卡通告群 ❌",
+        {"野寻·上海打卡通告群": "https://t.me/+abc12345678"},
+    )
+    password_post = PASSWORD_POST.replace("出击婷婷宝宝", "出击普陀嫩妹思思")
+    asyncio.run(
+        engine._send_password_tasks(
+            "acc",
+            client,
+            "BaibaoxiangCjBot",
+            _msg(text=password_post),
+            [checklist],
+        )
+    )
+    assert client.invocations, "应先经 CheckChatInvite 解析私有邀请链接"
+    assert (-1002651731839, "出击普陀嫩妹思思") in client.sent
+    assert any("已在「野寻·上海打卡通告群」发送口令" in line for line in logs)
+
+
+def test_send_password_tasks_two_way_account_skips(tmp_path):
+    """双向账号一律跳过口令任务（含 bot 清单 ❌ 补发场景）：
+    不发送、不产生 speak_failed 事件、无日志，避免触发 Telegram 风控。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.two_way_accounts = {"双向号"}
+    logs: list = []
+    engine.log = logs.append
+    events: list = []
+    engine.on_event = events.append
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    checklist = _status_message(
+        "您需加入指定的群组/频道\n\n🎫 加入-野寻·上海打卡通告群 ❌",
+        {"野寻·上海打卡通告群": "https://t.me/daka_group"},
+    )
+    asyncio.run(
+        engine._send_password_tasks(
+            "双向号", client, "LotteryBestBot", _msg(text=PASSWORD_POST), [checklist]
+        )
+    )
+    assert not client.sent
+    assert not logs
+    assert not events
+
+
+def test_send_password_tasks_stale_username_dialog_fallback(tmp_path, monkeypatch):
+    """清单链接的用户名失效（群改名/收回用户名）：按群名在已加入会话中
+    精确匹配兜底发送；匹配不到时保留原失败路径。"""
+    import asyncio
+    from types import SimpleNamespace
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    class StaleClient(FakeClient):
+        def __init__(self):
+            super().__init__(bot_users={"LotteryBestBot"})
+
+        async def send_message(self, chat_id, text):
+            if str(chat_id) == "stale_group":
+                raise RuntimeError(
+                    "Telegram says: [400 USERNAME_INVALID] - "
+                    "The provided username is not valid."
+                )
+            self.sent.append((chat_id, text))
+
+        async def get_dialogs(self, limit=None):
+            yield SimpleNamespace(
+                chat=SimpleNamespace(id=-1002651731839, title="野寻·上海打卡通告群")
+            )
+
+    client = StaleClient()
+    checklist = _status_message(
+        "您需加入指定的群组/频道\n\n🎫 加入-野寻·上海打卡通告群 ❌",
+        {"野寻·上海打卡通告群": "https://t.me/stale_group"},
+    )
+    asyncio.run(
+        engine._send_password_tasks(
+            "acc",
+            client,
+            "LotteryBestBot",
+            _msg(text=PASSWORD_POST.replace("出击婷婷宝宝", "出击普陀嫩妹思思")),
+            [checklist],
+        )
+    )
+    assert (-1002651731839, "出击普陀嫩妹思思") in client.sent
+    assert any("已按群名匹配已加入会话兜底发送" in line for line in logs)
+
+
 ACTIVATION_REPLY = (
     "您已成功报名抽奖（未达标α）\n"
     "\n"
@@ -2326,6 +2458,60 @@ def test_extract_password_tasks_activation_reply():
         "发送口令﹝出击雾织星宝宝﹞ ❌", "发送口令﹝出击雾织星宝宝﹞ ✅"
     )
     assert extract_password_tasks(_msg(text=done)) == []
+
+
+def test_extract_speech_tasks_activation_reply():
+    """报名成功清单：「发言数大于 N 条」子行按上方最近加入行归属群组，
+    ✅ 已达标行跳过。"""
+    from tg_signer.giveaway_core import extract_speech_tasks
+
+    assert extract_speech_tasks(_msg(text=ACTIVATION_REPLY)) == [
+        ("野寻·上海学生交流群", 6)
+    ]
+    done = ACTIVATION_REPLY.replace("发言数大于 6 条 ❌", "发言数大于 6 条 ✅")
+    assert extract_speech_tasks(_msg(text=done)) == []
+    # 原帖写法（无 ❌ 标记）同样可解析
+    assert extract_speech_tasks(
+        _msg(text="🎫 加入-某测试群组A\n└  🎟️ 发言数大于 10 条")
+    ) == [("某测试群组A", 10)]
+
+
+def test_verify_after_click_emits_speech_required(tmp_path, monkeypatch):
+    """报名成功清单中 ❌ 发言数任务 → speech_required 事件（含标题/群组/条数）。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    events: list = []
+    engine.on_event = events.append
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    activation = _status_message(
+        ACTIVATION_REPLY,
+        {
+            "已加入-野寻·上海学生交流群": "https://t.me/xuesheng_group",
+            "已加入-野寻·上海打卡通告群": "https://t.me/daka_group2",
+        },
+    )
+    client.history = [activation]
+    asyncio.run(
+        engine._verify_after_click("acc", client, "LotteryBestBot", [activation])
+    )
+    speech = [e for e in events if e.get("type") == "speech_required"]
+    assert speech == [
+        {
+            "type": "speech_required",
+            "account": "acc",
+            "bot": "LotteryBestBot",
+            "title": "上海雾织星半价券",
+            "group": "野寻·上海学生交流群",
+            "required": 6,
+        }
+    ]
 
 
 def test_verify_after_click_resends_pending_password(tmp_path, monkeypatch):

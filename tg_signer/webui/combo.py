@@ -1,7 +1,8 @@
-"""组合任务 tab：把已有任务按顺序组合为命名组合，各子任务用其绑定账号执行。
+"""组合任务 tab：只展示历史任务列表；模板配置与新增任务均在弹窗中完成。
 
-持久化在工作目录 ``webui_composite_tasks.json``；执行复用 TaskRunnerBlock
-的 _launch（task_type="组合任务"），运行状态与历史统一记录在「签到」tab。
+模板（命名组合）持久化在工作目录 ``webui_composite_tasks.json``；新增任务时
+选择一个模板和账号（可空，留空则各子任务用其绑定账号）立即执行，执行复用
+TaskRunnerBlock 的 _launch（task_type="组合任务"），历史统一记录在任务历史里。
 """
 
 import json
@@ -17,6 +18,7 @@ from tg_signer.webui.auto_leave import load_leave_tasks
 from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
+    copy_text_to_clipboard,
     format_duration,
     with_select_all,
 )
@@ -205,6 +207,64 @@ def _sub_config_params(sub: dict, workdir) -> list[tuple[str, str]] | None:
     return None
 
 
+def _sub_config_params_brief(sub: dict, workdir) -> list[tuple[str, str, str]] | None:
+    """进度弹窗用的简略参数：跳过逐账号/逐频道明细，只保留关键项。
+
+    返回 (参数名, 缩略展示, 悬停完整内容) 三元组；无截断时两者相同。
+    """
+    params = _sub_config_params(sub, workdir)
+    if not params:
+        return params
+    sub_type = str(sub.get("type") or "")
+    rows: list[tuple[str, str, str]] = []
+    for lbl, val in params:
+        # 账号已在子任务卡片上单独展示，不重复
+        if lbl == "账号":
+            continue
+        # 签到：跳过逐频道明细（频道1、频道2…）
+        if "run-once" in sub_type and str(lbl).startswith("频道"):
+            continue
+        # 抽奖：只保留频道/群组（缩略前3个）、消息关键词、超时
+        if "抽奖" in sub_type:
+            if lbl == "监控频道/群组":
+                lines = [ln for ln in str(val).splitlines() if ln.strip()]
+                names = [
+                    ln.rsplit(" (", 1)[0] if ln.endswith(")") else ln for ln in lines
+                ]
+                total = len(names)
+                if total > 3:
+                    short = f"{'、'.join(names[:3])} 等{total}个"
+                else:
+                    short = f"{'、'.join(names)}（共 {total} 个）"
+                rows.append((lbl, short, str(val)))
+            elif lbl in ("消息关键词", "超时（分钟，全局）"):
+                rows.append((lbl, str(val), str(val)))
+            continue
+        rows.append((lbl, str(val), str(val)))
+    return rows
+
+
+def _leave_task_display(task_name: str, workdir) -> str:
+    """退频道任务显示名：带与「批量退频道」tab 一致的序号（N，按创建顺序，最早为 1）。
+
+    仅用于界面展示；执行匹配的 label 保持「类型 · 任务名」不变。
+    """
+    if not task_name:
+        return task_name
+    for i, t in enumerate(load_leave_tasks(workdir), 1):
+        if str(t.get("name")) == task_name:
+            return f"{i}｜{task_name}"
+    return task_name
+
+
+def _sub_task_display(sub: dict, workdir) -> str:
+    """子任务绑定任务的显示名：退频道任务带序号（不带井号），其余原样。"""
+    task_name = str(sub.get("task") or "")
+    if "退频道" in str(sub.get("type") or ""):
+        return _leave_task_display(task_name, workdir)
+    return task_name
+
+
 def giveaway_chats_text(task_name, workdir: Path | str | None = None) -> str:
     """自动抽奖任务的监控对象文案：优先显示频道/群组名称，未缓存的保留原 id。
 
@@ -225,7 +285,14 @@ def giveaway_chats_text(task_name, workdir: Path | str | None = None) -> str:
 
 
 class ComboTaskBlock:
-    """组合任务 tab 面板：组合列表、创建/编辑弹窗、执行弹窗、运行中状态。"""
+    """组合任务 tab 面板：历史任务列表、新增任务弹窗、模板配置弹窗、进度弹窗。"""
+
+    STATUS_COLOR = {
+        "运行中": "info",
+        "已完成": "positive",
+        "失败": "negative",
+        "已停止": "grey-6",
+    }
 
     def __init__(self, runner, workdir: Path | str | None = None) -> None:
         self.runner = runner  # TaskRunnerBlock 实例：复用 _launch/_stop_run/账号发现
@@ -234,30 +301,119 @@ class ComboTaskBlock:
 
         ui.label("组合任务").classes("text-lg font-semibold")
         ui.label(
-            "把多个已有任务按顺序组合成一个组合任务；执行时各子任务使用其绑定的账号，"
-            "账号之间并行。运行状态与历史记录在「签到」tab 查看。"
+            "点击「新增任务」选择组合任务模板和账号立即执行（账号可留空，"
+            "留空时各子任务使用其绑定的账号）；模板的创建与编辑在右上角"
+            "「任务组合配置」。"
         ).classes("text-sm text-gray-500")
 
-        with ui.row().classes("gap-2 items-center"):
+        with ui.row().classes("w-full gap-2 items-center no-wrap"):
             ui.button(
-                "新增组合任务",
-                icon="playlist_add",
+                "新增任务",
+                icon="add",
                 color="primary",
-                on_click=self.open_combo_dialog,
+                on_click=lambda: self.open_new_task_dialog(),
             )
-            ui.button("刷新", icon="refresh", on_click=self.refresh).props("outline")
+            ui.space()
+            ui.button(
+                "任务组合配置",
+                icon="settings",
+                on_click=lambda: self.open_config_dialog(),
+            ).props("outline")
 
-        # 运行中的组合任务
-        self.running_container = ui.column().classes("w-full gap-2 mt-1")
-        ui.separator().classes("my-2")
-        ui.label("已保存的组合").classes("text-md font-semibold")
-        self.list_container = ui.column().classes("w-full gap-2")
+        ui.label("历史任务").classes("text-md font-semibold")
+        # 桌面端表格（<=640px 隐藏，改用下方卡片列表），操作列：进度/停止/复制
+        self.history_table = (
+            ui.table(
+                columns=[
+                    {
+                        "name": "status",
+                        "label": "状态",
+                        "field": "status",
+                        "align": "left",
+                    },
+                    {
+                        "name": "task_name",
+                        "label": "任务名",
+                        "field": "task_name",
+                        "align": "left",
+                    },
+                    {
+                        "name": "accounts",
+                        "label": "账号",
+                        "field": "accounts",
+                        "align": "left",
+                    },
+                    {
+                        "name": "start_time",
+                        "label": "开始时间",
+                        "field": "start_time",
+                        "align": "left",
+                    },
+                    {
+                        "name": "duration",
+                        "label": "时长",
+                        "field": "duration",
+                        "align": "left",
+                    },
+                    {
+                        "name": "result",
+                        "label": "结果",
+                        "field": "result",
+                        "align": "left",
+                        "style": "min-width: 220px;",
+                    },
+                    {
+                        "name": "actions",
+                        "label": "操作",
+                        "field": "actions",
+                        "align": "left",
+                        "classes": "col-actions",
+                        "style": "white-space: nowrap;",
+                    },
+                ],
+                rows=[],
+                pagination=10,
+            )
+            .classes("w-full tgs-desktop-table")
+            .props("flat dense")
+        )
+        # 状态列渲染为彩色徽章
+        self.history_table.add_slot(
+            "body-cell-status",
+            '<q-td :props="props">'
+            "<q-badge :color=\"props.row.status === '已完成' ? 'positive' : "
+            "props.row.status === '失败' ? 'negative' : "
+            "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
+            "{{ props.row.status }}</q-badge></q-td>",
+        )
+        # 操作列：进度（所有行）、停止（仅运行中）、复制（用该行参数打开新增弹窗）
+        self.history_table.add_slot(
+            "body-cell-actions",
+            '<q-td :props="props" class="col-actions">'
+            '<q-btn flat dense color="primary" '
+            'label="进度" @click="$parent.$emit(\'progressTask\', props.row)" />'
+            '<q-btn v-if="props.row.status === \'运行中\'" flat dense color="negative" '
+            'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
+            '<q-btn flat dense color="grey-8" '
+            'label="复制" @click="$parent.$emit(\'duplicateTask\', props.row)" />'
+            "</q-td>",
+        )
+        self.history_table.on("progressTask", self._on_table_progress)
+        self.history_table.on("stopTask", self._on_table_stop)
+        self.history_table.on("duplicateTask", self._on_table_duplicate)
+        # 移动端（<=640px）卡片列表，桌面端隐藏
+        self.history_container = ui.column().classes(
+            "w-full gap-2 tgs-mobile-cards mt-1"
+        )
 
-        self._build_combo_dialog()
-        self._build_run_dialog()
-        self.refresh()
-        # 运行中组合任务的轮询刷新：每秒同步子任务进度与运行日志
-        self._last_tick_sig: tuple | None = None
+        self._build_new_task_dialog()
+        self._build_config_dialog()
+        self._build_progress_dialog()
+        self._progress_record: dict | None = None
+        self._last_hist_sig: tuple | None = None
+        self._last_prog_sig: tuple | None = None
+        self._render_history()
+        # 轮询刷新：历史状态变化时刷新列表；进度弹窗打开时每秒同步进度与日志
         ui.timer(1.0, self._tick)
 
     # ---- 数据 ----
@@ -268,30 +424,159 @@ class ComboTaskBlock:
     def _save(self, items: list[dict]) -> None:
         save_composite_tasks(items, self.workdir)
 
+    def _combo_history_records(self) -> list[dict]:
+        """任务历史里的组合任务记录（最新在前）。"""
+        try:
+            from tg_signer.webui.sign import load_task_history
+
+            items = load_task_history()
+        except Exception:
+            logger.debug("读取任务历史失败", exc_info=True)
+            return []
+        records = [r for r in items if "组合" in str(r.get("task_type") or "")]
+        return list(reversed(records))
+
     # ---- 页面渲染 ----
 
     def refresh(self) -> None:
-        self._render_running()
-        self._render_list()
+        self._render_history()
+        if getattr(self.config_dialog, "visible", False):
+            self._render_template_list()
 
     def __call__(self) -> None:
         self.refresh()
 
-    def _render_running(self) -> None:
-        self.running_container.clear()
-        with self.running_container:
-            runs = self._combo_runs()
-            if not runs:
-                ui.label("当前没有运行中的组合任务").classes("text-sm text-gray-400")
-            for rid, run in runs:
-                self._render_running_card(rid, run)
+    def _record_status(self, rec: dict) -> str:
+        """历史记录的状态；运行中任务以内存里的实时状态为准。"""
+        run = self.runner.runs.get(str(rec.get("id") or ""))
+        if run is not None:
+            return str(run["record"].get("status") or rec.get("status") or "未知")
+        return str(rec.get("status") or "未知")
 
-    def _combo_runs(self) -> list[tuple[str, dict]]:
-        return [
-            (rid, run)
-            for rid, run in self.runner.runs.items()
-            if "组合" in str(run["record"].get("task_type") or "")
+    def _render_history(self) -> None:
+        self.history_container.clear()
+        records = self._combo_history_records()
+        self._last_hist_sig = tuple(
+            (str(rec.get("id") or ""), self._record_status(rec)) for rec in records
+        )
+        # 桌面端表格同步行数据（表格自带分页，每页 10 条）
+        self.history_table.rows = [
+            {
+                "id": str(rec.get("id") or ""),
+                "status": self._record_status(rec),
+                "task_name": str(rec.get("task_name") or "-"),
+                "accounts": str(rec.get("accounts") or "—"),
+                "start_time": str(rec.get("start_time") or "—"),
+                "duration": str(rec.get("duration") or "—"),
+                "result": str(rec.get("result") or ""),
+            }
+            for rec in records
         ]
+        self.history_table.update()
+        # 分页：每页 10 条；列表刷新时夹取页码到有效范围，避免越界空白
+        page_size = 10
+        total = len(records)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(getattr(self, "_hist_page", 0), total_pages - 1)
+        self._hist_page = page
+        page_records = records[page * page_size : (page + 1) * page_size]
+
+        def _goto(p: int) -> None:
+            self._hist_page = min(max(p, 0), total_pages - 1)
+            self._render_history()
+
+        with self.history_container:
+            if not records:
+                ui.label("暂无历史任务，点击「新增任务」启动组合任务").classes(
+                    "text-sm text-gray-400"
+                )
+            for rec in page_records:
+                rid = str(rec.get("id") or "")
+                status = self._record_status(rec)
+                with ui.card().classes("w-full border"):
+                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        ui.badge(status).props(
+                            f"color={self.STATUS_COLOR.get(status, 'grey-6')} outline"
+                        )
+                        ui.label(str(rec.get("task_name") or "-")).classes(
+                            "text-sm font-medium"
+                        )
+                        ui.space()
+                        if self.runner.runs.get(rid) is not None:
+                            ui.button(
+                                "停止", on_click=lambda r=rid: self._stop(r)
+                            ).props("flat dense color=negative")
+                        ui.button(
+                            "复制",
+                            on_click=lambda r=rec: self._duplicate_from_rec(r),
+                        ).props("flat dense color=primary")
+                        ui.button(
+                            "查看进度",
+                            on_click=lambda r=rec: self.open_progress_dialog(r),
+                        ).props("flat dense color=primary")
+                    ui.label(
+                        f"开始：{rec.get('start_time') or '—'}　"
+                        f"时长：{rec.get('duration') or '—'}　"
+                        f"账号：{rec.get('accounts') or '—'}"
+                    ).classes("text-xs text-gray-600")
+                    if rec.get("result"):
+                        ui.label(f"结果：{rec['result']}").classes(
+                            "text-xs text-gray-600"
+                        )
+            # 分页控件：仅超过一页时显示
+            if total_pages > 1:
+                with ui.row().classes("w-full items-center justify-center gap-1 mt-1"):
+                    ui.button(
+                        icon="chevron_left", on_click=lambda: _goto(page - 1)
+                    ).props("flat round dense").props(
+                        "disable" if page <= 0 else ""
+                    ).tooltip("上一页")
+                    ui.label(
+                        f"第 {page + 1} / {total_pages} 页 · 共 {total} 条"
+                    ).classes("text-xs text-gray-500")
+                    ui.button(
+                        icon="chevron_right", on_click=lambda: _goto(page + 1)
+                    ).props("flat round dense").props(
+                        "disable" if page >= total_pages - 1 else ""
+                    ).tooltip("下一页")
+
+    @staticmethod
+    def _event_row(e) -> dict | None:
+        """从 Quasar 表格事件对象中取出行 dict（事件参数可能被包成 list）。"""
+        row = getattr(e, "args", None)
+        if isinstance(row, list) and row and isinstance(row[0], dict):
+            row = row[0]
+        return row if isinstance(row, dict) else None
+
+    def _on_table_progress(self, e) -> None:
+        """桌面表格「进度」按钮：打开进度弹窗。"""
+        row = self._event_row(e)
+        if row:
+            self.open_progress_dialog(row)
+
+    def _on_table_stop(self, e) -> None:
+        """桌面表格「停止」按钮。"""
+        row = self._event_row(e)
+        if row and row.get("id"):
+            self._stop(str(row["id"]))
+
+    def _on_table_duplicate(self, e) -> None:
+        """桌面表格「复制」按钮：用该行参数打开新增任务弹窗。"""
+        row = self._event_row(e)
+        if row:
+            self._duplicate_from_rec(row)
+
+    def _duplicate_from_rec(self, rec: dict) -> None:
+        """「复制」：按历史记录参数预填并打开新增组合任务弹窗。"""
+        accounts = [
+            a.strip()
+            for a in str(rec.get("accounts") or "").replace("，", ",").split(",")
+            if a.strip()
+        ]
+        self.open_new_task_dialog(
+            template=str(rec.get("task_name") or "") or None,
+            accounts=accounts,
+        )
 
     def _run_subs(self, run: dict) -> list[dict]:
         """本次实际执行的子任务列表；旧启动（无 combo_subs）回退读已保存组合。"""
@@ -370,13 +655,16 @@ class ComboTaskBlock:
             result.append((acc, text))
         return result
 
-    def _render_running_card(self, rid: str, run: dict) -> None:
+    def _render_running_card(self, run: dict) -> None:
         rec = run["record"]
+        rid = str(rec.get("id") or "")
         elapsed = format_duration(max(0, time.time() - run["start_ts"]))
         combo_subs = self._run_subs(run)
         subs_status = [self._sub_run_status(s, run) for s in combo_subs]
         with ui.card().classes("w-full border"):
-            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+            with ui.row().classes(
+                "w-full items-center gap-2 no-wrap tgs-prog-head-row"
+            ):
                 ui.badge("运行中").props("color=info")
                 ui.label(rec.get("task_name") or "-").classes("text-base font-semibold")
                 ui.label(f"账号: {rec.get('accounts', '')}").classes(
@@ -400,121 +688,211 @@ class ComboTaskBlock:
             ]
             text = f"子任务进度（{len(combo_subs)} 个）：{' · '.join(parts) or '—'}"
             ui.label(text).classes("text-sm text-gray-800 font-medium")
-            # 按账号展示各账号进行到哪一步（组合任务按账号串行执行子任务）
-            for acc, txt in self._account_progress(run, combo_subs):
-                with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                    ui.badge(acc).props("outline color=primary dense")
-                    ui.label(txt).classes("text-xs text-gray-700")
-            # 每个子任务一张子卡片：状态 + 账号 + 与原类别一致的完整配置参数
-            status_color = {
-                "成功": "positive",
-                "失败": "negative",
-                "进行中": "info",
-                "等待": "grey-6",
-            }
-            with ui.column().classes("w-full gap-2 mt-1"):
-                for i, (sub, status) in enumerate(
-                    zip(combo_subs, subs_status, strict=True), 1
-                ):
-                    with (
-                        ui.card()
-                        .classes("w-full border gap-1")
-                        .style("background: #fafafa")
-                    ):
-                        with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                            ui.badge(str(i)).props(
-                                "color=positive"
-                                if status == "成功"
-                                else (
-                                    "color=negative"
-                                    if status == "失败"
-                                    else "color=primary"
-                                )
-                            )
-                            ui.label(f"{sub.get('type')} · {sub.get('task')}").classes(
-                                "text-sm font-medium"
-                            )
-                            ui.space()
-                            ui.badge(status).props(
-                                f"color={status_color.get(status, 'grey-6')} outline"
-                            )
-                        ui.label(f"账号：{self._sub_accounts_text(sub)}").classes(
-                            "text-xs text-gray-600"
-                        )
-                        try:
-                            params = _sub_config_params(sub, self.workdir)
-                        except Exception:
-                            params = []
-                        if params:
-                            with ui.column().classes("w-full gap-0 mt-1"):
-                                for lbl, val in params:
-                                    with ui.row().classes(
-                                        "w-full items-start gap-3 no-wrap"
-                                    ):
-                                        ui.label(lbl).classes(
-                                            "text-xs text-gray-500 shrink-0 min-w-[130px] max-w-[200px]"
-                                        )
-                                        ui.label(val).classes(
-                                            "text-xs text-gray-800 whitespace-pre-line flex-grow"
-                                        )
-                        else:
-                            ui.label(
-                                "未找到该任务的配置参数（任务可能已被删除）"
-                            ).classes("text-xs text-gray-500")
-            # 运行日志区：只显示本组合任务的输出行
+            # 按账号展开：每个账号一个折叠面板，展示该账号执行了哪些子任务及状态
+            self._render_account_sections(run, combo_subs)
+            # 运行日志区：只显示本组合任务的输出行；不再独立滚动，
+            # 统一由进度弹窗的滚动区承载（避免出现两条滚动条）
+            prefix = f"[{rec.get('task_name') or ''}:"
+            lines = [
+                line for line in self.runner.output_lines if line.startswith(prefix)
+            ]
+
+            def _copy_log() -> None:
+                if not lines:
+                    ui.notify("暂无可复制的日志", type="warning")
+                    return
+                copy_text_to_clipboard("\n".join(lines))
+                ui.notify(f"已复制 {len(lines)} 行日志", type="positive")
+
+            def _toggle_log_fullscreen() -> None:
+                """切换组合任务日志全屏态：日志区 fixed 铺满视口，右上角显示退出按钮。"""
+                self._combo_log_full = not getattr(self, "_combo_log_full", False)
+                # 内容由轮询重建，这里立即按最新状态重渲染弹窗内容
+                self._render_progress_content()
+
             with ui.row().classes("w-full items-center justify-between mt-1"):
                 ui.label("运行日志").classes("text-xs font-semibold text-gray-600")
+                with ui.row().classes("gap-1 items-center"):
+                    ui.button(icon="content_copy", on_click=_copy_log).props(
+                        "flat round dense"
+                    ).tooltip("一键复制日志")
+                    ui.button(icon="fullscreen", on_click=_toggle_log_fullscreen).props(
+                        "flat round dense"
+                    ).tooltip("全屏显示")
+            log_classes = (
+                "w-full bg-gray-50 rounded-lg border border-gray-200 gap-0 p-2 "
+                "font-mono text-xs"
+            )
+            if getattr(self, "_combo_log_full", False):
+                log_classes += " tgs-page-log-fullscreen"
+            # pre-wrap：保留日志缩进但允许长行折行，避免移动端横向溢出
             with (
-                ui.scroll_area()
-                .classes("w-full bg-gray-50 rounded-lg border border-gray-200")
-                .style("max-height: 220px")
+                ui.column()
+                .classes(log_classes)
+                .style("white-space: pre-wrap; overflow-wrap: anywhere;")
             ):
-                with (
-                    ui.column()
-                    .classes("w-full gap-0 p-2 font-mono text-xs")
-                    .style("white-space: pre;")
-                ):
-                    prefix = f"[{rec.get('task_name') or ''}:"
-                    lines = [
-                        line
-                        for line in self.runner.output_lines
-                        if line.startswith(prefix)
-                    ]
-                    if not lines:
-                        ui.label("暂无日志输出").classes("text-xs text-gray-400")
-                    for line in lines[-200:]:
-                        ui.label(line).classes("w-full").style("white-space: pre;")
+                if not lines:
+                    ui.label("暂无日志输出").classes("text-xs text-gray-400")
+                for line in lines[-200:]:
+                    ui.label(line).classes("w-full").style(
+                        "white-space: pre-wrap; overflow-wrap: anywhere;"
+                    )
+            # 退出全屏悬浮按钮：仅全屏时 fixed 显示在视口右上角，平时不占布局
+            if getattr(self, "_combo_log_full", False):
+                ui.button(icon="close", on_click=_toggle_log_fullscreen).props(
+                    "flat round dense unelevated"
+                ).classes("tgs-log-exit-full tgs-log-exit-visible")
+
+    def _acc_sub_labels(self, run: dict, acc: str, labels: list[str]) -> list[str]:
+        """某账号实际参与的子任务标签：优先读进程的 sub_labels，旧运行回退明细。"""
+        for p in run.get("procs") or []:
+            if str(p.get("account") or "") == acc and p.get("sub_labels"):
+                sub = [lb for lb in p["sub_labels"] if lb in labels]
+                if sub:
+                    return sub
+        return [
+            lb
+            for lb in labels
+            if any(
+                d.get("chat") == lb and str(d.get("account") or "") == acc
+                for d in run["details"]
+            )
+        ]
+
+    def _acc_sub_status(self, run: dict, acc: str, label: str) -> str:
+        """某账号在某个子任务上的状态；无明细但进程存在时视为等待。"""
+        rows = [
+            d
+            for d in run["details"]
+            if d.get("chat") == label and str(d.get("account") or "") == acc
+        ]
+        for st in ("进行中", "失败", "成功"):
+            if any(d.get("status") == st for d in rows):
+                return st
+        return "等待"
+
+    def _render_account_sections(self, run: dict, combo_subs: list[dict]) -> None:
+        """按账号折叠展开：面板头为账号+进度摘要，展开可见该账号的各子任务状态与参数。"""
+        labels = [f"{s.get('type')} · {s.get('task')}" for s in combo_subs]
+        sub_by_label = dict(zip(labels, combo_subs, strict=False))
+        status_color = {
+            "成功": "positive",
+            "失败": "negative",
+            "进行中": "info",
+            "等待": "grey-6",
+        }
+        # 展开状态需跨轮询重建保留；默认仅展开当前「进行中」的账号
+        if not hasattr(self, "_acc_expand"):
+            self._acc_expand = {}
+        for acc, txt in self._account_progress(run, combo_subs):
+            acc_labels = self._acc_sub_labels(run, acc, labels)
+            default_open = "进行中" in txt
+            open_state = self._acc_expand.setdefault(acc, default_open)
+            with ui.expansion(acc, caption=txt, icon="person").classes(
+                "w-full border"
+            ) as exp:
+                exp.value = open_state
+                exp.on_value_change(
+                    lambda e, a=acc: self._acc_expand.__setitem__(a, e.value)
+                )
+                with ui.column().classes("w-full gap-1"):
+                    if not acc_labels:
+                        ui.label("暂无该账号的执行明细").classes(
+                            "text-xs text-gray-400"
+                        )
+                        continue
+                    for lb in acc_labels:
+                        sub = sub_by_label.get(lb) or {}
+                        st = self._acc_sub_status(run, acc, lb)
+                        with (
+                            ui.card()
+                            .classes("w-full border gap-1")
+                            .style("background: #fafafa")
+                        ):
+                            with ui.row().classes(
+                                "w-full items-center gap-2 no-wrap tgs-prog-sub-row"
+                            ):
+                                idx = labels.index(lb) + 1
+                                ui.badge(str(idx)).props(
+                                    "color=positive"
+                                    if st == "成功"
+                                    else (
+                                        "color=negative"
+                                        if st == "失败"
+                                        else "color=primary"
+                                    )
+                                )
+                                ui.label(
+                                    f"{lb.split(' · ')[0]} · "
+                                    f"{_sub_task_display(sub, self.workdir)}"
+                                ).classes("text-sm font-medium tgs-prog-sub-title")
+                                ui.space()
+                                ui.badge(st).props(
+                                    f"color={status_color.get(st, 'grey-6')} outline"
+                                )
+                            try:
+                                params = _sub_config_params_brief(sub, self.workdir)
+                            except Exception:
+                                params = []
+                            if params:
+                                with ui.column().classes("w-full gap-0 mt-1"):
+                                    for lbl, short, full in params:
+                                        with ui.row().classes(
+                                            "w-full items-start gap-3 no-wrap tgs-prog-param-row"
+                                        ):
+                                            ui.label(lbl).classes(
+                                                "text-xs text-gray-500 shrink-0 min-w-[130px] max-w-[200px] tgs-prog-param-label"
+                                            )
+                                            value = ui.label(short).classes(
+                                                "text-xs text-gray-800 whitespace-pre-line flex-grow tgs-prog-param-value"
+                                            )
+                                            if full != short:
+                                                value.tooltip(
+                                                    f"{lbl}（全部）：\n{full}"
+                                                )
+                            else:
+                                ui.label(
+                                    "未找到该任务的配置参数（任务可能已被删除）"
+                                ).classes("text-xs text-gray-500")
 
     def _tick(self) -> None:
-        """每秒轮询：有运行中的组合任务时同步子任务进度与日志。"""
-        if not self._combo_runs():
-            if self._last_tick_sig is not None:
-                # 最后一个组合已结束，刷新一次清掉运行中卡片
-                self._last_tick_sig = None
-                self._render_running()
+        """每秒轮询：历史状态变化时刷新列表；进度弹窗打开时同步进度与日志。"""
+        # 历史列表：仅状态/记录数变化时重渲染，避免每秒重建
+        hist_sig = tuple(
+            (str(rec.get("id") or ""), self._record_status(rec))
+            for rec in self._combo_history_records()
+        )
+        if hist_sig != self._last_hist_sig:
+            self._last_hist_sig = hist_sig
+            self._render_history()
+
+        # 进度弹窗：打开且对应任务仍在运行时，每秒同步子任务进度与日志
+        if not getattr(self.progress_dialog, "visible", False):
             return
-        sig = tuple(
-            (
-                rid,
+        run = self.runner.runs.get(str((self._progress_record or {}).get("id") or ""))
+        if run is not None:
+            rec = run["record"]
+            prog_sig: tuple = (
+                "live",
                 len(run["details"]),
                 tuple(self._sub_run_status(s, run) for s in self._run_subs(run)),
                 len(
                     [
                         line
                         for line in self.runner.output_lines
-                        if line.startswith(f"[{run['record'].get('task_name') or ''}:")
+                        if line.startswith(f"[{rec.get('task_name') or ''}:")
                     ]
                 ),
                 int(time.time() - run["start_ts"]),
             )
-            for rid, run in self._combo_runs()
-        )
-        if sig != self._last_tick_sig:
-            self._last_tick_sig = sig
-            self._render_running()
+        else:
+            prog_sig = ("done", str((self._progress_record or {}).get("status") or ""))
+        if prog_sig != self._last_prog_sig:
+            self._last_prog_sig = prog_sig
+            self._render_progress_content()
 
-    def _render_list(self) -> None:
-        self.list_container.clear()
+    def _render_template_list(self) -> None:
+        self.template_container.clear()
         items = self._load()
         # 从任务历史中找每个组合最近一次执行记录（避免与 sign.py 循环导入，延迟导入）
         last_runs: dict[str, dict] = {}
@@ -529,9 +907,9 @@ class ComboTaskBlock:
                     last_runs[name] = rec
         except Exception:
             logger.debug("读取任务历史失败", exc_info=True)
-        with self.list_container:
+        with self.template_container:
             if not items:
-                ui.label("还没有组合任务，点击「新增组合任务」创建").classes(
+                ui.label("还没有组合任务模板，点击「新增组合任务模板」创建").classes(
                     "text-sm text-gray-400"
                 )
             for c in items:
@@ -543,9 +921,6 @@ class ComboTaskBlock:
                         ui.badge(f"{len(subs)} 个子任务").props("color=grey-6 outline")
                         ui.space()
                         ui.button(
-                            "执行", on_click=lambda n=name: self.open_run_dialog(n)
-                        ).props("flat dense color=primary")
-                        ui.button(
                             "编辑", on_click=lambda cc=c: self.open_combo_dialog(cc)
                         ).props("flat dense color=grey-8")
                         ui.button(
@@ -553,7 +928,10 @@ class ComboTaskBlock:
                         ).props("flat dense color=negative")
                     with ui.column().classes("w-full gap-0 mt-1"):
                         for i, s in enumerate(subs, 1):
-                            text = f"{i}. {s.get('type', '')} · {s.get('task', '')}"
+                            text = (
+                                f"{i}. {s.get('type', '')} · "
+                                f"{_sub_task_display(s, self.workdir)}"
+                            )
                             if "抽奖" in str(s.get("type") or ""):
                                 chats_text = giveaway_chats_text(
                                     s.get("task"), self.workdir
@@ -574,12 +952,12 @@ class ComboTaskBlock:
 
     def _stop(self, run_id: str) -> None:
         self.runner._stop_run(run_id)
-        self._render_running()
+        self._render_history()
 
     def _confirm_delete(self, name: str) -> None:
         with ui.dialog() as dlg, ui.card():
             add_dialog_close_button(dlg)
-            ui.label(f"确定删除组合任务「{name}」？").classes("text-base")
+            ui.label(f"确定删除组合任务模板「{name}」？").classes("text-base")
             with ui.row().classes("w-full justify-end gap-2"):
                 ui.button("取消", on_click=dlg.close).props("outline")
                 ui.button(
@@ -593,8 +971,8 @@ class ComboTaskBlock:
         items = [c for c in self._load() if c.get("name") != name]
         self._save(items)
         dlg.close()
-        self._render_list()
-        ui.notify(f"已删除组合任务: {name}", type="positive")
+        self._render_template_list()
+        ui.notify(f"已删除组合任务模板: {name}", type="positive")
 
     # ---- 创建/编辑弹窗 ----
 
@@ -738,154 +1116,169 @@ class ComboTaskBlock:
         )
         self._save(items)
         self.combo_dialog.close()
-        self._render_list()
+        self._render_template_list()
         ui.notify(
-            f"{'已更新' if updated else '已保存'}组合任务: {name}（{len(subs)} 个子任务）",
+            f"{'已更新' if updated else '已保存'}组合任务模板: {name}"
+            f"（{len(subs)} 个子任务）",
             type="positive",
         )
 
-    # ---- 执行弹窗 ----
+    # ---- 模板配置弹窗（右上角入口） ----
 
-    def _build_run_dialog(self) -> None:
-        self._run_sub_checks: list = []
-        with ui.dialog() as self.run_dialog, ui.card().classes("w-full max-w-xl"):
-            add_dialog_close_button(self.run_dialog)
-            self.run_title = ui.label("执行组合任务").classes("text-lg font-semibold")
+    def _build_config_dialog(self) -> None:
+        with (
+            ui.dialog() as self.config_dialog,
+            ui.card().classes("w-full max-w-2xl"),
+        ):
+            add_dialog_close_button(self.config_dialog)
+            ui.label("任务组合配置").classes("text-lg font-semibold")
             ui.label(
-                "勾选要执行的子任务（默认全选）；点击子任务可查看其全部配置参数"
+                "把多个已有任务按顺序组合成模板；在「新增任务」中选择模板执行，"
+                "执行时各子任务使用其绑定的账号，账号之间并行。"
             ).classes("text-xs text-gray-500")
-            self.run_subs_container = ui.column().classes("w-full gap-1")
-            # 可选账号覆盖：留空走各子任务绑定账号，选了则全部子任务仅用所选账号
-            self.run_accounts_select = ui.select(
-                label="指定账号（可选，选了则全部子任务仅用所选账号）",
+            with ui.row().classes("w-full gap-2"):
+                ui.button(
+                    "新增组合任务模板",
+                    icon="playlist_add",
+                    color="primary",
+                    on_click=lambda: self.open_combo_dialog(),
+                )
+            self.template_container = ui.column().classes("w-full gap-2")
+        self._build_combo_dialog()
+
+    def open_config_dialog(self) -> None:
+        """打开模板配置弹窗：创建/编辑/删除组合任务模板。"""
+        self._render_template_list()
+        self.config_dialog.open()
+
+    # ---- 新增任务弹窗：选择模板 + 账号（可空）立即执行 ----
+
+    def _build_new_task_dialog(self) -> None:
+        with (
+            ui.dialog() as self.new_task_dialog,
+            ui.card().classes("w-full max-w-lg"),
+        ):
+            add_dialog_close_button(self.new_task_dialog)
+            ui.label("新增组合任务").classes("text-lg font-semibold")
+            ui.label("选择一个组合任务模板和账号后立即执行。").classes(
+                "text-xs text-gray-500"
+            )
+            self.new_task_template = ui.select(
+                {}, label="组合任务模板", with_input=True
+            ).classes("w-full")
+            self.new_task_accounts = ui.select(
+                label="账号（可选，选了则所有子任务仅用所选账号）",
                 options={},
                 multiple=True,
-                on_change=None,
             ).classes("w-full")
-            attach_select_all(self.run_accounts_select)
+            attach_select_all(self.new_task_accounts)
             ui.label(
                 "留空：各子任务使用其绑定的账号执行（账号之间并行启动）。"
                 "选择账号后：所有子任务仅用所选账号执行。"
             ).classes("text-xs text-gray-500")
             with ui.row().classes("gap-2 justify-end w-full"):
-                ui.button("取消", on_click=self.run_dialog.close).props("outline")
-                ui.button("执行", color="primary", on_click=self._start_run)
-        self._build_sub_detail_dialog()
+                ui.button("取消", on_click=self.new_task_dialog.close).props("outline")
+                ui.button("启动", color="primary", on_click=self._start_new_task)
 
-    def _render_run_subs(self) -> None:
-        """执行弹窗的子任务列表；每行带勾选框（默认勾选），点击可查看配置参数。"""
-        from tg_signer.webui.data import apply_account_order
-        from tg_signer.webui.sign import _combo_sub_accounts
-
-        self.run_subs_container.clear()
-        self._run_sub_checks = []
-        with self.run_subs_container:
-            for i, sub in enumerate(self._run_combo["subs"], 1):
-                accs = apply_account_order(
-                    _combo_sub_accounts(sub, self.workdir), self.workdir
-                )
-                acc_text = "、".join(accs) if accs else "未绑定"
-                chats_part = ""
-                if "抽奖" in str(sub.get("type") or ""):
-                    chats_text = giveaway_chats_text(sub.get("task"), self.workdir)
-                    if chats_text:
-                        chats_part = f"｜监控对象：{chats_text}"
-                with ui.row().classes("w-full items-center gap-1 no-wrap"):
-                    check = (
-                        ui.checkbox(value=True)
-                        .props("dense")
-                        .tooltip("取消勾选则本次执行跳过该子任务")
-                    )
-                    self._run_sub_checks.append(check)
-                    with (
-                        ui.button(
-                            on_click=lambda s=sub, a=acc_text: self._open_sub_detail(
-                                s, a
-                            )
-                        )
-                        .props("flat no-caps color=grey-9")
-                        .classes("flex-grow border rounded-lg")
-                        .tooltip("点击查看全部配置参数"),
-                        ui.row().classes(
-                            "tgs-run-sub-inner w-full items-center gap-2 no-wrap"
-                        ),
-                    ):
-                        ui.badge(str(i)).props("color=primary")
-                        ui.label(
-                            f"{sub.get('type')} · {sub.get('task')}{chats_part}"
-                        ).classes("tgs-run-sub-title text-sm")
-                        ui.space().classes("tgs-run-sub-space")
-                        ui.label(f"账号：{acc_text}").classes(
-                            "tgs-run-sub-accs text-xs text-gray-500 whitespace-nowrap"
-                        )
-                        ui.icon("chevron_right").classes(
-                            "tgs-run-sub-chev text-gray-400"
-                        )
-
-    def _build_sub_detail_dialog(self) -> None:
-        with (
-            ui.dialog() as self.sub_detail_dialog,
-            ui.card().classes("w-full max-w-2xl"),
-        ):
-            add_dialog_close_button(self.sub_detail_dialog)
-            self.sub_detail_title = ui.label("子任务配置参数").classes(
-                "text-lg font-semibold"
+    def open_new_task_dialog(
+        self, template: str | None = None, accounts: list[str] | None = None
+    ) -> None:
+        """打开新增组合任务弹窗；传入 template/accounts 时按历史行参数预填（复制）。"""
+        items = self._load()
+        if not items:
+            ui.notify(
+                "还没有组合任务模板，请先在右上角「任务组合配置」中创建",
+                type="warning",
             )
-            self.sub_detail_summary = ui.label("").classes(
-                "text-xs text-gray-600 whitespace-pre-line"
-            )
-            with ui.scroll_area().classes("w-full max-h-[60vh] border-t pt-2"):
-                self.sub_detail_container = ui.column().classes("w-full gap-1")
-
-    def _open_sub_detail(self, sub: dict, accounts_text: str) -> None:
-        """弹窗展示子任务绑定任务的全部配置参数。"""
-        sub_type = str(sub.get("type") or "")
-        task_name = str(sub.get("task") or "")
-        self.sub_detail_title.text = f"子任务配置参数：{sub_type} · {task_name}"
-        self.sub_detail_summary.text = f"绑定账号：{accounts_text}"
-        self.sub_detail_container.clear()
-        with self.sub_detail_container:
-            params = _sub_config_params(sub, self.workdir)
-            if not params:
-                ui.label("未找到该任务的配置参数（任务可能已被删除）").classes(
-                    "text-sm text-gray-500"
-                )
-            for label, value in params or []:
-                with ui.row().classes(
-                    "tgs-sub-detail-row w-full items-start gap-3 no-wrap"
-                ):
-                    ui.label(label).classes(
-                        "tgs-sub-detail-label text-xs text-gray-500 shrink-0 min-w-[150px] max-w-[240px]"
-                    )
-                    ui.label(value).classes(
-                        "tgs-sub-detail-value text-sm whitespace-pre-line flex-grow"
-                    )
-        self.sub_detail_dialog.open()
-
-    def open_run_dialog(self, name: str) -> None:
-        combo = next((c for c in self._load() if c.get("name") == name), None)
-        if not combo or not combo.get("subs"):
-            ui.notify("组合任务不存在或没有子任务", type="warning")
             return
-        self.run_title.text = f"执行组合任务: {name}"
-        self._run_combo = combo
-        self._render_run_subs()
-        # 刷新可选账号（仅活跃账号，按账户管理排序），并清空上次的选择
-        options = {name: name for name in self.runner._get_account_names()}
-        self.run_accounts_select.options = with_select_all(options)
-        self.run_accounts_select.update()
-        self.run_accounts_select.set_value([])
-        self._run_name = name
-        self.run_dialog.open()
+        name_map = {str(c.get("name")): str(c.get("name")) for c in items}
+        self.new_task_template.options = name_map
+        self.new_task_template.value = template if template in name_map else None
+        self.new_task_template.update()
+        valid_accounts = list(self.runner._get_account_names())
+        options = {a: a for a in valid_accounts}
+        self.new_task_accounts.options = with_select_all(options)
+        self.new_task_accounts.update()
+        self.new_task_accounts.set_value(
+            [a for a in (accounts or []) if a in valid_accounts]
+        )
+        self.new_task_dialog.open()
+        if template:
+            ui.notify("已复制任务参数，可调整后点击「启动」", type="positive")
 
-    def _start_run(self) -> None:
-        selected = list(self.run_accounts_select.value or [])
-        sub_indexes = [i for i, check in enumerate(self._run_sub_checks) if check.value]
-        if self.runner._launch(
-            "组合任务", self._run_name, selected, sub_indexes=sub_indexes
-        ):
-            self.run_dialog.close()
-            self._render_running()
+    def _start_new_task(self) -> None:
+        name = self.new_task_template.value
+        if not name:
+            ui.notify("请选择组合任务模板", type="warning")
+            return
+        accounts = [a for a in (self.new_task_accounts.value or []) if a]
+        if self.runner._launch("组合任务", str(name), accounts):
+            self.new_task_dialog.close()
+            self._render_history()
+
+    # ---- 进度弹窗：展示运行中/已结束任务的内容 ----
+
+    def _build_progress_dialog(self) -> None:
+        with ui.dialog() as self.progress_dialog:
+            # 默认全屏展示（96vw×92vh，复用日志弹窗全局样式），无需手动切换
+            self._progress_card = ui.card().classes("tgs-log-fullscreen")
+            with self._progress_card:
+                with ui.row().classes(
+                    "w-full items-center gap-2 no-wrap shrink-0 pr-10"
+                ):
+                    self.progress_title = ui.label("任务进度").classes(
+                        "text-lg font-semibold flex-grow"
+                    )
+                # 内容超出时只在弹窗内滚动；tgs-log-area 让全屏态样式
+                # 的 .tgs-log-area 规则作用于本滚动区（撑满剩余高度）
+                with ui.scroll_area().classes("w-full min-h-0 flex-grow tgs-log-area"):
+                    self.progress_container = ui.column().classes("w-full gap-2")
+            # 关闭按钮需在卡片创建之后调用（helper 会遍历 dialog 下的卡片）
+            add_dialog_close_button(self.progress_dialog)
+
+    def open_progress_dialog(self, rec: dict) -> None:
+        """点击历史任务的「查看进度」：弹窗展示运行内容（运行中实时刷新）。"""
+        self._progress_record = rec
+        self._combo_log_full = False
+        self._acc_expand = {}
+        self.progress_title.text = f"任务进度：{rec.get('task_name') or '-'}"
+        self._render_progress_content()
+        self.progress_dialog.open()
+
+    def _render_progress_content(self) -> None:
+        rec = self._progress_record or {}
+        self.progress_container.clear()
+        run = self.runner.runs.get(str(rec.get("id") or ""))
+        with self.progress_container:
+            if run is not None:
+                # 运行中（或刚结束未清理）：展示实时的子任务进度与运行日志
+                self._render_running_card(run)
+                return
+            status = str(rec.get("status") or "未知")
+            with ui.card().classes("w-full border gap-1"):
+                with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    ui.badge(status).props(
+                        f"color={self.STATUS_COLOR.get(status, 'grey-6')} outline"
+                    )
+                    ui.label(str(rec.get("task_name") or "-")).classes(
+                        "text-base font-semibold"
+                    )
+                ui.label(
+                    f"开始：{rec.get('start_time') or '—'}　"
+                    f"时长：{rec.get('duration') or '—'}　"
+                    f"账号：{rec.get('accounts') or '—'}"
+                ).classes("text-xs text-gray-600")
+                if rec.get("result"):
+                    ui.label(f"结果：{rec['result']}").classes("text-xs text-gray-600")
+                if status == "运行中":
+                    ui.label(
+                        "未找到本服务的运行记录（可能启动于上次服务运行期间），"
+                        "仅展示历史信息。"
+                    ).classes("text-xs text-gray-400")
+                else:
+                    ui.label("任务已结束，无实时进度数据。").classes(
+                        "text-xs text-gray-400"
+                    )
 
 
 def combo_block(runner, workdir: Path | str | None = None) -> ComboTaskBlock:

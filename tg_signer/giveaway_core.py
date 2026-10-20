@@ -279,6 +279,19 @@ def _giveaway_title(message: Any, limit: int = 30) -> str:
     return snippet if len(snippet) <= limit else snippet[:limit] + "…"
 
 
+def extract_giveaway_title(message: Any, limit: int = 40) -> str:
+    """提取 bot 清单回复中的抽奖标题行（以 🎰 开头），取不到返回空串。"""
+    text = _message_text(message)
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line.startswith("🎰"):
+            continue
+        title = line.lstrip("🎰").strip()
+        if title:
+            return title if len(title) <= limit else title[:limit] + "…"
+    return ""
+
+
 def _iter_candidate_urls(message: Any) -> Iterable[str]:
     """从消息中枚举可能含 bot 链接的 URL：明文文本 + 隐藏超链接实体 + 内联按钮。"""
     text = _message_text(message)
@@ -411,6 +424,10 @@ def message_region_allowed(message: Any) -> bool:
 # 抽奖帖含「发言数大于 N 条」「发言数超过 N 条」等参与条件时，双向账号
 # （隐私设置导致无法被 bot/群成员主动私聊核实）无法达标，需自动跳过。
 SPEECH_REQUIRE_RE = re.compile(r"发言数?\s*(?:大于等于|不少于|大于|超过|>=|>)\s*\d+")
+# 清单/原帖中的发言数任务行，捕获要求条数（「发言数大于 6 条」→ 6）
+SPEECH_TASK_RE = re.compile(
+    r"发言数?\s*(?:大于等于|不少于|大于|超过|>=|>)\s*(\d+)\s*条?"
+)
 
 
 def message_requires_speech(message: Any) -> bool:
@@ -435,6 +452,25 @@ def message_requires_password(message: Any) -> bool:
 # 无括号写法不视为携带口令文本。
 PASSWORD_TEXT_RE = re.compile(r"发送口令\s*[﹝「『【（(]\s*(.+?)\s*[﹞」』】）)]")
 JOIN_ROW_RE = re.compile(r"加入\s*[-–—:：]\s*(.+?)\s*[❌✅]?\s*$")
+# 私有邀请链接（t.me/+hash、t.me/joinchat/hash）：send_message 无法用链接
+# 字符串解析 peer（kurigram 会剥掉 + 误走 contacts.ResolveUsername 抛
+# USERNAME_INVALID），必须先解析成真实 chat id 再发送
+_INVITE_LINK_RE = re.compile(
+    r"^(?:https?://)?t\.me/(?:joinchat/|\+)([A-Za-z0-9_-]+)$", re.IGNORECASE
+)
+# send_message 对字符串 peer 的解析类错误：触发「按群名匹配已加入会话」
+# 兜底（群改名/收回公开用户名时清单链接已失效，但账号已在真实群组中）
+_USERNAME_RESOLVE_ERRORS = (
+    "USERNAME_INVALID",
+    "USERNAME_NOT_OCCUPIED",
+    "CHANNEL_INVALID",
+    "PEER_ID_INVALID",
+)
+
+
+def _is_username_resolve_error(exc: BaseException) -> bool:
+    msg = str(exc).upper()
+    return any(code in msg for code in _USERNAME_RESOLVE_ERRORS)
 
 
 def extract_password_tasks(message: Any) -> List[Tuple[str, str]]:
@@ -465,6 +501,37 @@ def extract_password_tasks(message: Any) -> List[Tuple[str, str]]:
                 if key not in seen:
                     seen.add(key)
                     tasks.append((current_group, password))
+    return tasks
+
+
+def extract_speech_tasks(message: Any) -> List[Tuple[str, int]]:
+    """解析清单/原帖中的发言数任务，返回 [(群组名称, 要求条数)]。
+
+    「发言数大于 N 条」子行归属上方最近的「(已)加入-名称」行；
+    ✅ 行代表已达标跳过。无群组归属的孤立要求不处理。
+    """
+    text = _message_text(message)
+    if not text or "发言" not in text:
+        return []
+    tasks: List[Tuple[str, int]] = []
+    seen: set = set()
+    current_group = ""
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        jm = JOIN_ROW_RE.search(line)
+        if jm and jm.group(1).strip():
+            current_group = jm.group(1).strip()
+        sm = SPEECH_TASK_RE.search(line)
+        if sm is None or "✅" in line or not current_group:
+            continue
+        try:
+            required = int(sm.group(1))
+        except ValueError:
+            continue
+        key = (current_group.lower(), required)
+        if key not in seen:
+            seen.add(key)
+            tasks.append((current_group, required))
     return tasks
 
 
@@ -2306,6 +2373,10 @@ class GiveawayEngine:
         报名成功后的激活清单补发场景传 ignore_sent=True 忽略去重
         （清单仍标 ❌ 即代表 bot 未计入此前发送，需要重发）。
         """
+        # 双向账户一律不执行口令任务：无法主动发言/私聊，避免反复触发
+        # Telegram 风控（USER_BANNED_IN_CHANNEL），跳过保持静默
+        if account in self.two_way_accounts:
+            return
         # 口令任务以 bot 回复清单为准（原帖与回复都可能出现「发送口令﹝xx﹞」行）：
         # bot 返回了口令任务（❌ 未完成行）才发送，✅ 行已发送过自动跳过。
         # 仅当 bot 回复完全不带口令要求时才回退解析原始抽奖帖，兼容帖内
@@ -2366,10 +2437,36 @@ class GiveawayEngine:
                     }
                 )
                 continue
-            already = await self._is_member(client, target)
+            # 私有邀请链接目标：先解析成真实 chat id（未加入则顺带加入），
+            # 直接拿链接字符串 send_message 会误走用户名解析必失败
+            send_target: Any = target
+            invite_match = _INVITE_LINK_RE.match(str(target).strip())
+            if invite_match:
+                send_target = await self._resolve_invite_target(
+                    client, invite_match.group(1), str(target).strip()
+                )
+                if send_target is None:
+                    self.log(
+                        f"[{account}] 加入口令群「{group_name}」失败，"
+                        "无法发送口令: 邀请链接解析失败（私有群可能需管理员审批）"
+                    )
+                    self._emit(
+                        {
+                            "type": "speak_failed",
+                            "account": account,
+                            "group": group_name,
+                            "password": password,
+                            "error": "加入口令群失败: 邀请链接解析失败（私有群可能需管理员审批）",
+                        }
+                    )
+                    continue
+                # 解析即加入：无需再做成员检查/二次 join
+                already = True
+            else:
+                already = await self._is_member(client, send_target)
             if already is False:
                 try:
-                    await client.join_chat(target)
+                    await client.join_chat(send_target)
                     self.log(f"[{account}] 已加入口令群「{group_name}」")
                     # 成员状态同步后再发言，避免 bot 侧校验不到
                     await asyncio.sleep(3)
@@ -2391,7 +2488,21 @@ class GiveawayEngine:
             try:
                 # 随机延迟错峰：多账号不在同一时刻向同群发言
                 await asyncio.sleep(random.uniform(2.0, 6.0))
-                await client.send_message(target, password)
+                try:
+                    await client.send_message(send_target, password)
+                except Exception as resolve_exc:
+                    # 公开用户名失效（群改名/收回用户名）：按群名在账号已
+                    # 加入会话中精确匹配兜底；其余异常原样抛出
+                    if not _is_username_resolve_error(resolve_exc):
+                        raise
+                    fallback = await self._find_dialog_by_title(client, group_name)
+                    if fallback is None:
+                        raise
+                    self.log(
+                        f"[{account}] 口令群「{group_name}」链接解析失败，"
+                        "已按群名匹配已加入会话兜底发送"
+                    )
+                    await client.send_message(fallback, password)
                 self._password_sent.add(sent_key)
                 self.log(
                     f"[{account}] 已在「{group_name}」发送口令"
@@ -2416,6 +2527,58 @@ class GiveawayEngine:
                         "error": str(exc)[:120],
                     }
                 )
+
+    async def _resolve_invite_target(
+        self, client: Any, invite_hash: str, invite_link: str
+    ) -> Optional[int]:
+        """私有邀请链接 → 真实 chat id（未加入则先加入）。
+
+        CheckChatInvite 已加入时直接返回群组；未加入走 join_chat 后再查。
+        审批类链接（JoinRequest）拿不到 chat 时返回 None。
+        """
+        try:
+            from pyrogram import raw as _raw
+            from pyrogram import utils as _utils
+
+            r = await client.invoke(
+                _raw.functions.messages.CheckChatInvite(hash=invite_hash)
+            )
+            chat = getattr(r, "chat", None)
+            if chat is None:
+                await client.join_chat(invite_link)
+                await asyncio.sleep(3)
+                r = await client.invoke(
+                    _raw.functions.messages.CheckChatInvite(hash=invite_hash)
+                )
+                chat = getattr(r, "chat", None)
+            if chat is None:
+                return None
+            # CheckChatInvite 的 chat 是 raw Chat/Channel（非 Peer），
+            # 需按类型换算成带 -100 前缀的标记 id
+            if isinstance(chat, _raw.types.Channel):
+                return _utils.get_channel_id(chat.id)
+            if isinstance(chat, _raw.types.Chat):
+                return -chat.id
+            return None
+        except Exception:
+            logger.debug("私有邀请链接解析口令群失败", exc_info=True)
+            return None
+
+    async def _find_dialog_by_title(self, client: Any, title: str) -> Optional[int]:
+        """按群名在账号已加入会话中精确匹配，返回 chat id（找不到返回 None）。"""
+        target_title = (title or "").strip()
+        if not target_title:
+            return None
+        try:
+            async for dlg in client.get_dialogs(limit=300):
+                chat = getattr(dlg, "chat", None)
+                chat_title = (getattr(chat, "title", "") or "").strip()
+                chat_id = getattr(chat, "id", None)
+                if chat_title == target_title and chat_id is not None:
+                    return chat_id
+        except Exception:
+            logger.debug("按群名遍历会话匹配口令群失败", exc_info=True)
+        return None
 
     async def _is_member(self, client: Any, target: str) -> Optional[bool]:
         """检查当前账号是否已是 target 的成员。
@@ -2886,6 +3049,24 @@ class GiveawayEngine:
                 self.log(f"点击 @{username} 确认按钮失败: {exc}")
                 return
 
+    def _emit_speech_tasks(self, account: str, bot_username: str, message: Any) -> None:
+        """报名成功回复中的发言数任务 → 消息中心提醒（还需发言条数）。"""
+        tasks = extract_speech_tasks(message)
+        if not tasks:
+            return
+        title = extract_giveaway_title(message)
+        for group, required in tasks:
+            self._emit(
+                {
+                    "type": "speech_required",
+                    "account": account,
+                    "bot": bot_username,
+                    "title": title,
+                    "group": group,
+                    "required": required,
+                }
+            )
+
     async def _verify_after_click(
         self,
         account: str,
@@ -2925,6 +3106,8 @@ class GiveawayEngine:
                         )
                     except Exception:
                         logger.debug("报名成功后补发口令任务失败", exc_info=True)
+                    # 清单中未达标（❌）的发言数任务：推送「还需发言 N 条」提醒
+                    self._emit_speech_tasks(account, username, msg)
                 elif not reply_says_ended(msg):
                     self.log(f"@{username} 点击后回复：{flat}")
         except Exception:

@@ -242,7 +242,9 @@ def test_combo_runonce_lists_history_tasks(monkeypatch):
     )
     opts = blk._get_combo_task_names("批量退频道 (auto leave)")
     assert opts == {
-        "自动退任务": "自动退任务（14天｜自动退出｜账号：bob）",
+        # 序号与「批量退频道」tab 一致：按创建顺序编号（leave_t2 是第 2 个任务），
+        # 与自动抽奖风格一致，不带井号
+        "自动退任务": "2｜自动退任务（14天｜自动退出｜账号：bob）",
     }  # 仅自动退出任务列出，仅扫描任务被排除
     # 无任务时返回空（无兜底项）
     monkeypatch.setattr(sign_mod, "_load_leave_tasks", lambda _wd: [])

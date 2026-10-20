@@ -812,15 +812,18 @@ class TaskRunnerBlock:
             return opts
         if "退频道" in task_type:
             # 批量退频道为任务列表模式：仅列出「自动退出」任务（排除仅扫描任务），
-            # 按创建时间倒序
+            # 按创建时间倒序；序号与「批量退频道」tab 一致（按创建顺序，最早为 1）
+            all_tasks = _load_leave_tasks(state.workdir)
+            total = len(all_tasks)
             opts = {}
-            for t in reversed(_load_leave_tasks(state.workdir)):
+            for j, t in enumerate(reversed(all_tasks)):
                 name = str(t.get("name") or "")
                 if not name or not t.get("auto_leave"):
                     continue
                 accs = "、".join(str(a) for a in (t.get("accounts") or []))
                 opts[name] = (
-                    f"{name}（{t.get('days')}天｜自动退出｜账号：{accs or '未设置'}）"
+                    f"{total - j}｜{name}"
+                    f"（{t.get('days')}天｜自动退出｜账号：{accs or '未设置'}）"
                 )
             return opts
         return self._get_task_names(task_type)
@@ -2111,6 +2114,102 @@ def user_info_block() -> Callable[[], None]:
             type="positive",
         )
 
+    # @spambot 批量状态查询：进行中标记（防并发重复触发）
+    _spamb_checking = [False]
+
+    def _spamb_set(lbl, text: str, cls: str = "text-xs text-gray-500") -> None:
+        try:
+            lbl.classes(replace=cls)
+            lbl.text = text
+            lbl.update()
+        except Exception:  # noqa: BLE001 - 元素可能已被 refresh 清理
+            logger.debug("更新状态查询标签失败", exc_info=True)
+
+    async def _query_spamb(name: str) -> str:
+        """连接 @spambot 查询单个账户状态，返回 bot 回复文本（短暂连接即断）。"""
+        from tg_signer.core import get_client
+
+        client = get_client(name, reuse=False)
+        try:
+            await client.start()
+            await client.send_message("spambot", "/start")
+            await asyncio.sleep(6)
+            async for m in client.get_chat_history("spambot", limit=3):
+                if m.from_user and m.from_user.is_bot:
+                    return m.text or ""
+            return ""
+        finally:
+            await safe_disconnect(client)
+
+    def check_all_status() -> None:
+        """查询所有账户在 @spambot 的限制状态：弹窗内并发 3 逐个展示。"""
+        if _spamb_checking[0]:
+            ui.notify("状态查询进行中，请稍候", type="warning")
+            return
+        names = apply_account_order(
+            sorted(p.stem for p in Path(".").glob("*.session")), state.workdir
+        )
+        if not names:
+            ui.notify("未发现账户（当前目录无 *.session）", type="warning")
+            return
+        _spamb_checking[0] = True
+        with ui.dialog() as dlg, ui.card().classes("w-[560px] max-w-full"):
+            add_dialog_close_button(dlg)
+            ui.label("@spambot 账户限制状态").classes("text-lg font-semibold")
+            ui.label("逐个连接 Telegram 查询，结果实时刷新").classes(
+                "text-xs text-gray-500"
+            )
+            with ui.column().classes("w-full gap-1"):
+                labels: Dict[str, object] = {}
+                for n in names:
+                    with ui.row().classes("w-full items-center gap-2"):
+                        ui.label(n).classes("text-sm font-medium w-28 truncate")
+                        labels[n] = ui.label("等待查询…").classes("text-xs")
+        dlg.open()
+
+        async def _run() -> None:
+            semaphore = asyncio.Semaphore(3)
+
+            async def _one(n: str) -> None:
+                async with semaphore:
+                    lbl = labels[n]
+                    _spamb_set(lbl, "查询中…", "text-xs text-gray-500")
+                    try:
+                        text = await _query_spamb(n)
+                    except Exception as exc:
+                        msg = str(exc)[:120]
+                        if "locked" in msg.lower():
+                            msg = "session 被占用（任务运行中），请停止相关任务后重试"
+                        _spamb_set(lbl, f"查询失败: {msg}", "text-xs text-negative")
+                        return
+                    low = text.lower()
+                    if not text:
+                        _spamb_set(
+                            lbl,
+                            "未收到回复，请在 TG 内手动查看",
+                            "text-xs text-orange-600",
+                        )
+                    elif "not limited" in low or "good news" in low:
+                        _spamb_set(lbl, "正常：未被限制", "text-xs text-green-600")
+                    elif "limited" in low:
+                        _spamb_set(
+                            lbl,
+                            "受限：可在 TG 内打开 @spambot 申诉；"
+                            "建议标记「双向」跳过发言类抽奖任务",
+                            "text-xs text-negative",
+                        )
+                    else:
+                        _spamb_set(
+                            lbl, f"回复：{text.strip()[:120]}", "text-xs text-gray-600"
+                        )
+
+            try:
+                await asyncio.gather(*(_one(n) for n in names))
+            finally:
+                _spamb_checking[0] = False
+
+        asyncio.ensure_future(_run())
+
     def refresh() -> None:
         container.clear()
         disabled = load_disabled_accounts(state.workdir)
@@ -2124,11 +2223,17 @@ def user_info_block() -> Callable[[], None]:
                         ui.icon("swap_vert").classes("text-gray-400").tooltip(
                             "用上下箭头调整顺序，保存后各页面账号下拉也按此顺序显示"
                         )
-                    ui.button(
-                        "增加账户",
-                        icon="person_add",
-                        on_click=lambda: (_reset_login_dialog(), add_dlg.open()),
-                    ).props("outline")
+                    with ui.row().classes("items-center gap-2"):
+                        ui.button(
+                            "查询状态",
+                            icon="fact_check",
+                            on_click=check_all_status,
+                        ).props("outline").tooltip("查询所有账户在 @spambot 的限制状态")
+                        ui.button(
+                            "增加账户",
+                            icon="person_add",
+                            on_click=lambda: (_reset_login_dialog(), add_dlg.open()),
+                        ).props("outline")
                 names = sorted(p.stem for p in Path(".").glob("*.session"))
                 env_account = os.environ.get("TG_ACCOUNT")
                 if env_account and env_account not in names:

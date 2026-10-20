@@ -58,6 +58,9 @@ JOIN_ALERTS_MAX = 200
 # 抽奖过程中记录的未完成口令发言任务（持久化，口令发送成功后自动消除）
 SPEAK_ALERTS_FILE = "webui_speak_alerts.json"
 SPEAK_ALERTS_MAX = 200
+# 报名成功后仍未达标的发言数任务（持久化，消息中心提示还需发言条数）
+SPEECH_ALERTS_FILE = "webui_speech_alerts.json"
+SPEECH_ALERTS_MAX = 200
 # 中奖提醒（bot 私聊识别到中奖消息，持久化，不清除仅限量）
 WIN_ALERTS_FILE = "webui_win_alerts.json"
 WIN_ALERTS_MAX = 200
@@ -125,6 +128,38 @@ def format_speak_alert(a: dict) -> str:
     return (
         f"账号 {a.get('account')} 口令发言未完成：群组「{a.get('group')}」"
         f"需发送口令{pwd_disp}，原因：{a.get('error')}（{a.get('time')}）"
+    )
+
+
+def load_speech_alerts(workdir) -> List[dict]:
+    path = Path(workdir) / SPEECH_ALERTS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        alerts = data.get("alerts") if isinstance(data, dict) else None
+        return [a for a in (alerts or []) if isinstance(a, dict)]
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        logger.debug("读取未达标发言数任务文件失败", exc_info=True)
+        return []
+
+
+def save_speech_alerts(workdir, alerts: List[dict]) -> None:
+    try:
+        atomic_write_json(
+            Path(workdir) / SPEECH_ALERTS_FILE, {"alerts": alerts[:SPEECH_ALERTS_MAX]}
+        )
+    except OSError:
+        logger.debug("写入未达标发言数任务文件失败", exc_info=True)
+
+
+def format_speech_alert(a: dict) -> str:
+    title = str(a.get("title") or "")
+    title_part = f"抽奖「{title}」" if title else "抽奖"
+    return (
+        f"账号 {a.get('account')} {title_part}发言任务未完成："
+        f"群组「{a.get('group')}」还需发言 {a.get('required')} 条"
+        f"（{a.get('time')}）"
     )
 
 
@@ -730,6 +765,47 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         logger.debug("推送发言任务通知失败", exc_info=True)
                 else:
                     save_speak_alerts(workdir, alerts)
+            elif etype == "speech_required":
+                acct = str(ev.get("account") or "")
+                bot = str(ev.get("bot") or "")
+                group = str(ev.get("group") or "")
+                title = str(ev.get("title") or "")
+                try:
+                    required = int(ev.get("required"))
+                except (TypeError, ValueError):
+                    return
+                if not acct or not group:
+                    return
+                skey = f"{acct}|{bot}|{group}|{required}|{title}"
+                alerts = load_speech_alerts(workdir)
+                if any(
+                    f"{a.get('account')}|{a.get('bot')}|{a.get('group')}|"
+                    f"{a.get('required')}|{a.get('title')}" == skey
+                    for a in alerts
+                ):
+                    # 同一抽奖/群组/要求重复上报：不重复弹窗
+                    return
+                alerts.insert(
+                    0,
+                    {
+                        "account": acct,
+                        "bot": bot,
+                        "title": title,
+                        "group": group,
+                        "required": required,
+                        "time": f"{datetime.now():%m-%d %H:%M:%S}",
+                    },
+                )
+                save_speech_alerts(workdir, alerts)
+                try:
+                    with client:
+                        ui.notify(
+                            format_speech_alert(alerts[0]),
+                            type="warning",
+                            multi_line=True,
+                        )
+                except Exception:
+                    logger.debug("推送发言数任务通知失败", exc_info=True)
 
         engine = ensure_engine(name)
         start_ts = time.time()

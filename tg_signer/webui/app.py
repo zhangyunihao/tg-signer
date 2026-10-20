@@ -595,7 +595,8 @@ def _build_dashboard(container) -> None:
         def _build_combo_panel() -> None:
             with panel_combo:
                 ui.label(
-                    "组合任务：把多个已有任务按顺序组合执行，每个账号依次跑完全部子任务。"
+                    "组合任务历史：新增任务选择组合任务模板与账号立即执行"
+                    "（账号可留空）；右上角「任务组合配置」管理模板。"
                 ).classes("text-gray-600")
                 refreshers.append(combo_block(runner, state.workdir))
 
@@ -753,7 +754,7 @@ _NETWORK_CHECK_TIMEOUT = 8.0
 
 
 async def _probe_telegram_connectivity() -> None:
-    """通过当前代理配置连一次 Telegram DC，失败时在页面顶部弹出持久报错。"""
+    """通过当前代理配置连一次 Telegram DC，失败时在页面顶部弹出持久警告。"""
     proxy = get_proxy()
     dest = f"{_TELEGRAM_DC_HOST}:{_TELEGRAM_DC_PORT}"
     logger.info(
@@ -798,7 +799,7 @@ async def _probe_telegram_connectivity() -> None:
         ui.notify(
             f"科学上网不可用：{reason}连接 Telegram 失败（{_NETWORK_CHECK_TIMEOUT:.0f} 秒内未握手成功）。"
             "所有任务功能都无法正常使用，请检查代理/VPN 后刷新页面重试。",
-            type="negative",
+            type="warning",
             position="top",
             timeout=0,
             close_button="知道了",
@@ -1026,34 +1027,27 @@ def build_ui(auth_code: str = None) -> None:
                 .leave-days { width: 104px; min-width: 104px; }
                 /* 表格底部分页栏字号略缩，避免拥挤 */
                 .q-table__bottom { font-size: 13px; }
-                /* 执行组合任务弹窗：子任务行改两行显示——标题占满首行可换行，
-                   账号独立一行（与标题左对齐），避免「标题+账号」单行挤压溢出；
-                   右箭头在触屏上无意义一并隐藏 */
-                .tgs-run-sub-inner { flex-wrap: wrap !important; }
-                .tgs-run-sub-space { display: none !important; }
-                .tgs-run-sub-title {
-                    flex: 1 1 0 !important;
-                    min-width: 0 !important;
+                /* 任务进度弹窗（tgs-log-fullscreen）：移动端铺满几乎整个视口 */
+                .tgs-log-fullscreen {
+                    width: calc(100vw - 16px) !important;
+                    height: calc(100dvh - 16px) !important;
+                }
+                /* 进度内容行移动端允许换行，长参数名/任务名不挤压值区 */
+                .tgs-prog-head-row,
+                .tgs-prog-sub-row { flex-wrap: wrap; row-gap: 2px; }
+                .tgs-prog-sub-row .tgs-prog-sub-title {
+                    flex: 1 1 0;
+                    min-width: 0;
                     overflow-wrap: anywhere;
                 }
-                .tgs-run-sub-accs {
-                    flex: 0 0 100% !important;
-                    white-space: normal !important;
-                    padding-left: 28px;
+                /* 参数行改为上下两行：参数名占整行，值换行展示 */
+                .tgs-prog-param-row { flex-wrap: wrap; }
+                .tgs-prog-param-row .tgs-prog-param-label {
+                    flex: 0 0 100%;
+                    min-width: 0;
+                    max-width: none;
                 }
-                .tgs-run-sub-chev { display: none !important; }
-                /* 子任务配置参数弹窗：参数名与值改为上下两行（解除 150px 固定标签宽），
-                   长参数值可断行，避免窄屏横向溢出 */
-                .tgs-sub-detail-row { flex-wrap: wrap !important; }
-                .tgs-sub-detail-label {
-                    flex: 0 0 100% !important;
-                    min-width: 0 !important;
-                    max-width: 100% !important;
-                }
-                .tgs-sub-detail-value {
-                    flex: 1 1 100% !important;
-                    overflow-wrap: anywhere;
-                }
+                .tgs-prog-param-row .tgs-prog-param-value { flex: 1 1 100%; }
             }
         </style>
         """

@@ -5,6 +5,7 @@
 - 抽奖任务监控对象加入失败提醒：webui_join_alerts.json（加入成功后由任务自动消除）
 - 抽奖过程中记录的未完成发言任务（口令发送失败）：webui_speak_alerts.json
   （口令发送成功后由任务自动消除）
+- 报名成功后仍未达标的发言数任务（还需发言 N 条）：webui_speech_alerts.json
 
 已读状态按消息键持久化在工作目录 webui_message_read.json，
 刷新页面、重启服务、更换浏览器后依然保留。
@@ -25,9 +26,11 @@ from tg_signer.webui.giveaway import (
     channel_title_map,
     format_join_alert,
     format_speak_alert,
+    format_speech_alert,
     format_win_alert,
     load_join_alerts,
     load_speak_alerts,
+    load_speech_alerts,
     load_win_alerts,
 )
 
@@ -78,9 +81,14 @@ def _time_sort_value(m: dict) -> int:
     )
 
 
-def message_sort_key(m: dict) -> tuple:
-    """排序规则：中奖消息最优先，同一优先级内新消息在前。"""
-    return (0 if m["tag"] == "中奖" else 1, -_time_sort_value(m))
+def message_sort_key(m: dict, read_keys: Set[str]) -> tuple:
+    """排序规则：未读优先于已读；未读内部中奖消息最优先；同组内新消息在前。"""
+    unread = m["key"] not in read_keys
+    return (
+        0 if unread else 1,
+        (0 if m["tag"] == "中奖" else 1) if unread else 1,
+        -_time_sort_value(m),
+    )
 
 
 def collect_messages(workdir) -> List[dict]:
@@ -131,6 +139,24 @@ def collect_messages(workdir) -> List[dict]:
                 "text": format_speak_alert(a),
             }
         )
+    # 3) 报名成功后仍未达标的发言数任务（还需发言 N 条）
+    for a in load_speech_alerts(wd):
+        acct = str(a.get("account") or "")
+        bot = str(a.get("bot") or "")
+        group = str(a.get("group") or "")
+        time_str = str(a.get("time") or "")
+        messages.append(
+            {
+                "key": (
+                    f"speech_required|{acct}|{bot}|{group}|"
+                    f"{a.get('required')}|{time_str}"
+                ),
+                "tag": "发言数未达标",
+                "color": "blue",
+                "time": time_str,
+                "text": format_speech_alert(a),
+            }
+        )
     return messages
 
 
@@ -160,8 +186,8 @@ def message_center_button() -> Callable[[], None]:
     def render_list() -> None:
         list_container.clear()
         messages = collect_messages(state.workdir)
-        # 中奖消息置顶，其余按新消息优先（时间倒序）
-        messages.sort(key=message_sort_key)
+        # 未读在前；未读内部中奖消息置顶；同组内按新消息优先（时间倒序）
+        messages.sort(key=lambda m: message_sort_key(m, read_keys))
         with list_container:
             if not messages:
                 ui.label("暂无消息").classes("text-sm text-gray-400")
@@ -202,7 +228,7 @@ def message_center_button() -> Callable[[], None]:
         ui.label("消息中心").classes("text-lg font-semibold")
         ui.label(
             "汇总抽奖中奖提醒、监控对象加入失败提醒与抽奖过程中未完成的发言任务"
-            "（口令发送失败，发送成功后自动消除），点击消息标记为已读。"
+            "（口令发送失败/发言数未达标，显示还需发言条数），点击消息标记为已读。"
         ).classes("text-xs text-gray-500")
         with ui.row().classes("w-full justify-end"):
             ui.button("全部已读", on_click=mark_all_read).props("outline dense")
@@ -218,9 +244,10 @@ def message_center_button() -> Callable[[], None]:
         badge.set_text(str(count))
         badge.set_visibility(count > 0)
         # 有未读中奖消息时，铃铛换成绿色奖杯以示区分
+        # 注意：props() 按空格分词，不能用逗号分隔（逗号会并入图标名渲染成多余字符）
         msg_btn.props(
-            f"icon={'emoji_events' if has_unread_win else 'notifications'}"
-            f", color={'green' if has_unread_win else 'primary'}"
+            f"icon={'emoji_events' if has_unread_win else 'notifications'} "
+            f"color={'green' if has_unread_win else 'primary'}"
         )
 
     def open_center() -> None:

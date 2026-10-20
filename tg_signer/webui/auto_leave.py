@@ -631,86 +631,115 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             sts["selected"].clear()
         render_detail_rows(task_id)
 
-    def render_detail_rows(task_id: str) -> None:
+    # 明细分组懒加载：每批渲染的分组数，条目过多时分批渲染避免卡顿
+    DETAIL_CHUNK = 30
+
+    def _render_detail_group(st: Dict, task_id: str, group: List[Dict]) -> None:
+        group.sort(key=lambda r: (-r["age_days"], str(r["account"])))
+        head = group[0]
+        group_keys = {r["key"] for r in group}
+        group_days = max(r["age_days"] for r in group)
+        all_on = group_keys <= st["selected"]
+
+        def _toggle_group(e, keys=group_keys, t=task_id) -> None:
+            sts = task_states.get(t)
+            if not sts:
+                return
+            if e.value:
+                sts["selected"].update(keys)
+            else:
+                sts["selected"].difference_update(keys)
+            render_detail_rows(t)
+
+        with ui.column().classes("w-full gap-1 p-2 rounded border"):
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                ui.checkbox(value=all_on, on_change=_toggle_group).props("dense")
+                with ui.column().classes("gap-0 min-w-0"):
+                    ui.label(str(head["title"])).classes("text-sm font-semibold").style(
+                        "overflow-wrap: anywhere;"
+                    )
+                    ui.label(
+                        f"{head['type']}　{len(group)} 个账号"
+                        + ("" if len(group) == 1 else f"　最多 {group_days} 天未更新")
+                    ).classes("text-xs text-gray-500")
+            for row in group:
+                key = row["key"]
+                with ui.row().classes("w-full items-center gap-2 no-wrap pl-6"):
+                    ui.checkbox(
+                        value=key in st["selected"],
+                        on_change=lambda e, k=key, t=task_id: _detail_on_toggle(
+                            e, k, t
+                        ),
+                    ).props("dense")
+                    ui.label(f"{row['account']}（{row['age_days']}天未更新）").classes(
+                        "text-xs"
+                    ).style("overflow-wrap: anywhere;")
+
+    def render_detail_rows(task_id: str, append: bool = False) -> None:
         body = detail_refs.get("body")
         if body is None:
             return
         st = task_states.get(task_id) or {"rows": [], "selected": set()}
-        body.clear()
+        rows = st["rows"]
+        # 按频道聚合（chat_id 跨账号相同），组间按未更新天数由大到小排序
+        groups: Dict = {}
+        for row in rows:
+            groups.setdefault(row.get("chat_id", row["key"]), []).append(row)
+        ordered = sorted(
+            groups.values(),
+            key=lambda g: max(r["age_days"] for r in g),
+            reverse=True,
+        )
+
+        if append:
+            # 追加下一批前，移除上一批尾部的「加载更多」按钮与提示
+            for ref_key in ("more", "tail"):
+                old = detail_refs.pop(ref_key, None)
+                if old is not None:
+                    old.delete()
+            start = detail_refs.get("shown") or 0
+        else:
+            body.clear()
+            start = 0
+            with body:
+                if not rows:
+                    detail_refs["shown"] = 0
+                    ui.label("暂无待确认的频道").classes("text-sm text-gray-400")
+                    return
+                with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+                    ui.button(
+                        "全选", on_click=lambda t=task_id: _detail_select(t, True)
+                    ).props("flat dense")
+                    ui.button(
+                        "全不选", on_click=lambda t=task_id: _detail_select(t, False)
+                    ).props("flat dense")
+                    ui.button(
+                        "退出所选", on_click=lambda t=task_id: leave_selected(t)
+                    ).props("outline dense color=negative")
+                    detail_refs["count"] = ui.label(
+                        f"已选 {len(st['selected'])}/{len(rows)}"
+                    ).classes("text-xs text-gray-500 ml-auto")
+            # 非追加渲染保留已展开的批次数，避免勾选分组后列表折叠回第一页
+        if append:
+            end = start + DETAIL_CHUNK
+        else:
+            end = detail_refs.get("shown") or DETAIL_CHUNK
+        shown_end = min(end, len(ordered))
+        detail_refs["shown"] = shown_end
         with body:
-            rows = st["rows"]
-            if not rows:
-                ui.label("暂无待确认的频道").classes("text-sm text-gray-400")
-                return
-            with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-                ui.button(
-                    "全选", on_click=lambda t=task_id: _detail_select(t, True)
-                ).props("flat dense")
-                ui.button(
-                    "全不选", on_click=lambda t=task_id: _detail_select(t, False)
-                ).props("flat dense")
-                ui.button(
-                    "退出所选", on_click=lambda t=task_id: leave_selected(t)
-                ).props("outline dense color=negative")
-                detail_refs["count"] = ui.label(
-                    f"已选 {len(st['selected'])}/{len(rows)}"
-                ).classes("text-xs text-gray-500 ml-auto")
-            # 按频道聚合（chat_id 跨账号相同），组间按未更新天数由大到小排序
-            groups: Dict = {}
-            for row in rows:
-                groups.setdefault(row.get("chat_id", row["key"]), []).append(row)
-            ordered = sorted(
-                groups.values(),
-                key=lambda g: max(r["age_days"] for r in g),
-                reverse=True,
+            for group in ordered[start:shown_end]:
+                _render_detail_group(st, task_id, group)
+            if shown_end < len(ordered):
+                remaining = len(ordered) - shown_end
+                detail_refs["more"] = ui.button(
+                    f"加载更多（剩余 {remaining} 组）",
+                    on_click=lambda t=task_id: render_detail_rows(t, append=True),
+                ).props("flat dense full-width")
+            else:
+                detail_refs.pop("more", None)
+            detail_refs["tail"] = ui.label("退出不可撤销，请仔细核对").classes(
+                "text-xs text-gray-500"
             )
-            for group in ordered:
-                group.sort(key=lambda r: (-r["age_days"], str(r["account"])))
-                head = group[0]
-                group_keys = {r["key"] for r in group}
-                group_days = max(r["age_days"] for r in group)
-                all_on = group_keys <= st["selected"]
-
-                def _toggle_group(e, keys=group_keys, t=task_id) -> None:
-                    sts = task_states.get(t)
-                    if not sts:
-                        return
-                    if e.value:
-                        sts["selected"].update(keys)
-                    else:
-                        sts["selected"].difference_update(keys)
-                    render_detail_rows(t)
-
-                with ui.column().classes("w-full gap-1 p-2 rounded border"):
-                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                        ui.checkbox(value=all_on, on_change=_toggle_group).props(
-                            "dense"
-                        )
-                        with ui.column().classes("gap-0 min-w-0"):
-                            ui.label(str(head["title"])).classes(
-                                "text-sm font-semibold"
-                            ).style("overflow-wrap: anywhere;")
-                            ui.label(
-                                f"{head['type']}　{len(group)} 个账号"
-                                + (
-                                    ""
-                                    if len(group) == 1
-                                    else f"　最多 {group_days} 天未更新"
-                                )
-                            ).classes("text-xs text-gray-500")
-                    for row in group:
-                        key = row["key"]
-                        with ui.row().classes("w-full items-center gap-2 no-wrap pl-6"):
-                            ui.checkbox(
-                                value=key in st["selected"],
-                                on_change=lambda e, k=key, t=task_id: _detail_on_toggle(
-                                    e, k, t
-                                ),
-                            ).props("dense")
-                            ui.label(
-                                f"{row['account']}（{row['age_days']}天未更新）"
-                            ).classes("text-xs").style("overflow-wrap: anywhere;")
-            ui.label("退出不可撤销，请仔细核对").classes("text-xs text-gray-500")
 
     def open_detail_dialog(task_id: str) -> None:
         task = find_task(task_id)
@@ -721,6 +750,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         # 填充页面级持久明细弹窗（不在事件槽位里动态创建弹窗）
         detail_refs["task_id"] = task_id
         detail_refs["body"] = detail_body
+        detail_refs["shown"] = 0  # 每次打开弹窗重置懒加载，从第一批开始渲染
         detail_title.text = f"任务明细 — #{_seq_of(task['id'])}"
         render_detail_rows(task_id)
         detail_dialog.open()
