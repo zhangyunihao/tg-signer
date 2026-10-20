@@ -887,6 +887,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     "align": "left",
                 },
                 {
+                    "name": "ignore_hist",
+                    "label": "忽略历史成功",
+                    "field": "ignore_hist",
+                    "align": "left",
+                },
+                {
                     "name": "joined",
                     "label": "新参加",
                     "field": "joined",
@@ -945,6 +951,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         "scan": "不限"
                         if not cfg.get("max_joins")
                         else str(cfg["max_joins"]),
+                        "ignore_hist": (
+                            "是" if cfg.get("ignore_history", True) else "否"
+                        ),
                         "joined": f"{joined_count(name)} 个",
                         "last_time": str(cfg.get("last_start_time") or "") or "—",
                         "duration": duration_text,
@@ -1094,7 +1103,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             "text-xs text-gray-600"
                         )
                         ui.label(
-                            f"关键词：{row['keywords']}　参与上限：{row['scan']}"
+                            f"关键词：{row['keywords']}　参与上限：{row['scan']}　"
+                            f"忽略历史成功：{row['ignore_hist']}"
                         ).classes("text-xs text-gray-600")
                         ui.label(
                             f"新参加：{row['joined']}抽奖　"
