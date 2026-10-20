@@ -98,7 +98,11 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
                 "spec": {
                     "account": account,
                     "session_dir": str(workdir),
-                    "days": int(leave_task.get("days") or 7),
+                    "days": (
+                        int(leave_task["days"])
+                        if leave_task.get("days") is not None
+                        else 7
+                    ),
                     "scan_types": _leave_scan_types(leave_task),
                     "include_groups": bool(leave_task.get("include_groups")),
                     "skip_pinned": bool(leave_task.get("skip_pinned", True)),
@@ -116,7 +120,7 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
             "spec": {
                 "account": account,
                 "session_dir": str(workdir),
-                "days": int(cfg.get("days") or 7),
+                "days": int(cfg["days"]) if cfg.get("days") is not None else 7,
                 "scan_types": _leave_scan_types(cfg),
                 "include_groups": bool(cfg.get("include_groups")),
                 "skip_pinned": bool(cfg.get("skip_pinned", True)),

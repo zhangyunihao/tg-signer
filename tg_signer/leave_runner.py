@@ -11,6 +11,8 @@ spec 格式::
      "include_keywords": ["签到", ...], "exclude_keywords": ["抽奖", ...],
      "auto_leave": true}
 
+days 为不更新天数阈值，0 表示扫描全部频道/群组（此时不允许自动退出）。
+
 scan_types 扫描范围："channel" 仅频道 / "group" 仅群组 / "both" 频道+群组
 （缺省时按旧字段 include_groups 推导，True→both、False→channel）。
 
@@ -48,10 +50,12 @@ async def run_leave(spec: dict) -> int:
     def log(msg: str) -> None:
         print(msg, flush=True)
 
+    d = spec.get("days")
+    days = max(0, int(d)) if d is not None else 7
     rows = await scan_stale_chats(
         account,
         Path(str(spec.get("session_dir") or ".")),
-        max(1, int(spec.get("days") or 7)),
+        days,
         _scan_types_of(spec),
         bool(spec.get("skip_pinned", True)),
         log,
@@ -62,6 +66,10 @@ async def run_leave(spec: dict) -> int:
         rows = [r for r in rows if any(k in str(r["title"]) for k in inc_kws)]
         log(f"[{account}] 包含关键字过滤：{before} -> {len(rows)} 个候选")
     auto = bool(spec.get("auto_leave", True))
+    if auto and days <= 0:
+        # 天数为 0（扫描全部对话）时不允许自动退出
+        log(f"[{account}] 不更新天数为 0（扫描全部），自动退出不可用，仅扫描记录")
+        auto = False
     if auto and _scan_types_of(spec) != "channel":
         # 扫描范围包含群组时不允许自动退出（仅频道可自动退出）
         log(f"[{account}] 扫描范围包含群组，自动退出不可用，仅扫描记录")

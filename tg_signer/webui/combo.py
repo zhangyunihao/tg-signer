@@ -175,9 +175,15 @@ def _leave_config_params(task_name: str, workdir) -> list[tuple[str, str]] | Non
     if task is None:
         return None
     scan = str(task.get("scan_types") or "")
+    days = task.get("days")
     return [
         ("账号", _fmt_param_value(task.get("accounts"))),
-        ("不更新天数阈值", str(task.get("days") or "—")),
+        (
+            "不更新天数阈值",
+            f"{days}（全部）"
+            if days == 0
+            else (str(days) if days is not None else "—"),
+        ),
         ("扫描范围", SCAN_TYPE_DESC.get(scan, scan or "—")),
         ("跳过置顶对话", _fmt_param_value(task.get("skip_pinned", True))),
         ("包含关键字", _fmt_param_value(task.get("include_keywords"))),
@@ -318,15 +324,15 @@ class ComboTaskBlock:
         from tg_signer.webui.sign import _combo_sub_accounts
 
         try:
-            accs = apply_account_order(_combo_sub_accounts(sub, self.workdir), self.workdir)
+            accs = apply_account_order(
+                _combo_sub_accounts(sub, self.workdir), self.workdir
+            )
         except Exception:
             accs = []
         return "、".join(accs) if accs else "未绑定"
 
     @staticmethod
-    def _account_progress(
-        run: dict, combo_subs: list[dict]
-    ) -> list[tuple[str, str]]:
+    def _account_progress(run: dict, combo_subs: list[dict]) -> list[tuple[str, str]]:
         """按账号汇总进度：(账号, 当前进行到哪步的描述)。
 
         组合任务按账号串行执行子任务，明细行的 chat 即子任务标签。

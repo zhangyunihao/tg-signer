@@ -1,7 +1,8 @@
 """自动退群：任务列表模式。
 
 新建任务（选择账号、不更新天数阈值、扫描范围、包含/保护关键字、自动退出开关），
-启动后按扫描范围（仅频道/仅群组/频道+群组）扫描所选账号超过 N 天未更新的对话：
+启动后按扫描范围（仅频道/仅群组/频道+群组）扫描所选账号超过 N 天未更新的对话
+（不更新天数阈值填 0 表示扫描全部对话，此时不允许自动退出）：
 - 填写包含关键字时，标题命中任一关键字（或关系）的对话才进入扫描结果（留空不限制）；
 - 未命中保护关键字的对话：开关打开时自动退出（无需确认，仅扫描范围为「仅频道」时可选）；
 - 命中保护关键字的对话：始终展示在任务结果里，可手动勾选后退出。
@@ -138,10 +139,12 @@ async def scan_stale_chats(
     """扫描单个账号，返回超过 days 天不更新的对话列表（只读，不做任何退出）
 
     scan_types: 扫描范围——"channel" 仅频道 / "group" 仅群组 / "both" 频道+群组
+    days: 不更新天数阈值，0 表示不按天数过滤（扫描全部符合条件的对话）
     """
     scan_types = str(scan_types or "both")
     want_channel = scan_types in ("channel", "both")
     want_group = scan_types in ("group", "both")
+    days = max(0, int(days or 0))
     found: List[Dict] = []
     client = None
     try:
@@ -150,7 +153,7 @@ async def scan_stale_chats(
         if not ok:
             log(f"[{account}] 会话未授权，跳过")
             return found
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = datetime.utcnow() - timedelta(days=days) if days > 0 else None
         scanned = 0
         async for dialog in client.get_dialogs():  # 不设上限，遍历全部对话
             scanned += 1
@@ -172,7 +175,7 @@ async def scan_stale_chats(
             if top is None or getattr(top, "date", None) is None:
                 log(f"[{account}] 无最新消息信息，跳过：{title}")
                 continue
-            if top.date < cutoff:
+            if cutoff is None or top.date < cutoff:
                 age_days = max(0, (datetime.utcnow() - top.date).days)
                 found.append(
                     {
@@ -184,9 +187,8 @@ async def scan_stale_chats(
                         "age_days": age_days,
                     }
                 )
-        log(
-            f"[{account}] 扫描完成，共 {scanned} 个对话，{len(found)} 个超过 {days} 天未更新"
-        )
+        stale_desc = f"超过 {days} 天未更新" if days > 0 else "全部（未按天数过滤）"
+        log(f"[{account}] 扫描完成，共 {scanned} 个对话，{len(found)} 个{stale_desc}")
     except asyncio.TimeoutError:
         log(f"[{account}] 连接超时（30s），跳过")
     except Exception as exc:
@@ -339,10 +341,18 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         task["start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
         task["duration"] = ""
         render_list()
+        days = int(task["days"]) if task.get("days") is not None else 7
         log(
-            f"[{task['name']}] 启动：{len(accounts)} 个账号，阈值 {task.get('days')} 天"
+            f"[{task['name']}] 启动：{len(accounts)} 个账号，"
+            + (f"阈值 {days} 天" if days > 0 else "阈值 0 天（扫描全部）")
         )
         auto_leave_on = bool(task.get("auto_leave"))
+        if auto_leave_on and days <= 0:
+            # 不更新天数为 0（扫描全部对话）时不允许自动退出
+            log(
+                f"[{task['name']}] 不更新天数为 0（扫描全部），自动退出不可用，仅扫描记录"
+            )
+            auto_leave_on = False
         if auto_leave_on and _scan_types_of(task) != "channel":
             # 扫描范围包含群组时不允许自动退出（仅频道可自动退出）
             log(f"[{task['name']}] 扫描范围包含群组，自动退出不可用，仅扫描记录")
@@ -355,7 +365,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 found = await scan_stale_chats(
                     account,
                     session_dir,
-                    int(task.get("days") or 7),
+                    days,
                     _scan_types_of(task),
                     bool(task.get("skip_pinned", True)),
                     log,
@@ -510,7 +520,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             a for a in (prefill.get("accounts") or []) if a in names
         ] or None
         account_sel.update()
-        days_input.value = int(prefill.get("days") or 7)
+        d = prefill.get("days")
+        days_input.value = int(d) if d is not None else 7
         scope_sel.value = _scan_types_of(prefill)
         sp.value = bool(prefill.get("skip_pinned", True))
         kw_input.value = ",".join(prefill.get("keywords") or []) or DEFAULT_KEYWORDS
@@ -525,17 +536,19 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             ui.notify("请至少选择一个账号", type="warning")
             return
         scope = str(scope_sel.value or "both")
+        d = days_input.value
+        days = max(0, int(d)) if d is not None else 7
         task = {
             "id": f"leave_{datetime.now():%Y%m%d%H%M%S%f}",
             "name": f"退频道任务 {datetime.now():%m-%d %H:%M}",
             "accounts": accounts,
-            "days": max(1, int(days_input.value or 7)),
+            "days": days,
             "scan_types": scope,
             "skip_pinned": bool(sp.value),
             "keywords": _split_keywords(str(kw_input.value or "")),
             "include_keywords": _split_keywords(str(ik_input.value or "")),
-            # 扫描范围包含群组时不允许自动退出
-            "auto_leave": bool(auto_cb.value) and scope == "channel",
+            # 扫描范围包含群组、或天数为 0（扫描全部）时不允许自动退出
+            "auto_leave": bool(auto_cb.value) and scope == "channel" and days > 0,
             "status": "—",
         }
         tasks.append(task)
@@ -818,7 +831,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
 
     ui.label("批量退频道").classes("text-lg font-semibold")
     ui.label(
-        "扫描所选账号超过指定天数没有新消息的频道（可选包含群组）并批量退出。"
+        "扫描所选账号超过指定天数没有新消息的频道（可选包含群组）并批量退出；"
+        "不更新天数阈值填 0 表示扫描全部频道/群组，此时不允许自动退出。"
         "开启「自动退出未命中关键字」后，未命中保护关键字的频道自动退出；"
         "命中关键字的频道在「明细」中展示，需手动勾选退出。自己是创建者的对话永远不会被退出。"
     ).classes("text-sm text-gray-500")
@@ -933,14 +947,17 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         attach_select_all(account_sel)
         with ui.row().classes("w-full items-end flex-wrap gap-2"):
             days_input = ui.number(
-                label="不更新天数阈值", value=7, min=1, step=1, format="%.0f"
-            ).classes("w-36")
+                label="不更新天数阈值（0=全部）", value=7, min=0, step=1, format="%.0f"
+            ).classes("w-44")
             scope_sel = ui.select(
                 {"channel": "仅频道", "group": "仅群组", "both": "频道+群组"},
                 value="both",
                 label="扫描范围",
             ).classes("w-40")
             sp = ui.checkbox("跳过置顶", value=True)
+        ui.label(
+            "不更新天数阈值填 0 表示扫描全部频道/群组，此时不允许勾选自动退出"
+        ).classes("text-xs text-gray-500")
         kw_input = ui.input("保护关键字（逗号分隔）", value=DEFAULT_KEYWORDS).classes(
             "w-full"
         )
@@ -957,15 +974,20 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         auto_cb = ui.checkbox("自动退出未命中关键字的频道")
 
         def _sync_auto_cb() -> None:
-            # 扫描范围包含群组时自动退出不可选（仅频道可自动退出）
-            if str(scope_sel.value or "both") == "channel":
+            # 扫描范围包含群组、或天数为 0（扫描全部）时自动退出不可选
+            days_ok = (days_input.value or 0) > 0
+            if str(scope_sel.value or "both") == "channel" and days_ok:
                 auto_cb.enable()
             else:
                 auto_cb.value = False
                 auto_cb.disable()
-                auto_cb.tooltip("扫描范围包含群组时不允许自动退出")
+                if not days_ok:
+                    auto_cb.tooltip("不更新天数为 0（扫描全部）时不允许自动退出")
+                else:
+                    auto_cb.tooltip("扫描范围包含群组时不允许自动退出")
 
         scope_sel.on_value_change(lambda _e: _sync_auto_cb())
+        days_input.on_value_change(lambda _e: _sync_auto_cb())
         _sync_auto_cb()
         with ui.row().classes("w-full justify-end"):
             ui.button("取消", on_click=create_dialog.close).props("flat")
