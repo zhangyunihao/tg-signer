@@ -469,61 +469,6 @@ async def test_login_reports_available_folders_when_selection_is_missing(
         await signer.login(folder="Missing")
 
 
-def test_user_signer_load_sign_record_migrates_legacy_json(signer_factory):
-    signer = signer_factory(task_name="linuxdo")
-    signer.user = SimpleNamespace(id=123456)
-    legacy_record_file = signer.task_dir / "sign_record.json"
-    legacy_record_file.write_text(
-        json.dumps({"2026-03-17": "2026-03-17T06:00:00+08:00"}),
-        encoding="utf-8",
-    )
-
-    records = signer.load_sign_record()
-
-    assert records == {"2026-03-17": "2026-03-17T06:00:00+08:00"}
-    assert signer.sign_record_store.load_records("linuxdo", "123456") == records
-
-
-def test_user_signer_load_sign_record_logs_migration_hint(monkeypatch, signer_factory):
-    signer = signer_factory(task_name="linuxdo")
-    signer.user = SimpleNamespace(id=123456)
-    legacy_record_file = signer.task_dir / "sign_record.json"
-    legacy_record_file.write_text(
-        json.dumps({"2026-03-17": "2026-03-17T06:00:00+08:00"}),
-        encoding="utf-8",
-    )
-    messages = []
-
-    def fake_log(message, level="INFO", **kwargs):
-        del kwargs
-        messages.append((level, message))
-
-    monkeypatch.setattr(signer, "log", fake_log)
-
-    signer.load_sign_record()
-
-    assert any(
-        level == "WARNING" and "已自动导入 SQLite" in message
-        for level, message in messages
-    )
-
-
-def test_user_signer_persist_sign_record_writes_sqlite_only_by_default(signer_factory):
-    signer = signer_factory(task_name="linuxdo")
-    signer.user = SimpleNamespace(id=123456)
-    sign_record = {}
-
-    signer.persist_sign_record(
-        sign_record,
-        "2026-03-17",
-        "2026-03-17T06:00:00+08:00",
-    )
-
-    assert sign_record == {"2026-03-17": "2026-03-17T06:00:00+08:00"}
-    assert signer.sign_record_store.load_records("linuxdo", "123456") == sign_record
-    assert not signer.sign_record_file.exists()
-
-
 @pytest.mark.asyncio
 async def test_login_skips_topics_for_non_forum_supergroup(monkeypatch, signer_factory):
     import tg_signer.core as core
@@ -1377,8 +1322,6 @@ def test_normal_run_skips_username_resolution_errors_per_chat(signer_factory):
     signer.user = SimpleNamespace(id=1)
     signer.context = signer.ensure_ctx()
     signer._validate_sign_at = lambda *_: "0 0 * * *"
-    signer.load_sign_record = lambda: {}
-    signer.persist_sign_record = lambda *_args, **_kwargs: None
 
     config = SignConfigV3(
         chats=[

@@ -16,11 +16,11 @@ from typing import Callable, Dict, List, Optional
 from nicegui import ui
 
 from tg_signer.giveaway_core import (
-    DEFAULT_KEYWORDS,
     WIN_SWEEP_LIMIT,
     GiveawayEngine,
-    GiveawayState,
 )
+from tg_signer.giveaway_parsing import DEFAULT_KEYWORDS
+from tg_signer.giveaway_state import GiveawayState
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.common import (
     add_dialog_close_button,
@@ -68,26 +68,51 @@ WIN_ALERTS_MAX = 200
 WIN_SETTINGS_FILE = "webui_win_settings.json"
 
 
+class _AlertStore:
+    """提醒列表的 JSON 持久化（统一格式：{"alerts": [...]}，超限截断）。
+
+    四类提醒（加入失败/未完成口令/未达标发言/中奖）字段不同，但读写逻辑一致，
+    统一收敛到这里，避免重复实现。
+    """
+
+    def __init__(self, filename: str, limit: int, label: str) -> None:
+        self.filename = filename
+        self.limit = limit
+        self.label = label
+
+    def load(self, workdir) -> List[dict]:
+        path = Path(workdir) / self.filename
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            alerts = data.get("alerts") if isinstance(data, dict) else None
+            return [a for a in (alerts or []) if isinstance(a, dict)]
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError):
+            logger.debug("读取%s文件失败", self.label, exc_info=True)
+            return []
+
+    def save(self, workdir, alerts: List[dict]) -> None:
+        try:
+            atomic_write_json(
+                Path(workdir) / self.filename, {"alerts": alerts[: self.limit]}
+            )
+        except OSError:
+            logger.debug("写入%s文件失败", self.label, exc_info=True)
+
+
+_JOIN_ALERTS = _AlertStore(JOIN_ALERTS_FILE, JOIN_ALERTS_MAX, "加入失败提醒")
+_SPEAK_ALERTS = _AlertStore(SPEAK_ALERTS_FILE, SPEAK_ALERTS_MAX, "未完成发言任务")
+_SPEECH_ALERTS = _AlertStore(SPEECH_ALERTS_FILE, SPEECH_ALERTS_MAX, "未达标发言数任务")
+_WIN_ALERTS = _AlertStore(WIN_ALERTS_FILE, WIN_ALERTS_MAX, "中奖提醒")
+
+
 def load_join_alerts(workdir) -> List[dict]:
-    path = Path(workdir) / JOIN_ALERTS_FILE
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        alerts = data.get("alerts") if isinstance(data, dict) else None
-        return [a for a in (alerts or []) if isinstance(a, dict)]
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError):
-        logger.debug("读取加入失败提醒文件失败", exc_info=True)
-        return []
+    return _JOIN_ALERTS.load(workdir)
 
 
 def save_join_alerts(workdir, alerts: List[dict]) -> None:
-    try:
-        atomic_write_json(
-            Path(workdir) / JOIN_ALERTS_FILE, {"alerts": alerts[:JOIN_ALERTS_MAX]}
-        )
-    except OSError:
-        logger.debug("写入加入失败提醒文件失败", exc_info=True)
+    _JOIN_ALERTS.save(workdir, alerts)
 
 
 def format_join_alert(a: dict, title_map: Dict[str, str]) -> str:
@@ -101,25 +126,11 @@ def format_join_alert(a: dict, title_map: Dict[str, str]) -> str:
 
 
 def load_speak_alerts(workdir) -> List[dict]:
-    path = Path(workdir) / SPEAK_ALERTS_FILE
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        alerts = data.get("alerts") if isinstance(data, dict) else None
-        return [a for a in (alerts or []) if isinstance(a, dict)]
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError):
-        logger.debug("读取未完成发言任务文件失败", exc_info=True)
-        return []
+    return _SPEAK_ALERTS.load(workdir)
 
 
 def save_speak_alerts(workdir, alerts: List[dict]) -> None:
-    try:
-        atomic_write_json(
-            Path(workdir) / SPEAK_ALERTS_FILE, {"alerts": alerts[:SPEAK_ALERTS_MAX]}
-        )
-    except OSError:
-        logger.debug("写入未完成发言任务文件失败", exc_info=True)
+    _SPEAK_ALERTS.save(workdir, alerts)
 
 
 def format_speak_alert(a: dict) -> str:
@@ -132,25 +143,11 @@ def format_speak_alert(a: dict) -> str:
 
 
 def load_speech_alerts(workdir) -> List[dict]:
-    path = Path(workdir) / SPEECH_ALERTS_FILE
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        alerts = data.get("alerts") if isinstance(data, dict) else None
-        return [a for a in (alerts or []) if isinstance(a, dict)]
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError):
-        logger.debug("读取未达标发言数任务文件失败", exc_info=True)
-        return []
+    return _SPEECH_ALERTS.load(workdir)
 
 
 def save_speech_alerts(workdir, alerts: List[dict]) -> None:
-    try:
-        atomic_write_json(
-            Path(workdir) / SPEECH_ALERTS_FILE, {"alerts": alerts[:SPEECH_ALERTS_MAX]}
-        )
-    except OSError:
-        logger.debug("写入未达标发言数任务文件失败", exc_info=True)
+    _SPEECH_ALERTS.save(workdir, alerts)
 
 
 def format_speech_alert(a: dict) -> str:
@@ -164,25 +161,11 @@ def format_speech_alert(a: dict) -> str:
 
 
 def load_win_alerts(workdir) -> List[dict]:
-    path = Path(workdir) / WIN_ALERTS_FILE
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        alerts = data.get("alerts") if isinstance(data, dict) else None
-        return [a for a in (alerts or []) if isinstance(a, dict)]
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError):
-        logger.debug("读取中奖提醒文件失败", exc_info=True)
-        return []
+    return _WIN_ALERTS.load(workdir)
 
 
 def save_win_alerts(workdir, alerts: List[dict]) -> None:
-    try:
-        atomic_write_json(
-            Path(workdir) / WIN_ALERTS_FILE, {"alerts": alerts[:WIN_ALERTS_MAX]}
-        )
-    except OSError:
-        logger.debug("写入中奖提醒文件失败", exc_info=True)
+    _WIN_ALERTS.save(workdir, alerts)
 
 
 def format_win_alert(a: dict) -> str:

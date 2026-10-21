@@ -46,8 +46,8 @@ from tg_signer.webui.random_chat import random_chat_block
 from tg_signer.webui.sign import (
     SIGNER_TEMPLATE,
     SignerBlock,
-    SignRecordBlock,
     TaskRunnerBlock,
+    flush_task_history,
     user_info_block,
 )
 
@@ -288,13 +288,6 @@ def _build_dashboard(container) -> None:
         add_dialog_close_button(users_dialog)
 
         with (
-            ui.dialog() as records_dialog,
-            ui.card().classes("w-full max-w-4xl") as records_card,
-        ):
-            pass
-        add_dialog_close_button(records_dialog)
-
-        with (
             ui.dialog() as logs_dialog,
             ui.card().classes("w-full max-w-4xl") as logs_card,
         ):
@@ -308,7 +301,6 @@ def _build_dashboard(container) -> None:
             pass
         add_dialog_close_button(configs_dialog)
 
-        _records_block: Optional[SignRecordBlock] = None
         _users_built = False
         _logs_built = False
         _configs_built = False
@@ -331,23 +323,6 @@ def _build_dashboard(container) -> None:
                 with ui.row().classes("w-full justify-end"):
                     ui.button("关闭", on_click=users_dialog.close).props("outline")
 
-        def _ensure_records() -> None:
-            """签到记录对话框内容懒构建（仅首次）。"""
-            nonlocal _records_block
-            if _records_block is not None:
-                return
-            with records_card:
-                ui.label("签到记录").classes("text-lg font-semibold")
-                ui.label(
-                    "签到记录（优先读取 SQLite，兼容旧 sign_record.json）"
-                ).classes("text-gray-600")
-                _records_block = SignRecordBlock()
-                refreshers.append(_records_block)
-                # SignRecordBlock 构造时同样只建空容器，需立即 refresh 填充
-                _records_block.refresh()
-                with ui.row().classes("w-full justify-end"):
-                    ui.button("关闭", on_click=records_dialog.close).props("outline")
-
         def _ensure_logs() -> None:
             """日志对话框内容懒构建（仅首次）。"""
             nonlocal _logs_built
@@ -362,12 +337,6 @@ def _build_dashboard(container) -> None:
                 logs_refresh()
                 with ui.row().classes("w-full justify-end"):
                     ui.button("关闭", on_click=logs_dialog.close).props("outline")
-
-        def goto_records(task_name: str) -> None:
-            _ensure_records()
-            assert _records_block is not None
-            _records_block.filter_input.set_value(task_name)
-            records_dialog.open()
 
         def open_settings() -> None:
             with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
@@ -497,10 +466,6 @@ def _build_dashboard(container) -> None:
                 ui.menu_item("设置", on_click=open_settings)
                 ui.menu_item(
                     "用户信息", on_click=lambda: (_ensure_users(), users_dialog.open())
-                )
-                ui.menu_item(
-                    "签到记录",
-                    on_click=lambda: (_ensure_records(), records_dialog.open()),
                 )
                 ui.menu_item(
                     "日志", on_click=lambda: (_ensure_logs(), logs_dialog.open())
@@ -697,7 +662,7 @@ def _build_dashboard(container) -> None:
                     with ui.row().classes("w-full justify-end"):
                         ui.button("关闭", on_click=import_dlg.close).props("outline")
 
-                signer_block = SignerBlock(SIGNER_TEMPLATE, goto_records=goto_records)
+                signer_block = SignerBlock(SIGNER_TEMPLATE)
                 refreshers.append(signer_block)
                 # 块本身只创建空容器并返回 refresh，需立即调用一次填充配置列表
                 signer_block()
@@ -1154,6 +1119,11 @@ def main(host: str = None, port: int = None, storage_secret: str = None) -> None
     @app.on_startup
     async def _setup_loop_handler() -> None:
         _install_loop_exception_handler()
+
+    @app.on_shutdown
+    async def _flush_pending_writes() -> None:
+        # 任务历史为防抖写盘，退出前强制落盘，避免最后一条记录丢失
+        flush_task_history()
 
     # GZip 压缩：NiceGUI 静态资源约 6MB（Vue/Quasar/字体等），gzip 后约 1.5MB，
     # 显著降低手机等弱网环境的首次加载耗时

@@ -4,10 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tg_signer.giveaway_core import (
-    FLOOD_COOLDOWN,
-    GiveawayEngine,
-    GiveawayState,
+from tg_signer.giveaway_core import GiveawayEngine
+from tg_signer.giveaway_parsing import (
     extract_bot_links,
     extract_channel_targets,
     message_matches_keywords,
@@ -18,6 +16,7 @@ from tg_signer.giveaway_core import (
     parse_region_limits,
     strip_rules_section,
 )
+from tg_signer.giveaway_state import FLOOD_COOLDOWN, GiveawayState
 
 # ---------------- parse_bot_start_link ----------------
 
@@ -335,17 +334,17 @@ def test_state_caps_per_account(tmp_path):
     state = GiveawayState(tmp_path)
     for i in range(10):
         state.add("acc", f"Bot{i:05d}", "p")
-    import tg_signer.giveaway_core as core
+    import tg_signer.giveaway_state as state_mod
 
-    old_cap = core.MAX_STATE_PER_ACCOUNT
-    core.MAX_STATE_PER_ACCOUNT = 5
+    old_cap = state_mod.MAX_STATE_PER_ACCOUNT
+    state_mod.MAX_STATE_PER_ACCOUNT = 5
     try:
         state2 = GiveawayState(tmp_path)
         for i in range(10, 20):
             state2.add("acc", f"Bot{i:05d}", "p")
         assert len(state2._data["acc"]) == 5
     finally:
-        core.MAX_STATE_PER_ACCOUNT = old_cap
+        state_mod.MAX_STATE_PER_ACCOUNT = old_cap
 
 
 # ---------------- GiveawayEngine._process_message 决策 ----------------
@@ -1730,7 +1729,7 @@ def _status_message(text, name_urls):
 
 
 def test_extract_join_status_targets():
-    from tg_signer.giveaway_core import extract_join_status_targets
+    from tg_signer.giveaway_parsing import extract_join_status_targets
 
     msg = _status_message(
         STATUS_REPLY,
@@ -1759,7 +1758,7 @@ def test_extract_join_status_targets():
 def test_extract_join_status_targets_utf16_and_edge_urls():
     """真实场景回归：astral emoji 造成 UTF-16 偏移漂移、尾斜杠链接、
     tg://resolve 形态链接、帖子路径链接仍被排除。"""
-    from tg_signer.giveaway_core import extract_join_status_targets
+    from tg_signer.giveaway_parsing import extract_join_status_targets
 
     text = (
         "您需加入指定的群组/频道\n"
@@ -1794,7 +1793,7 @@ def test_extract_join_status_targets_caption_entities():
     """带图帖子的清单实体在 caption_entities 里，同样要能提取。"""
     from types import SimpleNamespace
 
-    from tg_signer.giveaway_core import extract_join_status_targets
+    from tg_signer.giveaway_parsing import extract_join_status_targets
 
     text = "🎫 加入-某测试频道G ❌"
     msg = SimpleNamespace(
@@ -1818,7 +1817,7 @@ def test_extract_join_status_targets_pyrogram_text_link():
     之前被类型过滤整体丢弃，导致 ❌ 清单永远解析不到链接。"""
     from types import SimpleNamespace
 
-    from tg_signer.giveaway_core import extract_join_status_targets
+    from tg_signer.giveaway_parsing import extract_join_status_targets
 
     msg = SimpleNamespace(
         text="🎫 加入-某测试频道H ❌",
@@ -1855,7 +1854,7 @@ SPEECH_TASK_REPLY = (
 def test_extract_join_status_targets_speech_task_rows():
     """发言数 ❌ 子行不是未加入频道行：已加入行 + 发言任务行的清单
     整体提取不到任何加入目标。"""
-    from tg_signer.giveaway_core import extract_join_status_targets
+    from tg_signer.giveaway_parsing import extract_join_status_targets
 
     msg = _status_message(
         SPEECH_TASK_REPLY,
@@ -1868,7 +1867,7 @@ def test_extract_join_status_targets_speech_task_rows():
 def test_reply_says_signup_success():
     """「已成功报名抽奖（未达标β）」「已获得抽奖资格」＝报名成功（已参与，
     未达标仅剩发言数这类激活任务，系统标记为完成）。"""
-    from tg_signer.giveaway_core import reply_says_signup_success
+    from tg_signer.giveaway_parsing import reply_says_signup_success
 
     assert reply_says_signup_success(_msg(text=SPEECH_TASK_REPLY))
     assert reply_says_signup_success(
@@ -1883,7 +1882,7 @@ def test_reply_says_signup_success():
 def test_reply_says_ended():
     """bot 回复「已结束/已经结束」类文案＝终态（如 @Lottery8Bot 的
     「该活动已经结束或不存在」与英文 "The event has ended or does not exist"）。"""
-    from tg_signer.giveaway_core import reply_says_ended
+    from tg_signer.giveaway_parsing import reply_says_ended
 
     # 中文变体（含「已经结束」，2026-10-19 修复前仅匹配「已结束」漏掉该文案）
     assert reply_says_ended(_msg(text="该活动已经结束或不存在"))
@@ -2037,7 +2036,7 @@ PASSWORD_POST = """🎰 上海婷婷半价券
 
 
 def test_message_requires_password():
-    from tg_signer.giveaway_core import message_requires_password
+    from tg_signer.giveaway_parsing import message_requires_password
 
     assert message_requires_password(_msg(text=PASSWORD_POST))
     assert message_requires_password(_msg(text="请先参与抽奖，再发送口令激活"))
@@ -2074,7 +2073,7 @@ def test_draw_announce_post_is_filtered(tmp_path):
     """开奖结果公告帖（含置顶路径）直接过滤：即使带 start 链接也不参与。"""
     import asyncio
 
-    from tg_signer.giveaway_core import message_is_draw_announce
+    from tg_signer.giveaway_parsing import message_is_draw_announce
 
     announce = (
         "🎉🎉🎉 开奖通知 🎉🎉🎉\n\n"
@@ -2120,7 +2119,7 @@ def test_active_post_mentioning_announce_not_filtered(tmp_path):
     """活跃帖仅在「抽奖说明」段提及「开奖通知」时不被误过滤。"""
     import asyncio
 
-    from tg_signer.giveaway_core import message_is_draw_announce
+    from tg_signer.giveaway_parsing import message_is_draw_announce
 
     active = (
         "🎰 上海江晚晴福利抽奖\n\n"
@@ -2164,7 +2163,7 @@ PAOFU_POST = """🎰 上海泡芙半价券
 
 
 def test_extract_password_tasks():
-    from tg_signer.giveaway_core import extract_password_tasks
+    from tg_signer.giveaway_parsing import extract_password_tasks
 
     # 帖内口令子行归属上方最近的「加入-」行
     assert extract_password_tasks(_msg(text=PASSWORD_POST)) == [
@@ -2192,7 +2191,7 @@ def test_extract_password_tasks():
 
 
 def test_extract_join_name_links():
-    from tg_signer.giveaway_core import extract_join_name_links
+    from tg_signer.giveaway_parsing import extract_join_name_links
 
     text = (
         "您需加入指定的群组/频道\n"
@@ -2511,7 +2510,7 @@ ACTIVATION_REPLY = (
 def test_extract_password_tasks_activation_reply():
     """报名成功后的激活任务清单：❌ 口令子行按上方最近「已加入-名称」
     行归属群组；✅ 行跳过；发言数子行不视为口令任务。"""
-    from tg_signer.giveaway_core import extract_password_tasks
+    from tg_signer.giveaway_parsing import extract_password_tasks
 
     msg = _status_message(
         ACTIVATION_REPLY,
@@ -2531,7 +2530,7 @@ def test_extract_password_tasks_activation_reply():
 def test_extract_speech_tasks_activation_reply():
     """报名成功清单：「发言数大于 N 条」子行按上方最近加入行归属群组，
     ✅ 已达标行跳过。"""
-    from tg_signer.giveaway_core import extract_speech_tasks
+    from tg_signer.giveaway_parsing import extract_speech_tasks
 
     assert extract_speech_tasks(_msg(text=ACTIVATION_REPLY)) == [
         ("野寻·上海学生交流群", 6)
@@ -2661,7 +2660,7 @@ WIN_SAMPLE = (
 
 def test_win_regex_matches_real_bot_samples():
     """真实 bot 中奖私信样本均命中识别正则；参与类消息不误报。"""
-    from tg_signer.giveaway_core import WIN_MESSAGE_RE
+    from tg_signer.giveaway_parsing import WIN_MESSAGE_RE
 
     # @LotteryBestBot：标题行 + 正文恭喜 + 防伪编号
     assert WIN_MESSAGE_RE.search(WIN_SAMPLE)
@@ -2689,7 +2688,7 @@ def test_check_win_message_skips_draw_announcement(tmp_path):
     """开奖结果公告（防伪编号+他人中奖名单，无个人化标记）不按中奖处理。"""
     import asyncio
 
-    from tg_signer.giveaway_core import (
+    from tg_signer.giveaway_parsing import (
         WIN_ANNOUNCE_RE,
         WIN_MESSAGE_RE,
         WIN_PERSONAL_RE,
@@ -2972,7 +2971,7 @@ DBCHOUJIANG_VERIFY_TEXT = (
 
 
 def test_extract_emoji_order_samples():
-    from tg_signer.giveaway_core import _extract_emoji_order
+    from tg_signer.giveaway_parsing import _extract_emoji_order
 
     # @dbchoujiang123_bot 样本：顿号分隔
     assert _extract_emoji_order(DBCHOUJIANG_VERIFY_TEXT) == ["🎯", "🐻", "🐴"]
@@ -2989,7 +2988,7 @@ def test_extract_emoji_order_samples():
 
 
 def test_is_emoji_verify_message():
-    from tg_signer.giveaway_core import is_emoji_verify_message
+    from tg_signer.giveaway_parsing import is_emoji_verify_message
 
     assert is_emoji_verify_message(_msg(text=DBCHOUJIANG_VERIFY_TEXT))
     # 点错重试提示同样命中

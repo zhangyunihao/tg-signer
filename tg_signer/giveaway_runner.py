@@ -28,7 +28,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict
 
-from tg_signer.giveaway_core import GiveawayEngine, GiveawayState
+from tg_signer.giveaway_core import GiveawayEngine
+from tg_signer.giveaway_state import GiveawayState
 
 # 已自带 HH:MM:SS 时间戳的消息不重复加前缀
 _TS_RE = re.compile(r"^\d{2}:\d{2}:\d{2}")

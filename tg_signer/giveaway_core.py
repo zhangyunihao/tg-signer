@@ -1,11 +1,11 @@
-"""自动抽奖核心：识别频道消息中的 t.me/<bot>?start=<参数> 链接并自动参与。
+"""自动抽奖引擎：识别频道消息中的 t.me/<bot>?start=<参数> 链接并自动参与。
 
 典型链路：频道抽奖帖 -> 消息文本/隐藏超链接/内联按钮中的 bot 深度链接 ->
 调用 messages.StartBot（等价于点开链接）-> 机器人若回复带「确认参与」类
 回调按钮，再自动点击一次。
 
-纯解析函数不依赖网络，便于单测；GiveawayEngine 负责连接、
-历史扫描、去重与参与。
+本模块只保留引擎（连接、扫描、去重、参与）与运行期调优常量；
+纯文本/链接解析在 giveaway_parsing，参与记录持久化在 giveaway_state。
 
 触发方式：启动时可选自动扫描最近消息 + 手动扫描 + 周期性历史补漏
 （重拉最近消息捞回漏网之鱼，含连续失败熔断暂停）；同一引擎常驻连接，
@@ -16,90 +16,116 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import logging
 import random
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
 
 from tg_signer.core import get_client, safe_disconnect
+from tg_signer.giveaway_parsing import (
+    _INVITE_LINK_RE,
+    _POPUP_ENDED_RE,
+    _TME_RE,
+    DEFAULT_CONFIRM_KEYWORDS,
+    DEFAULT_KEYWORDS,
+    JOIN_RETRY_BUTTON_KEYWORDS,
+    PASSWORD_REQUIRE_RE,
+    SCORE_BUTTON_RE,
+    SCORE_SPEND_RE,
+    WIN_ANNOUNCE_RE,
+    WIN_MESSAGE_RE,
+    WIN_PERSONAL_RE,
+    _extract_emoji_order,
+    _giveaway_title,
+    _is_username_resolve_error,
+    _message_text,
+    _utf16_to_index,
+    bot_is_blocked,
+    bot_policy,
+    extract_bot_links,
+    extract_channel_targets,
+    extract_giveaway_title,
+    extract_join_name_links,
+    extract_join_status_targets,
+    extract_password_tasks,
+    extract_speech_tasks,
+    is_emoji_verify_message,
+    message_is_draw_announce,
+    message_matches_keywords,
+    message_region_allowed,
+    message_requires_password,
+    message_requires_speech,
+    parse_bot_start_link,
+    parse_draw_date,
+    reply_says_ended,
+    reply_says_signup_success,
+)
+from tg_signer.giveaway_state import (
+    GiveawayState,
+)
 
 logger = logging.getLogger(__name__)
 
-# 命中「确认参与」类按钮的默认关键词（callback 按钮直接点击；URL 按钮仅当
-# 链接指向同一 bot 的 start 深度链接时才点击，即重发 start 完成参与）
-DEFAULT_CONFIRM_KEYWORDS = (
-    "确认",
-    "参与",
-    "参加",
-    "立即",
-    "领取",
-    "报名",
-    "提交",
-    "抽奖",
-    "签到",
-)
-DEFAULT_KEYWORDS = ("上海", "现金", "红包")
-# 「加入频道后重试参与」类按钮关键词：bot 明确提示「加入后需再点一次
-# 我已加入 重试参与」时，优先点该按钮而不是重发 start——少触发一轮
-# 防脚本验证、少消耗一条 start 消息（降低 FLOOD_WAIT 概率）
-JOIN_RETRY_BUTTON_KEYWORDS = ("我已加入", "重试参与")
-STATE_FILE = "giveaway_state.json"
-# 每个账号最多保留的去重记录数，超出丢弃最旧的
-MAX_STATE_PER_ACCOUNT = 1000
+
 # 同一 bot 连续 FLOOD_WAIT 达到该次数后，本轮运行熔断（不再对其 start_bot）
 MAX_FLOOD_STRIKES = 3
+
+
 # 同一 bot 累计收到该次数「抽奖已结束」类回复后，本轮运行熔断该 bot
 # （如 @Lottery8Bot 对所有 start 一律回复 "The event has ended or does not exist"）
 MAX_ENDED_STRIKES = 3
 
-# 抽奖 bot 黑名单（小写用户名）：消息中的这些 bot 链接不作为抽奖链接参与，
-# 整条消息直接跳过（不 start、不加频道、不留日志）。
-# 如御姐群抽奖 bot：正文链接是推广位、真实参与靠其站内按钮，start 流程无意义且耗时
-BLOCKED_BOTS = frozenset({"yujie_feedback_search_bot"})
-# 强制重参与名单：即使消息里没有加频道要求也重发 start 的 bot（小写用户名）
-BOTS_RESTART_AFTER_JOIN = frozenset({"realsaberbot", "lotterybestbot"})
-# FLOOD_WAIT 失败记录的冷却时间（秒），冷却后允许重试
-FLOOD_COOLDOWN = 3600
+
 # 扫描停止条件：连续这么多条「已开奖」的抽奖帖后，认为再往前都是旧抽奖
 EXPIRED_STOP_STREAK = 5
+
+
 # 单频道单次扫描的硬上限（条），防止无开奖日期标注时无限回溯
 SCAN_HARD_CAP = 1000
+
+
 
 # —— 历史补漏 ——
 # 周期性重拉各频道最近若干条消息，捞回此前扫描失败/中断漏掉的抽奖帖
 RESCUE_INTERVAL = 600  # 补漏扫描间隔（秒），0 = 关闭
+
+
 RESCUE_LIMIT = 10  # 每次补漏每频道重拉的消息条数
+
+
 RESCUE_MAX_FAILS = 3  # 连续失败达该轮数后熔断暂停补漏
+
+
 RESCUE_RESUME_COOLDOWN = 1800  # 熔断后的自动恢复等待（秒）
+
+
 RESCUE_FETCH_TIMEOUT = 60  # 单频道补漏拉取消息的超时（秒）
+
+
 SEEN_CAP_PER_CHAT = 500  # 每频道保留的已处理消息 id 上限
 
-# —— 中奖识别 ——
-# bot 私聊中奖消息的默认识别正则（样本来自 @LotteryBestBot：标题行为
-# 「💐💐💐 中奖提醒 💐💐💐」，正文有「恭喜您中奖了！」与「🔖 防伪编号：H…」；
-# 注意「防伪编号」也会出现在开奖结果公告里，公告由 WIN_ANNOUNCE_RE 排除）
-WIN_MESSAGE_RE = re.compile(r"中奖提醒|恭喜.{0,8}中奖|防伪编号")
-# 开奖结果公告（bot 群发给全体参与者的「🎉 开奖通知 🎉」，列出的是他人
-# 中奖名单与防伪编号）不是个人中奖：含公告特征但无「恭喜…中奖/中奖提醒/
-# 中奖人：」等个人化标记时，不按中奖处理（曾把 @shlldqbot 的开奖通知
-# 误判为中奖转发进中奖群）
-WIN_ANNOUNCE_RE = re.compile(r"开奖通知|开奖结果|中奖名单")
-WIN_PERSONAL_RE = re.compile(r"恭喜.{0,8}中奖|中奖提醒|中奖人[：:]")
+
 # 首次记录某 bot 时的回看消息条数（初始基线）；之后按水位线增量扫描，
 # 只处理比上次扫到的消息 id 更新的消息，该值不再参与日常回扫
 WIN_SWEEP_LIMIT = 50
+
+
 WIN_SWEEP_PAGE = 100  # 增量回扫单页拉取的消息条数
+
+
 WIN_SWEEP_PAGE_MAX = 20  # 增量回扫最多翻页数（防水位线异常时无限翻页）
+
+
 
 # —— 网络调用统一超时 ——
 # 半开连接（手机切换网络/代理僵死）下 Pyrogram 请求可能永久挂起，导致引擎
 # 任务协程卡死、WebUI 状态永不收敛。所有经引擎客户端发出的请求统一加超时：
 # 单次请求超过 NET_CALL_TIMEOUT 秒按网络异常抛错，由各调用点的既有异常处理兜底。
 NET_CALL_TIMEOUT = 90
+
+
 
 
 async def _timeout_aiter(agen: Any, timeout: float, name: str = "") -> Any:
@@ -114,6 +140,8 @@ async def _timeout_aiter(agen: Any, timeout: float, name: str = "") -> Any:
                 f"网络请求 {name or '消息拉取'} 超时（{timeout:.0f} 秒，网络异常）"
             ) from None
         yield item
+
+
 
 
 class _TimeoutClient:
@@ -147,876 +175,6 @@ class _TimeoutClient:
             ) from None
 
 
-# URL 主体合法字符（不含空白与非西文字符）：链接紧贴中文/全角标点时在此截断
-_URL_BODY = r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*"
-# t.me/<username> + 后续路径/查询（用户名 5~32 位，字母/数字/下划线）
-_TME_RE = re.compile(
-    r"(?:https?://)?t\.me/(?P<name>[A-Za-z0-9_]{5,32})(?P<rest>[/?#]"
-    + _URL_BODY
-    + r")?",
-    re.IGNORECASE,
-)
-# tg://resolve?domain=<u>&start=<p> 形式
-_TG_RESOLVE_RE = re.compile(r"tg://resolve\?", re.IGNORECASE)
-_TG_RESOLVE_FULL_RE = re.compile(r"tg://resolve\?" + _URL_BODY, re.IGNORECASE)
-# start 参数合法字符：字母数字下划线短横；URL 紧贴中文时取首个非法字符之前部分
-_START_PARAM_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
-# t.me 频道/群组目标：邀请链接（+hash / joinchat/hash）或公开用户名
-_TME_CHANNEL_RE = re.compile(
-    r"(?:https?://)?t\.me/(?P<target>\+[A-Za-z0-9_-]{8,64}|joinchat/[A-Za-z0-9_-]{8,64}|[A-Za-z0-9_]{5,32})"
-    r"(?P<rest>[/?#]\S*)?",
-    re.IGNORECASE,
-)
-# 文本中的 @username（前后排除仅限 ASCII 词符与 @，避免紧贴中文时被漏掉）
-_AT_CHANNEL_RE = re.compile(r"(?<![A-Za-z0-9_@])@([A-Za-z0-9_]{5,32})(?![A-Za-z0-9_])")
-# 开奖日期解析：仅在文本含「开奖/公布/抽出/揭晓」提示词时尝试
-_DRAW_HINT_RE = re.compile(r"开奖|公布|抽出|揭晓")
-# 日期：2026-01-01 / 2026年1月1日 / 1月1日（年份可选）
-_DATE_YMD_RE = re.compile(
-    r"(?:(?P<y>20\d{2})\s*[-/.年]\s*)?(?P<m>\d{1,2})\s*[-/.月]\s*(?P<d>\d{1,2})\s*[日号]?"
-)
-# 时间：20:00 / 20点30分 / 8点
-_TIME_HM_RE = re.compile(
-    r"(?P<h>\d{1,2})\s*[:点时]\s*(?P<mi>\d{1,2})\s*分?|(?P<h2>\d{1,2})点"
-)
-
-
-def parse_draw_date(text: str, now: Optional[datetime] = None) -> Optional[datetime]:
-    """解析消息文本中的开奖日期；无提示词或解析不出返回 None。
-
-    支持 2026-01-01、2026年1月1日、1月1日（默认当年），可带 20:00 / 20点30分；
-    无时间的日期按当天 23:59:59 处理（保守：当天内不视为已开奖）。
-    无年份的日期一律按当年理解：过期即视为旧帖跳过（宁可漏不可错参与）。
-    提示词可能有多个（如 @choujiangs_bot 说明段「3日后开奖了」在前、
-    「开奖时间：2026-09-30 12:00」在后）：逐个提示词位置尝试解析，
-    取第一个能解析出的日期；窗口内无法构成合法日期的数字
-    （如奖品行「18.8」）跳过继续，不中断整体解析。
-
-    窗口向后取 80 字符（老猫福利榜帖「📅 开奖日期:(UTC+8)⏎2026年10月26日…」
-    的前缀「日期:(UTC+8)」+换行恰好吃掉 13 字符，旧版 +20 窗口把
-    「10月26日」截成「10月2」误判为已开奖）；窗口因长度上限被截断时，
-    贴边（起止顶到窗口边界）的匹配视为残缺日期跳过，不参与判定。
-    """
-    if not text or not _DRAW_HINT_RE.search(text):
-        return None
-    now = now or datetime.now()
-    for hint in _DRAW_HINT_RE.finditer(text):
-        start = max(0, hint.start() - 20)
-        end = min(len(text), hint.end() + 80)
-        # 窗口是否因 +80 上限被截断（截断时贴边匹配不可信）
-        truncated = end < len(text)
-        window = text[start:end]
-        for dm in _DATE_YMD_RE.finditer(window):
-            if truncated and (
-                dm.end() == len(window) or (dm.start() == 0 and start > 0)
-            ):
-                continue  # 贴窗口边界的日期可能被截断，宁可不判不误判
-            year = int(dm.group("y")) if dm.group("y") else now.year
-            try:
-                dt = datetime(year, int(dm.group("m")), int(dm.group("d")))
-            except ValueError:
-                continue
-            tail = window[dm.end() : dm.end() + 12]
-            tm = _TIME_HM_RE.search(tail)
-            if tm is not None:
-                hour = int(tm.group("h") or tm.group("h2") or 0)
-                minute = int(tm.group("mi") or 0)
-                try:
-                    dt = dt.replace(hour=hour, minute=minute)
-                except ValueError:
-                    dt = dt.replace(hour=23, minute=59, second=59)
-            else:
-                dt = dt.replace(hour=23, minute=59, second=59)
-            return dt
-    return None
-
-
-def parse_bot_start_link(url: str) -> Optional[Tuple[str, str]]:
-    """解析 bot 深度链接，返回 (用户名(不带@), start参数)；不是则返回 None。
-
-    支持：
-      https://t.me/SomeBot?start=abc
-      http://t.me/SomeBot?start=abc
-      t.me/SomeBot?start=abc
-      tg://resolve?domain=SomeBot&start=abc
-    不支持 startgroup/startapp（拉群/小程序，语义不同）与路径型链接
-    （如 t.me/SomeBot/123 是消息/邀请类链接）。
-    """
-    if not url or not isinstance(url, str):
-        return None
-    raw = url.strip()
-    if _TG_RESOLVE_RE.search(raw):
-        query = parse_qs(urlparse(raw).query)
-        domain = (query.get("domain") or [""])[0]
-        param = (query.get("start") or [""])[0]
-    else:
-        m = _TME_RE.search(raw)
-        if not m:
-            return None
-        domain = m.group("name")
-        rest = m.group("rest") or ""
-        # 路径型（t.me/Bot/xxx、t.me/joinchat/...）不是 start 深度链接
-        if rest.startswith("/"):
-            return None
-        query = parse_qs(urlparse(rest).query) if rest.startswith("?") else {}
-        param = (query.get("start") or [""])[0]
-    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", domain or ""):
-        return None
-    if not param:
-        return None
-    mparam = _START_PARAM_RE.match(param)
-    if mparam is None:
-        return None
-    return domain, mparam.group(0)
-
-
-def _message_text(message: Any) -> str:
-    return str(
-        getattr(message, "text", None) or getattr(message, "caption", None) or ""
-    )
-
-
-def _giveaway_title(message: Any, limit: int = 30) -> str:
-    """截取抽奖帖标题：消息文本压成单行取前 limit 字，空文本返回空串。"""
-    text = _message_text(message).strip()
-    if not text:
-        return ""
-    snippet = re.sub(r"\s+", " ", text)
-    return snippet if len(snippet) <= limit else snippet[:limit] + "…"
-
-
-def extract_giveaway_title(message: Any, limit: int = 40) -> str:
-    """提取 bot 清单回复中的抽奖标题行（以 🎰 开头），取不到返回空串。"""
-    text = _message_text(message)
-    for raw_line in text.split("\n"):
-        line = raw_line.strip()
-        if not line.startswith("🎰"):
-            continue
-        title = line.lstrip("🎰").strip()
-        if title:
-            return title if len(title) <= limit else title[:limit] + "…"
-    return ""
-
-
-def _iter_candidate_urls(message: Any) -> Iterable[str]:
-    """从消息中枚举可能含 bot 链接的 URL：明文文本 + 隐藏超链接实体 + 内联按钮。"""
-    text = _message_text(message)
-    if text:
-        yield text
-    for attr in ("entities", "caption_entities"):
-        for ent in getattr(message, attr, None) or []:
-            ent_type = str(getattr(ent, "type", ""))
-            url = getattr(ent, "url", None)
-            # 文本超链接实体（pyrogram: TEXT_LINK；telethon: TEXT_URL）
-            if (
-                "TEXT_URL" in ent_type.upper() or "TEXT_LINK" in ent_type.upper()
-            ) and url:
-                yield str(url)
-    reply_markup = getattr(message, "reply_markup", None)
-    for row in getattr(reply_markup, "inline_keyboard", None) or []:
-        for btn in row or []:
-            url = getattr(btn, "url", None)
-            if url:
-                yield str(url)
-
-
-def extract_bot_links(message: Any) -> List[Tuple[str, str]]:
-    """提取消息中全部去重后的 (用户名, start参数)，按出现顺序排列。
-
-    对整段候选文本做全局正则扫描：多个链接紧挨着（仅以中文标点等
-    非 URL 字符分隔、无空格）也能逐个取出，不漏掉后面的链接。
-    """
-    found: List[Tuple[str, str]] = []
-    seen: set = set()
-
-    def _push(parsed: Optional[Tuple[str, str]]) -> None:
-        if parsed is None:
-            return
-        key = (parsed[0].lower(), parsed[1])
-        if key not in seen:
-            seen.add(key)
-            found.append(parsed)
-
-    for candidate in _iter_candidate_urls(message):
-        # 两种链接一起按出现位置排序，保持消息中的先后顺序
-        hits: List[Tuple[int, Tuple[str, str]]] = []
-        for m in _TME_RE.finditer(candidate):
-            parsed = parse_bot_start_link(m.group(0))
-            if parsed is not None:
-                hits.append((m.start(), parsed))
-        for m in _TG_RESOLVE_FULL_RE.finditer(candidate):
-            parsed = parse_bot_start_link(m.group(0))
-            if parsed is not None:
-                hits.append((m.start(), parsed))
-        for _, parsed in sorted(hits, key=lambda x: x[0]):
-            _push(parsed)
-    return found
-
-
-def message_matches_keywords(message: Any, keywords: Iterable[str]) -> bool:
-    """消息文本是否包含任一关键词；关键词为空表示全部放行。
-
-    匹配时剔除「抽奖说明」段落：该段落是规则描述，常出现与奖品无关的
-    关键字（如说明里提到群内每日现金红包），不应据此判定抽奖命中关键词。
-    """
-    kws = [str(k).strip() for k in (keywords or []) if str(k).strip()]
-    if not kws:
-        return True
-    text = strip_rules_section(_message_text(message))
-    return any(kw in text for kw in kws)
-
-
-# 「抽奖说明」段落边界：段头行含「抽奖说明」，段落延续到下一个
-# 「行首 emoji + 文字 + 冒号」的段头（如 🔋人品加成 / 💁参与情况 / 📅开奖日期），
-# 无后续段头则到文本末尾。
-_RULES_HEADER_RE = re.compile(r"抽奖说明")
-_SECTION_HEADER_RE = re.compile(r"^[^\w\s\u4e00-\u9fff]+\s*\S*[：:]", re.MULTILINE)
-
-
-def strip_rules_section(text: str) -> str:
-    """剔除抽奖帖「抽奖说明」段落（含段头行），只保留其余内容。"""
-    if not text:
-        return text
-    lines = text.splitlines()
-    for idx, line in enumerate(lines):
-        if not _RULES_HEADER_RE.search(line):
-            continue
-        end = len(lines)
-        for j in range(idx + 1, len(lines)):
-            if _SECTION_HEADER_RE.match(lines[j]):
-                end = j
-                break
-        return "\n".join(lines[:idx] + lines[end:])
-    return text
-
-
-# —— 开奖结果公告过滤 ——
-# bot 群发给全体参与者的开奖结果公告（如「🎉🎉🎉 开奖通知 🎉🎉🎉」+ 防伪编号 +
-# 他人中奖名单）：抽奖已结束，参与无意义。置顶路径不受关键词过滤，且公告帖
-# 可能残留参与按钮或客服 start 链接，须在链接提取前显式拦截。仅按剔除
-# 「抽奖说明」段后的文本判断，避免活跃帖说明段里提及「开奖通知」被误过滤。
-DRAW_ANNOUNCE_RE = re.compile(r"开奖通知|开奖结果|中奖名单")
-
-
-def message_is_draw_announce(message: Any) -> bool:
-    """消息是否为开奖结果公告（非活跃抽奖帖）。"""
-    text = strip_rules_section(_message_text(message))
-    return bool(text and DRAW_ANNOUNCE_RE.search(text))
-
-
-# —— 归属地限制过滤 ——
-# 消息中出现「归属地 xxx」行（如「归属地 陕西」「归属地 上海,江苏」）视为地区限制抽奖：
-# 无该行 = 不限地区；有该行时仅当受限地区包含白名单地区（或写明全国/不限）才参与。
-# 允许行首有至多 4 个非中文字符的装饰（emoji、符号等），「归属地」必须位于行首附近，
-# 避免句子中间提及「归属地」被误判为限制声明。
-REGION_LIMIT_RE = re.compile(
-    r"^[^\u4e00-\u9fff\n]{0,4}归属地\s*[:：]?\s*(\S.*)$", re.MULTILINE
-)
-REGION_SPLIT_RE = re.compile(r"[，,、/|\s]+")
-ALLOWED_REGIONS = ("上海",)
-REGION_UNLIMITED_WORDS = ("全国", "不限", "所有", "全部")
-
-
-def parse_region_limits(text: str) -> Optional[List[List[str]]]:
-    """提取文本中全部「归属地」行的地区列表；无该行返回 None（不限地区）。"""
-    limits: List[List[str]] = []
-    for m in REGION_LIMIT_RE.finditer(text or ""):
-        regions = [r for r in REGION_SPLIT_RE.split(m.group(1).strip()) if r]
-        if regions:
-            limits.append(regions)
-    return limits or None
-
-
-def message_region_allowed(message: Any) -> bool:
-    """归属地限制过滤：无「归属地」行，或任一行的地区含白名单地区/全国不限时放行。"""
-    limits = parse_region_limits(_message_text(message))
-    if limits is None:
-        return True
-    for regions in limits:
-        if any(any(w in r for w in REGION_UNLIMITED_WORDS) for r in regions):
-            return True
-        if any(any(want in r for r in regions) for want in ALLOWED_REGIONS):
-            return True
-    return False
-
-
-# —— 发言数要求检测 ——
-# 抽奖帖含「发言数大于 N 条」「发言数超过 N 条」等参与条件时，双向账号
-# （隐私设置导致无法被 bot/群成员主动私聊核实）无法达标，需自动跳过。
-SPEECH_REQUIRE_RE = re.compile(r"发言数?\s*(?:大于等于|不少于|大于|超过|>=|>)\s*\d+")
-# 清单/原帖中的发言数任务行，捕获要求条数（「发言数大于 6 条」→ 6）
-SPEECH_TASK_RE = re.compile(
-    r"发言数?\s*(?:大于等于|不少于|大于|超过|>=|>)\s*(\d+)\s*条?"
-)
-
-
-def message_requires_speech(message: Any) -> bool:
-    """消息是否带「发言数」类参与条件。"""
-    return bool(SPEECH_REQUIRE_RE.search(_message_text(message) or ""))
-
-
-# 口令参与条件：「发送口令﹝xx﹞」「发送口令激活」及「口令提示」段落头，
-# 出现即代表参与需先发送口令（双向账号无法完成该私聊互动）。
-PASSWORD_REQUIRE_RE = re.compile(r"发送口令|口令提示")
-
-
-def message_requires_password(message: Any) -> bool:
-    """消息是否带「发送口令」类参与条件。"""
-    return bool(PASSWORD_REQUIRE_RE.search(_message_text(message) or ""))
-
-
-# —— 口令任务解析 ——
-# 「└  🔑 发送口令﹝出击泡芙宝宝﹞」子行归属上方最近的「🎫 加入-名称」行，
-# 得到（群名 → 口令文本）对应关系，加入该群组后发送口令完成激活。
-# 口令文本支持 ﹝﹞「」『』【】（）() 等括号变体；「发送口令激活」类
-# 无括号写法不视为携带口令文本。
-PASSWORD_TEXT_RE = re.compile(r"发送口令\s*[﹝「『【（(]\s*(.+?)\s*[﹞」』】）)]")
-JOIN_ROW_RE = re.compile(r"加入\s*[-–—:：]\s*(.+?)\s*[❌✅]?\s*$")
-# 私有邀请链接（t.me/+hash、t.me/joinchat/hash）：send_message 无法用链接
-# 字符串解析 peer（kurigram 会剥掉 + 误走 contacts.ResolveUsername 抛
-# USERNAME_INVALID），必须先解析成真实 chat id 再发送
-_INVITE_LINK_RE = re.compile(
-    r"^(?:https?://)?t\.me/(?:joinchat/|\+)([A-Za-z0-9_-]+)$", re.IGNORECASE
-)
-# send_message 对字符串 peer 的解析类错误：触发「按群名匹配已加入会话」
-# 兜底（群改名/收回公开用户名时清单链接已失效，但账号已在真实群组中）
-_USERNAME_RESOLVE_ERRORS = (
-    "USERNAME_INVALID",
-    "USERNAME_NOT_OCCUPIED",
-    "CHANNEL_INVALID",
-    "PEER_ID_INVALID",
-)
-
-
-def _is_username_resolve_error(exc: BaseException) -> bool:
-    msg = str(exc).upper()
-    return any(code in msg for code in _USERNAME_RESOLVE_ERRORS)
-
-
-def extract_password_tasks(message: Any) -> List[Tuple[str, str]]:
-    """解析抽奖帖中的口令任务，返回 [(群组名称, 口令文本)]。
-
-    「发送口令﹝xx﹞」子行归属上方最近的「加入-名称」行；多个群组
-    各带口令时逐个返回。无口令任务时返回 []。
-    """
-    text = _message_text(message)
-    if not text or "发送口令" not in text:
-        return []
-    tasks: List[Tuple[str, str]] = []
-    seen: set = set()
-    current_group = ""
-    for raw_line in text.split("\n"):
-        line = raw_line.strip()
-        jm = JOIN_ROW_RE.search(line)
-        if jm and jm.group(1).strip():
-            current_group = jm.group(1).strip()
-        pm = PASSWORD_TEXT_RE.search(line)
-        if pm:
-            if "✅" in line:
-                # bot 回复清单中口令行标 ✅＝口令已发送过，不重复发
-                continue
-            password = pm.group(1).strip()
-            if current_group and password:
-                key = (current_group.lower(), password)
-                if key not in seen:
-                    seen.add(key)
-                    tasks.append((current_group, password))
-    return tasks
-
-
-def extract_speech_tasks(message: Any) -> List[Tuple[str, int]]:
-    """解析清单/原帖中的发言数任务，返回 [(群组名称, 要求条数)]。
-
-    「发言数大于 N 条」子行归属上方最近的「(已)加入-名称」行；
-    ✅ 行代表已达标跳过。无群组归属的孤立要求不处理。
-    """
-    text = _message_text(message)
-    if not text or "发言" not in text:
-        return []
-    tasks: List[Tuple[str, int]] = []
-    seen: set = set()
-    current_group = ""
-    for raw_line in text.split("\n"):
-        line = raw_line.strip()
-        jm = JOIN_ROW_RE.search(line)
-        if jm and jm.group(1).strip():
-            current_group = jm.group(1).strip()
-        sm = SPEECH_TASK_RE.search(line)
-        if sm is None or "✅" in line or not current_group:
-            continue
-        try:
-            required = int(sm.group(1))
-        except ValueError:
-            continue
-        key = (current_group.lower(), required)
-        if key not in seen:
-            seen.add(key)
-            tasks.append((current_group, required))
-    return tasks
-
-
-def _tme_join_target(url: str) -> Optional[str]:
-    """t.me / tg://resolve 链接 → 可 join 的目标（用户名或私有邀请链接）。
-
-    帖子路径（t.me/x/123）、bot 深度链接、无效域名返回 None。
-    """
-    url_s = str(url)
-    if url_s.lower().startswith("tg://resolve"):
-        query = parse_qs(urlparse(url_s).query)
-        domain = (query.get("domain") or [""])[0]
-        if re.fullmatch(r"[A-Za-z0-9_]{5,32}", domain or ""):
-            return domain
-        return None
-    m = _TME_CHANNEL_RE.search(url_s)
-    if m is None:
-        return None
-    target = m.group("target")
-    rest = m.group("rest") or ""
-    if target.lower().startswith(("+", "joinchat/")):
-        return f"https://t.me/{target}"
-    if rest not in ("", "/"):
-        return None
-    return target
-
-
-def extract_join_name_links(message: Any) -> List[Tuple[str, str]]:
-    """解析「加入-名称」隐藏链接行的（名称, 加入目标）对应关系。
-
-    ❌（未加入）/✅（已加入）行均收集——口令群即使已加入也需定位目标
-    才能发送口令。仅处理带 TEXT_URL/TEXT_LINK 实体的行；无实体的普通
-    文本行（原始帖只有群名没链接）忽略。
-    """
-    text = _message_text(message)
-    if not text or "加入" not in text:
-        return []
-    bounds: List[Tuple[int, int, str]] = []
-    start = 0
-    for i, ch in enumerate(text):
-        if ch == "\n":
-            bounds.append((start, i, text[start:i]))
-            start = i + 1
-    bounds.append((start, len(text), text[start:]))
-    results: List[Tuple[str, str]] = []
-    seen: set = set()
-    for attr in ("entities", "caption_entities"):
-        for ent in getattr(message, attr, None) or []:
-            # 隐藏链接实体：Pyrogram 叫 TEXT_LINK，Telethon 叫 TEXT_URL
-            ent_type = str(getattr(ent, "type", "")).upper()
-            if "TEXT_URL" not in ent_type and "TEXT_LINK" not in ent_type:
-                continue
-            url = getattr(ent, "url", None)
-            if not url:
-                continue
-            offset = _utf16_to_index(text, int(getattr(ent, "offset", 0) or 0))
-            line = next((lt for ls, le, lt in bounds if ls <= offset < le), "")
-            if "加入" not in line:
-                continue
-            jm = JOIN_ROW_RE.search(line.strip())
-            if jm is None:
-                continue
-            name = jm.group(1).strip()
-            target = _tme_join_target(str(url))
-            if name and target:
-                key = name.lower()
-                if key not in seen:
-                    seen.add(key)
-                    results.append((name, target))
-    return results
-
-
-# bot 回复「抽奖活动已结束」类文案（活动可能提前结束）＝终态：
-# 跳过加入、重发、点按钮等一切后续跟进，避免对已结束的抽奖反复发 start
-# 中文与英文文案均覆盖（如 @Lottery8Bot 的 "The event has ended or does not exist"
-# 与中文「该活动已经结束或不存在」，「已结束/已经结束」两种变体均命中）
-ENDED_REPLY_RE = re.compile(
-    r"抽奖活动已(?:经)?结束|活动已(?:经)?结束|抽奖已(?:经)?结束"
-    r"|event\s+has\s+ended|giveaway\s+has\s+ended|lottery\s+has\s+ended"
-    r"|已过期",
-    re.IGNORECASE,
-)
-
-
-def reply_says_ended(message: Any) -> bool:
-    """bot 回复是否表明该抽奖已结束（终态）。"""
-    return bool(ENDED_REPLY_RE.search(_message_text(message) or ""))
-
-
-# 点击确认按钮后的弹窗提示（callback answer alert，非新消息）中的终态文案。
-# 部分抽奖 bot（如 @choujiangs_bot）抽奖结束后不回复新消息，仅弹窗提示；
-# 弹窗为即时短文本，匹配可比消息回复更宽（含「已开奖」），误判风险极低
-_POPUP_ENDED_RE = re.compile(
-    r"已结束|已开奖|已过期|has\s+ended",
-    re.IGNORECASE,
-)
-
-
-# bot 回复「您已成功报名抽奖（未达标β）您还需完成激活任务才能抽奖！」
-# 「您已获得抽奖资格（已达标）」等 ＝ 报名已成功：未达标仅剩发言数这类
-# 激活任务（❌ 标在「└ 🎟️ 发言数大于 N 条」子行上，非未加入频道），
-# 系统按参与成功标记，不再以中性行「点击后回复」呈现
-SIGNUP_SUCCESS_RE = re.compile(r"已成功报名|报名成功|已获得抽奖资格")
-
-
-def reply_says_signup_success(message: Any) -> bool:
-    """bot 回复是否表明报名成功（未达标仅剩激活任务时同样算已参与）。"""
-    return bool(SIGNUP_SUCCESS_RE.search(_message_text(message) or ""))
-
-
-# —— 防脚本验证（按顺序点击 emoji，如 @dbchoujiang123_bot）——
-# start 后 bot 回复「🤖 防脚本验证\n请按顺序点击：【🎯、🐻、🐴】\n
-# 点错会冷却 30 秒。」，需按正文给出的顺序依次点击该消息内联键盘上的
-# 对应 emoji 回调按钮；点错有冷却惩罚，解析不出顺序或缺按钮时不乱点。
-EMOJI_VERIFY_RE = re.compile(r"防脚本验证|按顺序点击")
-# 点击顺序写在【…】内
-EMOJI_ORDER_RE = re.compile(r"【([^】]+)】")
-# emoji 主体字符（符号区 + 补充符号区）与修饰符（变体选择符/ZWJ/肤色/键帽）
-_EMOJI_BASE_RE = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF]")
-_EMOJI_MOD_RE = re.compile(r"[\uFE0F\u200D\U0001F3FB-\U0001F3FF\u20E3]")
-
-
-def _extract_emoji_order(text: str) -> List[str]:
-    """从「请按顺序点击：【🎯、🐻、🐴】」提取需按序点击的 emoji 列表。
-
-    支持 、，, 空格等分隔，也支持无分隔连写；无【】括号返回空列表。
-    """
-    if not text:
-        return []
-    m = EMOJI_ORDER_RE.search(text)
-    if not m:
-        return []
-    order: List[str] = []
-    for part in re.split(r"[、，,\s|·•/]+", m.group(1)):
-        cur = ""
-        for ch in part:
-            if _EMOJI_BASE_RE.match(ch):
-                # ZWJ 连接的复合 emoji（当前 token 以 ZWJ 结尾）并入 token
-                if cur and not cur.endswith("\u200d"):
-                    order.append(cur)
-                    cur = ""
-                cur += ch
-            elif cur and _EMOJI_MOD_RE.match(ch):
-                cur += ch
-        if cur:
-            order.append(cur)
-    return order
-
-
-def is_emoji_verify_message(message: Any) -> bool:
-    """bot 回复是否为「防脚本验证」（要求按顺序点击 emoji 按钮）。"""
-    return bool(EMOJI_VERIFY_RE.search(_message_text(message) or ""))
-
-
-# —— LotteryBestBot 式回复解析 ——
-# start 后不满足条件时 bot 回复「您需加入指定的群组/频道」，逐行列出
-# 「🎫 加入-名称 ❌/✅」，名称是带 TEXT_URL 隐藏链接的文本。只提取
-# ❌（未加入）行的链接目标，✅ 已加入行跳过；无链接实体的行不处理。
-LOTTERYBEST_BOT = "lotterybestbot"
-
-
-def _utf16_to_index(text: str, u16_offset: int) -> int:
-    """Telegram 实体 offset 按 UTF-16 code units 计，转成 Python 字符索引。
-
-    消息里含 🎫🎰🧸 等 emoji（UTF-16 占 2 位）时，直接用实体 offset 对齐
-    Python 行区间会逐行漂移，导致实体被错分到相邻行而丢失加入目标。
-    """
-    if u16_offset <= 0:
-        return 0
-    units = 0
-    for i, ch in enumerate(text):
-        if units >= u16_offset:
-            return i
-        units += 2 if ord(ch) > 0xFFFF else 1
-    return len(text)
-
-
-def extract_join_status_targets(message: Any) -> List[str]:
-    """从「加入-名称 ❌」式回复提取隐藏链接加入目标（仅未加入行）。"""
-    text = _message_text(message)
-    if not text or "加入" not in text:
-        return []
-    # 行区间表：实体 offset 定位所在行，据此判断该行是否为 ❌ 未加入
-    bounds: List[Tuple[int, int, str]] = []
-    start = 0
-    for i, ch in enumerate(text):
-        if ch == "\n":
-            bounds.append((start, i, text[start:i]))
-            start = i + 1
-    bounds.append((start, len(text), text[start:]))
-    targets: List[str] = []
-    seen: set = set()
-
-    def _add(target: str) -> None:
-        key = target.lower()
-        if key not in seen:
-            seen.add(key)
-            targets.append(target)
-
-    for attr in ("entities", "caption_entities"):
-        for ent in getattr(message, attr, None) or []:
-            # 隐藏链接实体：Pyrogram 叫 TEXT_LINK，Telethon 叫 TEXT_URL
-            ent_type = str(getattr(ent, "type", "")).upper()
-            if "TEXT_URL" not in ent_type and "TEXT_LINK" not in ent_type:
-                continue
-            url = getattr(ent, "url", None)
-            if not url:
-                continue
-            url_s = str(url)
-            offset = _utf16_to_index(text, int(getattr(ent, "offset", 0) or 0))
-            line = next((lt for ls, le, lt in bounds if ls <= offset < le), "")
-            if "加入" not in line or "❌" not in line or "✅" in line:
-                continue
-            target = _tme_join_target(url_s)
-            if target is not None:
-                _add(target)
-    return targets
-
-
-def extract_channel_targets(message: Any) -> List[str]:
-    """从消息文本/实体/按钮中提取频道与群组加入目标（激进模式）。
-
-    返回可供 join_chat 的目标列表：
-      - 公开频道/群组用户名（"SomeChannel"，不带 @）
-      - 私有邀请链接（"https://t.me/+hash" 或 "https://t.me/joinchat/hash"）
-    排除：start/startgroup/startapp 深度链接、帖子路径链接（t.me/x/123）。
-    """
-    targets: List[str] = []
-    seen: set = set()
-
-    def _add(item: str) -> None:
-        key = item.lower()
-        if key not in seen:
-            seen.add(key)
-            targets.append(item)
-
-    for candidate in _iter_candidate_urls(message):
-        if candidate.lower().startswith("tg://resolve"):
-            # tg://resolve?domain=xxx 形态的隐藏链接
-            query = parse_qs(urlparse(candidate).query)
-            domain = (query.get("domain") or [""])[0]
-            if re.fullmatch(r"[A-Za-z0-9_]{5,32}", domain or ""):
-                _add(domain)
-            continue
-        for match in re.finditer(r"\S+", candidate):
-            piece = match.group(0)
-            m = _TME_CHANNEL_RE.search(piece)
-            if m is not None:
-                target = m.group("target")
-                rest = m.group("rest") or ""
-                if target.lower().startswith(("+", "joinchat/")):
-                    # 私有邀请链接
-                    _add(f"https://t.me/{target}")
-                    continue
-                if rest not in ("", "/") and not rest.startswith("?"):
-                    continue  # 帖子/消息路径链接（t.me/x/123），不能 join
-                if rest.startswith("?"):
-                    query = parse_qs(urlparse(rest).query)
-                    if any(k in query for k in ("start", "startgroup", "startapp")):
-                        continue  # bot 深度链接，不属于加入目标
-                _add(target)
-            for am in _AT_CHANNEL_RE.finditer(piece):
-                _add(am.group(1))
-    return targets
-
-
-class GiveawayState:
-    """按账号持久化已参与记录：{accounts: {account: {"bot|param": record}}}。
-
-    另持久化中奖回扫水位线 {win_watermarks: {account: {bot_lower: msg_id}}}。
-    """
-
-    def __init__(self, workdir) -> None:
-        self.path = Path(workdir) / STATE_FILE
-        self._data: Dict[str, Dict[str, dict]] = {}
-        self._win_wm: Dict[str, Dict[str, int]] = {}
-        self._dirty = False
-        self.load()
-
-    def load(self) -> None:
-        if not self.path.is_file():
-            return
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            accounts = data.get("accounts")
-            if isinstance(accounts, dict):
-                self._data = {
-                    str(k): dict(v) for k, v in accounts.items() if isinstance(v, dict)
-                }
-            wm = data.get("win_watermarks")
-            if isinstance(wm, dict):
-                parsed: Dict[str, Dict[str, int]] = {}
-                for acc, sub in wm.items():
-                    if not isinstance(sub, dict):
-                        continue
-                    bot_map: Dict[str, int] = {}
-                    for bot, mid in sub.items():
-                        try:
-                            bot_map[str(bot)] = int(mid)
-                        except (TypeError, ValueError):
-                            continue
-                    if bot_map:
-                        parsed[str(acc)] = bot_map
-                self._win_wm = parsed
-        except (OSError, json.JSONDecodeError):
-            self._data = {}
-            self._win_wm = {}
-
-    def _merge_from_disk(self) -> None:
-        """落盘前重读磁盘并合并，防止并发覆盖（多任务并发运行时各自持有
-        独立的 GiveawayState 实例，save 整文件写入会让旧快照冲掉他处
-        新写入的参与/去重记录）：
-
-        - 本地没有的账号/键 → 从磁盘补进来
-        - 同键都存在 → 保留 ts 较新的一条
-        """
-        if not self.path.is_file():
-            return
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        accounts = data.get("accounts")
-        if not isinstance(accounts, dict):
-            return
-        for account, bucket in accounts.items():
-            if not isinstance(bucket, dict):
-                continue
-            local = self._data.setdefault(str(account), {})
-            for key, rec in bucket.items():
-                if not isinstance(rec, dict):
-                    continue
-                cur = local.get(key)
-                if cur is None or str(rec.get("ts") or "") > str(cur.get("ts") or ""):
-                    local[key] = rec
-
-    def save(self, force: bool = False) -> None:
-        if not self._dirty and not force:
-            return
-        self._merge_from_disk()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(
-                {"accounts": self._data, "win_watermarks": self._win_wm},
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        tmp.replace(self.path)
-        self._dirty = False
-
-    @staticmethod
-    def _key(username: str, param: str) -> str:
-        return f"{username.lower()}|{param}"
-
-    def has(self, account: str, username: str, param: str) -> bool:
-        """已真正参与（非 flood_wait 失败记录）才视为重复"""
-        rec = self._data.get(account, {}).get(self._key(username, param))
-        if rec is None:
-            return False
-        return not str(rec.get("note") or "").startswith("flood_wait")
-
-    def is_ended(self, account: str, username: str, param: str) -> bool:
-        """bot 曾回复「已结束」＝该链接终态，无论是否忽略历史都不再重试"""
-        rec = self._data.get(account, {}).get(self._key(username, param))
-        return rec is not None and str(rec.get("note") or "") == "ended"
-
-    def is_blocked(
-        self, account: str, username: str, param: str, cooldown: int = FLOOD_COOLDOWN
-    ) -> bool:
-        """flood_wait 失败记录是否仍在冷却期内（冷却后允许重试）"""
-        rec = self._data.get(account, {}).get(self._key(username, param))
-        if rec is None or not str(rec.get("note") or "").startswith("flood_wait"):
-            return False
-        try:
-            ts = datetime.fromisoformat(str(rec.get("ts") or ""))
-        except ValueError:
-            return False
-        return (datetime.now() - ts).total_seconds() < cooldown
-
-    def add(
-        self,
-        account: str,
-        username: str,
-        param: str,
-        *,
-        channel: str = "",
-        note: str = "joined",
-    ) -> None:
-        bucket = self._data.setdefault(account, {})
-        bucket[self._key(username, param)] = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "bot": username,
-            "param": param,
-            "channel": channel,
-            "note": note,
-        }
-        if len(bucket) > MAX_STATE_PER_ACCOUNT:
-            # 按时间戳丢弃最旧的若干条
-            for old_key in sorted(bucket, key=lambda k: str(bucket[k].get("ts") or ""))[
-                : len(bucket) - MAX_STATE_PER_ACCOUNT
-            ]:
-                bucket.pop(old_key, None)
-        self._dirty = True
-
-    def count(self, account: Optional[str] = None) -> int:
-        if account is not None:
-            return len(self._data.get(account, {}))
-        return sum(len(v) for v in self._data.values())
-
-    def clear(self) -> int:
-        """清空所有账号的已参与记录（含中奖消息去重与回扫水位线）并立即落盘。
-
-        返回清除的参与记录条数。win: 去重记录存于 _data 一并清除；
-        回扫水位线（每账号 × bot 扫到的位置）同步重置，下轮回扫从
-        新基线（回扫条数）重建。
-        """
-        total = self.count()
-        self._data = {}
-        self._win_wm = {}
-        self._dirty = True
-        # save 会从磁盘合并回来，先删文件确保清空真正生效
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
-        self.save(force=True)
-        return total
-
-    def bots_for(self, account: str) -> List[str]:
-        """该账号有过交互记录的全部 bot 用户名（按最近交互时间倒序）。
-
-        中奖回扫用：账号参与过的 bot 才可能发来中奖私信。
-        """
-        bucket = self._data.get(account, {})
-        latest: Dict[str, tuple] = {}  # lower -> (ts, 原始用户名)
-        for key, rec in bucket.items():
-            bot = str((rec or {}).get("bot") or key.split("|", 1)[0]).strip()
-            if not bot:
-                continue
-            lower = bot.lower()
-            ts = str((rec or {}).get("ts") or "")
-            if lower not in latest or ts > latest[lower][0]:
-                latest[lower] = (ts, bot)
-        return [
-            bot
-            for _, bot in sorted(
-                latest.values(), key=lambda pair: pair[0], reverse=True
-            )
-        ]
-
-    def win_watermark(self, account: str, bot: str) -> Optional[int]:
-        """该账号 × bot 上次中奖回扫扫到的消息 id，从未扫过返回 None。"""
-        return self._win_wm.get(account, {}).get(bot.lower())
-
-    def set_win_watermark(self, account: str, bot: str, msg_id: int) -> None:
-        """推进中奖回扫水位线到 msg_id（仅前进不后退）。"""
-        bot_map = self._win_wm.setdefault(account, {})
-        old = bot_map.get(bot.lower())
-        if old is not None and int(msg_id) <= old:
-            return
-        bot_map[bot.lower()] = int(msg_id)
-        self._dirty = True
 
 
 class GiveawayEngine:
@@ -1535,7 +693,7 @@ class GiveawayEngine:
         url = str(getattr(btn, "url", "") or "").strip()
         if url and not getattr(btn, "callback_data", None):
             link = parse_bot_start_link(url)
-            if link is not None and link[0].lower() not in BLOCKED_BOTS:
+            if link is not None and not bot_is_blocked(link[0]):
                 await self._participate(
                     account,
                     client,
@@ -1967,7 +1125,7 @@ class GiveawayEngine:
             return None
         links = extract_bot_links(message)
         # 黑名单 bot 的链接不作为抽奖链接（整条消息无可用链接时直接跳过）
-        links = [ln for ln in links if ln[0].lower() not in BLOCKED_BOTS]
+        links = [ln for ln in links if not bot_is_blocked(ln[0])]
         if not links:
             if log_skips:
                 self.log(f"[{account}] {tag} 无可用抽奖 bot 链接，跳过")
@@ -2271,7 +1429,7 @@ class GiveawayEngine:
                 )
             return False
         targets = extract_channel_targets(message)
-        if bot_username.lower() == LOTTERYBEST_BOT:
+        if bot_policy(bot_username).join_status_checklist:
             # LotteryBestBot 的回复把「加入-名称」做成带隐藏链接的❌/✅清单，
             # 补充提取其中 ❌（未加入）行的链接目标
             known = {t.lower() for t in targets}
@@ -2875,8 +2033,10 @@ class GiveawayEngine:
                 self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
                 return
         if self.confirm_wait > 0:
-            deadline = asyncio.get_event_loop().time() + self.confirm_wait
-            while asyncio.get_event_loop().time() < deadline:
+            # 按 confirm_wait 换算固定轮询次数（而非读墙钟）：总等待时长不变，
+            # 但不再依赖真实时间流逝，单测注入 no-op sleep 时行为完全确定
+            poll_times = max(1, int(round(self.confirm_wait / 1.5)))
+            for _ in range(poll_times):
                 await asyncio.sleep(1.5)
                 fresh: List[Any] = []
                 try:
@@ -2916,7 +2076,7 @@ class GiveawayEngine:
                     if str(t).lower().lstrip("@") != username.lower()
                 ]
                 if join_targets or (
-                    username.lower() == LOTTERYBEST_BOT
+                    bot_policy(username).join_status_checklist
                     and extract_join_status_targets(message)
                 ):
                     had_join_targets = True
@@ -2979,7 +2139,7 @@ class GiveawayEngine:
                         )
                 except Exception as exc:
                     self.log(f"重新参与 @{username} 失败: {exc}")
-            elif username.lower() in BOTS_RESTART_AFTER_JOIN:
+            elif bot_policy(username).restart_after_join:
                 # 强制名单：无加入要求也重发一次
                 self.log(f"[{account}] @{username} 加入校验完成，重新发送 start")
                 try:
@@ -3142,6 +2302,10 @@ class GiveawayEngine:
             logger.debug("核对确认按钮回复失败", exc_info=True)
 
     def _find_confirm_button(self, message: Any) -> Optional[Any]:
+        # 「花费 N 积分」确认提示（如积分兑换）：点「确认」会消耗积分，
+        # 不属于参与动作，返回 None 跳过（覆盖确认按钮的全部调用点）
+        if SCORE_SPEND_RE.search(_message_text(message) or ""):
+            return None
         reply_markup = getattr(message, "reply_markup", None)
         for row in getattr(reply_markup, "inline_keyboard", None) or []:
             for btn in row or []:
@@ -3149,6 +2313,9 @@ class GiveawayEngine:
                 if not (
                     getattr(btn, "callback_data", None) or getattr(btn, "url", None)
                 ):
+                    continue
+                # 「参与（100 分）」类扣分按钮：不自动点击，避免消耗账号积分
+                if SCORE_BUTTON_RE.search(text):
                     continue
                 if any(kw in text for kw in self.confirm_keywords):
                     return btn

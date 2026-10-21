@@ -101,7 +101,6 @@ class UIState:
         self.workdir: Path = get_workdir(DEFAULT_WORKDIR)
         self.log_path: Path = DEFAULT_LOG_FILE
         self.log_limit: int = 200
-        self.record_filter: str = ""
 
     def set_workdir(self, path_str: str) -> None:
         self.workdir = get_workdir(Path(path_str).expanduser())

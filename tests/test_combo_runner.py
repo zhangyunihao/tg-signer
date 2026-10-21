@@ -7,8 +7,9 @@ import pytest
 from tg_signer import combo_runner
 
 
-def test_combo_runner_missing_args_exits_2(capsys):
-    combo_runner.main.__globals__["sys"].argv = ["combo_runner"]
+def test_combo_runner_missing_args_exits_2(monkeypatch, capsys):
+    # 用 monkeypatch 注入并自动还原 argv，避免污染同一进程内后续测试
+    monkeypatch.setattr(combo_runner.sys, "argv", ["combo_runner"])
     with pytest.raises(SystemExit) as exc:
         combo_runner.main()
     assert exc.value.code == 2

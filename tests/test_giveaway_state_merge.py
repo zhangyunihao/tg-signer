@@ -1,6 +1,6 @@
 """GiveawayState 并发落盘合并（防覆盖）测试。"""
 
-from tg_signer.giveaway_core import GiveawayState
+from tg_signer.giveaway_state import GiveawayState
 
 
 def test_save_merges_records_written_by_other_instance(tmp_path):

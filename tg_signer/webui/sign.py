@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Optional
@@ -47,7 +48,6 @@ from tg_signer.webui.data import (
     list_task_names,
     load_config,
     load_disabled_accounts,
-    load_sign_records,
     load_two_way_accounts,
     load_user_infos,
     rename_account_state,
@@ -356,43 +356,11 @@ class BaseConfigBlock:
 
 
 class SignerBlock(BaseConfigBlock):
-    def __init__(
-        self,
-        template: Dict[str, object],
-        *,
-        goto_records: Callable[[str], None] = lambda _task: None,
-    ):
-        self.record_btn = None
-        self.record_hint = None
-        self._goto_records = goto_records
+    def __init__(self, template: Dict[str, object]):
         super().__init__("signer", template)
 
     def setup_toolbar(self):
         ui.button("交互式配置", on_click=self.open_interactive).props("outline")
-
-    def setup_footer(self):
-        self.record_hint = ui.label("").classes("text-sm text-primary")
-        self.record_btn = ui.button(
-            "查看签到记录",
-            color="primary",
-            on_click=self.goto_records,
-        ).classes("min-w-[120px]")
-        self.record_btn.disable()
-
-    def on_loaded(self, target: str):
-        records = load_sign_records(state.workdir)
-        has_record = any(r.task == target for r in records)
-        if has_record:
-            self.record_btn.enable()
-            self.record_hint.text = f"发现签到记录: {target}"
-        else:
-            self.record_btn.disable()
-            self.record_hint.text = "无签到记录"
-        self.record_hint.update()
-        self.record_btn.update()
-
-    def goto_records(self):
-        self._goto_records(self.selected_name["value"])
 
     def open_interactive(self):
         def on_complete():
@@ -415,14 +383,29 @@ class SignerBlock(BaseConfigBlock):
 
 TASK_HISTORY_FILE = "webui_task_history.json"
 TASK_HISTORY_LIMIT = 100
+# 落盘防抖：组合任务结束时可能连续追加多条记录，先在内存合并再写盘
+TASK_HISTORY_DEBOUNCE_SEC = 0.5
+
+# 缓存结构：(文件路径, 文件指纹(mtime_ns, size), 记录列表)。
+# 指纹用于发现其他 WebUI 实例（如 8080/8081 共用工作目录）对同一文件的写入。
+_task_history_cache: Optional[tuple[Path, Optional[tuple[int, int]], list[dict]]] = None
+_task_history_timer: Optional[threading.Timer] = None
+_task_history_lock = threading.Lock()
 
 
 def _task_history_path() -> Path:
     return get_workdir(state.workdir) / TASK_HISTORY_FILE
 
 
-def load_task_history() -> list[dict]:
-    path = _task_history_path()
+def _task_history_fingerprint(path: Path) -> Optional[tuple[int, int]]:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _read_task_history(path: Path) -> list[dict]:
     if not path.is_file():
         return []
     try:
@@ -433,8 +416,72 @@ def load_task_history() -> list[dict]:
         return []
 
 
+def _write_task_history(path: Path, items: list[dict]) -> None:
+    global _task_history_cache
+    try:
+        atomic_write_json(path, items[-TASK_HISTORY_LIMIT:])
+    except OSError:
+        logger.debug("写入任务历史失败", exc_info=True)
+        return
+    # 写盘后同步缓存指纹，避免下一次读取重复解析
+    with _task_history_lock:
+        cache = _task_history_cache
+        if cache is not None and cache[0] == path and cache[2] is items:
+            _task_history_cache = (path, _task_history_fingerprint(path), items)
+
+
+def load_task_history() -> list[dict]:
+    global _task_history_cache
+    path = _task_history_path()
+    fingerprint = _task_history_fingerprint(path)
+    with _task_history_lock:
+        cache = _task_history_cache
+        if cache is not None and cache[0] == path and cache[1] == fingerprint:
+            return list(cache[2])
+        items = _read_task_history(path)
+        _task_history_cache = (path, fingerprint, items)
+        return list(items)
+
+
+def flush_task_history() -> None:
+    """立即把内存中的任务历史落盘（退出前调用，避免防抖窗口内丢数据）。"""
+    global _task_history_timer
+    with _task_history_lock:
+        timer = _task_history_timer
+        _task_history_timer = None
+        cache = _task_history_cache
+    if timer is not None:
+        timer.cancel()
+    if cache is not None:
+        _write_task_history(cache[0], cache[2])
+
+
+def _persist_task_history(path: Path, snapshot: list[dict]) -> None:
+    """防抖定时器回调：仅当缓存仍指向同一份快照时写盘，避免旧写覆盖新写。"""
+    global _task_history_timer
+    with _task_history_lock:
+        cache = _task_history_cache
+        if cache is None or cache[2] is not snapshot:
+            return
+        _task_history_timer = None
+    _write_task_history(path, snapshot)
+
+
 def save_task_history(items: list[dict]) -> None:
-    atomic_write_json(_task_history_path(), items[-TASK_HISTORY_LIMIT:])
+    global _task_history_cache, _task_history_timer
+    path = _task_history_path()
+    snapshot = list(items[-TASK_HISTORY_LIMIT:])
+    with _task_history_lock:
+        old_timer = _task_history_timer
+        _task_history_cache = (path, _task_history_fingerprint(path), snapshot)
+        timer = threading.Timer(
+            TASK_HISTORY_DEBOUNCE_SEC, _persist_task_history, args=(path, snapshot)
+        )
+        timer.daemon = True
+        _task_history_timer = timer
+    if old_timer is not None:
+        old_timer.cancel()
+    timer.start()
 
 
 def append_task_history(record: dict) -> None:
@@ -494,8 +541,27 @@ class TaskRunnerBlock:
     # 服务进程级共享：所有浏览器标签页看到并管理同一批运行中的任务，
     # 服务重启后也据此把上次未结束的常驻任务自动恢复
     runs: dict[str, dict] = {}
-    output_lines: list[str] = []
+    MAX_OUTPUT_LINES = 500  # 共享输出缓冲上限，防止长时间运行内存无限增长
+    MAX_RENDER_LINES = 200  # 日志区最多渲染的行数
+    output_lines: deque[str] = deque(maxlen=MAX_OUTPUT_LINES)
+    _line_seq: int = 0  # 累计追加行数（单调递增），用于各标签页增量渲染
+    _clear_seq: int = 0  # 清空代次：清空输出时 +1，各标签页检测到变化后全量重绘
     _restore_done: bool = False
+
+    @classmethod
+    def _append_output_line(cls, line: str) -> None:
+        cls.output_lines.append(line)
+        cls._line_seq += 1
+
+    @classmethod
+    def _lines_since(cls, seq: int) -> list[str]:
+        """返回 seq 之后追加的行（deque 淘汰旧行后起点自动截断）。"""
+        lines = list(cls.output_lines)
+        return lines[max(0, seq - (cls._line_seq - len(lines))) :]
+
+    @classmethod
+    def last_lines(cls, n: int) -> list[str]:
+        return list(cls.output_lines)[-n:]
 
     def __init__(self) -> None:
         ui.label("签到").classes("text-lg font-semibold")
@@ -658,6 +724,10 @@ class TaskRunnerBlock:
             .props("flat round dense unelevated")
             .classes("tgs-log-exit-full")
         )
+        # 增量渲染状态：记录 DOM 中已渲染的 label 与行序号/清空代次
+        self._rendered_labels: deque[ui.label] = deque()
+        self._last_render_seq: Optional[int] = None
+        self._last_clear_seq: int = 0
 
         # 轮询改用独立 asyncio 循环而非 ui.timer：页面重建（root.clear）会删除
         # timer 的父 slot，ui.timer 内部访问已删 slot 会抛 RuntimeError 并可能
@@ -1666,14 +1736,44 @@ class TaskRunnerBlock:
     def _poll_output(self) -> None:
         for run in self.runs.values():
             while not run["queue"].empty():
-                self.output_lines.append(run["queue"].get())
-        self.log_list.clear()
-        with self.log_list:
-            for line in self.output_lines[-200:]:
-                color = self._classify_line(line)
-                ui.label(line).classes(f"w-full {color}").style("white-space: pre;")
-        self.log_list.update()
+                self._append_output_line(run["queue"].get())
+        self._render_log_lines()
+        self._check_finished_runs()
 
+    def _render_log_lines(self) -> None:
+        """增量渲染日志：只追加新行并裁剪超限旧行，避免每 0.3 秒全量重建 DOM。
+
+        各标签页通过共享 _line_seq 计算各自缺的行（谁先轮询谁取队列，行只会进
+        共享缓冲一次），清空输出通过 _clear_seq 代次通知所有标签页全量重绘。
+        """
+        if self._last_clear_seq != TaskRunnerBlock._clear_seq:
+            self.log_list.clear()
+            self._rendered_labels.clear()
+            self._last_render_seq = None
+            self._last_clear_seq = TaskRunnerBlock._clear_seq
+        if self._last_render_seq is None:
+            # 首次渲染（页面新建/任务启动/清空后）：只显示最近 MAX_RENDER_LINES 行
+            pending = self._lines_since(
+                max(TaskRunnerBlock._line_seq - TaskRunnerBlock.MAX_RENDER_LINES, 0)
+            )
+        else:
+            pending = self._lines_since(self._last_render_seq)
+        self._last_render_seq = TaskRunnerBlock._line_seq
+        if pending:
+            with self.log_list:
+                for line in pending:
+                    color = self._classify_line(line)
+                    label = (
+                        ui.label(line)
+                        .classes(f"w-full {color}")
+                        .style("white-space: pre;")
+                    )
+                    self._rendered_labels.append(label)
+            while len(self._rendered_labels) > TaskRunnerBlock.MAX_RENDER_LINES:
+                self._rendered_labels.popleft().delete()
+            self.log_list.update()
+
+    def _check_finished_runs(self) -> None:
         finished_ids: list[str] = []
         for run_id, run in list(self.runs.items()):
             if all(i["proc"].poll() is not None for i in run["procs"]):
@@ -1712,7 +1812,10 @@ class TaskRunnerBlock:
 
     def clear_log(self) -> None:
         TaskRunnerBlock.output_lines.clear()
+        TaskRunnerBlock._clear_seq += 1
         self.log_list.clear()
+        self._rendered_labels.clear()
+        self._last_render_seq = None
         self.log_list.update()
 
     def _toggle_log_fullscreen(self) -> None:
@@ -1750,7 +1853,7 @@ class TaskRunnerBlock:
             sections.append(
                 (
                     "本次运行输出（最近300行）",
-                    "\n".join(TaskRunnerBlock.output_lines[-300:]),
+                    "\n".join(self.last_lines(300)),
                 )
             )
         history_tail = self._load_task_history_tail(15)
@@ -2511,63 +2614,3 @@ def user_info_block() -> Callable[[], None]:
                         )
 
     return refresh
-
-
-class SignRecordBlock:
-    def __init__(self):
-        self.container = ui.column().classes("w-full gap-3")
-        with ui.row().classes("items-end gap-3"):
-            self.filter_input = ui.input(
-                label="筛选任务/用户",
-                placeholder="输入任务名或用户ID过滤",
-                value=state.record_filter,
-                on_change=lambda e: self._update_filter(e.value),
-            ).classes("w-full")
-            ui.button("清除筛选", on_click=lambda: self._update_filter("")).props(
-                "outline"
-            )
-        self.status = ui.label("").classes("text-sm text-gray-500")
-
-    def _update_filter(self, value: str) -> None:
-        state.record_filter = value or ""
-        self.refresh()
-
-    def refresh(
-        self,
-    ) -> None:
-        self.container.clear()
-        records = load_sign_records(state.workdir)
-        keyword = (state.record_filter or "").lower().strip()
-        if keyword:
-            records = [
-                r
-                for r in records
-                if keyword in r.task.lower()
-                or (r.user_id and keyword in str(r.user_id).lower())
-            ]
-        with self.container:
-            if not records:
-                self.status.text = "未找到匹配的签到记录" if keyword else "尚无签到记录"
-                self.status.update()
-                return
-            self.status.text = f"共 {len(records)} 组记录"
-            self.status.update()
-            for record in records:
-                user_text = record.user_id or "默认"
-                header = f"{record.task} / {user_text}（{len(record.records)}条）"
-                with ui.expansion(header, icon="event").classes("shadow-sm"):
-                    ui.label(f"来源: {record.path}").classes("text-gray-500")
-                    if not record.records:
-                        ui.label("暂无记录").classes("text-gray-500")
-                        continue
-                    rows = [{"日期": k, "时间": v} for k, v in record.records]
-                    ui.table(
-                        columns=[
-                            {"name": "日期", "label": "日期", "field": "日期"},
-                            {"name": "时间", "label": "时间", "field": "时间"},
-                        ],
-                        rows=rows,
-                    ).classes("w-full").props("flat dense")
-
-    def __call__(self, *args, **kwargs):
-        return self.refresh()

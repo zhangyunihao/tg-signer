@@ -57,7 +57,6 @@ from tg_signer.config import (
 
 from ._kurigram import SafeGetForumTopics
 from .ai_tools import AITools, OpenAIConfigManager
-from .sign_record_store import SignRecordStore
 from .utils import UserInput, atomic_write_json, get_now, print_to_user
 from .utils import get_timezone as _get_timezone
 
@@ -811,10 +810,6 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
             waiting_message=None,
         )
 
-    @property
-    def sign_record_store(self) -> SignRecordStore:
-        return SignRecordStore(self.workdir)
-
     @staticmethod
     def get_route_key(
         chat_id: ChatId, message_thread_id: Optional[int] = None
@@ -842,16 +837,6 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
     def get_runtime_route_key(self, chat: SignChatV3) -> RouteKey:
         route_key = self.get_route_key(chat.chat_id, chat.message_thread_id)
         return self.context.resolved_route_keys.get(route_key, route_key)
-
-    @property
-    def sign_record_file(self):
-        sign_record_dir = self.task_dir / str(self.user.id)
-        make_dirs(sign_record_dir)
-        return sign_record_dir / "sign_record.json"
-
-    @property
-    def legacy_sign_record_file(self):
-        return self.task_dir / "sign_record.json"
 
     def _ask_actions(
         self, input_: UserInput, available_actions: List[SupportAction] = None
@@ -995,47 +980,6 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
     def _time_to_crontab(sign_at: dt_time) -> str:
         return f"{sign_at.minute} {sign_at.hour} * * *"
 
-    def load_sign_record(self):
-        user_id = str(self.user.id)
-        store = self.sign_record_store
-        if not store.has_records(self.task_name, user_id):
-            # Import legacy JSON lazily so existing workdirs keep working
-            # without requiring an explicit migration step first.
-            imported_paths = []
-            if store.import_json_file(
-                self.task_name,
-                user_id,
-                self.sign_record_file,
-                account=self._account,
-            ):
-                imported_paths.append(self.sign_record_file)
-            if store.import_json_file(
-                self.task_name,
-                user_id,
-                self.legacy_sign_record_file,
-                account=self._account,
-            ):
-                imported_paths.append(self.legacy_sign_record_file)
-            if imported_paths:
-                joined_paths = ", ".join(str(path) for path in imported_paths)
-                self.log(
-                    f"检测到旧版签到记录文件，已自动导入 SQLite: {joined_paths}。",
-                    level="WARNING",
-                )
-        return store.load_records(self.task_name, user_id)
-
-    def persist_sign_record(
-        self, sign_record: dict[str, str], sign_date: str, signed_at: str
-    ) -> None:
-        sign_record[sign_date] = signed_at
-        self.sign_record_store.upsert_record(
-            self.task_name,
-            str(self.user.id),
-            sign_date,
-            signed_at,
-            account=self._account,
-        )
-
     async def sign_a_chat(
         self,
         chat: SignChatV3,
@@ -1098,7 +1042,8 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         if config.requires_ai:
             self.ensure_ai_cfg()
 
-        sign_record = self.load_sign_record()
+        # 签到状态仅保存在当前进程内：进程重启后若当天签到时刻已过，会补签一次
+        sign_record: dict[str, str] = {}
         chat_ids = [c.chat_id for c in config.chats]
 
         async def sign_once():
@@ -1127,7 +1072,7 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
                 if route_key is not None:
                     self.context.chat_messages[route_key].clear()
                 await asyncio.sleep(config.sign_interval)
-            self.persist_sign_record(sign_record, str(now.date()), now.isoformat())
+            sign_record[str(now.date())] = now.isoformat()
 
         def need_sign(last_date_str):
             if force_rerun:

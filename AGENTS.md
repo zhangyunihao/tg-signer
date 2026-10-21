@@ -18,20 +18,19 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
   - Automation rule engine: `tg_signer/automation/`
   - Optional WebUI: `tg_signer/webui/`
 - The legacy `monitor` module (`UserMonitor` / `MonitorConfig`) has been removed. Message-watching capabilities live in the `automation` subsystem (`external_forward`, `ai_reply`, etc.). Legacy `monitors/` directories and `monitor` entries in old backups are simply ignored.
-- The primary storage for check-in records is now SQLite: `<workdir>/data.sqlite3`. `sign_record.json` is only kept for compatibility reads/migration and is no longer the primary write target.
+- Check-in history/record persistence has been removed. `UserSigner` tracks the current day's sign state only in memory; after a process restart it signs once if that day's scheduled time has already passed.
 - Automation configs support `config.json`, `config.yaml`, and `config.yml`. Resolution order is JSON first, then YAML. YAML requires `pyyaml`.
 - LLM configuration supports two sources:
   - Environment variables: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`
   - Workdir file: `<workdir>/.openai_config.json`
 - The current default model in code is `gpt-4o` (see `tg_signer/ai_tools.py`).
-- The current WebUI manages signer configs and check-in records; it is not an automation config editor.
+- The current WebUI manages signer configs; it is not an automation config editor.
 
 ## Key Directories
 - `tg_signer/cli/`: Start command (`webgui`) definition only. All other CLI commands have been removed; internal task subprocesses use `tg_signer/task_runner.py`.
 - `tg_signer/task_runner.py`: Internal subprocess entry (`python -m tg_signer.task_runner`) used by the WebUI to run sign run/run-once and automation run; not a user-facing command.
 - `tg_signer/core.py`: `BaseUserWorker`, `UserSigner`, Telegram API wrappers, rate limiting, and FloodWait retry handling.
 - `tg_signer/config.py`: Pydantic config models and backward-compatibility migration logic for check-in and automation.
-- `tg_signer/sign_record_store.py`: SQLite check-in record storage, schema migration, and legacy JSON migration.
 - `tg_signer/automation/engine.py`: Automation executor `UserAutomation`.
 - `tg_signer/automation/handlers.py`: Built-in handlers, template rendering, and plugin loading.
 - `tg_signer/automation/models.py`: `Event`, `AutomationContext`, and `RuleStateStore`.
@@ -39,7 +38,7 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
 - `tg_signer/webui/`: NiceGUI WebUI; data read/write logic is mainly in `webui/data.py`.
 - `docs/automation_usage.md`: Automation usage documentation.
 - `docs/automation_design.md`: Internal automation design documentation.
-- `tests/`: pytest test suite; there is already coverage for CLI, automation, check-in record migration, and message thread id behavior.
+- `tests/`: pytest test suite; there is already coverage for CLI, automation, and message thread id behavior.
 
 ## Local Environment Conventions (Must Follow)
 - Always prefer the repository virtual environment (`.venv` or `venv`). Do not use the system Python directly.
@@ -72,11 +71,7 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
 - User cache:
   - `<workdir>/users/<user_id>/me.json`
   - `<workdir>/users/<user_id>/latest_chats.json`
-- Primary check-in record database: `<workdir>/data.sqlite3`
 - Local OpenAI config: `<workdir>/.openai_config.json`
-- Compatible legacy check-in record layouts:
-  - `<workdir>/signs/<task>/<user_id>/sign_record.json`
-  - `<workdir>/signs/<task>/sign_record.json`
 
 ## Development Constraints
 - Follow the Ruff configuration for code style:
@@ -91,10 +86,9 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
 ## Change Strategy
 - Automation first: new rule-driven capabilities should go into `tg_signer/automation/`. Do not reintroduce the removed `monitor` module.
 - Preserve compatibility: when changing config models, keep the `BaseJSONConfig.load()` compatibility chain working, especially the migration logic for `SignConfigV1/V2/V3`.
-- SQLite is the source of truth for record storage: when changing check-in record logic, prefer extending `SignRecordStore` and schema migration rather than making JSON the primary storage again.
 - Telegram API calls must reuse existing wrappers: prefer `BaseUserWorker._call_telegram_api()`, `get_client()`, and `get_proxy()`. Do not bypass the unified rate limiting and FloodWait handling.
 - Do not reintroduce user-facing CLI commands: the CLI surface is intentionally limited to `webgui`; task execution goes through `tg_signer/task_runner.py`.
-- Confirm WebUI scope before changing it: `webui/data.py` currently only handles `signer` configs and check-in records. Do not assume it already covers `automation`.
+- Confirm WebUI scope before changing it: `webui/data.py` currently only handles `signer` configs. Do not assume it already covers `automation`.
 
 ## Security And Privacy
 - Never commit any sessions or sensitive information, for example:
@@ -112,7 +106,7 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
   - `docs/automation_usage.md` (if automation is involved)
   - `docs/automation_design.md` (if internal automation mechanics are involved)
   - The corresponding tests in `tests/`
-- When adding or fixing CLI behavior, prefer adding/updating existing CLI tests first. For check-in records and migration changes, prefer adding/updating `sign_record_store` / CLI migration tests first.
+- When adding or fixing CLI behavior, prefer adding/updating existing CLI tests first.
 
 ## User Collaboration Requirements
 - Unless otherwise specified, default to adapting to the language used by the person you are communicating with; if they use Chinese, default to Simplified Chinese.
