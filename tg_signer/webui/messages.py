@@ -48,6 +48,9 @@ ALL_ACCOUNTS = ""
 # 消息中心独立页面路由（右上角铃铛在新标签页打开）
 MESSAGES_PAGE_PATH = "/messages"
 
+# 消息中心用户过滤条件在 app.storage.user 中的持久化键（刷新页面后保留）
+FILTER_STORAGE_KEY = "tg_signer_messages_filter"
+
 
 def _read_state_path(workdir) -> Path:
     return Path(workdir) / READ_STATE_FILE
@@ -215,12 +218,25 @@ def message_center_button() -> Callable[[], None]:
     return refresh_badge
 
 
-def _filter_options() -> dict:
-    """构建用户过滤下拉选项：全部用户 + 消息中出现过的账号（去重排序）。"""
-    accounts = sorted(
-        {str(m.get("account") or "") for m in collect_messages(state.workdir)} - {""}
-    )
-    return {ALL_ACCOUNTS: "全部用户", **{acct: acct for acct in accounts}}
+def _filter_options(read_keys: Set[str]) -> dict:
+    """构建用户过滤下拉选项：全部用户 + 消息中出现过的全部账号。
+
+    有未读消息的账号排前面，每个账号标注当前未读条数（如 alice（3 未读））。
+    """
+    accounts: Set[str] = set()
+    unread_counts: dict[str, int] = {}
+    for m in collect_messages(state.workdir):
+        acct = str(m.get("account") or "")
+        if not acct:
+            continue
+        accounts.add(acct)
+        if m["key"] not in read_keys:
+            unread_counts[acct] = unread_counts.get(acct, 0) + 1
+    ordered = sorted(accounts, key=lambda a: (0 if unread_counts.get(a) else 1, a))
+    return {
+        ALL_ACCOUNTS: "全部用户",
+        **{acct: f"{acct}（{unread_counts.get(acct, 0)} 未读）" for acct in ordered},
+    }
 
 
 # 消息中心独立页面：与主控台同源的浅色渐变背景 + 白色卡片风格
@@ -262,6 +278,11 @@ def _build_center_page() -> None:
         render_list()
         refresh_unread_badge()
 
+    def _on_filter_change(_e) -> None:
+        # 持久化过滤选择：刷新页面、重开标签页后仍保留（clearable 清空存为「全部」）
+        app.storage.user[FILTER_STORAGE_KEY] = str(filter_sel.value or "")
+        render_list()
+
     def render_list() -> None:
         list_container.clear()
         messages = visible_messages()
@@ -300,10 +321,11 @@ def _build_center_page() -> None:
                     )
 
     def refresh_all() -> None:
-        # 重建过滤选项（账号集合可能变化），当前选中项失效时回落到「全部用户」
-        filter_sel.options = _filter_options()
+        # 重建过滤选项（未读账号置前并刷新未读数标注），选中项失效时回落「全部用户」
+        filter_sel.options = _filter_options(read_keys)
         if str(filter_sel.value or "") not in filter_sel.options:
             filter_sel.value = ALL_ACCOUNTS
+            app.storage.user[FILTER_STORAGE_KEY] = ALL_ACCOUNTS
         filter_sel.update()
         render_list()
         refresh_unread_badge()
@@ -335,12 +357,15 @@ def _build_center_page() -> None:
             "汇总抽奖中奖提醒、监控对象加入失败提醒与抽奖过程中未完成的发言任务"
             "（口令发送失败/发言数未达标，显示还需发言条数），点击消息标记为已读。"
         ).classes("text-xs text-gray-500")
+        # 恢复上次选择的过滤用户（刷新页面、重开标签页后仍保留）
+        options = _filter_options(read_keys)
+        saved = str(app.storage.user.get(FILTER_STORAGE_KEY) or "")
         filter_sel = (
             ui.select(
-                _filter_options(),
-                value=ALL_ACCOUNTS,
+                options,
+                value=saved if saved in options else ALL_ACCOUNTS,
                 label="按用户过滤",
-                on_change=lambda _e: render_list(),
+                on_change=_on_filter_change,
             )
             .props("dense outlined clearable options-dense")
             .classes("w-48")

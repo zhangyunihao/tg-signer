@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -123,11 +124,33 @@ def delete_config(
     return config_file
 
 
-def load_user_infos(workdir: Optional[Path | str] = None) -> List[UserInfo]:
-    base = get_workdir(workdir)
-    users_dir = base / "users"
-    if not users_dir.is_dir():
-        return []
+_user_infos_lock = threading.Lock()
+# 缓存 (users_dir, 内容指纹, 条目)：未读徽标/消息中心等轮询路径高频调用，
+# 避免每次轮询都重读全部 me.json / latest_chats.json
+_user_infos_cache: Optional[Tuple[Path, tuple, List[UserInfo]]] = None
+
+
+def _user_infos_fingerprint(users_dir: Path) -> tuple:
+    """users 目录内容指纹：用户目录列表 + 各 me.json/latest_chats.json 的 mtime+size。"""
+    try:
+        user_dirs = sorted(p.name for p in users_dir.iterdir() if p.is_dir())
+    except OSError:
+        return ()
+    parts: list = []
+    for name in user_dirs:
+        file_stats = []
+        for filename in ("me.json", "latest_chats.json"):
+            try:
+                st = (users_dir / name / filename).stat()
+            except OSError:
+                file_stats.append(None)
+            else:
+                file_stats.append((st.st_mtime_ns, st.st_size))
+        parts.append((name, tuple(file_stats)))
+    return tuple(parts)
+
+
+def _read_user_infos(users_dir: Path) -> List[UserInfo]:
     entries: List[UserInfo] = []
     for user_dir in sorted(
         [p for p in users_dir.iterdir() if p.is_dir()], key=lambda p: p.name
@@ -162,6 +185,23 @@ def load_user_infos(workdir: Optional[Path | str] = None) -> List[UserInfo]:
             )
         )
     return entries
+
+
+def load_user_infos(workdir: Optional[Path | str] = None) -> List[UserInfo]:
+    global _user_infos_cache
+    base = get_workdir(workdir)
+    users_dir = base / "users"
+    if not users_dir.is_dir():
+        return []
+    fingerprint = _user_infos_fingerprint(users_dir)
+    with _user_infos_lock:
+        cached = _user_infos_cache
+        if cached is not None and cached[0] == users_dir and cached[1] == fingerprint:
+            return list(cached[2])
+    entries = _read_user_infos(users_dir)
+    with _user_infos_lock:
+        _user_infos_cache = (users_dir, fingerprint, entries)
+    return list(entries)
 
 
 def chat_username_map(workdir: Optional[Path | str] = None) -> Dict[str, str]:

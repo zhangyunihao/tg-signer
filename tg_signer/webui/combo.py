@@ -413,8 +413,8 @@ class ComboTaskBlock:
         self._last_hist_sig: tuple | None = None
         self._last_prog_sig: tuple | None = None
         self._render_history()
-        # 轮询刷新：历史状态变化时刷新列表；进度弹窗打开时每秒同步进度与日志
-        ui.timer(1.0, self._tick)
+        # 轮询刷新：历史状态变化时刷新列表；进度弹窗打开时每 2 秒同步进度与日志
+        ui.timer(2.0, self._tick)
 
     # ---- 数据 ----
 
@@ -856,7 +856,7 @@ class ComboTaskBlock:
                                 ).classes("text-xs text-gray-500")
 
     def _tick(self) -> None:
-        """每秒轮询：历史状态变化时刷新列表；进度弹窗打开时同步进度与日志。"""
+        """每 2 秒轮询：历史状态变化时刷新列表；进度弹窗打开时同步进度与日志。"""
         # 历史列表：仅状态/记录数变化时重渲染，避免每秒重建
         hist_sig = tuple(
             (str(rec.get("id") or ""), self._record_status(rec))

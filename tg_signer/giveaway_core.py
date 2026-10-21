@@ -502,72 +502,11 @@ class GiveawayEngine:
         self.scanning = True
         try:
             total = len(self._clients) * max(1, len(self.chats))
-            done = {"n": 0}
+            done: Dict[str, int] = {"n": 0}
             joined_before = self.joined
-
-            async def _scan_one(account: str, client: Any) -> None:
-                if not await self._ensure_connected(client):
-                    self.log(f"[{account}] 连接不可用，跳过该账号本轮扫描")
-                    return
-                for chat in self.chats:
-                    if self._stop is not None and self._stop.is_set():
-                        return
-                    # 监控对象成员检查：账号未加入该频道/群组时自动尝试加入
-                    await self._ensure_monitor_membership(account, client, chat)
-                    done["n"] += 1
-                    self.scan_text = f"({done['n']}/{total})"
-                    expired_streak = 0
-                    scanned = 0
-                    # 识别聊天类型：群组仍只扫置顶；频道忽略置顶（多为长期
-                    # 挂着的旧抽奖帖），直接从最新历史消息开始扫
-                    is_group, chat_info = await self._detect_chat_type(
-                        account, client, chat
-                    )
-                    if is_group:
-                        await self._scan_pinned(
-                            account, client, chat, chat_info=chat_info
-                        )
-                    if is_group or (
-                        self.max_joins is not None and self.joined >= self.max_joins
-                    ):
-                        # 群组只扫指定（置顶）消息；达到上限也不再扫历史
-                        continue
-                    try:
-                        async for message in client.get_chat_history(chat):
-                            scanned += 1
-                            if scanned > SCAN_HARD_CAP:
-                                self.log(
-                                    f"[{account}] {chat} 已扫描 "
-                                    f"{SCAN_HARD_CAP} 条，停止该频道本轮扫描"
-                                )
-                                break
-                            mid = getattr(message, "id", None)
-                            if mid is not None:
-                                self._mark_seen(account, str(chat), mid)
-                            outcome = await self._process_message(
-                                account, client, message
-                            )
-                            if outcome == "joined":
-                                expired_streak = 0
-                            elif outcome == "expired":
-                                expired_streak += 1
-                                if expired_streak >= EXPIRED_STOP_STREAK:
-                                    self.log(
-                                        f"[{account}] 连续 {expired_streak} 条已开奖，"
-                                        f"停止扫描 {chat}"
-                                    )
-                                    break
-                            if (
-                                self.max_joins is not None
-                                and self.joined >= self.max_joins
-                            ):
-                                break
-                    except Exception as exc:
-                        self.log(f"[{account}] 扫描 {chat} 失败: {exc}")
-
             await asyncio.gather(
                 *[
-                    _scan_one(account, client)
+                    self._scan_one(account, client, done, total)
                     for account, client in list(self._clients.items())
                 ]
             )
@@ -582,6 +521,73 @@ class GiveawayEngine:
             self.scan_text = ""
             if self._state is not None:
                 self._state.save()
+
+    async def _scan_one(
+        self, account: str, client: Any, done: Dict[str, int], total: int
+    ) -> None:
+        """单账号扫描全部监控对象（scan_now 的并行子任务）。"""
+        if not await self._ensure_connected(client):
+            self.log(f"[{account}] 连接不可用，跳过该账号本轮扫描")
+            return
+        for chat in self.chats:
+            if self._stop is not None and self._stop.is_set():
+                return
+            # 监控对象成员检查：账号未加入该频道/群组时自动尝试加入
+            await self._ensure_monitor_membership(account, client, chat)
+            done["n"] += 1
+            self.scan_text = f"({done['n']}/{total})"
+            # 识别聊天类型：群组仍只扫置顶；频道忽略置顶（多为长期
+            # 挂着的旧抽奖帖），直接从最新历史消息开始扫
+            is_group, chat_info = await self._detect_chat_type(
+                account, client, chat
+            )
+            if is_group:
+                await self._scan_pinned(
+                    account, client, chat, chat_info=chat_info
+                )
+            if is_group or (
+                self.max_joins is not None and self.joined >= self.max_joins
+            ):
+                # 群组只扫指定（置顶）消息；达到上限也不再扫历史
+                continue
+            await self._scan_chat_history(account, client, chat)
+
+    async def _scan_chat_history(self, account: str, client: Any, chat: Any) -> None:
+        """单频道回溯扫描历史消息：水位线去重 + 处理，命中停止条件即止。"""
+        expired_streak = 0
+        scanned = 0
+        try:
+            async for message in client.get_chat_history(chat):
+                scanned += 1
+                if scanned > SCAN_HARD_CAP:
+                    self.log(
+                        f"[{account}] {chat} 已扫描 "
+                        f"{SCAN_HARD_CAP} 条，停止该频道本轮扫描"
+                    )
+                    break
+                mid = getattr(message, "id", None)
+                if mid is not None:
+                    self._mark_seen(account, str(chat), mid)
+                outcome = await self._process_message(
+                    account, client, message
+                )
+                if outcome == "joined":
+                    expired_streak = 0
+                elif outcome == "expired":
+                    expired_streak += 1
+                    if expired_streak >= EXPIRED_STOP_STREAK:
+                        self.log(
+                            f"[{account}] 连续 {expired_streak} 条已开奖，"
+                            f"停止扫描 {chat}"
+                        )
+                        break
+                if (
+                    self.max_joins is not None
+                    and self.joined >= self.max_joins
+                ):
+                    break
+        except Exception as exc:
+            self.log(f"[{account}] 扫描 {chat} 失败: {exc}")
 
     async def _detect_chat_type(
         self, account: str, client: Any, chat: Any
@@ -614,12 +620,38 @@ class GiveawayEngine:
         置顶消息与历史消息走同一套处理流程（关键词过滤、开奖日期跳过、
         去重、自动加入）。聊天类型识别由 _detect_chat_type 完成。
         """
+        pinned_list = await self._collect_pinned_messages(
+            account, client, chat, chat_info
+        )
+        for msg in pinned_list:
+            if self._stop is not None and self._stop.is_set():
+                break
+            if not self._mark_seen(account, str(chat), getattr(msg, "id", None)):
+                self.log(
+                    f"[{account}] 置顶消息 {getattr(msg, 'id', '?')} 本轮已处理过，跳过"
+                )
+                continue  # 本轮会话中已处理过
+            try:
+                await self._process_message(
+                    account,
+                    client,
+                    msg,
+                    skip_keywords=True,
+                    log_skips=True,
+                )  # 仅群组走此路径：置顶不受关键词过滤，且逐条打印跳过原因
+            except Exception as exc:
+                self.log(f"[{account}] 处理 {chat} 置顶消息失败: {exc}")
+
+    async def _collect_pinned_messages(
+        self, account: str, client: Any, chat: Any, chat_info: Any
+    ) -> List[Any]:
+        """收集群组全部置顶消息；聊天信息获取失败返回空列表（跳过扫描）。"""
         if chat_info is None:
             try:
                 chat_info = await client.get_chat(chat)
             except Exception as exc:
                 self.log(f"[{account}] 获取 {chat} 信息失败，跳过置顶扫描: {exc}")
-                return
+                return []
         pinned = getattr(chat_info, "pinned_message", None)
         # 枚举全部置顶消息：get_chat 只返回最新一条置顶，而群/频道可置顶多条，
         # 其余置顶只有通过 PINNED 过滤搜索才能拿到
@@ -642,24 +674,7 @@ class GiveawayEngine:
                 f"[{account}] 「{getattr(chat_info, 'title', '') or chat}」"
                 f"共有 {len(pinned_list)} 条置顶消息"
             )
-        for msg in pinned_list:
-            if self._stop is not None and self._stop.is_set():
-                break
-            if not self._mark_seen(account, str(chat), getattr(msg, "id", None)):
-                self.log(
-                    f"[{account}] 置顶消息 {getattr(msg, 'id', '?')} 本轮已处理过，跳过"
-                )
-                continue  # 本轮会话中已处理过
-            try:
-                await self._process_message(
-                    account,
-                    client,
-                    msg,
-                    skip_keywords=True,
-                    log_skips=True,
-                )  # 仅群组走此路径：置顶不受关键词过滤，且逐条打印跳过原因
-            except Exception as exc:
-                self.log(f"[{account}] 处理 {chat} 置顶消息失败: {exc}")
+        return pinned_list
 
     async def _participate_via_source_button(
         self, account: str, client: Any, message: Any
@@ -672,40 +687,85 @@ class GiveawayEngine:
         _participate 流程。以 source_btn|chat|msg_id 持久化去重，
         避免每轮扫描重复点击同一帖。
         """
-        if self._stop is not None and self._stop.is_set():
+        ctx = await self._source_button_ctx(account, message)
+        if ctx is None:
             return
-        chat_id = getattr(getattr(message, "chat", None), "id", None)
-        msg_id = getattr(message, "id", None)
-        if chat_id is None or msg_id is None:
-            return
-        state_key = f"{chat_id}|{msg_id}"
-        if self._state is not None and (
-            self._state.has(account, "source_btn", state_key)
-            or self._state.is_ended(account, "source_btn", state_key)
-        ):
-            return
-        if self.max_joins is not None and self.joined >= self.max_joins:
-            return
-        btn = self._find_confirm_button(message)
-        if btn is None:
-            return
+        chat_id, msg_id, btn = ctx
         channel = self._chat_title(message)
         title = _giveaway_title(message)
         # URL 按钮：解析为 bot start 链接则等同普通链接参与
         url = str(getattr(btn, "url", "") or "").strip()
         if url and not getattr(btn, "callback_data", None):
-            link = parse_bot_start_link(url)
-            if link is not None and not bot_is_blocked(link[0]):
-                await self._participate(
-                    account,
-                    client,
-                    link[0],
-                    link[1],
-                    channel,
-                    title,
-                    source_message=message,
-                )
+            await self._join_via_source_url(
+                account, client, url, channel, title, message
+            )
             return
+        await self._click_source_button(
+            account, client, message, btn, chat_id, msg_id, channel, title
+        )
+
+    async def _source_button_ctx(
+        self, account: str, message: Any
+    ) -> Optional[Tuple[int, int, Any]]:
+        """按钮型抽奖参与前的守卫检查；返回 (chat_id, msg_id, 按钮)，跳过时 None。"""
+        if self._stop is not None and self._stop.is_set():
+            return None
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+        msg_id = getattr(message, "id", None)
+        if chat_id is None or msg_id is None:
+            return None
+        state_key = f"{chat_id}|{msg_id}"
+        if self._source_btn_seen(account, state_key):
+            return None
+        if self.max_joins is not None and self.joined >= self.max_joins:
+            return None
+        btn = self._find_confirm_button(message)
+        if btn is None:
+            return None
+        return chat_id, msg_id, btn
+
+    def _source_btn_seen(self, account: str, state_key: str) -> bool:
+        """该置顶帖是否已处理过/已终态（source_btn 持久化去重）。"""
+        return self._state is not None and (
+            self._state.has(account, "source_btn", state_key)
+            or self._state.is_ended(account, "source_btn", state_key)
+        )
+
+    async def _join_via_source_url(
+        self,
+        account: str,
+        client: Any,
+        url: str,
+        channel: str,
+        title: str,
+        message: Any,
+    ) -> None:
+        """URL 按钮指向 bot start 深度链接（非黑名单 bot）时走常规参与流程。"""
+        link = parse_bot_start_link(url)
+        if link is not None and not bot_is_blocked(link[0]):
+            await self._participate(
+                account,
+                client,
+                link[0],
+                link[1],
+                channel,
+                title,
+                source_message=message,
+            )
+
+    async def _click_source_button(
+        self,
+        account: str,
+        client: Any,
+        message: Any,
+        btn: Any,
+        chat_id: int,
+        msg_id: int,
+        channel: str,
+        title: str,
+    ) -> None:
+        """callback 按钮参与：模拟节奏点击并按弹窗文案判定结果。"""
+        state_key = f"{chat_id}|{msg_id}"
         # 先按帖内频道/群组链接自动加入：按钮型抽奖点击后 bot 会校验
         # 「您未加入 XXX」，不先加入则点击无效
         if self.auto_join:
@@ -735,6 +795,24 @@ class GiveawayEngine:
             self.log(f"[{account}] 点击置顶抽奖帖「{btn.text}」按钮失败: {exc}")
             return
         popup = callback_answer_text(answer)
+        if self._source_btn_popup_blocked(
+            account, btn, popup, state_key, channel, reserved
+        ):
+            return
+        self._record_source_btn_join(
+            account, btn, state_key, channel, title, popup, reserved
+        )
+
+    def _source_btn_popup_blocked(
+        self,
+        account: str,
+        btn: Any,
+        popup: str,
+        state_key: str,
+        channel: str,
+        reserved: bool,
+    ) -> bool:
+        """终态/条件未满足弹窗处理：归还名额并记录，返回 True 表示终止参与。"""
         if popup and _POPUP_ENDED_RE.search(popup):
             if reserved:
                 self.joined -= 1
@@ -747,7 +825,7 @@ class GiveawayEngine:
                 f"[{account}] 置顶抽奖帖「{btn.text}」弹窗提示「{popup[:40]}」，"
                 "抽奖已结束，跳过"
             )
-            return
+            return True
         # 「您未加入 XXX」类弹窗：参与条件未满足，点击未生效，不能记为成功
         if popup and JOIN_REQUIRED_POPUP_RE.search(popup):
             if reserved:
@@ -757,7 +835,20 @@ class GiveawayEngine:
                 f"[{account}] 置顶抽奖帖「{btn.text}」弹窗提示「{popup[:60]}」，"
                 "参与条件未满足（未加入指定对象），未参与成功"
             )
-            return
+            return True
+        return False
+
+    def _record_source_btn_join(
+        self,
+        account: str,
+        btn: Any,
+        state_key: str,
+        channel: str,
+        title: str,
+        popup: str,
+        reserved: bool,
+    ) -> None:
+        """记录按钮型参与成功：持久化去重、计数与事件推送。"""
         if self._state is not None:
             self._state.add(
                 account,
@@ -967,23 +1058,7 @@ class GiveawayEngine:
         # 转发原消息到各转发目标（默认收藏夹），单个失败不阻断其余目标与提醒
         chat_id = getattr(getattr(message, "chat", None), "id", None) or bot_username
         if mid is not None:
-            for target in self.win_forward_targets:
-                try:
-                    await client.forward_messages(
-                        chat_id=target,
-                        from_chat_id=chat_id,
-                        message_ids=[mid],
-                    )
-                    self.log(
-                        f"[{account}] 中奖消息已转发到 "
-                        f"{'收藏夹' if target == 'me' else target}"
-                    )
-                except Exception as exc:
-                    self.log(
-                        f"[{account}] 中奖消息转发到 "
-                        f"{'收藏夹' if target == 'me' else target} 失败: {exc}"
-                    )
-                    logger.debug("中奖消息转发失败", exc_info=True)
+            await self._forward_win_message(account, client, chat_id, mid)
         self._emit(
             {
                 "type": "win",
@@ -992,6 +1067,28 @@ class GiveawayEngine:
                 "text": text[:300],
             }
         )
+
+    async def _forward_win_message(
+        self, account: str, client: Any, chat_id: Any, mid: int
+    ) -> None:
+        """转发中奖原消息到各转发目标（默认收藏夹），单个失败不阻断其余。"""
+        for target in self.win_forward_targets:
+            try:
+                await client.forward_messages(
+                    chat_id=target,
+                    from_chat_id=chat_id,
+                    message_ids=[mid],
+                )
+                self.log(
+                    f"[{account}] 中奖消息已转发到 "
+                    f"{'收藏夹' if target == 'me' else target}"
+                )
+            except Exception as exc:
+                self.log(
+                    f"[{account}] 中奖消息转发到 "
+                    f"{'收藏夹' if target == 'me' else target} 失败: {exc}"
+                )
+                logger.debug("中奖消息转发失败", exc_info=True)
 
     async def _sweep_bot_wins(self, account: str, client: Any) -> None:
         """增量回扫该账号全部已知 bot 的私聊消息，补捡错过的中奖通知。
@@ -1409,74 +1506,119 @@ class GiveawayEngine:
         try:
             start_msg = await client.start_bot(username, param)
         except Exception as exc:
-            if reserved:
-                self.joined -= 1
-            self.failed += 1
-            wait = self._flood_seconds(exc)
-            if wait > 0:
-                # Telegram 限流：记录失败（冷却期内不重试），连续超限则熔断该 bot
-                fkey = self._flood_key(account, username)
-                strikes = self._flood_counts.get(fkey, 0) + 1
-                self._flood_counts[fkey] = strikes
-                if self._state is not None:
-                    self._state.add(
-                        account,
-                        username,
-                        param,
-                        channel=channel,
-                        note=f"flood_wait:{wait}",
-                    )
-                    self._state.save()
-                self.log(
-                    f"[{account}] 参与失败 @{username}（{param}）: "
-                    f"Telegram 限流，需等待 {wait} 秒"
-                    f"（连续第 {strikes} 次）"
-                )
-                if strikes >= MAX_FLOOD_STRIKES:
-                    self._flood_bots.add(fkey)
-                    self.log(
-                        f"[{account}] @{username} 连续限流 {strikes} 次，"
-                        "本轮运行跳过该 bot"
-                    )
-            else:
-                self.log(f"[{account}] 参与失败 @{username}（{param}）: {exc}")
-            self._emit(
-                {
-                    "account": account,
-                    "bot": username,
-                    "channel": channel,
-                    "ok": False,
-                    "error": str(exc),
-                }
+            self._participate_start_failed(
+                account, username, param, channel, exc, reserved
             )
             return
         # bot 对本次 start 直接回复「已结束」（如 @Lottery8Bot 的
         # "The event has ended or does not exist"）＝终态：归还名额、
         # 不记已参与，持久化标记防止今后重试，并累计 bot 熔断计数
         if reply_says_ended(start_msg):
-            if reserved:
-                self.joined -= 1
-            if self._state is not None:
-                self._state.add(account, username, param, channel=channel, note="ended")
-                self._state.save()
-            self._note_ended(account, username)
-            from_part = f"来自 {channel or '未知频道'}"
-            if title:
-                from_part += f"：{title}"
-            self.log(
-                f"{datetime.now():%H:%M:%S} [已结束] {account} -> @{username} "
-                f"回复抽奖已结束，跳过（{from_part}）"
-            )
-            self._emit(
-                {
-                    "account": account,
-                    "bot": username,
-                    "channel": channel,
-                    "ok": False,
-                    "error": "抽奖已结束",
-                }
+            self._handle_start_ended(
+                account, username, param, channel, title, reserved
             )
             return
+        self._record_participate_success(
+            account, username, param, channel, title, reserved
+        )
+        await self._click_confirm(
+            account, client, username, start_msg, param, source_message=source_message
+        )
+
+    def _participate_start_failed(
+        self,
+        account: str,
+        username: str,
+        param: str,
+        channel: str,
+        exc: Exception,
+        reserved: bool,
+    ) -> None:
+        """start 失败处理：归还名额、失败计数、FLOOD_WAIT 熔断判定与事件推送。"""
+        if reserved:
+            self.joined -= 1
+        self.failed += 1
+        wait = self._flood_seconds(exc)
+        if wait > 0:
+            # Telegram 限流：记录失败（冷却期内不重试），连续超限则熔断该 bot
+            fkey = self._flood_key(account, username)
+            strikes = self._flood_counts.get(fkey, 0) + 1
+            self._flood_counts[fkey] = strikes
+            if self._state is not None:
+                self._state.add(
+                    account,
+                    username,
+                    param,
+                    channel=channel,
+                    note=f"flood_wait:{wait}",
+                )
+                self._state.save()
+            self.log(
+                f"[{account}] 参与失败 @{username}（{param}）: "
+                f"Telegram 限流，需等待 {wait} 秒"
+                f"（连续第 {strikes} 次）"
+            )
+            if strikes >= MAX_FLOOD_STRIKES:
+                self._flood_bots.add(fkey)
+                self.log(
+                    f"[{account}] @{username} 连续限流 {strikes} 次，"
+                    "本轮运行跳过该 bot"
+                )
+        else:
+            self.log(f"[{account}] 参与失败 @{username}（{param}）: {exc}")
+        self._emit(
+            {
+                "account": account,
+                "bot": username,
+                "channel": channel,
+                "ok": False,
+                "error": str(exc),
+            }
+        )
+
+    def _handle_start_ended(
+        self,
+        account: str,
+        username: str,
+        param: str,
+        channel: str,
+        title: str,
+        reserved: bool,
+    ) -> None:
+        """start 回复「已结束」终态处理：归还名额、持久化标记并累计熔断计数。"""
+        if reserved:
+            self.joined -= 1
+        if self._state is not None:
+            self._state.add(account, username, param, channel=channel, note="ended")
+            self._state.save()
+        self._note_ended(account, username)
+        from_part = f"来自 {channel or '未知频道'}"
+        if title:
+            from_part += f"：{title}"
+        self.log(
+            f"{datetime.now():%H:%M:%S} [已结束] {account} -> @{username} "
+            f"回复抽奖已结束，跳过（{from_part}）"
+        )
+        self._emit(
+            {
+                "account": account,
+                "bot": username,
+                "channel": channel,
+                "ok": False,
+                "error": "抽奖已结束",
+            }
+        )
+
+    def _record_participate_success(
+        self,
+        account: str,
+        username: str,
+        param: str,
+        channel: str,
+        title: str,
+        reserved: bool,
+    ) -> None:
+        """记录参与成功：持久化记录、计数与事件推送。"""
         if self._state is not None:
             self._state.add(account, username, param, channel=channel)
             self._state.save()
@@ -1501,9 +1643,6 @@ class GiveawayEngine:
                 "title": title,
                 "ok": True,
             }
-        )
-        await self._click_confirm(
-            account, client, username, start_msg, param, source_message=source_message
         )
 
     async def _join_from_message(

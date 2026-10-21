@@ -11,7 +11,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from nicegui import ui
 
@@ -73,26 +73,44 @@ class _AlertStore:
         self.filename = filename
         self.limit = limit
         self.label = label
+        # mtime 指纹缓存：消息中心/未读徽标每 10s 轮询读取，避免重复读盘解析
+        self._cache: Optional[Tuple[Path, Optional[Tuple[int, int]], List[dict]]] = None
+
+    @staticmethod
+    def _fingerprint(path: Path) -> Optional[Tuple[int, int]]:
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
 
     def load(self, workdir) -> List[dict]:
         path = Path(workdir) / self.filename
+        fingerprint = self._fingerprint(path)
+        cached = self._cache
+        if cached is not None and cached[0] == path and cached[1] == fingerprint:
+            return list(cached[2])
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             alerts = data.get("alerts") if isinstance(data, dict) else None
-            return [a for a in (alerts or []) if isinstance(a, dict)]
+            entries = [a for a in (alerts or []) if isinstance(a, dict)]
         except FileNotFoundError:
-            return []
+            entries = []
         except (OSError, ValueError):
             logger.debug("读取%s文件失败", self.label, exc_info=True)
-            return []
+            entries = []
+        self._cache = (path, fingerprint, entries)
+        return list(entries)
 
     def save(self, workdir, alerts: List[dict]) -> None:
+        path = Path(workdir) / self.filename
+        kept = alerts[: self.limit]
         try:
-            atomic_write_json(
-                Path(workdir) / self.filename, {"alerts": alerts[: self.limit]}
-            )
+            atomic_write_json(path, {"alerts": kept})
         except OSError:
             logger.debug("写入%s文件失败", self.label, exc_info=True)
+            return
+        self._cache = (path, self._fingerprint(path), kept)
 
 
 _JOIN_ALERTS = _AlertStore(JOIN_ALERTS_FILE, JOIN_ALERTS_MAX, "加入失败提醒")
@@ -220,9 +238,7 @@ def _handle_join_event(client, workdir, ev: dict, title_map: Dict[str, str]) -> 
     if not acct or not chat:
         return
     failed = ev.get("type") == "join_failed"
-    alerts = _drop_alert(
-        load_join_alerts(workdir), JOIN_ALERT_KEY, f"{acct}|{chat}"
-    )
+    alerts = _drop_alert(load_join_alerts(workdir), JOIN_ALERT_KEY, f"{acct}|{chat}")
     if failed:
         alerts.insert(
             0,
@@ -605,9 +621,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         def _log(msg: str) -> None:
             buf = _GLOBAL_LOGS.setdefault(wd_key, [])
             # 子进程日志已带「[#任务] HH:MM:SS」前缀且已自行落盘，直接沿用
-            from_child = bool(
-                re.match(r"^\[#[^\]]+\] \d{2}:\d{2}:\d{2} ", msg)
-            )
+            from_child = bool(re.match(r"^\[#[^\]]+\] \d{2}:\d{2}:\d{2} ", msg))
             if from_child:
                 line = msg
             else:

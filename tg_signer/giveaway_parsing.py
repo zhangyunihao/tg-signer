@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
@@ -657,6 +657,19 @@ def _tme_join_target(url: str) -> Optional[str]:
 
 
 
+def _line_bounds(text: str) -> List[Tuple[int, int, str]]:
+    """按换行切出每行 (起始, 结束, 内容) 区间表，供实体 offset 定位所在行。"""
+    bounds: List[Tuple[int, int, str]] = []
+    start = 0
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            bounds.append((start, i, text[start:i]))
+            start = i + 1
+    bounds.append((start, len(text), text[start:]))
+    return bounds
+
+
+
 def extract_join_name_links(message: Any) -> List[Tuple[str, str]]:
     """解析「加入-名称」隐藏链接行的（名称, 加入目标）对应关系。
 
@@ -667,39 +680,49 @@ def extract_join_name_links(message: Any) -> List[Tuple[str, str]]:
     text = _message_text(message)
     if not text or "加入" not in text:
         return []
-    bounds: List[Tuple[int, int, str]] = []
-    start = 0
-    for i, ch in enumerate(text):
-        if ch == "\n":
-            bounds.append((start, i, text[start:i]))
-            start = i + 1
-    bounds.append((start, len(text), text[start:]))
+    bounds = _line_bounds(text)
     results: List[Tuple[str, str]] = []
     seen: set = set()
     for attr in ("entities", "caption_entities"):
         for ent in getattr(message, attr, None) or []:
-            # 隐藏链接实体：Pyrogram 叫 TEXT_LINK，Telethon 叫 TEXT_URL
-            ent_type = str(getattr(ent, "type", "")).upper()
-            if "TEXT_URL" not in ent_type and "TEXT_LINK" not in ent_type:
+            parsed = _join_row_name_link(text, bounds, ent)
+            if parsed is None:
                 continue
-            url = getattr(ent, "url", None)
-            if not url:
-                continue
-            offset = _utf16_to_index(text, int(getattr(ent, "offset", 0) or 0))
-            line = next((lt for ls, le, lt in bounds if ls <= offset < le), "")
-            if "加入" not in line:
-                continue
-            jm = JOIN_ROW_RE.search(line.strip())
-            if jm is None:
-                continue
-            name = jm.group(1).strip()
-            target = _tme_join_target(str(url))
-            if name and target:
-                key = name.lower()
-                if key not in seen:
-                    seen.add(key)
-                    results.append((name, target))
+            name, target = parsed
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                results.append((name, target))
     return results
+
+
+def _join_row_name_link(
+    text: str, bounds: List[Tuple[int, int, str]], ent: Any
+) -> Optional[Tuple[str, str]]:
+    """单个隐藏链接实体 → 所在「加入-名称」行的（名称, 加入目标）。
+
+    非 TEXT_URL/TEXT_LINK 实体、无 url 或所在行非「加入-名称」格式
+    时返回 None。
+    """
+    # 隐藏链接实体：Pyrogram 叫 TEXT_LINK，Telethon 叫 TEXT_URL
+    ent_type = str(getattr(ent, "type", "")).upper()
+    if "TEXT_URL" not in ent_type and "TEXT_LINK" not in ent_type:
+        return None
+    url = getattr(ent, "url", None)
+    if not url:
+        return None
+    offset = _utf16_to_index(text, int(getattr(ent, "offset", 0) or 0))
+    line = next((lt for ls, le, lt in bounds if ls <= offset < le), "")
+    if "加入" not in line:
+        return None
+    jm = JOIN_ROW_RE.search(line.strip())
+    if jm is None:
+        return None
+    name = jm.group(1).strip()
+    target = _tme_join_target(str(url))
+    if name and target:
+        return (name, target)
+    return None
 
 
 
@@ -839,40 +862,41 @@ def extract_join_status_targets(message: Any) -> List[str]:
     if not text or "加入" not in text:
         return []
     # 行区间表：实体 offset 定位所在行，据此判断该行是否为 ❌ 未加入
-    bounds: List[Tuple[int, int, str]] = []
-    start = 0
-    for i, ch in enumerate(text):
-        if ch == "\n":
-            bounds.append((start, i, text[start:i]))
-            start = i + 1
-    bounds.append((start, len(text), text[start:]))
+    bounds = _line_bounds(text)
     targets: List[str] = []
     seen: set = set()
-
-    def _add(target: str) -> None:
-        key = target.lower()
-        if key not in seen:
-            seen.add(key)
-            targets.append(target)
-
     for attr in ("entities", "caption_entities"):
         for ent in getattr(message, attr, None) or []:
-            # 隐藏链接实体：Pyrogram 叫 TEXT_LINK，Telethon 叫 TEXT_URL
-            ent_type = str(getattr(ent, "type", "")).upper()
-            if "TEXT_URL" not in ent_type and "TEXT_LINK" not in ent_type:
+            target = _unjoined_row_target(text, bounds, ent)
+            if target is None:
                 continue
-            url = getattr(ent, "url", None)
-            if not url:
-                continue
-            url_s = str(url)
-            offset = _utf16_to_index(text, int(getattr(ent, "offset", 0) or 0))
-            line = next((lt for ls, le, lt in bounds if ls <= offset < le), "")
-            if "加入" not in line or "❌" not in line or "✅" in line:
-                continue
-            target = _tme_join_target(url_s)
-            if target is not None:
-                _add(target)
+            key = target.lower()
+            if key not in seen:
+                seen.add(key)
+                targets.append(target)
     return targets
+
+
+def _unjoined_row_target(
+    text: str, bounds: List[Tuple[int, int, str]], ent: Any
+) -> Optional[str]:
+    """单个隐藏链接实体 → 所在「加入-名称 ❌」（未加入）行的链接目标。
+
+    非 TEXT_URL/TEXT_LINK 实体、无 url 或所在行非未加入行（已加入 ✅
+    或非加入行）时返回 None。
+    """
+    # 隐藏链接实体：Pyrogram 叫 TEXT_LINK，Telethon 叫 TEXT_URL
+    ent_type = str(getattr(ent, "type", "")).upper()
+    if "TEXT_URL" not in ent_type and "TEXT_LINK" not in ent_type:
+        return None
+    url = getattr(ent, "url", None)
+    if not url:
+        return None
+    offset = _utf16_to_index(text, int(getattr(ent, "offset", 0) or 0))
+    line = next((lt for ls, le, lt in bounds if ls <= offset < le), "")
+    if "加入" not in line or "❌" not in line or "✅" in line:
+        return None
+    return _tme_join_target(str(url))
 
 
 
@@ -903,22 +927,30 @@ def extract_channel_targets(message: Any) -> List[str]:
                 _add(domain)
             continue
         for match in re.finditer(r"\S+", candidate):
-            piece = match.group(0)
-            m = _TME_CHANNEL_RE.search(piece)
-            if m is not None:
-                target = m.group("target")
-                rest = m.group("rest") or ""
-                if target.lower().startswith(("+", "joinchat/")):
-                    # 私有邀请链接
-                    _add(f"https://t.me/{target}")
-                    continue
-                if rest not in ("", "/") and not rest.startswith("?"):
-                    continue  # 帖子/消息路径链接（t.me/x/123），不能 join
-                if rest.startswith("?"):
-                    query = parse_qs(urlparse(rest).query)
-                    if any(k in query for k in ("start", "startgroup", "startapp")):
-                        continue  # bot 深度链接，不属于加入目标
-                _add(target)
-            for am in _AT_CHANNEL_RE.finditer(piece):
-                _add(am.group(1))
+            _collect_channel_piece(match.group(0), _add)
     return targets
+
+
+def _collect_channel_piece(piece: str, add: Callable[[str], None]) -> None:
+    """解析单个空白分隔词元，把其中可 join 的频道/群组目标经 add 收集。
+
+    t.me 帖子路径链接（t.me/x/123）与 start/startgroup/startapp bot
+    深度链接不属于加入目标，跳过；私有邀请链接转成完整 https 链接。
+    """
+    m = _TME_CHANNEL_RE.search(piece)
+    if m is not None:
+        target = m.group("target")
+        rest = m.group("rest") or ""
+        if target.lower().startswith(("+", "joinchat/")):
+            # 私有邀请链接
+            add(f"https://t.me/{target}")
+            return
+        if rest not in ("", "/") and not rest.startswith("?"):
+            return  # 帖子/消息路径链接（t.me/x/123），不能 join
+        if rest.startswith("?"):
+            query = parse_qs(urlparse(rest).query)
+            if any(k in query for k in ("start", "startgroup", "startapp")):
+                return  # bot 深度链接，不属于加入目标
+        add(target)
+    for am in _AT_CHANNEL_RE.finditer(piece):
+        add(am.group(1))
