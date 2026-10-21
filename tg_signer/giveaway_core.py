@@ -19,6 +19,7 @@ import inspect
 import logging
 import random
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -73,6 +74,15 @@ logger = logging.getLogger(__name__)
 
 # 同一 bot 连续 FLOOD_WAIT 达到该次数后，本轮运行熔断（不再对其 start_bot）
 MAX_FLOOD_STRIKES = 3
+
+
+# 单次限流要求等待超过该秒数时立即熔断该 bot（不必等满 MAX_FLOOD_STRIKES 次）
+FLOOD_HARD_BLOCK_SECONDS = 300
+
+
+# 同一 bot 相邻两次 StartBot 的最小间隔（秒）：一次参与流程会连发
+# 1~3 次 start（初次 / 加入后重发 / 点参与按钮），间隔过密会触发账号级限流
+START_MIN_INTERVAL = 8.0
 
 
 # 同一 bot 累计收到该次数「抽奖已结束」类回复后，本轮运行熔断该 bot
@@ -206,6 +216,11 @@ class GiveawayEngine:
         # FLOOD_WAIT 熔断：{account|bot_lower: 连续次数}；达到上限加入 _flood_bots
         self._flood_counts: Dict[str, int] = {}
         self._flood_bots: set = set()
+        # 限流暂停：{account|bot_lower: 恢复时刻（monotonic 秒）}，到期自动解除；
+        # 按 bot 级别而非单条链接，避免刚被罚就换 param 继续打同一个 bot
+        self._flood_until: Dict[str, float] = {}
+        # 同一 bot 上次 StartBot 时刻（monotonic 秒），用于强制最小间隔
+        self._last_start_at: Dict[str, float] = {}
         # 「已结束」回复熔断：{account|bot_lower: 次数}；达到上限加入 _ended_bots
         self._ended_counts: Dict[str, int] = {}
         self._ended_bots: set = set()
@@ -344,6 +359,8 @@ class GiveawayEngine:
         self._stopping = False
         self._flood_counts.clear()
         self._flood_bots.clear()
+        self._flood_until.clear()
+        self._last_start_at.clear()
         self._ended_counts.clear()
         self._ended_bots.clear()
         self._seen_msgs.clear()
@@ -1498,6 +1515,8 @@ class GiveawayEngine:
             return False
         if self._flood_key(account, username) in self._flood_bots:
             return False
+        if self._flood_paused(account, username):
+            return False  # 该 bot 仍在限流暂停期内，等恢复后下一轮再试
         if self._flood_key(account, username) in self._ended_bots:
             return False  # 已结束回复熔断的 bot，静默跳过
         return True
@@ -1592,6 +1611,86 @@ class GiveawayEngine:
             m = re.search(r"wait (\d+) seconds", str(exc))
             return int(m.group(1)) if m else 0
 
+    def _flood_paused(self, account: str, username: str) -> bool:
+        """该账号对该 bot 是否仍在限流暂停期内（到期自动解除）。"""
+        fkey = self._flood_key(account, username)
+        until = self._flood_until.get(fkey)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            self._flood_until.pop(fkey, None)
+            return False
+        return True
+
+    def _record_flood(
+        self,
+        account: str,
+        username: str,
+        param: str,
+        channel: str,
+        exc: Exception,
+        label: str = "参与失败",
+    ) -> bool:
+        """统一登记一次 FLOOD_WAIT：计入熔断次数、按 bot 级别暂停、持久化冷却。
+
+        返回 True 表示确是限流异常（调用方据此跳过后续跟进而不要当普通错误）。
+        """
+        wait = self._flood_seconds(exc)
+        if wait <= 0:
+            return False
+        fkey = self._flood_key(account, username)
+        strikes = self._flood_counts.get(fkey, 0) + 1
+        self._flood_counts[fkey] = strikes
+        # 按 bot 级别暂停到限流解除：暂停期间同账号不再对该 bot 发 start
+        resume_at = time.monotonic() + wait
+        self._flood_until[fkey] = max(self._flood_until.get(fkey, 0.0), resume_at)
+        # 已参与（joined）或已结束（ended）的记录不能被限流记录覆盖，
+        # 否则会把成功状态翻成失败并在冷却后重复参与
+        if self._state is not None and not self._state.has(
+            account, username, param
+        ):
+            self._state.add(
+                account,
+                username,
+                param,
+                channel=channel,
+                note=f"flood_wait:{wait}",
+            )
+            self._state.save()
+        self.log(
+            f"[{account}] {label} @{username}（{param}）: "
+            f"Telegram 限流，需等待 {wait} 秒"
+            f"（连续第 {strikes} 次）"
+        )
+        if wait >= FLOOD_HARD_BLOCK_SECONDS:
+            if fkey not in self._flood_bots:
+                self._flood_bots.add(fkey)
+                self.log(
+                    f"[{account}] @{username} 限流需等待 {wait} 秒"
+                    f"（≥{FLOOD_HARD_BLOCK_SECONDS} 秒），本轮运行直接跳过该 bot"
+                )
+        elif strikes >= MAX_FLOOD_STRIKES:
+            if fkey not in self._flood_bots:
+                self._flood_bots.add(fkey)
+                self.log(
+                    f"[{account}] @{username} 连续限流 {strikes} 次，"
+                    "本轮运行跳过该 bot"
+                )
+        return True
+
+    async def _start_bot(
+        self, client: Any, account: str, username: str, param: str
+    ) -> Any:
+        """带最小间隔的 StartBot：同一 bot 相邻两次调用至少间隔 START_MIN_INTERVAL。"""
+        fkey = self._flood_key(account, username)
+        last = self._last_start_at.get(fkey)
+        if last is not None:
+            gap = START_MIN_INTERVAL - (time.monotonic() - last)
+            if gap > 0:
+                await asyncio.sleep(gap)
+        self._last_start_at[fkey] = time.monotonic()
+        return await client.start_bot(username, param)
+
     async def _participate(
         self,
         account: str,
@@ -1621,7 +1720,7 @@ class GiveawayEngine:
             self.joined += 1
             reserved = True
         try:
-            start_msg = await client.start_bot(username, param)
+            start_msg = await self._start_bot(client, account, username, param)
         except Exception as exc:
             self._participate_start_failed(
                 account, username, param, channel, exc, reserved
@@ -1645,6 +1744,8 @@ class GiveawayEngine:
             return False
         if self._state is not None and self._state.is_ended(account, username, param):
             # bot 曾回复「已结束」＝终态，无论是否忽略历史都不再发 start
+            return False
+        if self._flood_paused(account, username):
             return False
         return True
 
@@ -1689,33 +1790,7 @@ class GiveawayEngine:
         if reserved:
             self.joined -= 1
         self.failed += 1
-        wait = self._flood_seconds(exc)
-        if wait > 0:
-            # Telegram 限流：记录失败（冷却期内不重试），连续超限则熔断该 bot
-            fkey = self._flood_key(account, username)
-            strikes = self._flood_counts.get(fkey, 0) + 1
-            self._flood_counts[fkey] = strikes
-            if self._state is not None:
-                self._state.add(
-                    account,
-                    username,
-                    param,
-                    channel=channel,
-                    note=f"flood_wait:{wait}",
-                )
-                self._state.save()
-            self.log(
-                f"[{account}] 参与失败 @{username}（{param}）: "
-                f"Telegram 限流，需等待 {wait} 秒"
-                f"（连续第 {strikes} 次）"
-            )
-            if strikes >= MAX_FLOOD_STRIKES:
-                self._flood_bots.add(fkey)
-                self.log(
-                    f"[{account}] @{username} 连续限流 {strikes} 次，"
-                    "本轮运行跳过该 bot"
-                )
-        else:
+        if not self._record_flood(account, username, param, channel, exc):
             self.log(f"[{account}] 参与失败 @{username}（{param}）: {exc}")
         self._emit(
             {
@@ -2554,7 +2629,7 @@ class GiveawayEngine:
             # 避免「立刻参加抽奖」点了却因身份未同步而不生效
             await asyncio.sleep(5)
         await self._click_first_confirm_button(
-            account, client, username, candidates
+            account, client, username, candidates, param
         )
 
     def _initial_confirm_candidates(
@@ -2716,9 +2791,12 @@ class GiveawayEngine:
         param: str,
         candidates: List[Any],
     ) -> Tuple[bool, List[Any]]:
-        """重发 start 并刷新候选；返回（是否因已结束中止，更新后的候选）。"""
+        """重发 start 并刷新候选；返回（是否中止后续跟进，更新后的候选）。
+
+        bot 终态回复或触发 FLOOD_WAIT 时返回 True 中止，避免继续打同一个 bot。
+        """
         try:
-            restart_msg = await client.start_bot(username, param)
+            restart_msg = await self._start_bot(client, account, username, param)
             if restart_msg is not None and reply_says_ended(restart_msg):
                 # 加入期间活动提前结束，bot 终态回复，不再点按钮
                 self._note_ended(account, username)
@@ -2744,18 +2822,30 @@ class GiveawayEngine:
                     account, client, username, candidates
                 )
         except Exception as exc:
+            # 限流也走统一登记（计数 + bot 级暂停 + 冷却落盘），并中止后续跟进
+            if self._record_flood(
+                account, username, param, "", exc, label="重新参与"
+            ):
+                return True, candidates
             self.log(f"重新参与 @{username} 失败: {exc}")
         return False, candidates
 
     async def _click_first_confirm_button(
-        self, account: str, client: Any, username: str, candidates: List[Any]
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        candidates: List[Any],
+        param: str = "",
     ) -> None:
+        if self._flood_paused(account, username):
+            return  # 该 bot 已被限流，暂停期内不再发起任何 start/点击
         for message in candidates:
             btn = self._find_confirm_button(message)
             if btn is None:
                 continue
             if await self._try_confirm_button(
-                account, client, username, message, btn, candidates
+                account, client, username, message, btn, candidates, param
             ):
                 return
 
@@ -2767,6 +2857,7 @@ class GiveawayEngine:
         message: Any,
         btn: Any,
         candidates: List[Any],
+        param: str = "",
     ) -> bool:
         """处理单个确认按钮；返回 True 表示结束整个跟进流程。"""
         try:
@@ -2801,7 +2892,14 @@ class GiveawayEngine:
                 if m and not (m.group("rest") or ""):
                     plain_same_bot = m.group("name").lower() == username.lower()
             if link is not None and link[0].lower() == username.lower():
-                await client.start_bot(username, link[1])
+                if param and link[1] == param:
+                    # 与本次已发出的 start 完全一致：重复调用只会加速触发
+                    # 账号级 FLOOD_WAIT，直接视为已完成
+                    self.log(
+                        f"[{account}] @{username} 参与按钮与本次 start 相同，跳过重复 start"
+                    )
+                    return True
+                await self._start_bot(client, account, username, link[1])
                 self.log(
                     f"已点击 @{username} 的参与按钮「{btn.text}」"
                     f"（按链接参数重新参与）"
@@ -2811,7 +2909,12 @@ class GiveawayEngine:
                 )
                 return True
             if plain_same_bot:
-                await client.start_bot(username, "")
+                if not param:
+                    self.log(
+                        f"[{account}] @{username} 参与按钮与本次 start 相同，跳过重复 start"
+                    )
+                    return True
+                await self._start_bot(client, account, username, "")
                 self.log(
                     f"已点击 @{username} 的参与按钮「{btn.text}」（重发 start）"
                 )
@@ -2820,6 +2923,12 @@ class GiveawayEngine:
                 )
                 return True
         except Exception as exc:
+            # 限流同样登记（计数 + bot 级暂停 + 冷却落盘），避免异常被吞后
+            # 继续对同一个 bot 发请求把短限流拖成小时级
+            if self._record_flood(
+                account, username, param, "", exc, label="点击确认按钮"
+            ):
+                return True
             self.log(f"点击 @{username} 确认按钮失败: {exc}")
             return True
         return False

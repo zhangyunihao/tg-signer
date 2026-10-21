@@ -938,16 +938,44 @@ class FloodBotClient(FakeClient):
         raise exc
 
 
-def test_engine_flood_wait_breaker_and_cooldown(tmp_path):
+def test_engine_flood_wait_hard_block_on_long_wait(tmp_path):
+    """限流需等待 ≥FLOOD_HARD_BLOCK_SECONDS 时立即熔断该 bot（不等 3 次），
+    且暂停期内换 param 也不再发请求。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    engine, state = _engine(tmp_path)
+    client = FloodBotClient(wait_seconds=gc.FLOOD_HARD_BLOCK_SECONDS + 1417)
+
+    msg = _msg(text="抽奖 https://t.me/LotteryBot?start=act1")
+    asyncio.run(_run_process(engine, client, "acc", msg))
+    assert client.calls == 1
+    assert "acc|lotterybot" in engine._flood_bots
+    assert engine._flood_paused("acc", "LotteryBot")
+
+    # 同一 bot 的其它 param 也不再调用 start_bot
+    msg = _msg(text="抽奖 https://t.me/LotteryBot?start=act2")
+    asyncio.run(_run_process(engine, client, "acc", msg))
+    assert client.calls == 1
+
+    # 失败已记录为 flood_wait：has() 不算已参与，但冷却期内 is_blocked
+    assert not state.has("acc", "LotteryBot", "act1")
+    assert state.is_blocked("acc", "LotteryBot", "act1")
+
+
+def test_engine_flood_wait_breaker_after_three_short_floods(tmp_path):
+    """短限流（<FLOOD_HARD_BLOCK_SECONDS）按次数熔断：连续 3 次后跳过该 bot。"""
     import asyncio
 
     engine, state = _engine(tmp_path)
-    client = FloodBotClient()
+    client = FloodBotClient(wait_seconds=30)
 
-    # 连续 3 次限流（不同 param，模拟不同抽奖帖）：第 3 次后熔断该 bot
     for i in range(3):
         msg = _msg(text=f"抽奖 https://t.me/LotteryBot?start=act{i + 1}")
         asyncio.run(_run_process(engine, client, "acc", msg))
+        # 模拟暂停期已过（真实运行中要等 Telegram 给的秒数）
+        engine._flood_until.clear()
     assert client.calls == 3
     assert "acc|lotterybot" in engine._flood_bots
 
@@ -958,9 +986,18 @@ def test_engine_flood_wait_breaker_and_cooldown(tmp_path):
     assert client.calls == 3
     assert engine.failed == failed_before
 
-    # 失败已记录为 flood_wait：has() 不算已参与，但冷却期内 is_blocked
-    assert not state.has("acc", "LotteryBot", "act1")
-    assert state.is_blocked("acc", "LotteryBot", "act1")
+
+def test_flood_does_not_overwrite_joined_record(tmp_path):
+    """已参与的记录不能被后来的限流记录覆盖（否则成功会翻成失败并被重复参与）。"""
+    engine, state = _engine(tmp_path)
+    state.add("acc", "LotteryBot", "act1", note="joined")
+    exc = RuntimeError(
+        "Telegram says: [420 FLOOD_WAIT_X] - Please wait 1717 seconds"
+    )
+    exc.value = 1717
+    assert engine._record_flood("acc", "LotteryBot", "act1", "", exc)
+    assert state.has("acc", "LotteryBot", "act1")
+    assert not state.is_blocked("acc", "LotteryBot", "act1")
 
 
 def test_state_flood_wait_cooldown_expiry(tmp_path):
@@ -1228,6 +1265,64 @@ def test_click_confirm_clicks_plain_same_bot_url_button(tmp_path, monkeypatch):
     )
     asyncio.run(engine._click_confirm("acc", client, "SomeGiveBot", msg, "r1"))
     assert client.started == [("SomeGiveBot", "")]
+
+
+def test_click_confirm_skips_duplicate_same_param_start(tmp_path, monkeypatch):
+    """URL 按钮的 start 链接与本次已发 start 完全一致：视为已完成，
+    不再重复调用 StartBot（避免连续请求触发账号级限流）。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _CallbackClient(bot_users={"SameLinkBot"})
+    msg = _msg(
+        text="请点击下方按钮参与抽奖",
+        buttons=[[_btn("🎟️ 点击参与抽奖", url="https://t.me/SameLinkBot?start=p1")]],
+    )
+    asyncio.run(engine._click_confirm("acc", client, "SameLinkBot", msg, "p1"))
+    assert client.started == []
+    assert any("跳过重复 start" in line for line in logs)
+
+
+def test_click_confirm_flood_records_strike_and_blocks_bot(tmp_path, monkeypatch):
+    """确认按钮里的 StartBot 触发长限流时，同样登记熔断（旧版此处直接吞异常）。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    class _FloodConfirmClient(_CallbackClient):
+        async def start_bot(self, username, param):
+            self.started.append((username, param))
+            exc = RuntimeError(
+                "Telegram says: [420 FLOOD_WAIT_X] - Please wait 1717 seconds"
+            )
+            exc.value = 1717
+            raise exc
+
+    client = _FloodConfirmClient(bot_users={"FloodConfirmBot"})
+    msg = _msg(
+        text="请点击下方按钮参与抽奖",
+        buttons=[[_btn("🎟️ 点击参与抽奖", url="https://t.me/FloodConfirmBot?start=q1")]],
+    )
+    asyncio.run(engine._click_confirm("acc", client, "FloodConfirmBot", msg, "p1"))
+    assert "acc|floodconfirmbot" in engine._flood_bots
+    assert engine._flood_paused("acc", "FloodConfirmBot")
+    assert any("点击确认按钮" in line and "限流" in line for line in logs)
 
 
 def test_click_confirm_ignores_url_button_other_target(tmp_path, monkeypatch):
