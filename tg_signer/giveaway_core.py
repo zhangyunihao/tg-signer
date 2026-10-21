@@ -30,6 +30,7 @@ from tg_signer.giveaway_parsing import (
     _TME_RE,
     DEFAULT_CONFIRM_KEYWORDS,
     DEFAULT_KEYWORDS,
+    JOIN_REQUIRED_POPUP_RE,
     JOIN_RETRY_BUTTON_KEYWORDS,
     PASSWORD_REQUIRE_RE,
     SCORE_BUTTON_RE,
@@ -44,6 +45,7 @@ from tg_signer.giveaway_parsing import (
     _utf16_to_index,
     bot_is_blocked,
     bot_policy,
+    callback_answer_text,
     extract_bot_links,
     extract_channel_targets,
     extract_giveaway_title,
@@ -704,6 +706,11 @@ class GiveawayEngine:
                     source_message=message,
                 )
             return
+        # 先按帖内频道/群组链接自动加入：按钮型抽奖点击后 bot 会校验
+        # 「您未加入 XXX」，不先加入则点击无效
+        if self.auto_join:
+            if await self._join_from_message(account, client, "", message):
+                await asyncio.sleep(2)
         # 模拟人工点击节奏，避免连点触发风控
         lo, hi = self.delay_range
         if hi > 0:
@@ -727,7 +734,7 @@ class GiveawayEngine:
             self.failed += 1
             self.log(f"[{account}] 点击置顶抽奖帖「{btn.text}」按钮失败: {exc}")
             return
-        popup = str(getattr(answer, "text", "") or "").strip()
+        popup = callback_answer_text(answer)
         if popup and _POPUP_ENDED_RE.search(popup):
             if reserved:
                 self.joined -= 1
@@ -739,6 +746,16 @@ class GiveawayEngine:
             self.log(
                 f"[{account}] 置顶抽奖帖「{btn.text}」弹窗提示「{popup[:40]}」，"
                 "抽奖已结束，跳过"
+            )
+            return
+        # 「您未加入 XXX」类弹窗：参与条件未满足，点击未生效，不能记为成功
+        if popup and JOIN_REQUIRED_POPUP_RE.search(popup):
+            if reserved:
+                self.joined -= 1
+            self.failed += 1
+            self.log(
+                f"[{account}] 置顶抽奖帖「{btn.text}」弹窗提示「{popup[:60]}」，"
+                "参与条件未满足（未加入指定对象），未参与成功"
             )
             return
         if self._state is not None:
@@ -798,15 +815,19 @@ class GiveawayEngine:
                 return  # 收到停止信号
             except asyncio.TimeoutError:
                 logger.debug("历史补漏轮询等待超时，继续下一周期", exc_info=True)
-            if self.scanning:
-                continue  # 完整/手动扫描进行中，让路并重等一个周期
-            if self._rescue_suspended_until is not None:
-                if datetime.now() < self._rescue_suspended_until:
-                    continue
-                self._rescue_suspended_until = None
-                self._rescue_fail_streak = 0
-                self.log("历史补漏已从熔断暂停中恢复")
-            await self._rescue_round()
+            await self._rescue_tick()
+
+    async def _rescue_tick(self) -> None:
+        """补漏循环的单轮决策（不含等待）：扫描中让路、熔断中跳过、否则执行一轮。"""
+        if self.scanning:
+            return  # 完整/手动扫描进行中，让路并重等一个周期
+        if self._rescue_suspended_until is not None:
+            if datetime.now() < self._rescue_suspended_until:
+                return
+            self._rescue_suspended_until = None
+            self._rescue_fail_streak = 0
+            self.log("历史补漏已从熔断暂停中恢复")
+        await self._rescue_round()
 
     async def _rescue_round(self) -> None:
         """执行一轮补漏：每账号 × 每频道重拉最近 rescue_limit 条消息（多账号并行）。"""
@@ -1106,10 +1127,50 @@ class GiveawayEngine:
         """
         if self._stop is not None and self._stop.is_set():
             return None
+        tag = self._message_log_tag(message, skip_keywords)
+        # 开奖结果公告（抽奖已结束）：链接/按钮提取前直接过滤，置顶路径同样生效
+        if message_is_draw_announce(message):
+            if log_skips:
+                self.log(f"[{account}] {tag} 开奖结果公告，跳过")
+            return None
+        links = self._candidate_bot_links(message)
+        if not links:
+            await self._handle_missing_bot_links(
+                account, client, message, tag, skip_keywords, log_skips
+            )
+            return None
+        if self._message_filtered_out(
+            account, message, tag, skip_keywords, log_skips
+        ):
+            return None
+        channel = self._chat_title(message)
+        title = _giveaway_title(message)
+        expired = self._expired_draw_status(account, message, tag)
+        if expired is not None:
+            return expired
+        if self._join_cap_reached(account):
+            return None
+        participated = 0
+        # 先过滤出可参与的链接（未参与过/未冷却/未熔断），全部不可参与时
+        # 连「命中」日志也静默，避免熔断或历史去重期间刷屏
+        actionable = self._filter_actionable_links(account, links)
+        if not actionable:
+            if log_skips:
+                self.log(
+                    f"[{account}] {tag} 命中 {len(links)} 个链接但均不可参与"
+                    "（已参与过/已结束/限流熔断），跳过"
+                )
+            return "joined" if participated else None
+        participated = await self._participate_actionable_links(
+            account, client, message, channel, title, actionable
+        )
+        return "joined" if participated else None
+
+    def _message_log_tag(self, message: Any, skip_keywords: bool) -> str:
         text = " ".join((_message_text(message) or "").split())
         mid = getattr(message, "id", None)
         # 置顶路径标「置顶消息」，历史扫描标「消息」，便于区分日志来源
-        tag = (
+        return (
             ("置顶消息 " if skip_keywords else "消息 ")
             + (str(mid) if mid is not None else "?")
             + (
@@ -1118,40 +1179,58 @@ class GiveawayEngine:
                 else (f"「{text}」" if text else "")
             )
         )
-        # 开奖结果公告（抽奖已结束）：链接/按钮提取前直接过滤，置顶路径同样生效
-        if message_is_draw_announce(message):
-            if log_skips:
-                self.log(f"[{account}] {tag} 开奖结果公告，跳过")
-            return None
+
+    @staticmethod
+    def _candidate_bot_links(message: Any) -> list:
         links = extract_bot_links(message)
         # 黑名单 bot 的链接不作为抽奖链接（整条消息无可用链接时直接跳过）
-        links = [ln for ln in links if not bot_is_blocked(ln[0])]
-        if not links:
-            if log_skips:
-                self.log(f"[{account}] {tag} 无可用抽奖 bot 链接，跳过")
-            if skip_keywords:
-                # 群组置顶的「按钮型」抽奖：帖内无可 start 的 bot 链接
-                # （或仅剩黑名单推广链接），但帖上带「参与抽奖」按钮，
-                # 直接点击源帖按钮完成参与
-                await self._participate_via_source_button(account, client, message)
-            return None
+        return [ln for ln in links if not bot_is_blocked(ln[0])]
+
+    async def _handle_missing_bot_links(
+        self,
+        account: str,
+        client: Any,
+        message: Any,
+        tag: str,
+        skip_keywords: bool,
+        log_skips: bool,
+    ) -> None:
+        if log_skips:
+            self.log(f"[{account}] {tag} 无可用抽奖 bot 链接，跳过")
+        if skip_keywords:
+            # 群组置顶的「按钮型」抽奖：帖内无可 start 的 bot 链接
+            # （或仅剩黑名单推广链接），但帖上带「参与抽奖」按钮，
+            # 直接点击源帖按钮完成参与
+            await self._participate_via_source_button(account, client, message)
+
+    def _message_filtered_out(
+        self,
+        account: str,
+        message: Any,
+        tag: str,
+        skip_keywords: bool,
+        log_skips: bool,
+    ) -> bool:
         if not skip_keywords and not message_matches_keywords(message, self.keywords):
             # 消息含 bot 链接但关键词未命中：静默跳过（日志逐条刷屏，不再打印）
-            return None
+            return True
         # 归属地限制过滤：仅参与无地区限制或含白名单地区的抽奖（对群组置顶同样生效）
         if not message_region_allowed(message):
             if log_skips:
                 self.log(f"[{account}] {tag} 含地区限制，跳过")
-            return None
+            return True
         # 发言数要求/口令要求 + 双向账户：无法达标，自动跳过（对群组置顶同样生效）
         if account in self.two_way_accounts and (
             message_requires_speech(message) or message_requires_password(message)
         ):
             if log_skips:
                 self.log(f"[{account}] {tag} 需发言数/口令，双向账户无法达标，跳过")
-            return None
-        channel = self._chat_title(message)
-        title = _giveaway_title(message)
+            return True
+        return False
+
+    def _expired_draw_status(
+        self, account: str, message: Any, tag: str
+    ) -> Optional[str]:
         # 开奖日期早于当前时间：自动跳过（始终带诊断日志，见下方注释）
         draw_dt = parse_draw_date(_message_text(message))
         if draw_dt is not None and draw_dt < datetime.now():
@@ -1161,6 +1240,9 @@ class GiveawayEngine:
                 f"（{draw_dt.strftime('%Y-%m-%d %H:%M')}），跳过"
             )
             return "expired"
+        return None
+
+    def _join_cap_reached(self, account: str) -> bool:
         # 参与条数上限（None = 不限），达到后本轮不再参与
         if self.max_joins is not None and self.joined >= self.max_joins:
             cap_key = ("cap", account)
@@ -1169,43 +1251,55 @@ class GiveawayEngine:
                 self.log(
                     f"[{account}] 已达参与上限 {self.max_joins} 个，后续命中不再参与"
                 )
-            return None
-        participated = 0
-        # 先过滤出可参与的链接（未参与过/未冷却/未熔断），全部不可参与时
-        # 连「命中」日志也静默，避免熔断或历史去重期间刷屏
+            return True
+        return False
+
+    def _filter_actionable_links(self, account: str, links: list) -> list:
         actionable: list = []
         for username, param in links:
             if self._stop is not None and self._stop.is_set():
                 break
             if self.max_joins is not None and self.joined >= self.max_joins:
                 break
-            if self._state is not None and self._state.is_ended(
-                account, username, param
-            ):
-                continue  # bot 曾回复「已结束」＝终态，静默跳过
-            if self._participated_before(account, username, param):
-                continue  # 已参与过且未忽略历史，静默跳过
-            if self._state is not None and self._state.is_blocked(
-                account, username, param
-            ):
+            if not self._link_is_actionable(account, username, param):
                 continue
-            if self._flood_key(account, username) in self._flood_bots:
-                continue
-            if self._flood_key(account, username) in self._ended_bots:
-                continue  # 已结束回复熔断的 bot，静默跳过
             actionable.append((username, param))
-        if not actionable:
-            if log_skips:
-                self.log(
-                    f"[{account}] {tag} 命中 {len(links)} 个链接但均不可参与"
-                    "（已参与过/已结束/限流熔断），跳过"
-                )
-            return "joined" if participated else None
+        return actionable
+
+    def _link_is_actionable(
+        self, account: str, username: str, param: str
+    ) -> bool:
+        if self._state is not None and self._state.is_ended(
+            account, username, param
+        ):
+            return False  # bot 曾回复「已结束」＝终态，静默跳过
+        if self._participated_before(account, username, param):
+            return False  # 已参与过且未忽略历史，静默跳过
+        if self._state is not None and self._state.is_blocked(
+            account, username, param
+        ):
+            return False
+        if self._flood_key(account, username) in self._flood_bots:
+            return False
+        if self._flood_key(account, username) in self._ended_bots:
+            return False  # 已结束回复熔断的 bot，静默跳过
+        return True
+
+    async def _participate_actionable_links(
+        self,
+        account: str,
+        client: Any,
+        message: Any,
+        channel: str,
+        title: str,
+        actionable: list,
+    ) -> int:
         # 命中多少个抽奖入口一目了然
         self.log(
             f"[{account}] 命中 {len(actionable)} 个抽奖链接："
             + "、".join(f"@{u}" for u, _ in actionable)
         )
+        participated = 0
         for username, param in actionable:
             # 名额上限在此快速检查；同步预留与失败归还在 _participate 内完成
             if self.max_joins is not None and self.joined >= self.max_joins:
@@ -1222,7 +1316,7 @@ class GiveawayEngine:
             )
             if self.joined > before:
                 participated += 1
-        return "joined" if participated else None
+        return participated
 
     async def _is_bot(self, account: str, client: Any, username: str) -> bool:
         cache_key = f"{account}|{username.lower()}"
@@ -1417,6 +1511,29 @@ class GiveawayEngine:
     ) -> bool:
         """激进模式：把消息中出现的频道/群组链接逐个加入。返回是否发生加入。"""
         joined_any = False
+        label = f"@{bot_username}" if bot_username else "置顶抽奖帖"
+        if self._join_paused():
+            return False
+        targets = self._join_targets(account, bot_username, message)
+        for target in targets:
+            if target.lower().lstrip("@") == bot_username.lower():
+                continue  # 跳过 bot 自己
+            key = f"{account}|{target.lower()}"
+            if key in self._join_cache:
+                continue
+            self._join_cache.add(key)
+            if not await self._should_join_target(account, client, target, label):
+                continue
+            joined, flood_paused = await self._join_single_target(
+                account, client, target, label
+            )
+            if joined:
+                joined_any = True
+            if flood_paused:
+                break  # 已被限流，本条消息剩余目标一并跳过
+        return joined_any
+
+    def _join_paused(self) -> bool:
         if (
             self._join_suspended_until is not None
             and datetime.now() < self._join_suspended_until
@@ -1427,118 +1544,132 @@ class GiveawayEngine:
                     "自动加入被限流暂停中，恢复时间 "
                     f"{self._join_suspended_until:%H:%M}（暂停期间跳过所有加入）"
                 )
-            return False
+            return True
+        return False
+
+    def _join_targets(
+        self, account: str, bot_username: str, message: Any
+    ) -> List[str]:
         targets = extract_channel_targets(message)
-        if bot_policy(bot_username).join_status_checklist:
-            # LotteryBestBot 的回复把「加入-名称」做成带隐藏链接的❌/✅清单，
-            # 补充提取其中 ❌（未加入）行的链接目标
-            known = {t.lower() for t in targets}
-            status_targets = [
-                t
-                for t in extract_join_status_targets(message)
-                if t.lower() not in known
-            ]
-            if not status_targets:
-                raw = _message_text(message)
-                # 「└ 🎟️ 发言数大于 N 条 ❌」等激活任务子行也带 ❌，但不含
-                # 「加入」，属于正常状态不是未加入频道行；仅当存在真正的
-                # 「加入-名称 ❌」行却提取不到链接时才报诊断，避免发言任务
-                # 行触发解析失败误报
-                has_unjoined_row = bool(raw) and any(
-                    "加入" in ln and "❌" in ln and "✅" not in ln
-                    for ln in raw.split("\n")
-                )
-                if raw and has_unjoined_row:
-                    # 逐行明细：每行文本 + 挂在该行上的链接实体，
-                    # 用于定位 ❌ 行是链接缺失还是行匹配失败
-                    ents = list(getattr(message, "entities", None) or []) + list(
-                        getattr(message, "caption_entities", None) or []
-                    )
-                    line_urls: Dict[int, List[str]] = {}
-                    bounds: List[Tuple[int, int]] = []
-                    pos = 0
-                    for ln in raw.split("\n"):
-                        bounds.append((pos, pos + len(ln)))
-                        pos += len(ln) + 1
-                    for ent in ents:
-                        url = getattr(ent, "url", None)
-                        if not url:
-                            continue
-                        off = _utf16_to_index(raw, int(getattr(ent, "offset", 0) or 0))
-                        for idx, (ls, le) in enumerate(bounds):
-                            if ls <= off <= le:
-                                line_urls.setdefault(idx, []).append(str(url))
-                                break
-                    detail = "；".join(
-                        "L{}`{}`{}`".format(
-                            i + 1,
-                            raw[ls:le].strip()[:36],
-                            ("→" + "、".join(line_urls[i])) if i in line_urls else "",
-                        )
-                        for i, (ls, le) in enumerate(bounds)
-                        if "❌" in raw[ls:le] or "✅" in raw[ls:le] or i in line_urls
-                    )
-                    self.log(
-                        f"[{account}] @LotteryBestBot 清单含未加入(❌)行但未解析到"
-                        f"链接（逐行明细：{detail}）"
-                    )
-            targets = targets + status_targets
-        for target in targets:
-            if target.lower().lstrip("@") == bot_username.lower():
-                continue  # 跳过 bot 自己
-            key = f"{account}|{target.lower()}"
-            if key in self._join_cache:
+        if not bot_policy(bot_username).join_status_checklist:
+            return targets
+        # LotteryBestBot 的回复把「加入-名称」做成带隐藏链接的❌/✅清单，
+        # 补充提取其中 ❌（未加入）行的链接目标
+        known = {t.lower() for t in targets}
+        status_targets = [
+            t for t in extract_join_status_targets(message) if t.lower() not in known
+        ]
+        if not status_targets:
+            self._log_join_status_diagnostic(account, message)
+        return targets + status_targets
+
+    def _log_join_status_diagnostic(self, account: str, message: Any) -> None:
+        raw = _message_text(message)
+        # 「└ 🎟️ 发言数大于 N 条 ❌」等激活任务子行也带 ❌，但不含
+        # 「加入」，属于正常状态不是未加入频道行；仅当存在真正的
+        # 「加入-名称 ❌」行却提取不到链接时才报诊断，避免发言任务
+        # 行触发解析失败误报
+        has_unjoined_row = bool(raw) and any(
+            "加入" in ln and "❌" in ln and "✅" not in ln
+            for ln in raw.split("\n")
+        )
+        if not (raw and has_unjoined_row):
+            return
+        detail = self._describe_unjoined_rows(raw, message)
+        self.log(
+            f"[{account}] @LotteryBestBot 清单含未加入(❌)行但未解析到"
+            f"链接（逐行明细：{detail}）"
+        )
+
+    def _describe_unjoined_rows(self, raw: str, message: Any) -> str:
+        # 逐行明细：每行文本 + 挂在该行上的链接实体，
+        # 用于定位 ❌ 行是链接缺失还是行匹配失败
+        ents = list(getattr(message, "entities", None) or []) + list(
+            getattr(message, "caption_entities", None) or []
+        )
+        line_urls: Dict[int, List[str]] = {}
+        bounds: List[Tuple[int, int]] = []
+        pos = 0
+        for ln in raw.split("\n"):
+            bounds.append((pos, pos + len(ln)))
+            pos += len(ln) + 1
+        for ent in ents:
+            url = getattr(ent, "url", None)
+            if not url:
                 continue
-            self._join_cache.add(key)
-            # 用户名目标先识别类型：个人用户/机器人/失效目标直接跳过，
-            # 避免发出注定失败的 JoinChannel（CHANNEL_INVALID 噪音）。
-            # 私有邀请链接（+hash/joinchat）无法预解析，仍直接尝试加入。
-            if not target.lower().startswith(("http://", "https://")):
-                type_name = await self._resolve_join_target_type(client, target)
-                if type_name is None:
-                    self.log(f"[{account}] 跳过无效目标 {target}（无法解析或已失效）")
-                    continue
-                if type_name not in ("GROUP", "SUPERGROUP", "CHANNEL"):
-                    continue  # 个人用户/机器人，静默跳过
-                # 加入前检查成员身份：能看到哪些目标还没加入（bot 常要求
-                # 加入频道后才给抽奖资格）
-                already_member = await self._is_member(client, target)
-                if already_member:
-                    self.log(f"[{account}] 已在 {target} 中，跳过加入")
-                    continue
+            off = _utf16_to_index(raw, int(getattr(ent, "offset", 0) or 0))
+            for idx, (ls, le) in enumerate(bounds):
+                if ls <= off <= le:
+                    line_urls.setdefault(idx, []).append(str(url))
+                    break
+        return "；".join(
+            "L{}`{}`{}`".format(
+                i + 1,
+                raw[ls:le].strip()[:36],
+                ("→" + "、".join(line_urls[i])) if i in line_urls else "",
+            )
+            for i, (ls, le) in enumerate(bounds)
+            if "❌" in raw[ls:le] or "✅" in raw[ls:le] or i in line_urls
+        )
+
+    async def _should_join_target(
+        self, account: str, client: Any, target: str, label: str
+    ) -> bool:
+        # 用户名目标先识别类型：个人用户/机器人/失效目标直接跳过，
+        # 避免发出注定失败的 JoinChannel（CHANNEL_INVALID 噪音）。
+        # 私有邀请链接（+hash/joinchat）无法预解析，仍直接尝试加入。
+        if not target.lower().startswith(("http://", "https://")):
+            type_name = await self._resolve_join_target_type(client, target)
+            if type_name is None:
+                self.log(f"[{account}] 跳过无效目标 {target}（无法解析或已失效）")
+                return False
+            if type_name not in ("GROUP", "SUPERGROUP", "CHANNEL"):
+                return False  # 个人用户/机器人，静默跳过
+            # 加入前检查成员身份：能看到哪些目标还没加入（bot 常要求
+            # 加入频道后才给抽奖资格）
+            already_member = await self._is_member(client, target)
+            if already_member:
+                self.log(f"[{account}] 已在 {target} 中，跳过加入")
+                return False
+            self.log(
+                f"[{account}] 尚未加入 {target}"
+                f"（{label} 要求加入后才能参与，自动加入中）"
+            )
+        return True
+
+    async def _join_single_target(
+        self, account: str, client: Any, target: str, label: str
+    ) -> Tuple[bool, bool]:
+        """加入单个目标，返回（是否发生加入，是否因限流中断后续目标）。"""
+        try:
+            chat = await client.join_chat(target)
+            title = str(getattr(chat, "title", "") or target)
+            self.log(f"[{account}] 已加入 {title}（来自 {label}）")
+            return True, False
+        except Exception as exc:
+            msg = str(exc)
+            if "ALREADY_PARTICIPANT" in msg or "already" in msg.lower():
+                self.log(f"[{account}] 已在 {target} 中，跳过加入")
+            elif "INVITE_REQUEST_SENT" in msg:
                 self.log(
-                    f"[{account}] 尚未加入 {target}"
-                    f"（@{bot_username} 要求加入后才能参与，自动加入中）"
+                    f"[{account}] 已提交加入 {target} 的申请"
+                    "（私有群/频道，待管理员审批）"
                 )
-            try:
-                chat = await client.join_chat(target)
-                title = str(getattr(chat, "title", "") or target)
-                self.log(f"[{account}] 已加入 {title}（来自 @{bot_username} 的消息）")
-                joined_any = True
-            except Exception as exc:
-                msg = str(exc)
-                if "ALREADY_PARTICIPANT" in msg or "already" in msg.lower():
-                    self.log(f"[{account}] 已在 {target} 中，跳过加入")
-                elif "INVITE_REQUEST_SENT" in msg:
-                    self.log(
-                        f"[{account}] 已提交加入 {target} 的申请"
-                        "（私有群/频道，待管理员审批）"
-                    )
-                    joined_any = True
-                elif "FLOOD_WAIT" in msg:
-                    wait = self._flood_seconds(exc) or 60
-                    self._join_suspended_until = datetime.now() + timedelta(
-                        seconds=wait + 10
-                    )
-                    self._join_suspend_logged = False
-                    self.log(
-                        f"[{account}] 加入频道触发限流（需等待 {wait} 秒），"
-                        f"自动加入暂停至 {self._join_suspended_until:%H:%M}"
-                    )
-                    break  # 已被限流，本条消息剩余目标一并跳过
-                else:
-                    self.log(f"[{account}] 加入 {target} 失败: {msg[:120]}")
-        return joined_any
+                return True, False
+            elif "FLOOD_WAIT" in msg:
+                wait = self._flood_seconds(exc) or 60
+                self._join_suspended_until = datetime.now() + timedelta(
+                    seconds=wait + 10
+                )
+                self._join_suspend_logged = False
+                self.log(
+                    f"[{account}] 加入频道触发限流（需等待 {wait} 秒），"
+                    f"自动加入暂停至 {self._join_suspended_until:%H:%M}"
+                )
+                return False, True
+            else:
+                self.log(f"[{account}] 加入 {target} 失败: {msg[:120]}")
+            return False, False
 
     async def _send_password_tasks(
         self,
@@ -1563,6 +1694,30 @@ class GiveawayEngine:
         # Telegram 风控（USER_BANNED_IN_CHANNEL），跳过保持静默
         if account in self.two_way_accounts:
             return
+        tasks = self._collect_password_tasks(bot_messages, source_message)
+        if not tasks:
+            return
+        name_links = self._collect_join_name_links(bot_messages, link_messages)
+        for group_name, password in tasks:
+            sent_key = f"{account}|{username}|{group_name.lower()}|{password}"
+            if not ignore_sent and sent_key in self._password_sent:
+                continue
+            target = self._match_password_target(group_name, name_links)
+            if target is None:
+                self._log_missing_password_target(account, group_name, password)
+                continue
+            send_target = await self._prepare_password_send_target(
+                account, client, group_name, password, target
+            )
+            if send_target is None:
+                continue
+            await self._send_password_to_target(
+                account, client, username, group_name, password, sent_key, send_target
+            )
+
+    def _collect_password_tasks(
+        self, bot_messages: List[Any], source_message: Any
+    ) -> List[Tuple[str, str]]:
         # 口令任务以 bot 回复清单为准（原帖与回复都可能出现「发送口令﹝xx﹞」行）：
         # bot 返回了口令任务（❌ 未完成行）才发送，✅ 行已发送过自动跳过。
         # 仅当 bot 回复完全不带口令要求时才回退解析原始抽奖帖，兼容帖内
@@ -1579,8 +1734,11 @@ class GiveawayEngine:
                     tasks.append(task)
         if not tasks and not bot_mentions_password and source_message is not None:
             tasks = extract_password_tasks(source_message)
-        if not tasks:
-            return
+        return tasks
+
+    def _collect_join_name_links(
+        self, bot_messages: List[Any], link_messages: Optional[List[Any]]
+    ) -> Dict[str, str]:
         # bot 回复清单「加入-名称」行的（名称 → 目标）映射，❌/✅ 行均收集：
         # 口令群即使已加入（✅）也需拿到目标才能发言；补发场景可传入
         # 更早的回复一并定位（link_messages 优先级高于 bot_messages）
@@ -1592,127 +1750,148 @@ class GiveawayEngine:
         for message in link_sources:
             for name, target in extract_join_name_links(message):
                 name_links.setdefault(name.lower(), target)
-        for group_name, password in tasks:
-            sent_key = f"{account}|{username}|{group_name.lower()}|{password}"
-            if not ignore_sent and sent_key in self._password_sent:
-                continue
-            target = name_links.get(group_name.lower())
-            if target is None:
-                # 名称不完全一致时按包含关系模糊匹配（帖子群名 vs 清单行名）
-                target = next(
-                    (
-                        t
-                        for n, t in name_links.items()
-                        if group_name in n or n in group_name
-                    ),
-                    None,
+        return name_links
+
+    @staticmethod
+    def _match_password_target(
+        group_name: str, name_links: Dict[str, str]
+    ) -> Optional[str]:
+        target = name_links.get(group_name.lower())
+        if target is not None:
+            return target
+        # 名称不完全一致时按包含关系模糊匹配（帖子群名 vs 清单行名）
+        return next(
+            (
+                t
+                for n, t in name_links.items()
+                if group_name in n or n in group_name
+            ),
+            None,
+        )
+
+    def _log_missing_password_target(
+        self, account: str, group_name: str, password: str
+    ) -> None:
+        self.log(
+            f"[{account}] 口令群「{group_name}」未在清单中定位到链接，"
+            "跳过发送口令"
+        )
+        # 记录未完成发言任务（消息中心展示，发送成功后自动消除）
+        self._emit(
+            {
+                "type": "speak_failed",
+                "account": account,
+                "group": group_name,
+                "password": password,
+                "error": "未在清单中定位到口令群组链接",
+            }
+        )
+
+    def _log_password_group_join_failure(
+        self, account: str, group_name: str, password: str, detail: str
+    ) -> None:
+        self.log(
+            f"[{account}] 加入口令群「{group_name}」失败，"
+            f"无法发送口令: {detail}"
+        )
+        self._emit(
+            {
+                "type": "speak_failed",
+                "account": account,
+                "group": group_name,
+                "password": password,
+                "error": f"加入口令群失败: {detail}",
+            }
+        )
+
+    async def _prepare_password_send_target(
+        self, account: str, client: Any, group_name: str, password: str, target: str
+    ) -> Any:
+        # 私有邀请链接目标：先解析成真实 chat id（未加入则顺带加入），
+        # 直接拿链接字符串 send_message 会误走用户名解析必失败
+        send_target: Any = target
+        invite_match = _INVITE_LINK_RE.match(str(target).strip())
+        if invite_match:
+            send_target = await self._resolve_invite_target(
+                client, invite_match.group(1), str(target).strip()
+            )
+            if send_target is None:
+                self._log_password_group_join_failure(
+                    account,
+                    group_name,
+                    password,
+                    "邀请链接解析失败（私有群可能需管理员审批）",
                 )
-            if target is None:
-                self.log(
-                    f"[{account}] 口令群「{group_name}」未在清单中定位到链接，"
-                    "跳过发送口令"
-                )
-                # 记录未完成发言任务（消息中心展示，发送成功后自动消除）
-                self._emit(
-                    {
-                        "type": "speak_failed",
-                        "account": account,
-                        "group": group_name,
-                        "password": password,
-                        "error": "未在清单中定位到口令群组链接",
-                    }
-                )
-                continue
-            # 私有邀请链接目标：先解析成真实 chat id（未加入则顺带加入），
-            # 直接拿链接字符串 send_message 会误走用户名解析必失败
-            send_target: Any = target
-            invite_match = _INVITE_LINK_RE.match(str(target).strip())
-            if invite_match:
-                send_target = await self._resolve_invite_target(
-                    client, invite_match.group(1), str(target).strip()
-                )
-                if send_target is None:
-                    self.log(
-                        f"[{account}] 加入口令群「{group_name}」失败，"
-                        "无法发送口令: 邀请链接解析失败（私有群可能需管理员审批）"
-                    )
-                    self._emit(
-                        {
-                            "type": "speak_failed",
-                            "account": account,
-                            "group": group_name,
-                            "password": password,
-                            "error": "加入口令群失败: 邀请链接解析失败（私有群可能需管理员审批）",
-                        }
-                    )
-                    continue
-                # 解析即加入：无需再做成员检查/二次 join
-                already = True
-            else:
-                already = await self._is_member(client, send_target)
-            if already is False:
-                try:
-                    await client.join_chat(send_target)
-                    self.log(f"[{account}] 已加入口令群「{group_name}」")
-                    # 成员状态同步后再发言，避免 bot 侧校验不到
-                    await asyncio.sleep(3)
-                except Exception as exc:
-                    self.log(
-                        f"[{account}] 加入口令群「{group_name}」失败，"
-                        f"无法发送口令: {str(exc)[:120]}"
-                    )
-                    self._emit(
-                        {
-                            "type": "speak_failed",
-                            "account": account,
-                            "group": group_name,
-                            "password": password,
-                            "error": f"加入口令群失败: {str(exc)[:120]}",
-                        }
-                    )
-                    continue
+                return None
+            # 解析即加入：无需再做成员检查/二次 join
+            already = True
+        else:
+            already = await self._is_member(client, send_target)
+        if already is False:
             try:
-                # 随机延迟错峰：多账号不在同一时刻向同群发言
-                await asyncio.sleep(random.uniform(2.0, 6.0))
-                try:
-                    await client.send_message(send_target, password)
-                except Exception as resolve_exc:
-                    # 公开用户名失效（群改名/收回用户名）：按群名在账号已
-                    # 加入会话中精确匹配兜底；其余异常原样抛出
-                    if not _is_username_resolve_error(resolve_exc):
-                        raise
-                    fallback = await self._find_dialog_by_title(client, group_name)
-                    if fallback is None:
-                        raise
-                    self.log(
-                        f"[{account}] 口令群「{group_name}」链接解析失败，"
-                        "已按群名匹配已加入会话兜底发送"
-                    )
-                    await client.send_message(fallback, password)
-                self._password_sent.add(sent_key)
-                self.log(
-                    f"[{account}] 已在「{group_name}」发送口令"
-                    f"（@{username} 要求：{password}）"
-                )
-                self._emit(
-                    {
-                        "type": "speak_done",
-                        "account": account,
-                        "group": group_name,
-                        "password": password,
-                    }
-                )
+                await client.join_chat(send_target)
+                self.log(f"[{account}] 已加入口令群「{group_name}」")
+                # 成员状态同步后再发言，避免 bot 侧校验不到
+                await asyncio.sleep(3)
             except Exception as exc:
-                self.log(f"[{account}] 发送口令失败（{group_name}）: {str(exc)[:120]}")
-                self._emit(
-                    {
-                        "type": "speak_failed",
-                        "account": account,
-                        "group": group_name,
-                        "password": password,
-                        "error": str(exc)[:120],
-                    }
+                self._log_password_group_join_failure(
+                    account, group_name, password, str(exc)[:120]
                 )
+                return None
+        return send_target
+
+    async def _send_password_to_target(
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        group_name: str,
+        password: str,
+        sent_key: str,
+        send_target: Any,
+    ) -> None:
+        try:
+            # 随机延迟错峰：多账号不在同一时刻向同群发言
+            await asyncio.sleep(random.uniform(2.0, 6.0))
+            try:
+                await client.send_message(send_target, password)
+            except Exception as resolve_exc:
+                # 公开用户名失效（群改名/收回用户名）：按群名在账号已
+                # 加入会话中精确匹配兜底；其余异常原样抛出
+                if not _is_username_resolve_error(resolve_exc):
+                    raise
+                fallback = await self._find_dialog_by_title(client, group_name)
+                if fallback is None:
+                    raise
+                self.log(
+                    f"[{account}] 口令群「{group_name}」链接解析失败，"
+                    "已按群名匹配已加入会话兜底发送"
+                )
+                await client.send_message(fallback, password)
+            self._password_sent.add(sent_key)
+            self.log(
+                f"[{account}] 已在「{group_name}」发送口令"
+                f"（@{username} 要求：{password}）"
+            )
+            self._emit(
+                {
+                    "type": "speak_done",
+                    "account": account,
+                    "group": group_name,
+                    "password": password,
+                }
+            )
+        except Exception as exc:
+            self.log(f"[{account}] 发送口令失败（{group_name}）: {str(exc)[:120]}")
+            self._emit(
+                {
+                    "type": "speak_failed",
+                    "account": account,
+                    "group": group_name,
+                    "password": password,
+                    "error": str(exc)[:120],
+                }
+            )
 
     async def _resolve_invite_target(
         self, client: Any, invite_hash: str, invite_link: str
@@ -1982,7 +2161,7 @@ class GiveawayEngine:
                             callback_data=btn.callback_data,
                         )
                         # 弹窗提示终态（抽奖已结束）＝不再跟进
-                        popup = str(getattr(answer, "text", "") or "").strip()
+                        popup = callback_answer_text(answer)
                         if popup and _POPUP_ENDED_RE.search(popup):
                             self._note_ended(account, username)
                             self.log(
@@ -2019,6 +2198,43 @@ class GiveawayEngine:
         source_message: Any = None,
     ) -> None:
         """start 后跟进：自动加入 bot 消息中的频道（若开启），并点确认按钮。"""
+        ended, candidates = self._initial_confirm_candidates(
+            account, username, start_msg, source_message
+        )
+        if ended:
+            return
+        if self.confirm_wait > 0:
+            if await self._poll_confirm_candidates(
+                account, client, username, candidates
+            ):
+                return
+        # 「防脚本验证」（如 @dbchoujiang123_bot）：按正文顺序点击 emoji 按钮
+        # 完成人机校验，再刷新候选，让后续加入/确认流程看到验证后的消息
+        await self._refresh_candidates_after_verification(
+            account, client, username, candidates
+        )
+        if self.auto_join:
+            stop, had_join_targets, candidates = await self._auto_join_and_restart(
+                account, client, username, param, source_message, candidates
+            )
+            if stop:
+                return
+        stop_set = self._stop is not None and self._stop.is_set()
+        if had_join_targets and not stop_set:
+            # 加入频道后稍等再点确认按钮，给 bot 侧成员状态同步留时间，
+            # 避免「立刻参加抽奖」点了却因身份未同步而不生效
+            await asyncio.sleep(5)
+        await self._click_first_confirm_button(
+            account, client, username, candidates
+        )
+
+    def _initial_confirm_candidates(
+        self,
+        account: str,
+        username: str,
+        start_msg: Any,
+        source_message: Any,
+    ) -> Tuple[bool, List[Any]]:
         candidates: List[Any] = []
         # 原始抽奖帖参与条件中的频道（如「加入：xx 频道」）与 bot 回复一并进行提取，
         # 否则只覆盖 bot 回复会漏加原始帖列出的频道
@@ -2031,211 +2247,260 @@ class GiveawayEngine:
             if reply_says_ended(start_msg):
                 self._note_ended(account, username)
                 self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
-                return
-        if self.confirm_wait > 0:
-            # 按 confirm_wait 换算固定轮询次数（而非读墙钟）：总等待时长不变，
-            # 但不再依赖真实时间流逝，单测注入 no-op sleep 时行为完全确定
-            poll_times = max(1, int(round(self.confirm_wait / 1.5)))
-            for _ in range(poll_times):
-                await asyncio.sleep(1.5)
-                fresh: List[Any] = []
-                try:
-                    async for recent in client.get_chat_history(username, limit=4):
-                        fresh.append(recent)
-                        await self._check_win_message(account, client, username, recent)
-                except Exception:
-                    logger.debug("轮询拉取 bot 最新消息失败", exc_info=True)
-                candidates.extend(fresh)
-                # 仅核对最新一条（get_chat_history 按新到旧返回）：
-                # 会话里历史遗留的旧「已结束」回复不应误杀本次参与
-                if fresh and reply_says_ended(fresh[0]):
-                    self._note_ended(account, username)
-                    self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
-                    return
-                if any(self._find_confirm_button(m) is not None for m in candidates):
-                    break
-                # 防脚本验证消息没有确认按钮：提前结束轮询交给验证处理
-                if any(is_emoji_verify_message(m) for m in candidates):
-                    break
-        # 「防脚本验证」（如 @dbchoujiang123_bot）：按正文顺序点击 emoji 按钮
-        # 完成人机校验，再刷新候选，让后续加入/确认流程看到验证后的消息
+                return True, candidates
+        return False, candidates
+
+    async def _poll_confirm_candidates(
+        self, account: str, client: Any, username: str, candidates: List[Any]
+    ) -> bool:
+        """轮询 bot 最新消息直到出现确认按钮/验证；返回是否因已结束而中止。"""
+        # 按 confirm_wait 换算固定轮询次数（而非读墙钟）：总等待时长不变，
+        # 但不再依赖真实时间流逝，单测注入 no-op sleep 时行为完全确定
+        poll_times = max(1, int(round(self.confirm_wait / 1.5)))
+        for _ in range(poll_times):
+            await asyncio.sleep(1.5)
+            fresh: List[Any] = []
+            try:
+                async for recent in client.get_chat_history(username, limit=4):
+                    fresh.append(recent)
+                    await self._check_win_message(account, client, username, recent)
+            except Exception:
+                logger.debug("轮询拉取 bot 最新消息失败", exc_info=True)
+            candidates.extend(fresh)
+            # 仅核对最新一条（get_chat_history 按新到旧返回）：
+            # 会话里历史遗留的旧「已结束」回复不应误杀本次参与
+            if fresh and reply_says_ended(fresh[0]):
+                self._note_ended(account, username)
+                self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
+                return True
+            if any(self._find_confirm_button(m) is not None for m in candidates):
+                break
+            # 防脚本验证消息没有确认按钮：提前结束轮询交给验证处理
+            if any(is_emoji_verify_message(m) for m in candidates):
+                break
+        return False
+
+    async def _refresh_candidates_after_verification(
+        self, account: str, client: Any, username: str, candidates: List[Any]
+    ) -> None:
         if await self._handle_emoji_verification(account, client, username, candidates):
             await asyncio.sleep(2)
             await self._append_recent_bot_messages(
                 account, client, username, candidates
             )
-        if self.auto_join:
-            did_join = False
-            had_join_targets = False
-            for message in candidates:
-                # 排除指向当前 bot 自身的 t.me 链接（按钮「点击参与抽奖」等）：
-                # 那是参与入口不是加入目标，交给下方 URL 按钮点击逻辑处理
-                join_targets = [
-                    t
-                    for t in extract_channel_targets(message)
-                    if str(t).lower().lstrip("@") != username.lower()
-                ]
-                if join_targets or (
-                    bot_policy(username).join_status_checklist
-                    and extract_join_status_targets(message)
-                ):
-                    had_join_targets = True
-                if await self._join_from_message(account, client, username, message):
-                    did_join = True
-            if did_join:
-                # 加入后稍等，再拉一轮消息（bot 可能更新了按钮/提示）
-                await asyncio.sleep(3)
-                try:
-                    async for recent in client.get_chat_history(username, limit=4):
-                        candidates.append(recent)
-                        await self._check_win_message(account, client, username, recent)
-                except Exception:
-                    logger.debug("加入频道后拉取 bot 最新消息失败", exc_info=True)
-            # 帖内口令任务：加入完成后按 bot 清单定位口令群组并发送口令，
-            # 发送后的重发 start（下方）让 bot 核验口令达标
-            await self._send_password_tasks(
-                account, client, username, source_message, candidates
+
+    async def _auto_join_and_restart(
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        param: str,
+        source_message: Any,
+        candidates: List[Any],
+    ) -> Tuple[bool, bool, List[Any]]:
+        """自动加入候选消息中的目标，必要时重发 start。
+
+        返回（是否应直接结束跟进，是否存在加入目标，更新后的候选）。
+        """
+        did_join, had_join_targets = await self._auto_join_candidates(
+            account, client, username, candidates
+        )
+        if did_join:
+            # 加入后稍等，再拉一轮消息（bot 可能更新了按钮/提示）
+            await asyncio.sleep(3)
+            try:
+                async for recent in client.get_chat_history(username, limit=4):
+                    candidates.append(recent)
+                    await self._check_win_message(account, client, username, recent)
+            except Exception:
+                logger.debug("加入频道后拉取 bot 最新消息失败", exc_info=True)
+        # 帖内口令任务：加入完成后按 bot 清单定位口令群组并发送口令，
+        # 发送后的重发 start（下方）让 bot 核验口令达标
+        await self._send_password_tasks(
+            account, client, username, source_message, candidates
+        )
+        # 通用策略：多数抽奖 bot 要求「先加入频道再点一次抽奖」——
+        # bot 消息里出现过加入要求时，加入校验完成后优先点
+        # 「我已加入/重试参与」按钮完成重试（bot 设计的重试入口）；
+        # 没有该按钮时兜底重发一次 start 完成参与（此前可能已全部
+        # 加入过，不必本次有新加入）
+        if had_join_targets:
+            if await self._click_join_retry_button(
+                account, client, username, candidates
+            ):
+                return True, had_join_targets, candidates
+            self.log(
+                f"[{account}] @{username} 要求加入频道后重新参与，再次发送 start"
             )
-            # 通用策略：多数抽奖 bot 要求「先加入频道再点一次抽奖」——
-            # bot 消息里出现过加入要求时，加入校验完成后优先点
-            # 「我已加入/重试参与」按钮完成重试（bot 设计的重试入口）；
-            # 没有该按钮时兜底重发一次 start 完成参与（此前可能已全部
-            # 加入过，不必本次有新加入）
-            if had_join_targets:
-                if await self._click_join_retry_button(
+            return await self._restart_after_join(
+                account, client, username, param, candidates, had_join_targets
+            )
+        if bot_policy(username).restart_after_join:
+            # 强制名单：无加入要求也重发一次
+            self.log(f"[{account}] @{username} 加入校验完成，重新发送 start")
+            return await self._restart_after_join(
+                account, client, username, param, candidates, had_join_targets
+            )
+        return False, had_join_targets, candidates
+
+    async def _auto_join_candidates(
+        self, account: str, client: Any, username: str, candidates: List[Any]
+    ) -> Tuple[bool, bool]:
+        did_join = False
+        had_join_targets = False
+        for message in candidates:
+            # 排除指向当前 bot 自身的 t.me 链接（按钮「点击参与抽奖」等）：
+            # 那是参与入口不是加入目标，交给下方 URL 按钮点击逻辑处理
+            join_targets = [
+                t
+                for t in extract_channel_targets(message)
+                if str(t).lower().lstrip("@") != username.lower()
+            ]
+            if join_targets or (
+                bot_policy(username).join_status_checklist
+                and extract_join_status_targets(message)
+            ):
+                had_join_targets = True
+            if await self._join_from_message(account, client, username, message):
+                did_join = True
+        return did_join, had_join_targets
+
+    async def _restart_after_join(
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        param: str,
+        candidates: List[Any],
+        had_join_targets: bool,
+    ) -> Tuple[bool, bool, List[Any]]:
+        stop, candidates = await self._restart_start_and_refresh(
+            account, client, username, param, candidates
+        )
+        return stop, had_join_targets, candidates
+
+    async def _restart_start_and_refresh(
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        param: str,
+        candidates: List[Any],
+    ) -> Tuple[bool, List[Any]]:
+        """重发 start 并刷新候选；返回（是否因已结束中止，更新后的候选）。"""
+        try:
+            restart_msg = await client.start_bot(username, param)
+            if restart_msg is not None and reply_says_ended(restart_msg):
+                # 加入期间活动提前结束，bot 终态回复，不再点按钮
+                self._note_ended(account, username)
+                self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
+                return True, candidates
+            # 重发 start 后：新回复与最新历史优先；重发前的消息保留在
+            # 候选末尾兜底——部分 bot（如百宝箱抽奖「全部关注后请点击
+            # 重新参与抽奖」）对重复 start 不再回复带按钮的新消息，
+            # 只有原消息上的「重新参与抽奖」按钮可点
+            pre_restart = candidates
+            candidates = [restart_msg] if restart_msg is not None else []
+            await asyncio.sleep(2)
+            async for recent in client.get_chat_history(username, limit=4):
+                candidates.append(recent)
+                await self._check_win_message(account, client, username, recent)
+            candidates.extend(pre_restart)
+            # 重发 start 可能再次触发防脚本验证：完成后刷新候选
+            if await self._handle_emoji_verification(
+                account, client, username, candidates
+            ):
+                await asyncio.sleep(2)
+                await self._append_recent_bot_messages(
                     account, client, username, candidates
-                ):
-                    return
-                self.log(
-                    f"[{account}] @{username} 要求加入频道后重新参与，再次发送 start"
                 )
-                try:
-                    restart_msg = await client.start_bot(username, param)
-                    if restart_msg is not None and reply_says_ended(restart_msg):
-                        # 加入期间活动提前结束，bot 终态回复，不再点按钮
-                        self._note_ended(account, username)
-                        self.log(
-                            f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进"
-                        )
-                        return
-                    # 重发 start 后：新回复与最新历史优先；重发前的消息保留在
-                    # 候选末尾兜底——部分 bot（如百宝箱抽奖「全部关注后请点击
-                    # 重新参与抽奖」）对重复 start 不再回复带按钮的新消息，
-                    # 只有原消息上的「重新参与抽奖」按钮可点
-                    pre_restart = candidates
-                    candidates = [restart_msg] if restart_msg is not None else []
-                    await asyncio.sleep(2)
-                    async for recent in client.get_chat_history(username, limit=4):
-                        candidates.append(recent)
-                        await self._check_win_message(account, client, username, recent)
-                    candidates.extend(pre_restart)
-                    # 重发 start 可能再次触发防脚本验证：完成后刷新候选
-                    if await self._handle_emoji_verification(
-                        account, client, username, candidates
-                    ):
-                        await asyncio.sleep(2)
-                        await self._append_recent_bot_messages(
-                            account, client, username, candidates
-                        )
-                except Exception as exc:
-                    self.log(f"重新参与 @{username} 失败: {exc}")
-            elif bot_policy(username).restart_after_join:
-                # 强制名单：无加入要求也重发一次
-                self.log(f"[{account}] @{username} 加入校验完成，重新发送 start")
-                try:
-                    restart_msg = await client.start_bot(username, param)
-                    if restart_msg is not None and reply_says_ended(restart_msg):
-                        self._note_ended(account, username)
-                        self.log(
-                            f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进"
-                        )
-                        return
-                    pre_restart = candidates
-                    candidates = [restart_msg] if restart_msg is not None else []
-                    await asyncio.sleep(2)
-                    async for recent in client.get_chat_history(username, limit=4):
-                        candidates.append(recent)
-                        await self._check_win_message(account, client, username, recent)
-                    candidates.extend(pre_restart)
-                    # 重发 start 可能再次触发防脚本验证：完成后刷新候选
-                    if await self._handle_emoji_verification(
-                        account, client, username, candidates
-                    ):
-                        await asyncio.sleep(2)
-                        await self._append_recent_bot_messages(
-                            account, client, username, candidates
-                        )
-                except Exception as exc:
-                    self.log(f"重新参与 @{username} 失败: {exc}")
+        except Exception as exc:
+            self.log(f"重新参与 @{username} 失败: {exc}")
+        return False, candidates
 
-        def _confirm_log(text: str) -> str:
-            """按钮文字含「已参加」= bot 已确认参与成功，日志按成功口径输出。"""
-            if "已参加" in text:
-                return f"@{username} 参与成功（{text}）"
-            return f"已点击 @{username} 的确认按钮「{text}」"
-
-        stop_set = self._stop is not None and self._stop.is_set()
-        if had_join_targets and not stop_set:
-            # 加入频道后稍等再点确认按钮，给 bot 侧成员状态同步留时间，
-            # 避免「立刻参加抽奖」点了却因身份未同步而不生效
-            await asyncio.sleep(5)
+    async def _click_first_confirm_button(
+        self, account: str, client: Any, username: str, candidates: List[Any]
+    ) -> None:
         for message in candidates:
             btn = self._find_confirm_button(message)
             if btn is None:
                 continue
-            try:
-                if getattr(btn, "callback_data", None):
-                    answer = await client.request_callback_answer(
-                        chat_id=username,
-                        message_id=message.id,
-                        callback_data=btn.callback_data,
-                    )
-                    # 抽奖结束后部分 bot 只弹窗提示、不发新消息：读弹窗文案，
-                    # 命中终态即返回，不进入回复核对（避免误读旧消息）
-                    popup = str(getattr(answer, "text", "") or "").strip()
-                    if popup and _POPUP_ENDED_RE.search(popup):
-                        self._note_ended(account, username)
-                        self.log(
-                            f"[{account}] @{username} 弹窗提示「{popup[:40]}」，"
-                            "抽奖已结束，跳过后续跟进"
-                        )
-                        return
-                    self.log(_confirm_log(btn.text))
-                    await self._verify_after_click(
-                        account, client, username, candidates
-                    )
-                    return
-                # URL 按钮：仅当链接指向同一 bot（含/不含 start 参数）时才「点击」
-                # （等同按链接参数重发 start 完成参与），其他链接一律不碰
-                url_btn = str(getattr(btn, "url", "") or "").strip()
-                link = parse_bot_start_link(url_btn)
-                plain_same_bot = False
-                if link is None:
-                    m = _TME_RE.search(url_btn)
-                    if m and not (m.group("rest") or ""):
-                        plain_same_bot = m.group("name").lower() == username.lower()
-                if link is not None and link[0].lower() == username.lower():
-                    await client.start_bot(username, link[1])
-                    self.log(
-                        f"已点击 @{username} 的参与按钮「{btn.text}」"
-                        f"（按链接参数重新参与）"
-                    )
-                    await self._verify_after_click(
-                        account, client, username, candidates
-                    )
-                    return
-                if plain_same_bot:
-                    await client.start_bot(username, "")
-                    self.log(
-                        f"已点击 @{username} 的参与按钮「{btn.text}」（重发 start）"
-                    )
-                    await self._verify_after_click(
-                        account, client, username, candidates
-                    )
-                    return
-            except Exception as exc:
-                self.log(f"点击 @{username} 确认按钮失败: {exc}")
+            if await self._try_confirm_button(
+                account, client, username, message, btn, candidates
+            ):
                 return
+
+    async def _try_confirm_button(
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        message: Any,
+        btn: Any,
+        candidates: List[Any],
+    ) -> bool:
+        """处理单个确认按钮；返回 True 表示结束整个跟进流程。"""
+        try:
+            if getattr(btn, "callback_data", None):
+                answer = await client.request_callback_answer(
+                    chat_id=username,
+                    message_id=message.id,
+                    callback_data=btn.callback_data,
+                )
+                # 抽奖结束后部分 bot 只弹窗提示、不发新消息：读弹窗文案，
+                # 命中终态即返回，不进入回复核对（避免误读旧消息）
+                popup = callback_answer_text(answer)
+                if popup and _POPUP_ENDED_RE.search(popup):
+                    self._note_ended(account, username)
+                    self.log(
+                        f"[{account}] @{username} 弹窗提示「{popup[:40]}」，"
+                        "抽奖已结束，跳过后续跟进"
+                    )
+                    return True
+                self.log(self._format_confirm_button_log(username, btn.text))
+                await self._verify_after_click(
+                    account, client, username, candidates
+                )
+                return True
+            # URL 按钮：仅当链接指向同一 bot（含/不含 start 参数）时才「点击」
+            # （等同按链接参数重发 start 完成参与），其他链接一律不碰
+            url_btn = str(getattr(btn, "url", "") or "").strip()
+            link = parse_bot_start_link(url_btn)
+            plain_same_bot = False
+            if link is None:
+                m = _TME_RE.search(url_btn)
+                if m and not (m.group("rest") or ""):
+                    plain_same_bot = m.group("name").lower() == username.lower()
+            if link is not None and link[0].lower() == username.lower():
+                await client.start_bot(username, link[1])
+                self.log(
+                    f"已点击 @{username} 的参与按钮「{btn.text}」"
+                    f"（按链接参数重新参与）"
+                )
+                await self._verify_after_click(
+                    account, client, username, candidates
+                )
+                return True
+            if plain_same_bot:
+                await client.start_bot(username, "")
+                self.log(
+                    f"已点击 @{username} 的参与按钮「{btn.text}」（重发 start）"
+                )
+                await self._verify_after_click(
+                    account, client, username, candidates
+                )
+                return True
+        except Exception as exc:
+            self.log(f"点击 @{username} 确认按钮失败: {exc}")
+            return True
+        return False
+
+    @staticmethod
+    def _format_confirm_button_log(username: str, text: str) -> str:
+        """按钮文字含「已参加」= bot 已确认参与成功，日志按成功口径输出。"""
+        if "已参加" in text:
+            return f"@{username} 参与成功（{text}）"
+        return f"已点击 @{username} 的确认按钮「{text}」"
 
     def _emit_speech_tasks(self, account: str, bot_username: str, message: Any) -> None:
         """报名成功回复中的发言数任务 → 消息中心提醒（还需发言条数）。"""

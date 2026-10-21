@@ -67,7 +67,7 @@ def test_safe_disconnect_timeout_falls_back_to_storage_close():
     client = FakeClient()
 
     async def hang_disconnect() -> None:
-        await asyncio.sleep(10)
+        await asyncio.Event().wait()  # 永不返回，等待 wait_for 超时
 
     client.disconnect = hang_disconnect  # type: ignore[method-assign]
     asyncio.run(safe_disconnect(client, timeout=0.05))

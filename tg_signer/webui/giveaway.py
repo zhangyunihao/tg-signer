@@ -15,10 +15,7 @@ from typing import Callable, Dict, List, Optional
 
 from nicegui import ui
 
-from tg_signer.giveaway_core import (
-    WIN_SWEEP_LIMIT,
-    GiveawayEngine,
-)
+from tg_signer.giveaway_core import WIN_SWEEP_LIMIT
 from tg_signer.giveaway_parsing import DEFAULT_KEYWORDS
 from tg_signer.giveaway_state import GiveawayState
 from tg_signer.utils import atomic_write_json
@@ -32,11 +29,8 @@ from tg_signer.webui.common import (
     read_file_tail,
     with_select_all,
 )
-from tg_signer.webui.data import (
-    chat_username_map,
-    load_two_way_accounts,
-    load_user_infos,
-)
+from tg_signer.webui.data import load_user_infos
+from tg_signer.webui.giveaway_process import GiveawayProcess
 from tg_signer.webui.random_chat import (
     build_account_options,
     list_session_names,
@@ -47,7 +41,7 @@ from tg_signer.webui.random_chat import (
 
 logger = logging.getLogger(__name__)
 
-_GLOBAL_ENGINES: Dict[str, GiveawayEngine] = {}
+_GLOBAL_ENGINES: Dict[str, GiveawayProcess] = {}
 _GLOBAL_LOGS: Dict[str, List[str]] = {}
 _GLOBAL_STATUS_CBS: Dict[str, Callable[[bool], None]] = {}
 
@@ -171,6 +165,158 @@ def save_win_alerts(workdir, alerts: List[dict]) -> None:
 def format_win_alert(a: dict) -> str:
     text = str(a.get("text") or "").replace("\n", " ")
     return f"账号 {a.get('account')} 中奖（@{a.get('bot')}）：{text}（{a.get('time')}）"
+
+
+def _alert_time() -> str:
+    return f"{datetime.now():%m-%d %H:%M:%S}"
+
+
+def _alert_key(alert: dict, fields: tuple[str, ...]) -> str:
+    return "|".join(str(alert.get(f) or "") for f in fields)
+
+
+def _drop_alert(alerts: List[dict], fields: tuple[str, ...], key: str) -> List[dict]:
+    return [a for a in alerts if _alert_key(a, fields) != key]
+
+
+def _notify_alert(client, text: str, level: str, debug_msg: str) -> None:
+    """在 WebUI 客户端上下文弹顶部通知；浏览器已断开时静默忽略。"""
+    try:
+        with client:
+            ui.notify(text, type=level, multi_line=True)
+    except Exception:
+        logger.debug(debug_msg, exc_info=True)
+
+
+JOIN_ALERT_KEY = ("account", "chat")
+SPEAK_ALERT_KEY = ("account", "group", "password")
+SPEECH_ALERT_KEY = ("account", "bot", "group", "required", "title")
+
+
+def _handle_win_event(client, workdir, ev: dict) -> None:
+    """中奖提醒：持久化 + 顶部弹窗（好消息，绿色通知）。"""
+    acct = str(ev.get("account") or "")
+    bot = str(ev.get("bot") or "")
+    if not acct or not bot:
+        return
+    alerts = load_win_alerts(workdir)
+    alerts.insert(
+        0,
+        {
+            "account": acct,
+            "bot": bot,
+            "text": str(ev.get("text") or "")[:300],
+            "time": _alert_time(),
+        },
+    )
+    save_win_alerts(workdir, alerts)
+    _notify_alert(client, format_win_alert(alerts[0]), "positive", "推送中奖提醒失败")
+
+
+def _handle_join_event(client, workdir, ev: dict, title_map: Dict[str, str]) -> None:
+    """加入失败 → 提醒；加入成功（join_resolved）→ 消除同账号/同对象的提醒。"""
+    acct = str(ev.get("account") or "")
+    chat = str(ev.get("chat") or "")
+    if not acct or not chat:
+        return
+    failed = ev.get("type") == "join_failed"
+    alerts = _drop_alert(
+        load_join_alerts(workdir), JOIN_ALERT_KEY, f"{acct}|{chat}"
+    )
+    if failed:
+        alerts.insert(
+            0,
+            {
+                "account": acct,
+                "chat": chat,
+                "error": str(ev.get("error") or "")[:200],
+                "time": _alert_time(),
+            },
+        )
+    save_join_alerts(workdir, alerts)
+    if failed:
+        _notify_alert(
+            client,
+            format_join_alert(alerts[0], title_map),
+            "warning",
+            "推送加入失败通知失败",
+        )
+
+
+def _handle_speak_event(client, workdir, ev: dict) -> None:
+    """口令发言失败 → 提醒；口令已发（speak_done）→ 消除同类提醒。"""
+    acct = str(ev.get("account") or "")
+    group = str(ev.get("group") or "")
+    password = str(ev.get("password") or "")
+    if not acct or not group:
+        return
+    failed = ev.get("type") == "speak_failed"
+    alerts = _drop_alert(
+        load_speak_alerts(workdir), SPEAK_ALERT_KEY, f"{acct}|{group}|{password}"
+    )
+    if failed:
+        alerts.insert(
+            0,
+            {
+                "account": acct,
+                "group": group,
+                "password": password,
+                "error": str(ev.get("error") or "")[:200],
+                "time": _alert_time(),
+            },
+        )
+        save_speak_alerts(workdir, alerts)
+        _notify_alert(
+            client, format_speak_alert(alerts[0]), "warning", "推送发言任务通知失败"
+        )
+    else:
+        save_speak_alerts(workdir, alerts)
+
+
+def _handle_speech_event(client, workdir, ev: dict) -> None:
+    """报名成功后仍需发言 N 条：同一抽奖/群组/要求只提醒一次。"""
+    acct = str(ev.get("account") or "")
+    bot = str(ev.get("bot") or "")
+    group = str(ev.get("group") or "")
+    title = str(ev.get("title") or "")
+    try:
+        required = int(ev.get("required"))
+    except (TypeError, ValueError):
+        return
+    if not acct or not group:
+        return
+    key = f"{acct}|{bot}|{group}|{required}|{title}"
+    alerts = load_speech_alerts(workdir)
+    if any(_alert_key(a, SPEECH_ALERT_KEY) == key for a in alerts):
+        return
+    alerts.insert(
+        0,
+        {
+            "account": acct,
+            "bot": bot,
+            "title": title,
+            "group": group,
+            "required": required,
+            "time": _alert_time(),
+        },
+    )
+    save_speech_alerts(workdir, alerts)
+    _notify_alert(
+        client, format_speech_alert(alerts[0]), "warning", "推送发言数任务通知失败"
+    )
+
+
+def handle_giveaway_event(client, workdir, ev: dict, title_map: Dict[str, str]) -> None:
+    """引擎事件分发：中奖 / 加入失败或解除 / 口令未完成 / 发言数未达标。"""
+    etype = ev.get("type")
+    if etype == "win":
+        _handle_win_event(client, workdir, ev)
+    elif etype in ("join_failed", "join_resolved"):
+        _handle_join_event(client, workdir, ev, title_map)
+    elif etype in ("speak_failed", "speak_done"):
+        _handle_speak_event(client, workdir, ev)
+    elif etype == "speech_required":
+        _handle_speech_event(client, workdir, ev)
 
 
 def load_win_forward_targets(workdir) -> List[str]:
@@ -396,7 +542,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     tasks: Dict[str, dict] = {
         str(k): v for k, v in store["tasks"].items() if isinstance(v, dict)
     }
-    giveaway_state = GiveawayState(workdir)
     chat_options_map: Dict[str, str] = {}
     chat_title_map: Dict[str, str] = {}
     kind_map: Dict[str, str] = {}
@@ -439,13 +584,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     def engine_key(name: str) -> str:
         return f"{wd_key}|{name}"
 
-    def get_engine(name: str) -> Optional[GiveawayEngine]:
+    def get_engine(name: str) -> Optional[GiveawayProcess]:
         return _GLOBAL_ENGINES.get(engine_key(name))
 
-    def ensure_engine(name: str) -> GiveawayEngine:
+    def ensure_engine(name: str) -> GiveawayProcess:
         engine = get_engine(name)
         if engine is None:
-            engine = GiveawayEngine(state=giveaway_state)
+            engine = GiveawayProcess(name, workdir)
             _GLOBAL_ENGINES[engine_key(name)] = engine
         return engine
 
@@ -459,14 +604,23 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
         def _log(msg: str) -> None:
             buf = _GLOBAL_LOGS.setdefault(wd_key, [])
-            # 消息已带时间戳（如「已参与」行）则不重复加
-            ts = f"{datetime.now():%H:%M:%S}"
-            if not re.match(r"^\d{2}:\d{2}:\d{2}", msg):
-                msg = f"{ts} {msg}"
-            line = f"[#{name}] {msg}"
+            # 子进程日志已带「[#任务] HH:MM:SS」前缀且已自行落盘，直接沿用
+            from_child = bool(
+                re.match(r"^\[#[^\]]+\] \d{2}:\d{2}:\d{2} ", msg)
+            )
+            if from_child:
+                line = msg
+            else:
+                # 消息已带时间戳（如「已参与」行）则不重复加
+                ts = f"{datetime.now():%H:%M:%S}"
+                if not re.match(r"^\d{2}:\d{2}:\d{2}", msg):
+                    msg = f"{ts} {msg}"
+                line = f"[#{name}] {msg}"
             buf.append(line)
             if len(buf) > 300:
                 del buf[:-300]
+            if from_child:
+                return
             # 同时落盘，便于服务重启后仍可追溯（单文件上限约 2MB）
             try:
                 if not log_file.exists() or log_file.stat().st_size < 2_000_000:
@@ -607,7 +761,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             eng = get_engine(_n)
             if eng is not None and eng.running:
                 try:
-                    await eng.stop()
+                    eng.stop()
                 except Exception:
                     logger.debug("任务运行超时自动停止失败", exc_info=True)
                 ui.notify(
@@ -651,175 +805,17 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 _apply_status(cb, False)
 
         def _on_event(ev: dict) -> None:
-            """加入失败/未完成发言 → 顶部通知 + 持久化；加入成功/口令已发则消除"""
-            etype = ev.get("type")
-            if etype == "win":
-                # 中奖提醒：持久化 + 顶部弹窗（好消息，绿色通知）
-                acct = str(ev.get("account") or "")
-                bot = str(ev.get("bot") or "")
-                if not acct or not bot:
-                    return
-                alerts = load_win_alerts(workdir)
-                alerts.insert(
-                    0,
-                    {
-                        "account": acct,
-                        "bot": bot,
-                        "text": str(ev.get("text") or "")[:300],
-                        "time": f"{datetime.now():%m-%d %H:%M:%S}",
-                    },
-                )
-                save_win_alerts(workdir, alerts)
-                try:
-                    with client:
-                        ui.notify(
-                            format_win_alert(alerts[0]),
-                            type="positive",
-                            multi_line=True,
-                        )
-                except Exception:
-                    logger.debug("推送中奖提醒失败", exc_info=True)
-                return
-            if etype in ("join_failed", "join_resolved"):
-                acct = str(ev.get("account") or "")
-                chat = str(ev.get("chat") or "")
-                if not acct or not chat:
-                    return
-                kkey = f"{acct}|{chat}"
-                alerts = [
-                    a
-                    for a in load_join_alerts(workdir)
-                    if f"{a.get('account')}|{a.get('chat')}" != kkey
-                ]
-                if etype == "join_failed":
-                    alerts.insert(
-                        0,
-                        {
-                            "account": acct,
-                            "chat": chat,
-                            "error": str(ev.get("error") or "")[:200],
-                            "time": f"{datetime.now():%m-%d %H:%M:%S}",
-                        },
-                    )
-                save_join_alerts(workdir, alerts)
-                try:
-                    with client:
-                        if etype == "join_failed":
-                            ui.notify(
-                                format_join_alert(alerts[0], chat_title_map),
-                                type="warning",
-                                multi_line=True,
-                            )
-                except Exception:
-                    logger.debug("推送加入失败通知失败", exc_info=True)
-            elif etype in ("speak_failed", "speak_done"):
-                acct = str(ev.get("account") or "")
-                group = str(ev.get("group") or "")
-                password = str(ev.get("password") or "")
-                if not acct or not group:
-                    return
-                skey = f"{acct}|{group}|{password}"
-                alerts = [
-                    a
-                    for a in load_speak_alerts(workdir)
-                    if f"{a.get('account')}|{a.get('group')}|{a.get('password')}"
-                    != skey
-                ]
-                if etype == "speak_failed":
-                    alerts.insert(
-                        0,
-                        {
-                            "account": acct,
-                            "group": group,
-                            "password": password,
-                            "error": str(ev.get("error") or "")[:200],
-                            "time": f"{datetime.now():%m-%d %H:%M:%S}",
-                        },
-                    )
-                    save_speak_alerts(workdir, alerts)
-                    try:
-                        with client:
-                            ui.notify(
-                                format_speak_alert(alerts[0]),
-                                type="warning",
-                                multi_line=True,
-                            )
-                    except Exception:
-                        logger.debug("推送发言任务通知失败", exc_info=True)
-                else:
-                    save_speak_alerts(workdir, alerts)
-            elif etype == "speech_required":
-                acct = str(ev.get("account") or "")
-                bot = str(ev.get("bot") or "")
-                group = str(ev.get("group") or "")
-                title = str(ev.get("title") or "")
-                try:
-                    required = int(ev.get("required"))
-                except (TypeError, ValueError):
-                    return
-                if not acct or not group:
-                    return
-                skey = f"{acct}|{bot}|{group}|{required}|{title}"
-                alerts = load_speech_alerts(workdir)
-                if any(
-                    f"{a.get('account')}|{a.get('bot')}|{a.get('group')}|"
-                    f"{a.get('required')}|{a.get('title')}" == skey
-                    for a in alerts
-                ):
-                    # 同一抽奖/群组/要求重复上报：不重复弹窗
-                    return
-                alerts.insert(
-                    0,
-                    {
-                        "account": acct,
-                        "bot": bot,
-                        "title": title,
-                        "group": group,
-                        "required": required,
-                        "time": f"{datetime.now():%m-%d %H:%M:%S}",
-                    },
-                )
-                save_speech_alerts(workdir, alerts)
-                try:
-                    with client:
-                        ui.notify(
-                            format_speech_alert(alerts[0]),
-                            type="warning",
-                            multi_line=True,
-                        )
-                except Exception:
-                    logger.debug("推送发言数任务通知失败", exc_info=True)
+            """引擎事件 → 顶部通知 + 持久化（按事件类型分发，见 handle_giveaway_event）"""
+            handle_giveaway_event(client, workdir, ev, chat_title_map)
 
         engine = ensure_engine(name)
         start_ts = time.time()
-        started = await engine.start(
-            accounts=list(cfg["accounts"]),
-            chats=[
-                parse_chat_id(c) if parse_chat_id(c) is not None else str(c)
-                for c in cfg["chats"]
-            ],
-            session_dir=Path(cfg["session_dir"]),
+        # 引擎在独立子进程运行：WebUI 不再承载长时间扫描/并发账号的 CPU 与内存
+        started = engine.start(
+            cfg,
             log=make_log(name),
-            keywords=list(cfg.get("keywords") or []),
-            auto_scan=bool(cfg.get("auto_scan", True)),
-            auto_join=bool(cfg.get("auto_join", True)),
-            ignore_history=bool(cfg.get("ignore_history", True)),
-            two_way_accounts=sorted(load_two_way_accounts(workdir)),
-            chat_usernames=chat_username_map(workdir),
-            max_joins=(int(cfg["max_joins"]) if cfg.get("max_joins") else None),
-            delay_range=(
-                float(cfg.get("delay_min") or 0),
-                float(cfg.get("delay_max") or 0),
-            ),
-            confirm_wait=int(cfg.get("confirm_wait") or 8),
-            rescue_interval=(int(cfg.get("rescue_interval_min") or 0) * 60),
-            rescue_limit=int(cfg.get("rescue_limit") or 10),
-            win_detect=bool(cfg.get("win_detect", True)),
-            win_forward_target=load_win_forward_targets(workdir),
-            win_sweep_limit=load_win_sweep_limit(workdir),
-            state=giveaway_state,
-            on_finish=_on_finish,
             on_event=_on_event,
+            on_finish=_on_finish,
         )
         if started:
             cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
@@ -838,7 +834,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     async def stop_task(name: str, set_status: Callable[[bool], None]) -> None:
         engine = get_engine(name)
         if engine is not None and engine.running:
-            await engine.stop()
+            engine.stop()
         else:
             set_status(False)
 
@@ -1234,7 +1230,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         if any(task_running(n) for n in tasks):
             ui.notify("有任务正在运行，请先停止再清除参与记录", type="warning")
             return
-        total = giveaway_state.count()
+        # 参与记录由子进程写入，这里每次重新读盘，避免页面持有过期快照
+        total = GiveawayState(workdir).count()
         clear_count_label.text = (
             f"当前共 {total} 条已参与记录（覆盖所有账号）。"
             "清除后，相同抽奖链接对所有账号都视为未参与，下次扫描将重新参与；"
@@ -1245,7 +1242,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         clear_records_dlg.open()
 
     def do_clear_records() -> None:
-        total = giveaway_state.clear()
+        total = GiveawayState(workdir).clear()
         clear_records_dlg.close()
         if total:
             log_buf.append(

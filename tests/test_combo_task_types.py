@@ -1,10 +1,11 @@
 """组合任务新增子任务类型（自动抽奖/批量退频道）的 spec 构建与 runner 纯函数测试。"""
 
 import json
+from pathlib import Path
 
 from tg_signer.giveaway_runner import engine_kwargs_from_spec
 from tg_signer.leave_runner import filter_candidates
-from tg_signer.webui import sign as sign_mod
+from tg_signer.webui import task_panel as sign_mod
 from tg_signer.webui.sign import TaskRunnerBlock, build_combo_sub_spec
 
 
@@ -378,3 +379,50 @@ def test_giveaway_runner_engine_kwargs():
     assert kwargs["confirm_wait"] == 0
     assert kwargs["rescue_interval"] == 1800
     assert kwargs["rescue_limit"] == 1  # 最小 1
+
+
+def test_giveaway_runner_engine_kwargs_multi_accounts():
+    """WebUI 抽奖任务把账号列表传给子进程（而非单个 account）。"""
+    kwargs = engine_kwargs_from_spec(
+        {"accounts": ["alice", " bob ", ""], "chats": ["-100123"]}
+    )
+    assert kwargs["accounts"] == ["alice", "bob"]
+
+
+def test_giveaway_process_spec_and_stats(tmp_path):
+    """子进程 spec 构建与统计回报解析：WebUI 只持有展示所需的快照。"""
+    from tg_signer.webui.giveaway_process import GiveawayProcess
+
+    proc = GiveawayProcess("t1", tmp_path)
+    spec = proc._build_spec(
+        {
+            "accounts": ["alice"],
+            "chats": [123],
+            "keywords": ["上海"],
+            "session_dir": ".sessions",
+            "max_joins": "5",
+            "delay_min": 1,
+            "delay_max": 2,
+            "auto_scan": False,
+        }
+    )
+    assert spec["accounts"] == ["alice"]
+    assert spec["chats"] == ["123"]
+    assert spec["task"] == "t1"
+    assert spec["session_dir"] == str(Path(".sessions"))
+    assert spec["auto_scan"] is False
+    assert spec["max_joins"] == "5"
+
+    proc._apply_stats(
+        {
+            "joined": 3,
+            "by_account": {"alice": 3},
+            "by_chat": {"alice": {"-100123": 2}},
+            "progress": "扫描中",
+        }
+    )
+    assert proc.joined == 3
+    assert proc.joined_by_account == {"alice": 3}
+    assert proc.joined_by_account_chat == {"alice": {"-100123": 2}}
+    assert proc.progress_text() == "扫描中"
+    assert not proc.running

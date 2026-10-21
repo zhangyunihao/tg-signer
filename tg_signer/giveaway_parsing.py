@@ -51,6 +51,25 @@ SCORE_BUTTON_RE = re.compile(
 JOIN_RETRY_BUTTON_KEYWORDS = ("我已加入", "重试参与")
 
 
+# callback 弹窗提示「您未加入 XXX」类：参与条件未满足（需先加入指定
+# 频道/群），点击并未真正参与，不能记为成功
+JOIN_REQUIRED_POPUP_RE = re.compile(
+    r"未加入|未满足|请先加入|需要先加入|加入后.{0,6}(参与|重试)"
+)
+
+
+def callback_answer_text(answer: Any) -> str:
+    """取 callback 弹窗文案。
+
+    pyrogram 的 request_callback_answer 返回 raw 类型 BotCallbackAnswer，
+    其文案字段是 message；部分封装返回 CallbackQueryAnswer 时字段为 text。
+    两种都读取，避免读不到弹窗导致失败提示被误判成参与成功。
+    """
+    return str(
+        getattr(answer, "text", None) or getattr(answer, "message", None) or ""
+    ).strip()
+
+
 
 
 class BotPolicy:

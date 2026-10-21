@@ -26,7 +26,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from tg_signer.giveaway_core import GiveawayEngine
 from tg_signer.giveaway_state import GiveawayState
@@ -38,8 +38,13 @@ _TS_RE = re.compile(r"^\d{2}:\d{2}:\d{2}")
 def engine_kwargs_from_spec(spec: dict) -> Dict[str, Any]:
     """把 JSON spec 映射为 GiveawayEngine.start 的关键字参数（纯函数，便于测试）。"""
     max_joins = spec.get("max_joins")
+    # 兼容单账号（组合任务）与多账号（WebUI 抽奖任务）两种 spec
+    if spec.get("accounts") is not None:
+        accounts = [str(a).strip() for a in spec.get("accounts") or [] if str(a).strip()]
+    else:
+        accounts = [str(spec.get("account") or "")]
     return {
-        "accounts": [str(spec.get("account") or "")],
+        "accounts": accounts,
         "chats": [str(c) for c in (spec.get("chats") or [])],
         "session_dir": Path(str(spec.get("session_dir") or ".")),
         "keywords": [str(k) for k in (spec.get("keywords") or [])],
@@ -88,10 +93,49 @@ def _make_log(workdir: str, task: str) -> Callable[[str], None]:
     return _log
 
 
+def _event_writer(path: Optional[str]) -> Callable[[dict], None]:
+    """事件通道：向 JSONL 文件追加一条记录（WebUI 父进程轮询读取）。
+
+    未指定 events_file 时（组合任务）返回空实现，不产生额外 IO。
+    """
+    if not path:
+        return lambda payload: None
+
+    def _emit(payload: dict) -> None:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    return _emit
+
+
+def _stats_payload(engine: GiveawayEngine) -> Dict[str, Any]:
+    return {
+        "joined": int(engine.joined),
+        "by_account": dict(engine.joined_by_account),
+        "by_chat": {k: dict(v) for k, v in engine.joined_by_account_chat.items()},
+        "progress": engine.progress_text() or "",
+    }
+
+
+async def _stats_loop(engine: GiveawayEngine, emit: Callable[[dict], None]) -> None:
+    """每秒回报一次运行统计，供 WebUI 实时展示进度与参与数。"""
+    while engine.running:
+        emit({"kind": "stats", **_stats_payload(engine)})
+        await asyncio.sleep(1)
+
+
 async def run_giveaway(spec: dict) -> int:
     account = str(spec.get("account") or "")
+    accounts = spec.get("accounts")
+    if accounts is not None:
+        accounts = [str(a).strip() for a in accounts if str(a).strip()]
+    else:
+        accounts = [account] if account else []
     workdir = str(spec.get("workdir") or ".")
-    if not account:
+    if not accounts:
         print("缺少账号", flush=True)
         return 2
     from tg_signer.webui.data import chat_username_map, load_two_way_accounts
@@ -101,6 +145,7 @@ async def run_giveaway(spec: dict) -> int:
     )
     from tg_signer.webui.random_chat import parse_chat_id
 
+    emit = _event_writer(spec.get("events_file"))
     kwargs = engine_kwargs_from_spec(spec)
     kwargs["chats"] = [
         parse_chat_id(c) if parse_chat_id(c) is not None else c for c in kwargs["chats"]
@@ -115,9 +160,16 @@ async def run_giveaway(spec: dict) -> int:
     kwargs["win_sweep_limit"] = load_win_sweep_limit(workdir)
     engine = GiveawayEngine()
     finished = asyncio.Event()
+
+    def _on_finish() -> None:
+        emit({"kind": "stats", **_stats_payload(engine)})
+        emit({"kind": "finish"})
+        finished.set()
+
     kwargs["state"] = GiveawayState(workdir)
-    kwargs["log"] = _make_log(workdir, str(spec.get("task") or account))
-    kwargs["on_finish"] = finished.set
+    kwargs["log"] = _make_log(workdir, str(spec.get("task") or accounts[0]))
+    kwargs["on_finish"] = _on_finish
+    kwargs["on_event"] = lambda ev: emit({"kind": "event", "event": ev})
     started = await engine.start(
         two_way_accounts=sorted(load_two_way_accounts(workdir)),
         chat_usernames=chat_username_map(workdir),
@@ -126,7 +178,11 @@ async def run_giveaway(spec: dict) -> int:
     if not started:
         print(f"任务 #{spec.get('task')} 未能启动（可能配置为空）", flush=True)
         return 1
-    await finished.wait()
+    stats_task = asyncio.create_task(_stats_loop(engine, emit))
+    try:
+        await finished.wait()
+    finally:
+        stats_task.cancel()
     return 0
 
 

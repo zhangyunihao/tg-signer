@@ -1667,31 +1667,41 @@ def test_rescue_suspends_after_consecutive_failures(tmp_path):
     assert engine2._rescue_suspended_until is None
 
 
-def test_rescue_loop_skips_while_suspended_then_recovers(tmp_path):
-    """熔断暂停期间补漏循环不扫描，到期后自动恢复。"""
+def test_rescue_tick_skips_while_suspended_then_recovers(tmp_path):
+    """熔断暂停期间单轮决策不扫描，到期后恢复并清零失败计数。"""
     import asyncio
     from datetime import datetime, timedelta
+    from unittest.mock import AsyncMock
 
     engine, _state = _engine(tmp_path)
     engine.chats = [123]
-    client = FakeClient(bot_users={"LotteryBot"})
-    client.history = [_msgid(_msg(text="抽奖 https://t.me/LotteryBot?start=r1"), 5)]
-    engine._clients = {"acc": client}
-    engine.rescue_interval = 0.01
-    engine._stop = asyncio.Event()
+    engine._clients = {"acc": FakeClient()}
+    engine._rescue_round = AsyncMock()
+    engine._rescue_suspended_until = datetime.now() + timedelta(seconds=60)
 
-    async def scenario():
-        engine._rescue_suspended_until = datetime.now() + timedelta(seconds=1)
-        task = asyncio.create_task(engine._rescue_loop())
-        await asyncio.sleep(0.1)
-        assert client.started == []  # 暂停期间不扫描
-        engine._rescue_suspended_until = datetime.now() - timedelta(seconds=1)
-        await asyncio.sleep(0.05)
-        assert ("LotteryBot", "r1") in client.started  # 恢复后正常补漏
-        engine._stop.set()
-        await asyncio.wait_for(task, timeout=2)
+    asyncio.run(engine._rescue_tick())
+    engine._rescue_round.assert_not_awaited()  # 暂停期间不扫描
 
-    asyncio.run(scenario())
+    engine._rescue_fail_streak = 3
+    engine._rescue_suspended_until = datetime.now() - timedelta(seconds=1)
+    asyncio.run(engine._rescue_tick())
+    engine._rescue_round.assert_awaited_once()  # 到期后正常补漏
+    assert engine._rescue_suspended_until is None
+    assert engine._rescue_fail_streak == 0
+
+
+def test_rescue_tick_skips_while_scanning(tmp_path):
+    """完整/手动扫描进行中时补漏让路，不重复拉取。"""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    engine, _state = _engine(tmp_path)
+    engine._clients = {"acc": FakeClient()}
+    engine.scanning = True
+    engine._rescue_round = AsyncMock()
+
+    asyncio.run(engine._rescue_tick())
+    engine._rescue_round.assert_not_awaited()
 
 
 # ---------------- LotteryBestBot 回复「加入-名称 ❌」链接解析 ----------------

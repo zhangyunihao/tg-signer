@@ -1,7 +1,5 @@
 """积分兑换确认拦截测试：「花费 N 积分」提示的确认按钮不得被点击。"""
 
-import types
-
 from tg_signer.giveaway_core import GiveawayEngine
 
 
