@@ -2070,6 +2070,74 @@ def test_two_way_account_skips_password_post(tmp_path):
     assert not any("口令要求" in line for line in logs)
 
 
+def test_draw_announce_post_is_filtered(tmp_path):
+    """开奖结果公告帖（含置顶路径）直接过滤：即使带 start 链接也不参与。"""
+    import asyncio
+
+    from tg_signer.giveaway_core import message_is_draw_announce
+
+    announce = (
+        "🎉🎉🎉 开奖通知 🎉🎉🎉\n\n"
+        "🔖 防伪编号：H179229906522\n\n"
+        "🎰 🎰 萝莉岛（@shlldq）  抽奖中奖联系 @shlldqbot\n\n"
+        "⚠️ 抽奖说明：\n"
+        "1️⃣本次抽奖由 上海萝莉岛赞助 \n"
+        "2️⃣开奖后请24小时内联系 @shlldqbot\n\n"
+        "💁 参与情况：1276达标 / 1349报名\n\n"
+        "🎅 联系领奖：上海萝莉岛客服\n\n"
+        "1. 富贵花开 奖品：口令🧧38\n"
+        "2. 为何如 此霸气 奖品：口令🧧38\n\n"
+        "祝大家心想事成好运连连！"
+    )
+    assert message_is_draw_announce(_msg(text=announce))
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"LotteryBot"})
+    # 公告帖尾部拼接 start 深度链接，模拟残留链接的最坏情况
+    msg = _msg(text=announce + "\n\nhttps://t.me/LotteryBot?start=again", id=33)
+
+    # 群置顶路径（绕过关键词过滤）：仍须过滤且不参与
+    result = asyncio.run(
+        engine._process_message(
+            "acc", client, msg, skip_keywords=True, log_skips=True
+        )
+    )
+    assert result is None
+    assert ("LotteryBot", "again") not in client.started
+    assert any("开奖结果公告，跳过" in line for line in logs)
+
+    # 历史扫描路径：静默过滤（不打跳过日志）
+    logs.clear()
+    result = asyncio.run(engine._process_message("acc", client, msg))
+    assert result is None
+    assert ("LotteryBot", "again") not in client.started
+    assert not any("跳过" in line for line in logs)
+
+
+def test_active_post_mentioning_announce_not_filtered(tmp_path):
+    """活跃帖仅在「抽奖说明」段提及「开奖通知」时不被误过滤。"""
+    import asyncio
+
+    from tg_signer.giveaway_core import message_is_draw_announce
+
+    active = (
+        "🎰 上海江晚晴福利抽奖\n\n"
+        "🎁 奖品：现金红包\n\n"
+        "⚠️ 抽奖说明：\n"
+        "1️⃣开奖后本频道将发布开奖通知，请留意\n"
+        "2️⃣中奖者请24小时内联系客服\n\n"
+        "https://t.me/LotteryBot?start=active1"
+    )
+    assert not message_is_draw_announce(_msg(text=active))
+
+    engine, _state = _engine(tmp_path, keywords=("上海",))
+    client = FakeClient(bot_users={"LotteryBot"})
+    asyncio.run(engine._process_message("acc", client, _msg(text=active)))
+    assert ("LotteryBot", "active1") in client.started
+
+
 # ---------------- 口令任务解析与自动发送 ----------------
 
 PAOFU_POST = """🎰 上海泡芙半价券
@@ -2615,6 +2683,66 @@ def test_win_regex_matches_real_bot_samples():
     # 参与清单/规则说明类消息不误报
     assert not WIN_MESSAGE_RE.search("🎫 加入-某频道 ❌\n└  🔑 发送口令﹝出击宝宝﹞")
     assert not WIN_MESSAGE_RE.search("📜 抽奖说明：中奖者联系老师兑奖")
+
+
+def test_check_win_message_skips_draw_announcement(tmp_path):
+    """开奖结果公告（防伪编号+他人中奖名单，无个人化标记）不按中奖处理。"""
+    import asyncio
+
+    from tg_signer.giveaway_core import (
+        WIN_ANNOUNCE_RE,
+        WIN_MESSAGE_RE,
+        WIN_PERSONAL_RE,
+    )
+
+    # 真实样本：@shlldqbot 群发的开奖通知（曾误转进中奖群）
+    announce = (
+        "🎉🎉🎉 开奖通知 🎉🎉🎉\n\n"
+        "🔖 防伪编号：H179229906522\n\n"
+        "🎰 🎰 萝莉岛（@shlldq）  抽奖中奖联系 @shlldqbot\n\n"
+        "⚠️ 抽奖说明：\n"
+        "1️⃣本次抽奖由 上海萝莉岛赞助 \n"
+        "2️⃣开奖后请24小时内联系 @shlldqbot\n"
+        "3️⃣遇到问题请找唯一客服 @shlldqbot\n\n"
+        "💁 参与情况：1276达标 / 1349报名\n\n"
+        "🎅 联系领奖：上海萝莉岛客服\n\n"
+        "1. 富贵花开 奖品：口令🧧38\n"
+        "2. 为何如 此霸气 奖品：口令🧧38\n\n"
+        "祝大家心想事成好运连连！"
+    )
+    assert WIN_MESSAGE_RE.search(announce)  # 命中防伪编号
+    assert WIN_ANNOUNCE_RE.search(announce)
+    assert not WIN_PERSONAL_RE.search(announce)
+
+    engine, _state = _engine(tmp_path)
+    client = FakeClient(bot_users={"shlldqbot"})
+    events: list = []
+    engine.on_event = events.append
+    asyncio.run(
+        engine._check_win_message(
+            "acc", client, "shlldqbot", _msg(text=announce, id=11)
+        )
+    )
+    assert client.forwarded == []
+    assert events == []
+
+    # 带个人化标记（恭喜的是「您」）的开奖消息仍照常识别为中奖
+    personal = (
+        "🎉 开奖通知 🎉\n\n恭喜您中奖了！\n\n"
+        "👑 中奖人：林叙\n🔖 防伪编号：H179229906522"
+    )
+    assert WIN_PERSONAL_RE.search(personal)
+    engine2, _ = _engine(tmp_path)
+    client2 = FakeClient(bot_users={"shlldqbot"})
+    events2: list = []
+    engine2.on_event = events2.append
+    asyncio.run(
+        engine2._check_win_message(
+            "acc", client2, "shlldqbot", _msg(text=personal, id=12)
+        )
+    )
+    assert len(client2.forwarded) == 1
+    assert len(events2) == 1
 
 
 def test_state_bots_for_orders_by_recency(tmp_path):

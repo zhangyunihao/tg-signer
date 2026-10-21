@@ -477,7 +477,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         def _log(msg: str) -> None:
             buf = _GLOBAL_LOGS.setdefault(wd_key, [])
             # 消息已带时间戳（如「已参与」行）则不重复加
-            ts = f"{datetime.now():%m-%d %H:%M:%S}"
+            ts = f"{datetime.now():%H:%M:%S}"
             if not re.match(r"^\d{2}:\d{2}:\d{2}", msg):
                 msg = f"{ts} {msg}"
             line = f"[#{name}] {msg}"

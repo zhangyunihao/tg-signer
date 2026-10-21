@@ -72,7 +72,7 @@ def _make_log(workdir: str, task: str) -> Callable[[str], None]:
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
     def _log(msg: str) -> None:
-        ts = f"{datetime.now():%m-%d %H:%M:%S}"
+        ts = f"{datetime.now():%H:%M:%S}"
         if not _TS_RE.match(msg):  # 已自带 HH:MM:SS 的消息不重复加前缀
             msg = f"{ts} {msg}"
         line = f"[#{task}] {msg}"

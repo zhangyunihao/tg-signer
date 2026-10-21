@@ -81,8 +81,14 @@ SEEN_CAP_PER_CHAT = 500  # 每频道保留的已处理消息 id 上限
 # —— 中奖识别 ——
 # bot 私聊中奖消息的默认识别正则（样本来自 @LotteryBestBot：标题行为
 # 「💐💐💐 中奖提醒 💐💐💐」，正文有「恭喜您中奖了！」与「🔖 防伪编号：H…」；
-# 三个特征均只出现在中奖消息里，参与清单/抽奖说明类回复不会误命中）
+# 注意「防伪编号」也会出现在开奖结果公告里，公告由 WIN_ANNOUNCE_RE 排除）
 WIN_MESSAGE_RE = re.compile(r"中奖提醒|恭喜.{0,8}中奖|防伪编号")
+# 开奖结果公告（bot 群发给全体参与者的「🎉 开奖通知 🎉」，列出的是他人
+# 中奖名单与防伪编号）不是个人中奖：含公告特征但无「恭喜…中奖/中奖提醒/
+# 中奖人：」等个人化标记时，不按中奖处理（曾把 @shlldqbot 的开奖通知
+# 误判为中奖转发进中奖群）
+WIN_ANNOUNCE_RE = re.compile(r"开奖通知|开奖结果|中奖名单")
+WIN_PERSONAL_RE = re.compile(r"恭喜.{0,8}中奖|中奖提醒|中奖人[：:]")
 # 首次记录某 bot 时的回看消息条数（初始基线）；之后按水位线增量扫描，
 # 只处理比上次扫到的消息 id 更新的消息，该值不再参与日常回扫
 WIN_SWEEP_LIMIT = 50
@@ -382,6 +388,20 @@ def strip_rules_section(text: str) -> str:
                 break
         return "\n".join(lines[:idx] + lines[end:])
     return text
+
+
+# —— 开奖结果公告过滤 ——
+# bot 群发给全体参与者的开奖结果公告（如「🎉🎉🎉 开奖通知 🎉🎉🎉」+ 防伪编号 +
+# 他人中奖名单）：抽奖已结束，参与无意义。置顶路径不受关键词过滤，且公告帖
+# 可能残留参与按钮或客服 start 链接，须在链接提取前显式拦截。仅按剔除
+# 「抽奖说明」段后的文本判断，避免活跃帖说明段里提及「开奖通知」被误过滤。
+DRAW_ANNOUNCE_RE = re.compile(r"开奖通知|开奖结果|中奖名单")
+
+
+def message_is_draw_announce(message: Any) -> bool:
+    """消息是否为开奖结果公告（非活跃抽奖帖）。"""
+    text = strip_rules_section(_message_text(message))
+    return bool(text and DRAW_ANNOUNCE_RE.search(text))
 
 
 # —— 归属地限制过滤 ——
@@ -1741,6 +1761,9 @@ class GiveawayEngine:
         text = _message_text(message)
         if not text or not WIN_MESSAGE_RE.search(text):
             return
+        # 开奖结果公告（含防伪编号但恭喜的是别人）：跳过，不按中奖处理
+        if WIN_ANNOUNCE_RE.search(text) and not WIN_PERSONAL_RE.search(text):
+            return
         mid = getattr(message, "id", None)
         dedup_key = (
             f"{account}|{bot_username.lower()}|{mid if mid is not None else hash(text)}"
@@ -1937,6 +1960,11 @@ class GiveawayEngine:
                 else (f"「{text}」" if text else "")
             )
         )
+        # 开奖结果公告（抽奖已结束）：链接/按钮提取前直接过滤，置顶路径同样生效
+        if message_is_draw_announce(message):
+            if log_skips:
+                self.log(f"[{account}] {tag} 开奖结果公告，跳过")
+            return None
         links = extract_bot_links(message)
         # 黑名单 bot 的链接不作为抽奖链接（整条消息无可用链接时直接跳过）
         links = [ln for ln in links if ln[0].lower() not in BLOCKED_BOTS]
