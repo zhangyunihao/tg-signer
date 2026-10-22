@@ -22,6 +22,8 @@ def _engine() -> GiveawayEngine:
     engine = GiveawayEngine(state=None)
     engine.confirm_wait = 0  # 不轮询 bot 后续消息
     engine.auto_join = True
+    engine.join_pace_range = (0.0, 0.0)
+    engine.resolve_pace_range = (0.0, 0.0)
     return engine
 
 

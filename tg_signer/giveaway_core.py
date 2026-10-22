@@ -67,6 +67,7 @@ from tg_signer.giveaway_parsing import (
     reply_says_signup_success,
 )
 from tg_signer.giveaway_state import (
+    JOIN_LOG_WINDOW,
     GiveawayState,
 )
 
@@ -86,6 +87,32 @@ FLOOD_HARD_BLOCK_SECONDS = 300
 START_MIN_INTERVAL = 8.0
 
 
+# —— 加入频道限流保护 ——
+# 抽奖参与通常要先加入条件频道；短时间大量 JoinChannel 会触发 FLOOD_WAIT，
+# 更严重时触发不可重试的 PEER_FLOOD（该账号数小时到数天不能加群/参与）。
+# 默认值沿用加限流保护之前的行为：不额外等待、不设配额（由任务配置按需开启）。
+# 相邻两次 JoinChannel 的最小间隔（秒，区间内随机取值，模拟人工节奏）
+JOIN_PACE_RANGE = (0.0, 0.0)
+
+
+# 单账号滚动 1 小时内最多加入的频道/群组数（突发保护），0=不限制
+JOIN_HOURLY_CAP = 0
+
+
+# 单账号滚动 24 小时内最多加入的频道/群组数（跨进程重启同样生效），0=不限制
+JOIN_DAILY_CAP = 0
+
+
+# 加入类调用触发 FLOOD_WAIT 后，在 Telegram 要求的等待时间之外再缓冲的秒数
+# （与加限流保护前一致：等待 wait+10 秒）
+JOIN_FLOOD_BUFFER = 10
+
+
+# 解析类调用（get_users/get_chat 等）的账号级最小间隔（秒），
+# 避免一条消息里十几条链接连续 resolve 触发限流；0=不节流
+RESOLVE_PACE_RANGE = (0.0, 0.0)
+
+
 # 同一 bot 累计收到该次数「抽奖已结束」类回复后，本轮运行熔断该 bot
 # （如 @Lottery8Bot 对所有 start 一律回复 "The event has ended or does not exist"）
 MAX_ENDED_STRIKES = 3
@@ -97,7 +124,6 @@ EXPIRED_STOP_STREAK = 5
 
 # 单频道单次扫描的硬上限（条），防止无开奖日期标注时无限回溯
 SCAN_HARD_CAP = 1000
-
 
 
 # —— 历史补漏 ——
@@ -131,14 +157,11 @@ WIN_SWEEP_PAGE = 100  # 增量回扫单页拉取的消息条数
 WIN_SWEEP_PAGE_MAX = 20  # 增量回扫最多翻页数（防水位线异常时无限翻页）
 
 
-
 # —— 网络调用统一超时 ——
 # 半开连接（手机切换网络/代理僵死）下 Pyrogram 请求可能永久挂起，导致引擎
 # 任务协程卡死、WebUI 状态永不收敛。所有经引擎客户端发出的请求统一加超时：
 # 单次请求超过 NET_CALL_TIMEOUT 秒按网络异常抛错，由各调用点的既有异常处理兜底。
 NET_CALL_TIMEOUT = 90
-
-
 
 
 async def _timeout_aiter(agen: Any, timeout: float, name: str = "") -> Any:
@@ -153,8 +176,6 @@ async def _timeout_aiter(agen: Any, timeout: float, name: str = "") -> Any:
                 f"网络请求 {name or '消息拉取'} 超时（{timeout:.0f} 秒，网络异常）"
             ) from None
         yield item
-
-
 
 
 class _TimeoutClient:
@@ -188,8 +209,6 @@ class _TimeoutClient:
             ) from None
 
 
-
-
 class GiveawayEngine:
     """自动抽奖后台引擎：每账号一个常驻连接，手动/启动时历史扫描并自动参与。"""
 
@@ -211,9 +230,22 @@ class GiveawayEngine:
         # 已处理过点击的防脚本验证消息：{account|bot|msg_id}，进程内去重
         # （重发 start 后旧验证消息仍在候选里，避免误点过期验证按钮）
         self._emoji_verify_handled: set = set()
-        # 自动加入频道的限流暂停（JoinChannel FLOOD_WAIT 后暂停一段时间再恢复）
-        self._join_suspended_until: Optional[datetime] = None
-        self._join_suspend_logged = False
+        # 自动加入频道的限流暂停：JoinChannel FLOOD_WAIT 后暂停该账号的加入
+        # {account: 恢复时刻（monotonic 秒）}，只影响触发限流的账号
+        self._join_suspended: Dict[str, float] = {}
+        self._join_suspend_logged: set = set()
+        # PEER_FLOOD 强制限流账号：本轮运行停止该账号的一切加入与参与
+        self._peer_flood_accounts: set = set()
+        # 加入频道时间日志（state 不可用时的内存兜底）{account: [epoch 秒...]}
+        self._join_events: Dict[str, List[float]] = {}
+        # 加入节奏与配额（任务级可配置，默认取模块常量）
+        self.join_pace_range: Tuple[float, float] = JOIN_PACE_RANGE
+        self.resolve_pace_range: Tuple[float, float] = RESOLVE_PACE_RANGE
+        self.join_hourly_cap: int = JOIN_HOURLY_CAP
+        self.join_daily_cap: int = JOIN_DAILY_CAP
+        self.join_flood_buffer: int = JOIN_FLOOD_BUFFER
+        # 解析类调用上次发起时刻（monotonic 秒），用于账号级最小间隔
+        self._last_resolve_at: Dict[str, float] = {}
         # FLOOD_WAIT 熔断：{account|bot_lower: 连续次数}；达到上限加入 _flood_bots
         self._flood_counts: Dict[str, int] = {}
         self._flood_bots: set = set()
@@ -305,6 +337,11 @@ class GiveawayEngine:
         rescue_interval: Optional[int] = None,
         rescue_limit: Optional[int] = None,
         delay_range: Tuple[float, float] = (3.0, 10.0),
+        join_pace_range: Optional[Tuple[float, float]] = None,
+        resolve_pace_range: Optional[Tuple[float, float]] = None,
+        join_hourly_cap: Optional[int] = None,
+        join_daily_cap: Optional[int] = None,
+        join_flood_buffer: Optional[int] = None,
         confirm_wait: int = 8,
         confirm_keywords: Optional[Iterable[str]] = None,
         ignore_history: bool = True,
@@ -350,6 +387,19 @@ class GiveawayEngine:
             self.rescue_limit = max(1, int(rescue_limit))
         lo, hi = delay_range
         self.delay_range = (min(lo, hi), max(lo, hi))
+        # 限流保护参数：None 表示沿用模块默认值（UI 未传时保持原行为）
+        if join_pace_range is not None:
+            lo, hi = join_pace_range
+            self.join_pace_range = (max(0.0, min(lo, hi)), max(0.0, lo, hi))
+        if resolve_pace_range is not None:
+            lo, hi = resolve_pace_range
+            self.resolve_pace_range = (max(0.0, min(lo, hi)), max(0.0, lo, hi))
+        if join_hourly_cap is not None:
+            self.join_hourly_cap = max(0, int(join_hourly_cap))
+        if join_daily_cap is not None:
+            self.join_daily_cap = max(0, int(join_daily_cap))
+        if join_flood_buffer is not None:
+            self.join_flood_buffer = max(0, int(join_flood_buffer))
         self.session_dir = Path(session_dir)
         self.log = log
         self.on_event = on_event
@@ -367,8 +417,11 @@ class GiveawayEngine:
         self._seen_msgs.clear()
         # 每次启动重新尝试自动加入监控对象（账号可能已手动加入/限流已解除）
         self._join_cache.clear()
-        self._join_suspended_until = None
-        self._join_suspend_logged = False
+        self._join_suspended.clear()
+        self._join_suspend_logged.clear()
+        self._peer_flood_accounts.clear()
+        self._join_events.clear()
+        self._last_resolve_at.clear()
         # 监控对象 chat_id -> @username：数字 id 无法直接加入时兜底
         self.chat_usernames = self._normalize_chat_usernames(chat_usernames)
         self._rescue_fail_streak = 0
@@ -573,13 +626,9 @@ class GiveawayEngine:
             self.scan_text = f"({done['n']}/{total})"
             # 识别聊天类型：群组仍只扫置顶；频道忽略置顶（多为长期
             # 挂着的旧抽奖帖），直接从最新历史消息开始扫
-            is_group, chat_info = await self._detect_chat_type(
-                account, client, chat
-            )
+            is_group, chat_info = await self._detect_chat_type(account, client, chat)
             if is_group:
-                await self._scan_pinned(
-                    account, client, chat, chat_info=chat_info
-                )
+                await self._scan_pinned(account, client, chat, chat_info=chat_info)
             if is_group or (
                 self.max_joins is not None and self.joined >= self.max_joins
             ):
@@ -603,18 +652,13 @@ class GiveawayEngine:
                 mid = getattr(message, "id", None)
                 if mid is not None:
                     self._mark_seen(account, str(chat), mid)
-                outcome = await self._process_message(
-                    account, client, message
-                )
+                outcome = await self._process_message(account, client, message)
                 expired_streak, stop = self._advance_expired_streak(
                     account, chat, outcome, expired_streak
                 )
                 if stop:
                     break
-                if (
-                    self.max_joins is not None
-                    and self.joined >= self.max_joins
-                ):
+                if self.max_joins is not None and self.joined >= self.max_joins:
                     break
         except Exception as exc:
             self.log(f"[{account}] 扫描 {chat} 失败: {exc}")
@@ -632,10 +676,7 @@ class GiveawayEngine:
             return expired_streak, False
         expired_streak += 1
         if expired_streak >= EXPIRED_STOP_STREAK:
-            self.log(
-                f"[{account}] 连续 {expired_streak} 条已开奖，"
-                f"停止扫描 {chat}"
-            )
+            self.log(f"[{account}] 连续 {expired_streak} 条已开奖，停止扫描 {chat}")
             return expired_streak, True
         return expired_streak, False
 
@@ -815,6 +856,8 @@ class GiveawayEngine:
         title: str,
     ) -> None:
         """callback 按钮参与：模拟节奏点击并按弹窗文案判定结果。"""
+        if account in self._peer_flood_accounts:
+            return  # 账号已被 PEER_FLOOD 熔断
         state_key = f"{chat_id}|{msg_id}"
         # 先按帖内频道/群组链接自动加入：按钮型抽奖点击后 bot 会校验
         # 「您未加入 XXX」，不先加入则点击无效
@@ -861,6 +904,9 @@ class GiveawayEngine:
             if self.max_joins is not None:
                 self.joined -= 1
             self.failed += 1
+            if self._is_peer_flood(exc):
+                self._block_peer_flood(account, f"点击按钮「{btn.text}」")
+                return None
             self.log(f"[{account}] 点击置顶抽奖帖「{btn.text}」按钮失败: {exc}")
             return None
         return callback_answer_text(answer)
@@ -1049,9 +1095,7 @@ class GiveawayEngine:
         try:
             await self._rescue_channel(account, client, chat)
         except asyncio.TimeoutError:
-            self.log(
-                f"[{account}] 补漏 {chat} 拉取超时（{RESCUE_FETCH_TIMEOUT}s）"
-            )
+            self.log(f"[{account}] 补漏 {chat} 拉取超时（{RESCUE_FETCH_TIMEOUT}s）")
             failures["n"] += 1
         except Exception as exc:
             self.log(f"[{account}] 补漏 {chat} 失败: {exc}")
@@ -1202,9 +1246,7 @@ class GiveawayEngine:
                 return
             await self._sweep_bot_messages(account, client, bot)
 
-    async def _sweep_bot_messages(
-        self, account: str, client: Any, bot: str
-    ) -> None:
+    async def _sweep_bot_messages(self, account: str, client: Any, bot: str) -> None:
         """回扫单个 bot 的私聊消息：拉取批次并按时间正序处理、推进水位线。
 
         bot 从未开过会话/已失效等拉取失败静默跳过（调试日志），不影响其他 bot。
@@ -1246,11 +1288,7 @@ class GiveawayEngine:
         )
         self.log(
             f"[{account}] 回扫 @{bot} 私聊：扫描 {len(batch)} 条"
-            + (
-                f"（新 {new_n} 条）"
-                if watermark is not None
-                else "（首次建基线）"
-            )
+            + (f"（新 {new_n} 条）" if watermark is not None else "（首次建基线）")
         )
         newest = getattr(batch[0], "id", None) if batch else None
         if newest is not None:
@@ -1380,9 +1418,7 @@ class GiveawayEngine:
         log_skips: bool,
     ) -> Optional[str]:
         """消息含抽奖链接时的过滤与参与流程。返回 "joined"/"expired"/None。"""
-        if self._message_filtered_out(
-            account, message, tag, skip_keywords, log_skips
-        ):
+        if self._message_filtered_out(account, message, tag, skip_keywords, log_skips):
             return None
         channel = self._chat_title(message)
         title = _giveaway_title(message)
@@ -1506,21 +1542,17 @@ class GiveawayEngine:
             actionable.append((username, param))
         return actionable
 
-    def _link_is_actionable(
-        self, account: str, username: str, param: str
-    ) -> bool:
-        if self._state is not None and self._state.is_ended(
-            account, username, param
-        ):
+    def _link_is_actionable(self, account: str, username: str, param: str) -> bool:
+        if self._state is not None and self._state.is_ended(account, username, param):
             return False  # bot 曾回复「已结束」＝终态，静默跳过
         if self._participated_before(account, username, param):
             return False  # 已参与过且未忽略历史，静默跳过
-        if self._state is not None and self._state.is_blocked(
-            account, username, param
-        ):
+        if self._state is not None and self._state.is_blocked(account, username, param):
             return False
         if self._flood_key(account, username) in self._flood_bots:
             return False
+        if account in self._peer_flood_accounts:
+            return False  # 账号已被 PEER_FLOOD 熔断，本轮不再参与任何抽奖
         if self._flood_paused(account, username):
             return False  # 该 bot 仍在限流暂停期内，等恢复后下一轮再试
         if self._flood_key(account, username) in self._ended_bots:
@@ -1567,6 +1599,7 @@ class GiveawayEngine:
             return cached
         try:
             # 通过 get_users 拿到 is_bot 标记（不同层的 InputPeer 标记不统一）
+            await self._pace_resolve(account)
             users = await client.get_users(username)
             is_bot = bool(getattr(users, "is_bot", False))
         except Exception:
@@ -1577,6 +1610,116 @@ class GiveawayEngine:
     @staticmethod
     def _flood_key(account: str, username: str) -> str:
         return f"{account}|{username.lower()}"
+
+    @staticmethod
+    def _is_peer_flood(exc: Exception) -> bool:
+        """PEER_FLOOD 为不可重试的账号级强制限流（没有 wait 秒数）。"""
+        return "PEER_FLOOD" in str(exc).upper()
+
+    def _block_peer_flood(self, account: str, detail: str = "") -> None:
+        """PEER_FLOOD 熔断：本轮运行停止该账号的一切加入与参与。"""
+        if account in self._peer_flood_accounts:
+            return
+        self._peer_flood_accounts.add(account)
+        where = f"（{detail}）" if detail else ""
+        self.log(
+            f"[{account}] 触发 Telegram 强制限流 PEER_FLOOD{where}："
+            "本账号本轮运行停止加入与参与，建议至少停用 24 小时后再试"
+        )
+
+    def _log_once(self, key: str, message: str) -> None:
+        """同一原因只提示一次，避免每轮扫描重复刷日志。"""
+        if key in self._skip_logged:
+            return
+        self._skip_logged.add(key)
+        self.log(message)
+
+    async def _pace_resolve(self, account: str) -> None:
+        """解析类调用（get_users 等）的账号级最小间隔。
+
+        一条消息里可能挂十几条抽奖链接，连续 resolve 同样会触发限流。
+        """
+        lo, hi = self.resolve_pace_range
+        if hi <= 0:
+            return
+        now = time.monotonic()
+        last = self._last_resolve_at.get(account)
+        if last is not None:
+            gap = random.uniform(lo, max(lo, hi)) - (now - last)
+            if gap > 0:
+                await asyncio.sleep(gap)
+        self._last_resolve_at[account] = time.monotonic()
+
+    def _account_join_events(self, account: str) -> List[float]:
+        """该账号滚动窗口内的加入时间，优先读持久化状态（跨重启生效）。"""
+        if self._state is not None:
+            return self._state.join_events(account)
+        cutoff = time.time() - JOIN_LOG_WINDOW
+        kept = [t for t in self._join_events.get(account, []) if t >= cutoff]
+        self._join_events[account] = kept
+        return kept
+
+    def _note_join_attempt(self, account: str) -> None:
+        """记录一次加入尝试（失败也计入配额：Telegram 按请求次数限流）。"""
+        if self._state is not None:
+            self._state.add_join_event(account)
+            self._state.save()
+        else:
+            self._join_events.setdefault(account, []).append(time.time())
+
+    def _suspend_joins(self, account: str, wait: int, target: Any = "") -> None:
+        """加入触发 FLOOD_WAIT：只暂停该账号的加入，其它账号照常。"""
+        pause = max(1, int(wait)) + self.join_flood_buffer
+        until = time.monotonic() + pause
+        self._join_suspended[account] = max(
+            self._join_suspended.get(account, 0.0), until
+        )
+        self._join_suspend_logged.discard(account)
+        resume_at = datetime.now() + timedelta(seconds=pause)
+        self.log(
+            f"[{account}] 加入 {target} 触发限流（需等待 {wait} 秒），"
+            f"本账号自动加入暂停至 {resume_at:%H:%M}"
+        )
+
+    async def _join_ready(self, account: str) -> bool:
+        """加入前统一闸门，返回是否允许本次加入（需要时已按节奏等待）。
+
+        - PEER_FLOOD 账号：直接拒绝
+        - FLOOD_WAIT 暂停期内：直接拒绝
+        - 滚动 1 小时 / 24 小时配额（0=不限制）：达上限后拒绝
+        - 相邻两次加入的最小随机间隔：不足则先 sleep 补齐
+        """
+        if account in self._peer_flood_accounts:
+            return False
+        until = self._join_suspended.get(account)
+        if until is not None:
+            if time.monotonic() < until:
+                return False
+            self._join_suspended.pop(account, None)
+        events = self._account_join_events(account)
+        wall = time.time()
+        hourly = sum(1 for t in events if t > wall - 3600)
+        daily = sum(1 for t in events if t > wall - 86400)
+        if self.join_hourly_cap > 0 and hourly >= self.join_hourly_cap:
+            self._log_once(
+                f"join_hourly_cap|{account}",
+                f"[{account}] 最近 1 小时已加入 {hourly} 个频道/群组"
+                f"（上限 {self.join_hourly_cap}），本轮暂停自动加入",
+            )
+            return False
+        if self.join_daily_cap > 0 and daily >= self.join_daily_cap:
+            self._log_once(
+                f"join_daily_cap|{account}",
+                f"[{account}] 最近 24 小时已加入 {daily} 个频道/群组"
+                f"（上限 {self.join_daily_cap}），为避免被限流今日不再自动加入",
+            )
+            return False
+        lo, hi = self.join_pace_range
+        if hi > 0 and events:
+            gap = random.uniform(lo, max(lo, hi)) - (wall - events[-1])
+            if gap > 0:
+                await asyncio.sleep(gap)
+        return True
 
     def _participated_before(self, account: str, username: str, param: str) -> bool:
         """该链接是否视为「已参与过」需要跳过。
@@ -1641,6 +1784,10 @@ class GiveawayEngine:
 
         返回 True 表示确是限流异常（调用方据此跳过后续跟进而不要当普通错误）。
         """
+        # PEER_FLOOD 没有 wait 秒数、重试也不会恢复：按账号整体熔断
+        if self._is_peer_flood(exc):
+            self._block_peer_flood(account, f"{label} @{username}")
+            return True
         wait = self._flood_seconds(exc)
         if wait <= 0:
             return False
@@ -1652,9 +1799,7 @@ class GiveawayEngine:
         self._flood_until[fkey] = max(self._flood_until.get(fkey, 0.0), resume_at)
         # 已参与（joined）或已结束（ended）的记录不能被限流记录覆盖，
         # 否则会把成功状态翻成失败并在冷却后重复参与
-        if self._state is not None and not self._state.has(
-            account, username, param
-        ):
+        if self._state is not None and not self._state.has(account, username, param):
             self._state.add(
                 account,
                 username,
@@ -1679,8 +1824,7 @@ class GiveawayEngine:
             if fkey not in self._flood_bots:
                 self._flood_bots.add(fkey)
                 self.log(
-                    f"[{account}] @{username} 连续限流 {strikes} 次，"
-                    "本轮运行跳过该 bot"
+                    f"[{account}] @{username} 连续限流 {strikes} 次，本轮运行跳过该 bot"
                 )
         return True
 
@@ -1746,6 +1890,8 @@ class GiveawayEngine:
 
     def _can_participate_link(self, account: str, username: str, param: str) -> bool:
         """发 start 前的本地守卫：已参与过（未忽略历史）或 bot 终态「已结束」时跳过。"""
+        if account in self._peer_flood_accounts:
+            return False  # 账号已被 PEER_FLOOD 熔断，本轮不再发任何 start
         if self._participated_before(account, username, param):
             return False
         if self._state is not None and self._state.is_ended(account, username, param):
@@ -1772,9 +1918,7 @@ class GiveawayEngine:
         # "The event has ended or does not exist"）＝终态：归还名额、
         # 不记已参与，持久化标记防止今后重试，并累计 bot 熔断计数
         if reply_says_ended(start_msg):
-            self._handle_start_ended(
-                account, username, param, channel, title, reserved
-            )
+            self._handle_start_ended(account, username, param, channel, title, reserved)
             return
         self._record_participate_success(
             account, username, param, channel, title, reserved
@@ -1883,7 +2027,7 @@ class GiveawayEngine:
         """激进模式：把消息中出现的频道/群组链接逐个加入。返回是否发生加入。"""
         joined_any = False
         label = f"@{bot_username}" if bot_username else "置顶抽奖帖"
-        if self._join_paused():
+        if self._join_paused(account):
             return False
         targets = self._join_targets(account, bot_username, message)
         for target in targets:
@@ -1901,26 +2045,31 @@ class GiveawayEngine:
             if joined:
                 joined_any = True
             if flood_paused:
-                break  # 已被限流，本条消息剩余目标一并跳过
+                # 限流/配额拦截不消耗尝试机会：恢复后（下一轮扫描）重试
+                self._join_cache.discard(key)
+                break
         return joined_any
 
-    def _join_paused(self) -> bool:
-        if (
-            self._join_suspended_until is not None
-            and datetime.now() < self._join_suspended_until
-        ):
-            if not self._join_suspend_logged:
-                self._join_suspend_logged = True
-                self.log(
-                    "自动加入被限流暂停中，恢复时间 "
-                    f"{self._join_suspended_until:%H:%M}（暂停期间跳过所有加入）"
-                )
+    def _join_paused(self, account: str) -> bool:
+        if account in self._peer_flood_accounts:
             return True
-        return False
+        until = self._join_suspended.get(account)
+        if until is None:
+            return False
+        left = until - time.monotonic()
+        if left <= 0:
+            self._join_suspended.pop(account, None)
+            return False
+        if account not in self._join_suspend_logged:
+            self._join_suspend_logged.add(account)
+            resume_at = datetime.now() + timedelta(seconds=left)
+            self.log(
+                f"[{account}] 自动加入被限流暂停中，恢复时间 "
+                f"{resume_at:%H:%M}（暂停期间跳过该账号的所有加入）"
+            )
+        return True
 
-    def _join_targets(
-        self, account: str, bot_username: str, message: Any
-    ) -> List[str]:
+    def _join_targets(self, account: str, bot_username: str, message: Any) -> List[str]:
         targets = extract_channel_targets(message)
         if not bot_policy(bot_username).join_status_checklist:
             return targets
@@ -1941,8 +2090,7 @@ class GiveawayEngine:
         # 「加入-名称 ❌」行却提取不到链接时才报诊断，避免发言任务
         # 行触发解析失败误报
         has_unjoined_row = bool(raw) and any(
-            "加入" in ln and "❌" in ln and "✅" not in ln
-            for ln in raw.split("\n")
+            "加入" in ln and "❌" in ln and "✅" not in ln for ln in raw.split("\n")
         )
         if not (raw and has_unjoined_row):
             return
@@ -2011,7 +2159,11 @@ class GiveawayEngine:
     async def _join_single_target(
         self, account: str, client: Any, target: str, label: str
     ) -> Tuple[bool, bool]:
-        """加入单个目标，返回（是否发生加入，是否因限流中断后续目标）。"""
+        """加入单个目标，返回（是否发生加入，是否因限流/配额中断后续目标）。"""
+        if not await self._join_ready(account):
+            return False, True
+        # 闸门放行后先记账：Telegram 按请求次数限流，失败请求同样消耗额度
+        self._note_join_attempt(account)
         try:
             chat = await client.join_chat(target)
             title = str(getattr(chat, "title", "") or target)
@@ -2019,6 +2171,9 @@ class GiveawayEngine:
             return True, False
         except Exception as exc:
             msg = str(exc)
+            if self._is_peer_flood(exc):
+                self._block_peer_flood(account, f"加入 {target}")
+                return False, True
             if "ALREADY_PARTICIPANT" in msg or "already" in msg.lower():
                 self.log(f"[{account}] 已在 {target} 中，跳过加入")
             elif "INVITE_REQUEST_SENT" in msg:
@@ -2029,14 +2184,7 @@ class GiveawayEngine:
                 return True, False
             elif "FLOOD_WAIT" in msg:
                 wait = self._flood_seconds(exc) or 60
-                self._join_suspended_until = datetime.now() + timedelta(
-                    seconds=wait + 10
-                )
-                self._join_suspend_logged = False
-                self.log(
-                    f"[{account}] 加入频道触发限流（需等待 {wait} 秒），"
-                    f"自动加入暂停至 {self._join_suspended_until:%H:%M}"
-                )
+                self._suspend_joins(account, wait, target)
                 return False, True
             else:
                 self.log(f"[{account}] 加入 {target} 失败: {msg[:120]}")
@@ -2132,11 +2280,7 @@ class GiveawayEngine:
             return target
         # 名称不完全一致时按包含关系模糊匹配（帖子群名 vs 清单行名）
         return next(
-            (
-                t
-                for n, t in name_links.items()
-                if group_name in n or n in group_name
-            ),
+            (t for n, t in name_links.items() if group_name in n or n in group_name),
             None,
         )
 
@@ -2144,8 +2288,7 @@ class GiveawayEngine:
         self, account: str, group_name: str, password: str
     ) -> None:
         self.log(
-            f"[{account}] 口令群「{group_name}」未在清单中定位到链接，"
-            "跳过发送口令"
+            f"[{account}] 口令群「{group_name}」未在清单中定位到链接，跳过发送口令"
         )
         # 记录未完成发言任务（消息中心展示，发送成功后自动消除）
         self._emit(
@@ -2161,10 +2304,7 @@ class GiveawayEngine:
     def _log_password_group_join_failure(
         self, account: str, group_name: str, password: str, detail: str
     ) -> None:
-        self.log(
-            f"[{account}] 加入口令群「{group_name}」失败，"
-            f"无法发送口令: {detail}"
-        )
+        self.log(f"[{account}] 加入口令群「{group_name}」失败，无法发送口令: {detail}")
         self._emit(
             {
                 "type": "speak_failed",
@@ -2342,11 +2482,8 @@ class GiveawayEngine:
         key = f"{account}|monitor|{str(chat).lower()}"
         if key in self._join_cache:
             return
-        # 自动加入被限流暂停中：不消耗本次尝试机会，恢复后重试
-        if (
-            self._join_suspended_until is not None
-            and datetime.now() < self._join_suspended_until
-        ):
+        # 该账号自动加入被限流暂停中：不消耗本次尝试机会，恢复后重试
+        if self._join_paused(account):
             return
         already = await self._is_member(client, chat)
         if already is True:
@@ -2372,6 +2509,10 @@ class GiveawayEngine:
         """逐个候选目标尝试加入监控对象；全部失败才记失败日志。"""
         last_exc: Optional[Exception] = None
         for cand in candidates:
+            # 与消息链接加入共用同一闸门：配额/限流期间整体暂停，恢复后重试
+            if not await self._join_ready(account):
+                return
+            self._note_join_attempt(account)
             try:
                 joined = await client.join_chat(cand)
                 title = str(getattr(joined, "title", "") or chat)
@@ -2405,31 +2546,24 @@ class GiveawayEngine:
     ) -> bool:
         """监控对象加入失败的分类处理。返回 True 表示已终态、停止尝试更多候选。"""
         msg = str(exc)
+        if self._is_peer_flood(exc):
+            self._block_peer_flood(account, f"加入监控对象 {chat}")
+            self._join_cache.discard(key)  # 熔断不消耗尝试机会
+            return True
         if "ALREADY_PARTICIPANT" in msg or "already" in msg.lower():
             self._join_cache.add(key)
-            self._emit(
-                {"type": "join_resolved", "account": account, "chat": str(chat)}
-            )
+            self._emit({"type": "join_resolved", "account": account, "chat": str(chat)})
             return True
         if "INVITE_REQUEST_SENT" in msg:
             self._join_cache.add(key)
             self.log(
                 f"[{account}] 已提交加入 {chat} 的申请（私有群/频道，待管理员审批）"
             )
-            self._emit(
-                {"type": "join_resolved", "account": account, "chat": str(chat)}
-            )
+            self._emit({"type": "join_resolved", "account": account, "chat": str(chat)})
             return True
         if "FLOOD_WAIT" in msg:
             wait = self._flood_seconds(exc) or 60
-            self._join_suspended_until = datetime.now() + timedelta(
-                seconds=wait + 10
-            )
-            self._join_suspend_logged = False
-            self.log(
-                f"[{account}] 加入监控对象 {chat} 触发限流（需等待 {wait} 秒），"
-                f"自动加入暂停至 {self._join_suspended_until:%H:%M}"
-            )
+            self._suspend_joins(account, wait, f"监控对象 {chat}")
             self._emit(
                 {
                     "type": "join_failed",
@@ -2739,9 +2873,7 @@ class GiveawayEngine:
                 account, client, username, candidates
             ):
                 return True, had_join_targets, candidates
-            self.log(
-                f"[{account}] @{username} 要求加入频道后重新参与，再次发送 start"
-            )
+            self.log(f"[{account}] @{username} 要求加入频道后重新参与，再次发送 start")
             return await self._restart_after_join(
                 account, client, username, param, candidates, had_join_targets
             )
@@ -2829,9 +2961,7 @@ class GiveawayEngine:
                 )
         except Exception as exc:
             # 限流也走统一登记（计数 + bot 级暂停 + 冷却落盘），并中止后续跟进
-            if self._record_flood(
-                account, username, param, "", exc, label="重新参与"
-            ):
+            if self._record_flood(account, username, param, "", exc, label="重新参与"):
                 return True, candidates
             self.log(f"重新参与 @{username} 失败: {exc}")
         return False, candidates
@@ -2884,9 +3014,7 @@ class GiveawayEngine:
                     )
                     return True
                 self.log(self._format_confirm_button_log(username, btn.text))
-                await self._verify_after_click(
-                    account, client, username, candidates
-                )
+                await self._verify_after_click(account, client, username, candidates)
                 return True
             # URL 按钮：仅当链接指向同一 bot（含/不含 start 参数）时才「点击」
             # （等同按链接参数重发 start 完成参与），其他链接一律不碰
@@ -2907,12 +3035,9 @@ class GiveawayEngine:
                     return True
                 await self._start_bot(client, account, username, link[1])
                 self.log(
-                    f"已点击 @{username} 的参与按钮「{btn.text}」"
-                    f"（按链接参数重新参与）"
+                    f"已点击 @{username} 的参与按钮「{btn.text}」（按链接参数重新参与）"
                 )
-                await self._verify_after_click(
-                    account, client, username, candidates
-                )
+                await self._verify_after_click(account, client, username, candidates)
                 return True
             if plain_same_bot:
                 if not param:
@@ -2921,12 +3046,8 @@ class GiveawayEngine:
                     )
                     return True
                 await self._start_bot(client, account, username, "")
-                self.log(
-                    f"已点击 @{username} 的参与按钮「{btn.text}」（重发 start）"
-                )
-                await self._verify_after_click(
-                    account, client, username, candidates
-                )
+                self.log(f"已点击 @{username} 的参与按钮「{btn.text}」（重发 start）")
+                await self._verify_after_click(account, client, username, candidates)
                 return True
         except Exception as exc:
             # 限流同样登记（计数 + bot 级暂停 + 冷却落盘），避免异常被吞后

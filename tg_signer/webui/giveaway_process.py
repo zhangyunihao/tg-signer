@@ -146,6 +146,14 @@ class GiveawayProcess:
             "rescue_interval_min": cfg.get("rescue_interval_min") or 0,
             "rescue_limit": cfg.get("rescue_limit") or 10,
             "win_detect": bool(cfg.get("win_detect", True)),
+            # 限流保护：加入/解析节奏与配额（None 表示沿用引擎默认值）
+            "join_pace_min": cfg.get("join_pace_min"),
+            "join_pace_max": cfg.get("join_pace_max"),
+            "resolve_pace_min": cfg.get("resolve_pace_min"),
+            "resolve_pace_max": cfg.get("resolve_pace_max"),
+            "join_hourly_cap": cfg.get("join_hourly_cap"),
+            "join_daily_cap": cfg.get("join_daily_cap"),
+            "join_flood_buffer": cfg.get("join_flood_buffer"),
         }
 
     def _read_stdout(self) -> None:
@@ -184,9 +192,7 @@ class GiveawayProcess:
                         buf += chunk
                         *lines, buf = buf.split(b"\n")
                         for raw in lines:
-                            self._handle_event_line(
-                                raw.decode("utf-8", "replace")
-                            )
+                            self._handle_event_line(raw.decode("utf-8", "replace"))
                         continue
                     if proc.poll() is not None:
                         break
@@ -222,9 +228,7 @@ class GiveawayProcess:
             self.joined = 0
         by_account = payload.get("by_account")
         if isinstance(by_account, dict):
-            self.joined_by_account = {
-                str(k): int(v) for k, v in by_account.items()
-            }
+            self.joined_by_account = {str(k): int(v) for k, v in by_account.items()}
         by_chat = payload.get("by_chat")
         if isinstance(by_chat, dict):
             self.joined_by_account_chat = {

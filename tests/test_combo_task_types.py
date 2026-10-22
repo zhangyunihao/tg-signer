@@ -379,6 +379,33 @@ def test_giveaway_runner_engine_kwargs():
     assert kwargs["confirm_wait"] == 0
     assert kwargs["rescue_interval"] == 1800
     assert kwargs["rescue_limit"] == 1  # 最小 1
+    # 旧任务未配置限流保护：保持 None，由引擎使用默认常量
+    assert kwargs["join_pace_range"] is None
+    assert kwargs["resolve_pace_range"] is None
+    assert kwargs["join_hourly_cap"] is None
+    assert kwargs["join_daily_cap"] is None
+    assert kwargs["join_flood_buffer"] is None
+
+
+def test_giveaway_runner_limits_from_spec():
+    """任务级限流保护参数（WebUI 配置）要透传到引擎。"""
+    kwargs = engine_kwargs_from_spec(
+        {
+            "account": "alice",
+            "join_pace_min": 60,
+            "join_pace_max": 30,
+            "resolve_pace_min": 1,
+            "resolve_pace_max": 3,
+            "join_hourly_cap": 4,
+            "join_daily_cap": 12,
+            "join_flood_buffer": 0,
+        }
+    )
+    assert kwargs["join_pace_range"] == (60.0, 30.0)  # 引擎内部再归序
+    assert kwargs["resolve_pace_range"] == (1.0, 3.0)
+    assert kwargs["join_hourly_cap"] == 4
+    assert kwargs["join_daily_cap"] == 12
+    assert kwargs["join_flood_buffer"] == 0
 
 
 def test_giveaway_runner_engine_kwargs_multi_accounts():
@@ -404,6 +431,13 @@ def test_giveaway_process_spec_and_stats(tmp_path):
             "delay_min": 1,
             "delay_max": 2,
             "auto_scan": False,
+            "join_pace_min": 20,
+            "join_pace_max": 60,
+            "join_hourly_cap": 8,
+            "join_daily_cap": 20,
+            "join_flood_buffer": 15,
+            "resolve_pace_min": 2,
+            "resolve_pace_max": 5,
         }
     )
     assert spec["accounts"] == ["alice"]
@@ -412,6 +446,11 @@ def test_giveaway_process_spec_and_stats(tmp_path):
     assert spec["session_dir"] == str(Path(".sessions"))
     assert spec["auto_scan"] is False
     assert spec["max_joins"] == "5"
+    # 限流保护配置原样透传（缺省 None → 引擎用默认值）
+    assert spec["join_pace_min"] == 20 and spec["join_pace_max"] == 60
+    assert spec["join_hourly_cap"] == 8 and spec["join_daily_cap"] == 20
+    assert spec["join_flood_buffer"] == 15
+    assert spec["resolve_pace_min"] == 2 and spec["resolve_pace_max"] == 5
 
     proc._apply_stats(
         {

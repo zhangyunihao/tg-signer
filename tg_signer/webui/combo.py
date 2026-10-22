@@ -219,6 +219,22 @@ def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | 
         ("补漏重拉条数/频道", str(cfg.get("rescue_limit") or 0)),
         ("中奖识别", _fmt_param_value(cfg.get("win_detect", True))),
         (
+            "加入间隔（秒）",
+            f"{cfg.get('join_pace_min') or 0}–{cfg.get('join_pace_max') or 0}",
+        ),
+        (
+            "每账号 1 小时/24 小时加入上限",
+            (
+                f"{cfg.get('join_hourly_cap') or 0} / {cfg.get('join_daily_cap') or 0}"
+                "（0=不限）"
+            ),
+        ),
+        ("限流额外缓冲（秒）", str(cfg.get("join_flood_buffer") or 0)),
+        (
+            "解析间隔（秒）",
+            f"{cfg.get('resolve_pace_min') or 0}–{cfg.get('resolve_pace_max') or 0}",
+        ),
+        (
             "超时（分钟，全局）",
             f"{load_giveaway_timeout_min(workdir)}（0=不限）",
         ),

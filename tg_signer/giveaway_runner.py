@@ -26,7 +26,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from tg_signer.giveaway_core import GiveawayEngine
 from tg_signer.giveaway_state import GiveawayState
@@ -38,9 +38,26 @@ _TS_RE = re.compile(r"^\d{2}:\d{2}:\d{2}")
 def engine_kwargs_from_spec(spec: dict) -> Dict[str, Any]:
     """把 JSON spec 映射为 GiveawayEngine.start 的关键字参数（纯函数，便于测试）。"""
     max_joins = spec.get("max_joins")
+
+    def _optional_range(prefix: str) -> Optional[Tuple[float, float]]:
+        """限流节奏区间：两项都缺省时返回 None（沿用引擎默认值）。"""
+        lo = spec.get(f"{prefix}_min")
+        hi = spec.get(f"{prefix}_max")
+        if lo is None and hi is None:
+            return None
+        return (float(lo or 0), float(hi or 0))
+
+    def _optional_int(key: str) -> Optional[int]:
+        val = spec.get(key)
+        if val is None or val == "":
+            return None
+        return int(val)
+
     # 兼容单账号（组合任务）与多账号（WebUI 抽奖任务）两种 spec
     if spec.get("accounts") is not None:
-        accounts = [str(a).strip() for a in spec.get("accounts") or [] if str(a).strip()]
+        accounts = [
+            str(a).strip() for a in spec.get("accounts") or [] if str(a).strip()
+        ]
     else:
         accounts = [str(spec.get("account") or "")]
     return {
@@ -60,6 +77,12 @@ def engine_kwargs_from_spec(spec: dict) -> Dict[str, Any]:
                 )
             )
         ),
+        # 加入/解析限流保护（任务级配置，缺省沿用引擎默认值）
+        "join_pace_range": _optional_range("join_pace"),
+        "resolve_pace_range": _optional_range("resolve_pace"),
+        "join_hourly_cap": _optional_int("join_hourly_cap"),
+        "join_daily_cap": _optional_int("join_daily_cap"),
+        "join_flood_buffer": _optional_int("join_flood_buffer"),
         "confirm_wait": (
             int(spec["confirm_wait"]) if spec.get("confirm_wait") is not None else 8
         ),

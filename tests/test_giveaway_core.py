@@ -423,6 +423,9 @@ def _engine(tmp_path, keywords=("抽奖",), delay_max=0.0):
     engine = GiveawayEngine(state=state)
     engine.keywords = tuple(keywords)
     engine.delay_range = (0.0, delay_max)
+    # 测试里禁用加入/解析节奏与滚动配额等待，只验证行为
+    engine.join_pace_range = (0.0, 0.0)
+    engine.resolve_pace_range = (0.0, 0.0)
     engine.confirm_wait = 0
     return engine, state
 
@@ -1124,6 +1127,125 @@ def test_join_precheck_logs_missing_membership(tmp_path):
     assert any("已在" in line and "AlreadyChan" in line for line in logs)
 
 
+def test_join_daily_cap_skips_without_join(tmp_path):
+    """滚动 24 小时加入配额用尽后不再调用 join_chat（跨重启仍生效）。"""
+    import asyncio
+    import time
+
+    engine, state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    engine.join_daily_cap = 20  # 默认不限，测试里显式开启
+    # 1 小时以前、24 小时以内的加入尝试：只触发 24 小时配额
+    old = time.time() - 2 * 3600
+    for _ in range(engine.join_daily_cap):
+        state.add_join_event("acc", old)
+    client = JoinClient()
+    msg = _msg(text="请先关注 @GiveawayChannel")
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBot", msg))
+    assert client.joined == []
+    assert any("今日不再自动加入" in line for line in logs)
+
+
+def test_join_hourly_cap_skips_without_join(tmp_path):
+    """滚动 1 小时加入配额用尽后暂停自动加入。"""
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    engine.join_hourly_cap = 8  # 默认不限，测试里显式开启
+    for _ in range(engine.join_hourly_cap):
+        state.add_join_event("acc")
+    client = JoinClient()
+    msg = _msg(text="请先关注 @GiveawayChannel")
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBot", msg))
+    assert client.joined == []
+    assert any("本轮暂停自动加入" in line for line in logs)
+
+
+def test_join_caps_configurable_per_task(tmp_path):
+    """任务级配额配置生效：0 表示不限制。"""
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    engine.log = lambda _m: None
+    state.add_join_event("acc")
+    state.add_join_event("acc")
+    engine.join_hourly_cap = 2
+    engine.join_daily_cap = 0
+    assert asyncio.run(engine._join_ready("acc")) is False  # 1 小时配额 2 已用完
+    engine.join_hourly_cap = 0
+    assert asyncio.run(engine._join_ready("acc")) is True  # 0 = 不限制
+
+
+def test_join_daily_cap_excludes_events_older_than_24h(tmp_path):
+    """24 小时配额只统计滚动 24 小时内的加入（48 小时日志中的旧记录不计）。"""
+    import asyncio
+    import time
+
+    engine, state = _engine(tmp_path)
+    engine.log = lambda _m: None
+    engine.join_daily_cap = 2
+    old = time.time() - 30 * 3600
+    state.add_join_event("acc", old)
+    state.add_join_event("acc", old)
+    assert asyncio.run(engine._join_ready("acc")) is True
+
+
+def test_join_peer_flood_blocks_account_only(tmp_path):
+    """PEER_FLOOD 后本账号本轮停止加入，其它账号不受影响。"""
+    import asyncio
+
+    class PeerFloodClient(JoinClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def join_chat(self, target):
+            self.calls += 1
+            raise RuntimeError(
+                "Telegram says: [420 PEER_FLOOD] - The method is too spammy"
+            )
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = PeerFloodClient()
+    msg = _msg(text="请先关注 @ChanA 和 @ChanB")
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBot", msg))
+    # 首个目标触发 PEER_FLOOD 后不再尝试第二个
+    assert client.calls == 1
+    assert engine._join_paused("acc")
+    assert not engine._join_paused("other")
+    assert any("PEER_FLOOD" in line for line in logs)
+
+
+def test_join_flood_wait_suspends_only_that_account(tmp_path):
+    """FLOOD_WAIT 只暂停触发限流的账号，且不再继续打第二个目标。"""
+    import asyncio
+
+    class FloodWaitClient(JoinClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def join_chat(self, target):
+            self.calls += 1
+            raise RuntimeError(
+                "Telegram says: [420 FLOOD_WAIT_X] - A wait of 120 seconds is required"
+            )
+
+    engine, _state = _engine(tmp_path)
+    engine.log = lambda _m: None
+    client = FloodWaitClient()
+    msg = _msg(text="请先关注 @ChanA 和 @ChanB")
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBot", msg))
+    assert client.calls == 1
+    assert engine._join_paused("acc")
+    assert not engine._join_paused("other")
+
+
 def test_click_confirm_restarts_any_bot_with_join_targets(tmp_path, monkeypatch):
     """通用策略：任何 bot 消息含加入要求时，加入后自动重发一次 start。"""
     import asyncio
@@ -1689,7 +1811,7 @@ def test_engine_join_flood_wait_suspends(tmp_path):
     assert joined_any is False
     assert any("自动加入被限流暂停中" in line for line in logs)
     # 暂停恢复后正常加入
-    engine._join_suspended_until = None
+    engine._join_suspended.clear()
     asyncio.run(engine._join_from_message("acc", client, "LotteryBot", msg2))
     assert client.calls == ["ChanA", "ChanC", "ChanD"]
 
@@ -2901,9 +3023,7 @@ def test_check_win_message_ignores_nenmeibi_prize(tmp_path):
     events: list = []
     engine.on_event = events.append
     asyncio.run(
-        engine._check_win_message(
-            "acc", client, "RealSaberBot", _msg(text=real, id=21)
-        )
+        engine._check_win_message("acc", client, "RealSaberBot", _msg(text=real, id=21))
     )
     assert client.forwarded == []
     assert events == []

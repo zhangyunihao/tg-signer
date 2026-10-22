@@ -146,6 +146,14 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
                 "rescue_interval_min": int(gcfg.get("rescue_interval_min") or 0),
                 "rescue_limit": int(gcfg.get("rescue_limit") or 10),
                 "win_detect": bool(gcfg.get("win_detect", True)),
+                # 限流保护：加入/解析节奏与配额（任务级配置）
+                "join_pace_min": gcfg.get("join_pace_min"),
+                "join_pace_max": gcfg.get("join_pace_max"),
+                "join_hourly_cap": gcfg.get("join_hourly_cap"),
+                "join_daily_cap": gcfg.get("join_daily_cap"),
+                "join_flood_buffer": gcfg.get("join_flood_buffer"),
+                "resolve_pace_min": gcfg.get("resolve_pace_min"),
+                "resolve_pace_max": gcfg.get("resolve_pace_max"),
                 # 超时（分钟→秒，全局设置）：0=不限
                 "timeout": load_giveaway_timeout_min(workdir) * 60,
             },
@@ -255,13 +263,12 @@ def stop_run_core(record_id: str) -> tuple[str, Optional[dict]]:
 
 
 class TaskRunnerBlock:
-    """执行任务面板：从 WebUI 直接运行签到/自动化/组合任务"""
+    """签到页执行面板：运行签到/自动化任务；组合任务由「组合任务」tab 复用 _launch 执行"""
 
     TASK_TYPES = [
         "签到 (run-once)",
         "签到 (run 定时)",
         "自动化 (automation run)",
-        "组合任务",
     ]
 
     # 服务进程级共享：所有浏览器标签页看到并管理同一批运行中的任务，
@@ -522,12 +529,6 @@ class TaskRunnerBlock:
             )
         elif "退频道" in task_type:
             return ["默认配置"]
-        elif "组合" in task_type:
-            return [
-                str(c.get("name"))
-                for c in load_composite_tasks(state.workdir)
-                if c.get("name")
-            ]
         return []
 
     def _get_combo_task_names(self, task_type: str) -> list[str] | dict[str, str]:
@@ -665,14 +666,17 @@ class TaskRunnerBlock:
     def _refresh_history_table(self) -> None:
         items = load_task_history()
         self._reconcile_history(items)
+        # 组合任务的历史只在「组合任务」tab 展示，签到页列表不混入组合任务记录；
+        # 孤儿「运行中」校正仍按全量数据处理，避免组合任务状态残留。
+        visible = [r for r in items if "组合" not in str(r.get("task_type") or "")]
         counts: dict[str, int] = dict.fromkeys(
             ("运行中", "已完成", "失败", "已停止"), 0
         )
-        for r in items:
+        for r in visible:
             status = r.get("status", "未知")
             if status in counts:
                 counts[status] += 1
-        summary = f"总任务数 {len(items)} | 运行中 {counts['运行中']} | 已完成 {counts['已完成']} | 失败 {counts['失败']} | 已停止 {counts['已停止']}"
+        summary = f"总任务数 {len(visible)} | 运行中 {counts['运行中']} | 已完成 {counts['已完成']} | 失败 {counts['失败']} | 已停止 {counts['已停止']}"
         self.history_summary.text = summary
         self.history_summary.update()
 
@@ -691,7 +695,7 @@ class TaskRunnerBlock:
                 "duration": r.get("duration") or "—",
                 "result": r.get("result", ""),
             }
-            for r in sorted(items, key=_id_key, reverse=True)
+            for r in sorted(visible, key=_id_key, reverse=True)
         ]
         self.history_rows = rows
         self.history_table.rows = rows

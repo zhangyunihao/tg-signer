@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -20,12 +21,12 @@ STATE_FILE = "giveaway_state.json"
 MAX_STATE_PER_ACCOUNT = 1000
 
 
-
-
 # FLOOD_WAIT 失败记录的冷却时间（秒），冷却后允许重试
 FLOOD_COOLDOWN = 3600
 
 
+# 加入频道时间日志的保留窗口（秒）：用于滚动 24 小时加入配额
+JOIN_LOG_WINDOW = 48 * 3600
 
 
 class GiveawayState:
@@ -38,6 +39,8 @@ class GiveawayState:
         self.path = Path(workdir) / STATE_FILE
         self._data: Dict[str, Dict[str, dict]] = {}
         self._win_wm: Dict[str, Dict[str, int]] = {}
+        # 加入频道时间日志 {account: [epoch 秒...]}：滚动窗口加入配额用
+        self._join_log: Dict[str, List[float]] = {}
         self._dirty = False
         self.load()
 
@@ -65,10 +68,19 @@ class GiveawayState:
                             continue
                     if bot_map:
                         parsed[str(acc)] = bot_map
-                self._win_wm = parsed
+                if parsed:
+                    self._win_wm = parsed
+            jl = data.get("join_log")
+            if isinstance(jl, dict):
+                self._join_log = {
+                    str(acc): [float(t) for t in times if isinstance(t, (int, float))]
+                    for acc, times in jl.items()
+                    if isinstance(times, list)
+                }
         except (OSError, json.JSONDecodeError):
             self._data = {}
             self._win_wm = {}
+            self._join_log = {}
 
     def _merge_from_disk(self) -> None:
         """落盘前重读磁盘并合并，防止并发覆盖（多任务并发运行时各自持有
@@ -85,18 +97,31 @@ class GiveawayState:
         except (OSError, json.JSONDecodeError):
             return
         accounts = data.get("accounts")
-        if not isinstance(accounts, dict):
-            return
-        for account, bucket in accounts.items():
-            if not isinstance(bucket, dict):
-                continue
-            local = self._data.setdefault(str(account), {})
-            for key, rec in bucket.items():
-                if not isinstance(rec, dict):
+        if isinstance(accounts, dict):
+            for account, bucket in accounts.items():
+                if not isinstance(bucket, dict):
                     continue
-                cur = local.get(key)
-                if cur is None or str(rec.get("ts") or "") > str(cur.get("ts") or ""):
-                    local[key] = rec
+                local = self._data.setdefault(str(account), {})
+                for key, rec in bucket.items():
+                    if not isinstance(rec, dict):
+                        continue
+                    cur = local.get(key)
+                    if cur is None or str(rec.get("ts") or "") > str(
+                        cur.get("ts") or ""
+                    ):
+                        local[key] = rec
+        self._merge_join_log(data.get("join_log"))
+
+    def _merge_join_log(self, disk_log) -> None:
+        """合并磁盘上的加入时间日志（并集去重），避免并发任务互相覆盖。"""
+        if not isinstance(disk_log, dict):
+            return
+        for account, times in disk_log.items():
+            if not isinstance(times, list):
+                continue
+            merged = set(self._join_log.get(str(account), []))
+            merged.update(float(t) for t in times if isinstance(t, (int, float)))
+            self._join_log[str(account)] = sorted(merged)
 
     def save(self, force: bool = False) -> None:
         if not self._dirty and not force:
@@ -106,7 +131,11 @@ class GiveawayState:
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(
             json.dumps(
-                {"accounts": self._data, "win_watermarks": self._win_wm},
+                {
+                    "accounts": self._data,
+                    "win_watermarks": self._win_wm,
+                    "join_log": self._join_log,
+                },
                 ensure_ascii=False,
                 indent=2,
             ),
@@ -226,4 +255,20 @@ class GiveawayState:
         if old is not None and int(msg_id) <= old:
             return
         bot_map[bot.lower()] = int(msg_id)
+        self._dirty = True
+
+    def join_events(self, account: str, window: int = JOIN_LOG_WINDOW) -> List[float]:
+        """该账号最近 window 秒内的加入时间（epoch 秒，升序），用于滚动配额。"""
+        cutoff = time.time() - window
+        kept = sorted(t for t in self._join_log.get(account, []) if t >= cutoff)
+        if len(kept) != len(self._join_log.get(account, [])):
+            self._join_log[account] = kept
+            self._dirty = True
+        return kept
+
+    def add_join_event(self, account: str, ts: Optional[float] = None) -> None:
+        """记录一次加入尝试的时间（配额按尝试计，失败也算）。"""
+        events = sorted([*self.join_events(account), float(ts or time.time())])
+        # 只为配额服务，保留一个窗口的量即可
+        self._join_log[account] = events[-200:]
         self._dirty = True

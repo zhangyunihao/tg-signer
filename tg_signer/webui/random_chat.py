@@ -752,7 +752,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         except Exception:
             logger.debug("更新任务运行状态回调执行失败", exc_info=True)
 
-    def on_add_task() -> None:
+    async def on_add_task() -> None:
         accounts = list(account_select.value or [])
         if not accounts:
             ui.notify("请至少选择一个账号", type="warning")
@@ -787,7 +787,14 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         _persist()
         render_tasks()
         add_dlg.close()
-        ui.notify(f"任务 #{name} 已添加，可手动点击「启动」开始运行", type="positive")
+        # 创建后直接启动任务，无需再手动点击「启动」
+        set_status = _GLOBAL_STATUS_CBS.get(engine_key(name))
+
+        def _noop_status(_running: bool) -> None:
+            pass
+
+        await start_task(name, set_status or _noop_status)
+        render_tasks()
 
     def render_tasks() -> None:
         task_list_container.clear()

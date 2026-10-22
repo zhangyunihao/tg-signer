@@ -15,7 +15,14 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from nicegui import ui
 
-from tg_signer.giveaway_core import WIN_SWEEP_LIMIT
+from tg_signer.giveaway_core import (
+    JOIN_DAILY_CAP,
+    JOIN_FLOOD_BUFFER,
+    JOIN_HOURLY_CAP,
+    JOIN_PACE_RANGE,
+    RESOLVE_PACE_RANGE,
+    WIN_SWEEP_LIMIT,
+)
 from tg_signer.giveaway_parsing import DEFAULT_KEYWORDS
 from tg_signer.giveaway_state import GiveawayState
 from tg_signer.utils import atomic_write_json
@@ -456,6 +463,14 @@ _CFG_FIELDS = {
     "rescue_interval_min": lambda: 0,  # 补漏扫描间隔（分钟），0=关闭（默认关闭）
     "rescue_limit": lambda: 10,  # 每次补漏每频道重拉条数
     "win_detect": lambda: True,  # 中奖识别：bot 私聊命中关键词时转发提醒
+    # —— 限流保护（任务级）——
+    "join_pace_min": lambda: int(JOIN_PACE_RANGE[0]),  # 相邻两次加入最小间隔（秒）
+    "join_pace_max": lambda: int(JOIN_PACE_RANGE[1]),
+    "join_hourly_cap": lambda: JOIN_HOURLY_CAP,  # 单账号滚动 1 小时加入上限
+    "join_daily_cap": lambda: JOIN_DAILY_CAP,  # 单账号滚动 24 小时加入上限
+    "join_flood_buffer": lambda: JOIN_FLOOD_BUFFER,  # FLOOD_WAIT 额外缓冲（秒）
+    "resolve_pace_min": lambda: int(RESOLVE_PACE_RANGE[0]),  # 解析类调用最小间隔
+    "resolve_pace_max": lambda: int(RESOLVE_PACE_RANGE[1]),
     "last_joined": lambda: 0,  # 上次运行新参与抽奖总数
     "last_joined_by_account": dict,  # 上次运行各账号新参与数 {account: count}
     "last_joined_by_account_chat": dict,  # 上次运行各账号按来源频道/群组分布 {account: {chat: count}}
@@ -576,6 +591,14 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "rescue_limit": max(1, int(cfg.get("rescue_limit") or 10)),
                 # 中奖识别配置（转发目标/Server酱为消息中心全局设置）
                 "win_detect": bool(cfg.get("win_detect", True)),
+                # 限流保护：加入/解析节奏与配额（0=不限制，缺省用常量默认值）
+                "join_pace_min": max(0, int(cfg.get("join_pace_min") or 0)),
+                "join_pace_max": max(0, int(cfg.get("join_pace_max") or 0)),
+                "join_hourly_cap": max(0, int(cfg.get("join_hourly_cap") or 0)),
+                "join_daily_cap": max(0, int(cfg.get("join_daily_cap") or 0)),
+                "join_flood_buffer": max(0, int(cfg.get("join_flood_buffer") or 0)),
+                "resolve_pace_min": max(0, int(cfg.get("resolve_pace_min") or 0)),
+                "resolve_pace_max": max(0, int(cfg.get("resolve_pace_max") or 0)),
                 # 上次执行的开始时间与时长（运行结束或停止时写入时长）
                 "last_start_time": str(cfg.get("last_start_time") or ""),
                 "last_duration": str(cfg.get("last_duration") or ""),
@@ -739,6 +762,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         rescue_limit_input.value = cfg.get("rescue_limit") or 10
         rescue_switch.value = bool(cfg.get("rescue_interval_min"))
         win_switch.value = bool(cfg.get("win_detect", True))
+        join_pace_min_input.value = cfg.get("join_pace_min")
+        join_pace_max_input.value = cfg.get("join_pace_max")
+        join_hourly_cap_input.value = cfg.get("join_hourly_cap")
+        join_daily_cap_input.value = cfg.get("join_daily_cap")
+        join_flood_buffer_input.value = cfg.get("join_flood_buffer")
+        resolve_pace_min_input.value = cfg.get("resolve_pace_min")
+        resolve_pace_max_input.value = cfg.get("resolve_pace_max")
         _apply_rescue_visibility()
         for el in (
             session_dir_input,
@@ -755,6 +785,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             rescue_interval_input,
             rescue_limit_input,
             win_switch,
+            join_pace_min_input,
+            join_pace_max_input,
+            join_hourly_cap_input,
+            join_daily_cap_input,
+            join_flood_buffer_input,
+            resolve_pace_min_input,
+            resolve_pace_max_input,
         ):
             el.update()
         ui.notify("已复制任务参数，可修改后点击「确定添加」", type="positive")
@@ -885,11 +922,22 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 else 0
             )
             rescue_limit = max(1, int(rescue_limit_input.value or 10))
+            join_pace_min = max(0, int(join_pace_min_input.value or 0))
+            join_pace_max = max(0, int(join_pace_max_input.value or 0))
+            join_hourly_cap = max(0, int(join_hourly_cap_input.value or 0))
+            join_daily_cap = max(0, int(join_daily_cap_input.value or 0))
+            join_flood_buffer = max(0, int(join_flood_buffer_input.value or 0))
+            resolve_pace_min = max(0, int(resolve_pace_min_input.value or 0))
+            resolve_pace_max = max(0, int(resolve_pace_max_input.value or 0))
         except (TypeError, ValueError):
-            ui.notify("参与上限/延迟/补漏参数需为数字", type="warning")
+            ui.notify("参与上限/延迟/补漏/限流参数需为数字", type="warning")
             return
         if delay_min > delay_max:
             delay_min, delay_max = delay_max, delay_min
+        if join_pace_min > join_pace_max:
+            join_pace_min, join_pace_max = join_pace_max, join_pace_min
+        if resolve_pace_min > resolve_pace_max:
+            resolve_pace_min, resolve_pace_max = resolve_pace_max, resolve_pace_min
         name = str(store["seq"])
         store["seq"] += 1
         tasks[name] = {
@@ -907,6 +955,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "rescue_interval_min": rescue_interval_min,
             "rescue_limit": rescue_limit,
             "win_detect": bool(win_switch.value),
+            "join_pace_min": join_pace_min,
+            "join_pace_max": join_pace_max,
+            "join_hourly_cap": join_hourly_cap,
+            "join_daily_cap": join_daily_cap,
+            "join_flood_buffer": join_flood_buffer,
+            "resolve_pace_min": resolve_pace_min,
+            "resolve_pace_max": resolve_pace_max,
         }
         ensure_engine(name)
         _persist()
@@ -1592,6 +1647,67 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 max=100,
                 format="%d",
             ).classes("w-44")
+
+        with ui.expansion("限流保护（加入/解析节奏与配额）", icon="shield").classes(
+            "w-full"
+        ):
+            with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+                join_pace_min_input = ui.number(
+                    label="加入间隔下限（秒）",
+                    value=int(JOIN_PACE_RANGE[0]),
+                    min=0,
+                    max=3600,
+                    format="%d",
+                ).classes("w-44")
+                join_pace_max_input = ui.number(
+                    label="加入间隔上限（秒）",
+                    value=int(JOIN_PACE_RANGE[1]),
+                    min=0,
+                    max=3600,
+                    format="%d",
+                ).classes("w-40")
+                join_hourly_cap_input = ui.number(
+                    label="每账号 1 小时加入上限（0=不限）",
+                    value=JOIN_HOURLY_CAP,
+                    min=0,
+                    max=1000,
+                    format="%d",
+                ).classes("w-60")
+                join_daily_cap_input = ui.number(
+                    label="每账号 24 小时加入上限（0=不限）",
+                    value=JOIN_DAILY_CAP,
+                    min=0,
+                    max=10000,
+                    format="%d",
+                ).classes("w-64")
+            with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+                resolve_pace_min_input = ui.number(
+                    label="解析间隔下限（秒）",
+                    value=int(RESOLVE_PACE_RANGE[0]),
+                    min=0,
+                    max=600,
+                    format="%d",
+                ).classes("w-44")
+                resolve_pace_max_input = ui.number(
+                    label="解析间隔上限（秒）",
+                    value=int(RESOLVE_PACE_RANGE[1]),
+                    min=0,
+                    max=600,
+                    format="%d",
+                ).classes("w-40")
+                join_flood_buffer_input = ui.number(
+                    label="限流额外缓冲（秒）",
+                    value=JOIN_FLOOD_BUFFER,
+                    min=0,
+                    max=600,
+                    format="%d",
+                ).classes("w-48")
+            ui.label(
+                "加入/解析节奏与滚动配额用于规避 Telegram 限流"
+                "（FLOOD_WAIT 短暂停、PEER_FLOOD 会数小时到数天无法加群）；"
+                "间隔在上下限之间随机取值，配额按账号统计且跨任务重启累计，"
+                "0 表示不限制。"
+            ).classes("text-xs text-gray-500")
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             win_switch = ui.switch(
