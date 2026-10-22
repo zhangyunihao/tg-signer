@@ -21,7 +21,7 @@ from typing import Callable, Dict, List
 from nicegui import ui
 from pyrogram.errors import FloodWait, RPCError
 
-from tg_signer.core import get_client, safe_disconnect
+from tg_signer.core import get_client, safe_disconnect, timeout_aiter
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.common import (
     add_dialog_close_button,
@@ -36,6 +36,9 @@ from tg_signer.webui.random_chat import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 单次网络调用超时（秒）：手机代理不稳定场景，超时明确失败而非永久挂起
+_NET_CALL_TIMEOUT = 90
 
 CONFIG_NAME = "auto_leave_config.json"
 LEAVE_TASKS_FILE = "webui_leave_tasks.json"
@@ -155,7 +158,10 @@ async def scan_stale_chats(
             return found
         cutoff = datetime.utcnow() - timedelta(days=days) if days > 0 else None
         scanned = 0
-        async for dialog in client.get_dialogs():  # 不设上限，遍历全部对话
+        # 逐项拉取套超时：代理僵死时明确失败，不永久挂起
+        async for dialog in timeout_aiter(
+            client.get_dialogs(), _NET_CALL_TIMEOUT, "get_dialogs"
+        ):
             scanned += 1
             if scanned % 200 == 0:
                 log(f"[{account}] 已扫描 {scanned} 个对话...")
@@ -200,12 +206,16 @@ async def scan_stale_chats(
 
 
 async def leave_one(client, chat_id, title: str, log: Callable[[str], None]) -> bool:
-    """退出单个对话，处理 FloodWait（等待后重试一次）"""
+    """退出单个对话，处理 FloodWait（等待后重试一次）；单次调用限时网络超时"""
+
     for attempt in (1, 2):
         try:
-            await client.leave_chat(chat_id)
+            await asyncio.wait_for(client.leave_chat(chat_id), _NET_CALL_TIMEOUT)
             log(f"[已退出] {title} ({chat_id})")
             return True
+        except asyncio.TimeoutError:
+            log(f"[失败] {title}: 网络超时（{_NET_CALL_TIMEOUT} 秒，网络异常）")
+            return False
         except FloodWait as exc:
             wait = min(int(getattr(exc, "value", 0) or 60), 120)
             if attempt == 2:

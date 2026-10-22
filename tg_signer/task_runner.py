@@ -94,8 +94,30 @@ def main(argv: list[str] | None = None) -> int:
         if action == "run-once":
             from tg_signer.core import UserSigner
 
-            signer = UserSigner(task_name=task_names[0], **kwargs)
-            signer.app_run(signer.run_once(200))
+            # 进程级兜底超时：代理长时间不可用时任务能明确失败退出，
+            # 而不是永远停留在"运行中"（长驻型 run/automation-run 不限时长）
+            try:
+                run_once_timeout = float(
+                    os.environ.get("TG_SIGNER_RUN_ONCE_TIMEOUT") or 1800
+                )
+            except ValueError:
+                run_once_timeout = 1800.0
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                signer = UserSigner(task_name=task_names[0], loop=loop, **kwargs)
+                loop.run_until_complete(
+                    asyncio.wait_for(signer.run_once(200), timeout=run_once_timeout)
+                )
+            except asyncio.TimeoutError:
+                print(
+                    f"任务超过 {run_once_timeout:.0f} 秒未完成"
+                    f"（网络长时间不可用），强制退出",
+                    flush=True,
+                )
+                return 1
+            finally:
+                loop.close()
         elif action == "run":
             from tg_signer.core import UserSigner
 

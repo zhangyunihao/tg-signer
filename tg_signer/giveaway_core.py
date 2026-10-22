@@ -1266,12 +1266,12 @@ class GiveawayEngine:
         最多翻 WIN_SWEEP_PAGE_MAX 页兜底（防水位线异常时无限翻页）。
         """
         batch: List[Any] = []
-        offset_id = 0
+        max_id = 0
         reached = False
         for _ in range(WIN_SWEEP_PAGE_MAX):
             page: List[Any] = []
             async for message in client.get_chat_history(
-                bot, offset_id=offset_id, limit=WIN_SWEEP_PAGE
+                bot, max_id=max_id, limit=WIN_SWEEP_PAGE
             ):
                 page.append(message)
             if not page:
@@ -1281,9 +1281,11 @@ class GiveawayEngine:
             )
             if stop:
                 break
-            offset_id = getattr(page[-1], "id", 0) or 0
-            if offset_id <= 0:
+            # max_id 为闭区间（含 max_id 本身）；下一页取 id 严格小于本页最旧消息。
+            oldest_id = getattr(page[-1], "id", 0) or 0
+            if oldest_id <= 1:
                 break
+            max_id = oldest_id - 1
         return batch
 
     @staticmethod

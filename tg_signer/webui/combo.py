@@ -214,6 +214,7 @@ def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | 
         ("参与前随机延迟上限（秒）", str(cfg.get("delay_max") or 0)),
         ("确认等待（秒）", str(cfg.get("confirm_wait") or 0)),
         ("参与条数上限", str(max_joins) if max_joins else "不限"),
+        ("允许重复参与", _fmt_param_value(cfg.get("ignore_history", True))),
         ("补漏扫描间隔（分钟）", f"{rescue_min}（0=关闭）"),
         ("补漏重拉条数/频道", str(cfg.get("rescue_limit") or 0)),
         ("中奖识别", _fmt_param_value(cfg.get("win_detect", True))),
@@ -280,7 +281,7 @@ def _sub_config_params_brief(sub: dict, workdir) -> list[tuple[str, str, str]] |
         # 签到：跳过逐频道明细（频道1、频道2…）
         if "run-once" in sub_type and str(lbl).startswith("频道"):
             continue
-        # 抽奖：只保留频道/群组（缩略前3个）、消息关键词、超时
+        # 抽奖：只保留频道/群组（缩略前3个）、消息关键词、参与上限、允许重复参与、超时
         if "抽奖" in sub_type:
             if lbl == "监控频道/群组":
                 lines = [ln for ln in str(val).splitlines() if ln.strip()]
@@ -293,7 +294,12 @@ def _sub_config_params_brief(sub: dict, workdir) -> list[tuple[str, str, str]] |
                 else:
                     short = f"{'、'.join(names)}（共 {total} 个）"
                 rows.append((lbl, short, str(val)))
-            elif lbl in ("消息关键词", "超时（分钟，全局）"):
+            elif lbl in (
+                "消息关键词",
+                "参与条数上限",
+                "允许重复参与",
+                "超时（分钟，全局）",
+            ):
                 rows.append((lbl, str(val), str(val)))
             continue
         rows.append((lbl, str(val), str(val)))
@@ -1702,9 +1708,7 @@ def _build_progress_page(record_id: str) -> None:
         if live_run is not None:
             record = live_run["record"]
 
-    with ui.row().classes(
-        "w-full items-center gap-2 flex-wrap tgs-page-head"
-    ):
+    with ui.row().classes("w-full items-center gap-2 flex-wrap tgs-page-head"):
         ui.button(icon="arrow_back").props("flat round dense").tooltip(
             "返回主控台"
         ).on_click(lambda: ui.navigate.to("/"))

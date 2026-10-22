@@ -231,8 +231,8 @@ def _handle_win_event(client, workdir, ev: dict) -> None:
     _notify_alert(client, format_win_alert(alerts[0]), "positive", "推送中奖提醒失败")
 
 
-def _handle_join_event(client, workdir, ev: dict, title_map: Dict[str, str]) -> None:
-    """加入失败 → 提醒；加入成功（join_resolved）→ 消除同账号/同对象的提醒。"""
+def _handle_join_event(workdir, ev: dict) -> None:
+    """加入失败 → 仅写入消息中心，不弹顶部通知；加入成功（join_resolved）→ 消除提醒。"""
     acct = str(ev.get("account") or "")
     chat = str(ev.get("chat") or "")
     if not acct or not chat:
@@ -250,13 +250,6 @@ def _handle_join_event(client, workdir, ev: dict, title_map: Dict[str, str]) -> 
             },
         )
     save_join_alerts(workdir, alerts)
-    if failed:
-        _notify_alert(
-            client,
-            format_join_alert(alerts[0], title_map),
-            "warning",
-            "推送加入失败通知失败",
-        )
 
 
 def _handle_speak_event(client, workdir, ev: dict) -> None:
@@ -322,13 +315,13 @@ def _handle_speech_event(client, workdir, ev: dict) -> None:
     )
 
 
-def handle_giveaway_event(client, workdir, ev: dict, title_map: Dict[str, str]) -> None:
+def handle_giveaway_event(client, workdir, ev: dict) -> None:
     """引擎事件分发：中奖 / 加入失败或解除 / 口令未完成 / 发言数未达标。"""
     etype = ev.get("type")
     if etype == "win":
         _handle_win_event(client, workdir, ev)
     elif etype in ("join_failed", "join_resolved"):
-        _handle_join_event(client, workdir, ev, title_map)
+        _handle_join_event(workdir, ev)
     elif etype in ("speak_failed", "speak_done"):
         _handle_speak_event(client, workdir, ev)
     elif etype == "speech_required":
@@ -454,10 +447,11 @@ _CFG_FIELDS = {
     "session_dir": str,
     "keywords": lambda: list(DEFAULT_KEYWORDS),
     "auto_scan": lambda: True,
+    "auto_join": lambda: True,
+    "ignore_history": lambda: True,  # 允许重复参与（忽略历史成功记录）
     "delay_min": lambda: 3,
     "delay_max": lambda: 10,
     "confirm_wait": lambda: 8,
-    "auto_join": lambda: True,
     "max_joins": lambda: None,
     "rescue_interval_min": lambda: 0,  # 补漏扫描间隔（分钟），0=关闭（默认关闭）
     "rescue_limit": lambda: 10,  # 每次补漏每频道重拉条数
@@ -573,6 +567,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "keywords": list(cfg.get("keywords") or []),
                 "auto_scan": bool(cfg.get("auto_scan", True)),
                 "auto_join": bool(cfg.get("auto_join", True)),
+                "ignore_history": bool(cfg.get("ignore_history", True)),
                 "delay_min": int(cfg.get("delay_min") or 0),
                 "delay_max": int(cfg.get("delay_max") or 0),
                 "confirm_wait": int(cfg.get("confirm_wait") or 0),
@@ -819,8 +814,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 _apply_status(cb, False)
 
         def _on_event(ev: dict) -> None:
-            """引擎事件 → 顶部通知 + 持久化（按事件类型分发，见 handle_giveaway_event）"""
-            handle_giveaway_event(client, workdir, ev, chat_title_map)
+            """引擎事件 → 顶部通知/消息中心 + 持久化（按事件类型分发，见 handle_giveaway_event）"""
+            handle_giveaway_event(client, workdir, ev)
 
         engine = ensure_engine(name)
         start_ts = time.time()
@@ -1311,8 +1306,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         手机端报错后一键复制，粘贴到电脑即可拿到定位/复现所需的全部上下文。
         """
         wd = Path(workdir)
+        # tasks 里存有 UI 回调（_set_status 等 _ 前缀内部键），不能直接序列化
+        serializable_tasks = {
+            n: {k: v for k, v in cfg.items() if not str(k).startswith("_")}
+            for n, cfg in tasks.items()
+        }
         sections: list[tuple[str, str]] = [
-            ("任务配置（所有抽奖任务）", pretty_json(tasks)),
+            ("任务配置（所有抽奖任务）", pretty_json(serializable_tasks)),
             ("任务状态", pretty_json({n: _status_text(n) for n in tasks})),
         ]
         try:
@@ -1623,17 +1623,4 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
     refresh_options()
     render_tasks()
-    # 回放持久化的「未加入监控对象且加入失败」提醒（加入成功后自动消除）
-    _persisted_alerts = load_join_alerts(workdir)
-    if _persisted_alerts:
-        try:
-            with client:
-                for a in reversed(_persisted_alerts[:10]):
-                    ui.notify(
-                        format_join_alert(a, chat_title_map),
-                        type="warning",
-                        multi_line=True,
-                    )
-        except Exception:
-            logger.debug("回放加入失败提醒失败", exc_info=True)
     return refresh_options

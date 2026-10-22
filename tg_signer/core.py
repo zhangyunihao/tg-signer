@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from datetime import time as dt_time
 from typing import (
     Annotated,
+    Any,
+    AsyncIterator,
     Awaitable,
     BinaryIO,
     Callable,
@@ -217,6 +219,16 @@ _API_LAST_CALL_AT: dict[str, float] = {}
 _API_MIN_INTERVAL_SECONDS = 0.35
 _API_FLOODWAIT_PADDING_SECONDS = 0.5
 _API_MAX_FLOODWAIT_RETRIES = 2
+# 手机代理不稳定场景：单次 API 调用超过该时长按网络异常处理，限时重试
+_API_CALL_TIMEOUT_SECONDS = 90.0
+_API_MAX_NET_RETRIES = 2
+_API_NET_RETRY_DELAY_SECONDS = 3.0
+# 客户端启动（connect+authorize）重试参数
+_CONNECT_ATTEMPTS = 3
+_CONNECT_ATTEMPT_TIMEOUT_SECONDS = 60.0
+_CONNECT_RETRY_DELAY_SECONDS = 5.0
+# 网络类异常（代理瞬断/半开连接）；asyncio.TimeoutError 与内置 TimeoutError 在 3.10/3.11 归属不同，都捕
+_NET_ERRORS = (asyncio.TimeoutError, TimeoutError, OSError)
 
 RouteKey = tuple[ChatId, Optional[int]]
 get_timezone = _get_timezone
@@ -236,6 +248,32 @@ class Client(SafeGetForumTopics, BaseClient):
                 in_memory=True,
             )
 
+    async def _start_with_retry(self) -> None:
+        """启动客户端；网络类失败自动重试（手机代理不稳定场景）。"""
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, _CONNECT_ATTEMPTS + 1):
+            try:
+                await asyncio.wait_for(
+                    self.start(), timeout=_CONNECT_ATTEMPT_TIMEOUT_SECONDS
+                )
+                return
+            except _NET_ERRORS as exc:
+                last_exc = exc
+                logger.debug(
+                    f"启动客户端连接失败（第 {attempt}/{_CONNECT_ATTEMPTS} 次）",
+                    exc_info=True,
+                )
+                if attempt < _CONNECT_ATTEMPTS:
+                    await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
+                # 超时被取消的 start 可能残留半开连接，先兜底断开再重试
+                try:
+                    await asyncio.wait_for(self.disconnect(), timeout=5)
+                except Exception:
+                    logger.debug("重试前兜底断开客户端失败", exc_info=True)
+        raise ConnectionError(
+            f"连接 Telegram 失败（已重试 {_CONNECT_ATTEMPTS} 次，请检查代理/网络）：{last_exc}"
+        ) from last_exc
+
     async def __aenter__(self):
         lock = _CLIENT_ASYNC_LOCKS.get(self.key)
         if lock is None:
@@ -245,9 +283,11 @@ class Client(SafeGetForumTopics, BaseClient):
             _CLIENT_REFS[self.key] += 1
             if _CLIENT_REFS[self.key] == 1:
                 try:
-                    await self.start()
-                except ConnectionError:
-                    logger.debug("启动客户端连接失败", exc_info=True)
+                    await self._start_with_retry()
+                except BaseException:
+                    # async with 失败不会走 __aexit__，回滚引用计数防泄漏
+                    _CLIENT_REFS[self.key] -= 1
+                    raise
             return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -378,6 +418,26 @@ async def safe_disconnect(client: Optional[Client], timeout: float = 15.0) -> No
             _CLIENT_INSTANCES.pop(key, None)
 
 
+async def timeout_aiter(
+    agen: AsyncIterator[Any], timeout: float, name: str = ""
+) -> AsyncIterator[Any]:
+    """给异步迭代器逐项套超时（手机代理不稳定场景）。
+
+    任一单项拉取超过 timeout 秒抛 RuntimeError（带说明），由调用点
+    既有异常处理兜底；正常结束时静默返回。
+    """
+    while True:
+        try:
+            item = await asyncio.wait_for(agen.__anext__(), timeout)
+        except StopAsyncIteration:
+            return
+        except _NET_ERRORS:
+            raise RuntimeError(
+                f"网络请求 {name or '数据拉取'} 超时（{timeout:.0f} 秒，网络异常）"
+            )
+        yield item
+
+
 def make_dirs(path: pathlib.Path, exist_ok=True):
     path = pathlib.Path(path)
     if not path.is_dir():
@@ -496,6 +556,7 @@ class BaseUserWorker(Generic[ConfigT]):
             _API_ASYNC_LOCKS[key] = lock
 
         retries_left = _API_MAX_FLOODWAIT_RETRIES
+        net_retries_left = _API_MAX_NET_RETRIES
         while True:
             async with lock:
                 loop = asyncio.get_running_loop()
@@ -507,7 +568,9 @@ class BaseUserWorker(Generic[ConfigT]):
                     if wait_for > 0:
                         await asyncio.sleep(wait_for)
                 try:
-                    result = await call()
+                    result = await asyncio.wait_for(
+                        call(), timeout=_API_CALL_TIMEOUT_SECONDS
+                    )
                     _API_LAST_CALL_AT[key] = loop.time()
                     return result
                 except errors.FloodWait as e:
@@ -524,6 +587,21 @@ class BaseUserWorker(Generic[ConfigT]):
                         level="WARNING",
                     )
                     await asyncio.sleep(wait_seconds)
+                except _NET_ERRORS as e:
+                    # 代理不稳/半开连接等网络异常：限时重试，耗尽后抛 RuntimeError
+                    # 由各调用点既有异常处理兜底；超时被取消的请求可能已到达服务端，
+                    # 重试极小概率重复发送，与手动重跑任务的语义一致
+                    if net_retries_left <= 0:
+                        raise RuntimeError(
+                            f"{operation} 网络异常（重试 {_API_MAX_NET_RETRIES} 次后放弃，请检查代理/网络）：{e}"
+                        ) from e
+                    net_retries_left -= 1
+                    self.log(
+                        f"{operation} 网络异常（可能代理不稳），"
+                        f"{_API_NET_RETRY_DELAY_SECONDS:.0f}s 后重试（剩余 {net_retries_left} 次）",
+                        level="WARNING",
+                    )
+                    await asyncio.sleep(_API_NET_RETRY_DELAY_SECONDS)
 
     def ask_for_config(self):
         raise NotImplementedError
@@ -1068,6 +1146,20 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
                     self.log(f"签到失败: {_e} \nchat: \n{chat}")
                     logger.warning(_e, exc_info=True)
                     continue
+                except _NET_ERRORS as _e:
+                    # 代理不稳场景：网络类异常只跳过当前频道，不中断整个签到流程
+                    self.log(
+                        f"签到失败（网络异常，跳过该频道继续）: {_e} \nchat: \n{chat}"
+                    )
+                    logger.warning(_e, exc_info=True)
+                    continue
+                except RuntimeError as _e:
+                    # _call_telegram_api 重试耗尽抛出的网络异常
+                    self.log(
+                        f"签到失败（网络异常，跳过该频道继续）: {_e} \nchat: \n{chat}"
+                    )
+                    logger.warning(_e, exc_info=True)
+                    continue
 
                 if route_key is not None:
                     self.context.chat_messages[route_key].clear()
@@ -1101,6 +1193,7 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
                 return False
             return True
 
+        connect_failures = 0
         while True:
             self.log(f"为以下Chat添加消息回调处理函数：{chat_ids}")
             self.app.add_handler(
@@ -1111,6 +1204,7 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
             )
             try:
                 async with self.app:
+                    connect_failures = 0
                     now = get_now()
                     self.log(f"当前时间: {now}")
                     now_date_str = str(now.date())
@@ -1121,6 +1215,14 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
             except (OSError, errors.Unauthorized) as e:
                 logger.exception(e)
                 await asyncio.sleep(30)
+                if only_once:
+                    # run-once 必须能结束：连接类失败最多重试 3 轮，之后明确失败退出
+                    connect_failures += 1
+                    if connect_failures >= 3:
+                        raise RuntimeError(
+                            "多次尝试后仍无法连接 Telegram，run-once 任务失败"
+                            "（请检查代理/网络后重试）"
+                        ) from e
                 continue
 
             if only_once:

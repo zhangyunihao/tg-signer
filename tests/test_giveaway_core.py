@@ -402,13 +402,13 @@ class FakeClient:
         self.started.append((username, param))
         return None
 
-    def get_chat_history(self, chat, limit=None, offset_id=0):
-        return self._history(limit, offset_id)
+    def get_chat_history(self, chat, limit=None, max_id=0):
+        return self._history(limit, max_id)
 
-    async def _history(self, limit=None, offset_id=0):
+    async def _history(self, limit=None, max_id=0):
         items = self.history
-        if offset_id:
-            items = [m for m in items if getattr(m, "id", 0) < offset_id]
+        if max_id:
+            items = [m for m in items if getattr(m, "id", 0) <= max_id]
         if limit is not None:
             items = items[:limit]
         for m in items:
@@ -1012,9 +1012,7 @@ def test_flood_does_not_overwrite_joined_record(tmp_path):
     """已参与的记录不能被后来的限流记录覆盖（否则成功会翻成失败并被重复参与）。"""
     engine, state = _engine(tmp_path)
     state.add("acc", "LotteryBot", "act1", note="joined")
-    exc = RuntimeError(
-        "Telegram says: [420 FLOOD_WAIT_X] - Please wait 1717 seconds"
-    )
+    exc = RuntimeError("Telegram says: [420 FLOOD_WAIT_X] - Please wait 1717 seconds")
     exc.value = 1717
     assert engine._record_flood("acc", "LotteryBot", "act1", "", exc)
     assert state.has("acc", "LotteryBot", "act1")
@@ -2239,9 +2237,7 @@ def test_draw_announce_post_is_filtered(tmp_path):
 
     # 群置顶路径（绕过关键词过滤）：仍须过滤且不参与
     result = asyncio.run(
-        engine._process_message(
-            "acc", client, msg, skip_keywords=True, log_skips=True
-        )
+        engine._process_message("acc", client, msg, skip_keywords=True, log_skips=True)
     )
     assert result is None
     assert ("LotteryBot", "again") not in client.started

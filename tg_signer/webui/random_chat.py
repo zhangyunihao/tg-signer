@@ -374,7 +374,10 @@ class RandomChatEngine:
                     break
                 text = random.choice(self.pool)
                 try:
-                    message = await client.send_message(chat_id, text)
+                    # 限时 90 秒：代理僵死时不永久卡住发送循环（否则任务无法停止）
+                    message = await asyncio.wait_for(
+                        client.send_message(chat_id, text), 90
+                    )
                     sent += 1
                     self.progress[account] = sent
                     undelivered.add(message.id)

@@ -252,9 +252,10 @@ async def test_client_context_manager_reference_counting_and_start_stop(
 
 
 @pytest.mark.asyncio
-async def test_client_context_manager_ignores_connection_error_during_start(
+async def test_client_context_manager_retries_start_and_rolls_back_ref_on_failure(
     monkeypatch, tmp_path
 ):
+    """手机代理不稳定场景：启动失败自动重试，重试耗尽后抛错并回滚引用计数。"""
     import tg_signer.core as core
 
     start_calls = 0
@@ -266,15 +267,50 @@ async def test_client_context_manager_ignores_connection_error_during_start(
         raise ConnectionError("temporary network issue")
 
     monkeypatch.setattr(core.Client, "start", fake_start)
+    monkeypatch.setattr(core, "_CONNECT_RETRY_DELAY_SECONDS", 0)
 
     client = get_client(name="acct", workdir=tmp_path)
+    key = client.key
+
+    with pytest.raises(ConnectionError, match="已重试"):
+        async with client:
+            pass
+
+    assert start_calls == core._CONNECT_ATTEMPTS
+    # async with 失败不会走 __aexit__，引用计数必须已回滚
+    assert core._CLIENT_REFS[key] == 0
+
+
+@pytest.mark.asyncio
+async def test_client_context_manager_recovers_when_start_succeeds_on_retry(
+    monkeypatch, tmp_path
+):
+    """启动首次失败、重试成功后应正常进入上下文。"""
+    import tg_signer.core as core
+
+    start_calls = 0
+
+    async def fake_start(self):
+        nonlocal start_calls
+        start_calls += 1
+        if start_calls == 1:
+            raise ConnectionError("temporary network issue")
+
+    async def fake_disconnect(self):
+        return None
+
+    monkeypatch.setattr(core.Client, "start", fake_start)
+    monkeypatch.setattr(core.Client, "disconnect", fake_disconnect)
+    monkeypatch.setattr(core, "_CONNECT_RETRY_DELAY_SECONDS", 0)
+
+    client = get_client(name="acct-retry-ok", workdir=tmp_path)
     key = client.key
 
     async with client as current:
         assert current is client
         assert core._CLIENT_REFS[key] == 1
 
-    assert start_calls == 1
+    assert start_calls == 2
     assert key not in core._CLIENT_INSTANCES
 
 
