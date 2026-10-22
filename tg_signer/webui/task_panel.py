@@ -199,6 +199,61 @@ def _combo_sub_accounts(sub: dict, workdir) -> list[str]:
     return []
 
 
+def close_pending_details(run: dict, default_status: str) -> None:
+    """进程结束后，把仍在「进行中」的子任务标记为最终状态。"""
+    for item in run["procs"]:
+        pos = item["stats"].get("current_pos")
+        rows = run["details"]
+        if pos is not None and pos < len(rows) and rows[pos]["status"] == "进行中":
+            if default_status == "自动":
+                rc = item["proc"].returncode
+                rows[pos]["status"] = "成功" if rc == 0 else "失败"
+            else:
+                rows[pos]["status"] = default_status
+    # 手动停止：兜底清理残留的「进行中」，避免记录已停止却仍显示进行中
+    if default_status != "自动":
+        for row in run["details"]:
+            if row.get("status") == "进行中":
+                row["status"] = default_status
+
+
+def stop_run_core(record_id: str) -> tuple[str, Optional[dict]]:
+    """停止运行中的任务并落盘历史（主控台与组合任务进度独立页面共用）。
+
+    返回 (结果, 记录)：结果 ``stopped`` 已停止、``orphan`` 已校正孤儿记录
+    （任务启动于上次服务运行期间，进程已脱离管理）、``missing`` 没有可停止的
+    运行记录或历史记录。调用方负责刷新自己的界面。
+    """
+    run = TaskRunnerBlock.runs.get(record_id)
+    if run is None:
+        items = load_task_history()
+        for r in items:
+            if str(r.get("id") or "") == record_id and r.get("status") == "运行中":
+                r["status"] = "已停止"
+                r["result"] = "服务重启，任务已脱离管理，状态已校正"
+                save_task_history(items)
+                return "orphan", r
+        return "missing", None
+    for item in run["procs"]:
+        proc = item["proc"]
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                logger.debug("任务进程 5 秒内未退出，强制结束", exc_info=True)
+                proc.kill()
+    TaskRunnerBlock.runs.pop(record_id, None)
+    close_pending_details(run, "中断")
+    record = run["record"]
+    record["status"] = "已停止"
+    record["details"] = list(run["details"])
+    record["duration"] = TaskRunnerBlock._format_duration_ts(run["start_ts"])
+    record["result"] = f"手动停止，耗时 {record['duration']}"
+    update_task_history(record)
+    return "stopped", record
+
+
 class TaskRunnerBlock:
     """执行任务面板：从 WebUI 直接运行签到/自动化/组合任务"""
 
@@ -1284,44 +1339,22 @@ class TaskRunnerBlock:
         ui.notify("已复制任务参数，可调整后点击「执行」", type="positive")
 
     def _stop_run(self, record_id: str) -> None:
-        run = self.runs.get(record_id)
-        if run is None:
-            # 孤儿记录（如服务重启前启动的任务）：进程已脱离本服务管理，
-            # 仅能把历史状态校正为已停止，避免按钮点了毫无反应
-            items = load_task_history()
-            for r in items:
-                if str(r.get("id") or "") == record_id and r.get("status") == "运行中":
-                    r["status"] = "已停止"
-                    r["result"] = "服务重启，任务已脱离管理，状态已校正"
-                    save_task_history(items)
-                    self._refresh_history_table()
-                    self._update_status()
-                    ui.notify(
-                        "该任务启动于上次服务运行期间，已无法远程停止；"
-                        "如进程仍在后台运行，请在系统任务管理器中结束对应 Python 进程",
-                        type="warning",
-                    )
-                    return
-            return
-        for item in run["procs"]:
-            proc = item["proc"]
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    proc.kill()
-        self.runs.pop(record_id, None)
-        self._close_pending_details(run, "中断")
-        record = run["record"]
-        record["status"] = "已停止"
-        record["details"] = list(run["details"])
-        record["duration"] = self._format_duration_ts(run["start_ts"])
-        record["result"] = f"手动停止，耗时 {record['duration']}"
-        update_task_history(record)
+        outcome, record = stop_run_core(record_id)
+        if outcome == "orphan":
+            self._refresh_history_table()
+            self._update_status()
+            ui.notify(
+                "该任务启动于上次服务运行期间，已无法远程停止；"
+                "如进程仍在后台运行，请在系统任务管理器中结束对应 Python 进程",
+                type="warning",
+            )
+            return outcome, record
+        if outcome != "stopped" or record is None:
+            return outcome, record
         self._refresh_history_table()
         self._update_status()
         ui.notify(f"已停止: {record['task_name']}", type="positive")
+        return outcome, record
 
     def _update_running_row(self, record_id: str, result_text: str) -> None:
         # 只同步内存行数据；进度文本用 JS 直接改写表格单元格与移动端卡片（固定
@@ -1348,25 +1381,13 @@ class TaskRunnerBlock:
             f"el => {{ el.textContent = '{safe_dur}'; }});"
         )
 
-    def _close_pending_details(self, run: dict, default_status: str) -> None:
-        """进程结束后，把仍在「进行中」的子任务标记为最终状态。"""
-        for item in run["procs"]:
-            pos = item["stats"].get("current_pos")
-            rows = run["details"]
-            if pos is not None and pos < len(rows) and rows[pos]["status"] == "进行中":
-                if default_status == "自动":
-                    rc = item["proc"].returncode
-                    rows[pos]["status"] = "成功" if rc == 0 else "失败"
-                else:
-                    rows[pos]["status"] = default_status
-
     def _finalize_run(self, record_id: str) -> None:
         run = self.runs.pop(record_id, None)
         if run is None:
             return  # 已被其他浏览器标签页的轮询收尾
         rcs = ", ".join(str(i["proc"].returncode) for i in run["procs"])
         ok = all(i["proc"].returncode == 0 for i in run["procs"])
-        self._close_pending_details(run, "自动")
+        close_pending_details(run, "自动")
         record = run["record"]
         record["status"] = "已完成" if ok else "失败"
         record["details"] = list(run["details"])

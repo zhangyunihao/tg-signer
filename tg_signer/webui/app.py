@@ -559,10 +559,7 @@ def _build_dashboard(container) -> None:
 
         def _build_combo_panel() -> None:
             with panel_combo:
-                ui.label(
-                    "组合任务历史：新增任务选择组合任务模板与账号立即执行"
-                    "（账号可留空）；右上角「任务组合配置」管理模板。"
-                ).classes("text-gray-600")
+                # 组合任务区块自带标题与说明，这里不再重复一段提示文案
                 refreshers.append(combo_block(runner, state.workdir))
 
         def _build_random_panel() -> None:
