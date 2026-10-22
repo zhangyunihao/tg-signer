@@ -557,9 +557,16 @@ def _expired_msg(days_ago: int, idx: int):
     return _msg(text=f"抽奖 {past} 开奖 https://t.me/OtherBot?start=e{idx}")
 
 
-def test_engine_ignore_history_allows_repeat(tmp_path):
+def test_engine_ignore_history_allows_repeat(tmp_path, monkeypatch):
     """忽略历史成功记录：关闭时已参与过的链接去重跳过，开启后允许重新参与。"""
     import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
 
     engine, state = _engine(tmp_path)
     engine.ignore_history = False
@@ -792,9 +799,16 @@ def test_scan_now_group_pinned_ignores_keywords(tmp_path):
     assert client2.started == []
 
 
-def test_rescue_group_rechecks_pinned_only(tmp_path):
+def test_rescue_group_rechecks_pinned_only(tmp_path, monkeypatch):
     """群组补漏只重查置顶消息（新置顶参与、历史不扫、旧置顶去重）。"""
     import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
 
     engine, _state = _engine(tmp_path)
     engine.ignore_history = False  # 显式关闭忽略历史，验证已参与链接去重
@@ -964,9 +978,16 @@ def test_engine_flood_wait_hard_block_on_long_wait(tmp_path):
     assert state.is_blocked("acc", "LotteryBot", "act1")
 
 
-def test_engine_flood_wait_breaker_after_three_short_floods(tmp_path):
+def test_engine_flood_wait_breaker_after_three_short_floods(tmp_path, monkeypatch):
     """短限流（<FLOOD_HARD_BLOCK_SECONDS）按次数熔断：连续 3 次后跳过该 bot。"""
     import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
 
     engine, state = _engine(tmp_path)
     client = FloodBotClient(wait_seconds=30)
@@ -1477,9 +1498,16 @@ def test_participate_ended_reply_marks_state_and_refunds_quota(tmp_path):
     assert client.started == [("Lottery8Bot", "dead1")]
 
 
-def test_ended_reply_breaks_bot_after_three_strikes(tmp_path):
+def test_ended_reply_breaks_bot_after_three_strikes(tmp_path, monkeypatch):
     """同一 bot 累计 3 次回复「已结束」：本轮熔断，后续新链接静默跳过。"""
     import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
 
     engine, _state = _engine(tmp_path)
     logs: list = []
@@ -1676,9 +1704,16 @@ def _msgid(message, mid):
     return message
 
 
-def test_rescue_round_dedups_seen_and_joins_new(tmp_path):
+def test_rescue_round_dedups_seen_and_joins_new(tmp_path, monkeypatch):
     """补漏只处理水位线之外的新消息，重复轮次不重复参与。"""
     import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
 
     engine, _state = _engine(tmp_path)
     engine.chats = [123]

@@ -1052,6 +1052,13 @@ class TaskRunnerBlock:
         combo: bool = False,
     ) -> None:
         prefix = f"[{task_name}:{account}] "
+
+        def _set_note(text: str) -> None:
+            """把当前子任务的进度备注写入对应明细行（进度页面展示）。"""
+            pos = stats.get("current_pos")
+            if pos is not None and 0 <= pos < len(detail_rows):
+                detail_rows[pos]["note"] = text
+
         while True:
             line = proc.stdout.readline()
             if not line:
@@ -1073,6 +1080,10 @@ class TaskRunnerBlock:
                 )
                 stats["current_pos"] = len(detail_rows) - 1
                 stats["started"] += 1
+                # 新子任务开始：重置该子任务的计数器（退频道/抽奖进度解析用）
+                stats["sub_left"] = 0
+                stats["sub_joined"] = 0
+                stats["sub_rounds"] = 0
                 q.put(prefix + line.rstrip("\r\n"))
                 continue
             if combo and stripped.startswith(">>> 子任务结束"):
@@ -1120,6 +1131,43 @@ class TaskRunnerBlock:
                 # 当天签到时刻未到时：等待定时执行（计划时刻 2026-10-15 00:43:00）
                 seg = stripped.split("计划时刻", 1)[1]
                 stats["next_run"] = seg.split("）", 1)[0].strip()
+            # 组合任务：按当前子任务类型解析退频道/抽奖的进度计数，写入明细行备注
+            if combo:
+                pos = stats.get("current_pos")
+                label_now = (
+                    detail_rows[pos].get("chat") or ""
+                    if pos is not None and 0 <= pos < len(detail_rows)
+                    else ""
+                )
+                if "退频道" in label_now:
+                    if "[已退出]" in stripped:
+                        stats["sub_left"] = stats.get("sub_left", 0) + 1
+                        stats["left_total"] = stats.get("left_total", 0) + 1
+                        _set_note(f"已退 {stats['sub_left']} 个")
+                    elif "批量退出完成：成功" in stripped:
+                        tail = stripped.split("成功", 1)[1].strip()
+                        _set_note(f"已退 {tail.split()[0]} 个" if tail else "退出完成")
+                    elif "开始批量退出" in stripped:
+                        head = stripped.split("开始批量退出", 1)[1].split("个", 1)[0]
+                        _set_note(f"待退 {head.strip()} 个")
+                    elif "没有需要退出的对话" in stripped:
+                        _set_note("没有需要退出的对话")
+                    elif "任务未开启自动退出，仅扫描：共" in stripped:
+                        head = stripped.split("仅扫描：共", 1)[1].split("个", 1)[0]
+                        _set_note(f"仅扫描，超期对话 {head.strip()} 个")
+                elif "抽奖" in label_now:
+                    if "[已参与]" in stripped:
+                        stats["sub_joined"] = stats.get("sub_joined", 0) + 1
+                        stats["joined_total"] = stats.get("joined_total", 0) + 1
+                        note = f"已参与 {stats['sub_joined']} 个"
+                        if stats.get("sub_rounds"):
+                            note += f" · 扫描 {stats['sub_rounds']} 轮"
+                        _set_note(note)
+                    elif "扫描完成：本次参与" in stripped or "补漏轮次完成" in stripped:
+                        stats["sub_rounds"] = stats.get("sub_rounds", 0) + 1
+                        note = f"已参与 {stats.get('sub_joined', 0)} 个"
+                        note += f" · 扫描 {stats['sub_rounds']} 轮"
+                        _set_note(note)
             q.put(prefix + line.rstrip("\r\n"))
 
     def _chat_labels(self, task_name: str) -> list[str]:

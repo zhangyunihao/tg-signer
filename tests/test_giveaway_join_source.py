@@ -2,7 +2,12 @@
 
 import asyncio
 
+import tg_signer.giveaway_core as gc
 from tg_signer.giveaway_core import GiveawayEngine
+
+
+async def _nosleep(*a, **k):
+    pass
 
 
 class _Msg:
@@ -23,6 +28,8 @@ def _engine() -> GiveawayEngine:
 def test_click_confirm_joins_from_source_message(monkeypatch):
     """原始抽奖帖中的频道目标应被提取并加入（不只 bot 回复）。"""
     engine = _engine()
+    # 加入频道路径含真实 sleep(5)：注入 no-op 保持用例聚焦行为本身
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
     source = _Msg("参与条件：加入 上海修车社区【公开榜】 https://t.me/shanghai_board")
     seen_messages: list = []
 
@@ -42,6 +49,7 @@ def test_click_confirm_joins_from_source_message(monkeypatch):
 def test_click_confirm_without_source_keeps_old_behavior(monkeypatch):
     """未传原始帖时行为不变（仅 bot 回复）。"""
     engine = _engine()
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
     start_reply = _Msg("加入频道后参与 https://t.me/bot_reply_ch")
     seen_messages: list = []
 

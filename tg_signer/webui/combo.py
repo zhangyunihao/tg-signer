@@ -382,6 +382,12 @@ class ComboTaskBlock:
             ui.table(
                 columns=[
                     {
+                        "name": "seq",
+                        "label": "序号",
+                        "field": "seq",
+                        "align": "left",
+                    },
+                    {
                         "name": "status",
                         "label": "状态",
                         "field": "status",
@@ -531,10 +537,11 @@ class ComboTaskBlock:
         self._last_hist_sig = tuple(
             (str(rec.get("id") or ""), self._record_status(rec)) for rec in records
         )
-        # 桌面端表格同步行数据（表格自带分页，每页 10 条）
+        # 桌面端表格同步行数据（表格自带分页，每页 10 条）；seq 为全量序号（跨页连续）
         self.history_table.rows = [
             {
                 "id": str(rec.get("id") or ""),
+                "seq": idx + 1,
                 "status": self._record_status(rec),
                 "task_name": str(rec.get("task_name") or "-"),
                 "accounts": str(rec.get("accounts") or "—"),
@@ -542,7 +549,7 @@ class ComboTaskBlock:
                 "duration": str(rec.get("duration") or "—"),
                 "result": str(rec.get("result") or ""),
             }
-            for rec in records
+            for idx, rec in enumerate(records)
         ]
         self.history_table.update()
         # 分页：每页 10 条；列表刷新时夹取页码到有效范围，避免越界空白
@@ -562,11 +569,15 @@ class ComboTaskBlock:
                 ui.label("暂无历史任务，点击「新增任务」启动组合任务").classes(
                     "text-sm text-gray-400"
                 )
-            for rec in page_records:
+            for i, rec in enumerate(page_records):
                 rid = str(rec.get("id") or "")
                 status = self._record_status(rec)
+                seq = page * page_size + i + 1  # 全量序号（跨页连续）
                 with ui.card().classes("w-full border"):
                     with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        ui.label(f"#{seq}").classes(
+                            "text-xs font-semibold text-gray-500 shrink-0"
+                        )
                         ui.badge(status).props(
                             f"color={self.STATUS_COLOR.get(status, 'grey-6')} outline"
                         )
@@ -754,7 +765,7 @@ class ComboTaskBlock:
             elapsed = str(rec.get("duration") or "—")
         combo_subs = self._run_subs(run)
         subs_status = [self._sub_run_status(s, run) for s in combo_subs]
-        with ui.card().classes("w-full border"):
+        with ui.card().classes("w-full border tgs-prog-outer"):
             with ui.row().classes(
                 "w-full items-center gap-2 no-wrap tgs-prog-head-row"
             ):
@@ -784,6 +795,20 @@ class ComboTaskBlock:
                 for k in ("进行中", "成功", "失败", "中断", "等待")
                 if counts[k]
             ]
+            # 退频道/抽奖的累计成果（多账号求和，来自子进程日志解析计数）
+            sub_types = " ".join(str(s.get("type") or "") for s in combo_subs)
+            left_n = sum(
+                int((p.get("stats") or {}).get("left_total") or 0)
+                for p in run.get("procs") or []
+            )
+            joined_n = sum(
+                int((p.get("stats") or {}).get("joined_total") or 0)
+                for p in run.get("procs") or []
+            )
+            if left_n and "退频道" in sub_types:
+                parts.append(f"已退频道 {left_n} 个")
+            if joined_n and "抽奖" in sub_types:
+                parts.append(f"已参与抽奖 {joined_n} 个")
             text = f"子任务进度（{len(combo_subs)} 个）：{' · '.join(parts) or '—'}"
             ui.label(text).classes("text-sm text-gray-800 font-medium")
             # 按账号展开：每个账号一个折叠面板，展示该账号执行了哪些子任务及状态
@@ -908,6 +933,17 @@ class ComboTaskBlock:
                     for lb in acc_labels:
                         sub = sub_by_label.get(lb) or {}
                         st = self._acc_sub_status(run, acc, lb)
+                        # 该账号该子任务的进度备注（退频道已退数/抽奖参与数等）
+                        note = next(
+                            (
+                                str(d.get("note") or "")
+                                for d in run["details"]
+                                if d.get("chat") == lb
+                                and str(d.get("account") or "") == acc
+                                and d.get("note")
+                            ),
+                            "",
+                        )
                         with (
                             ui.card()
                             .classes("w-full border gap-1")
@@ -937,6 +973,10 @@ class ComboTaskBlock:
                                 ui.space()
                                 ui.badge(st).props(
                                     f"color={status_color.get(st, 'grey-6')} outline"
+                                )
+                            if note:
+                                ui.label(note).classes(
+                                    "text-xs font-medium text-gray-500"
                                 )
                             try:
                                 params = _sub_config_params_brief(sub, self.workdir)
@@ -1085,6 +1125,12 @@ class ComboTaskBlock:
                 {
                     "account": str(p.get("account") or ""),
                     "sub_labels": [str(x) for x in (p.get("sub_labels") or [])],
+                    # 保留退频道/抽奖累计计数，任务结束后进度页仍可展示
+                    "stats": {
+                        k: (p.get("stats") or {}).get(k)
+                        for k in ("left_total", "joined_total")
+                        if (p.get("stats") or {}).get(k)
+                    },
                 }
                 for p in run.get("procs") or []
             ],
@@ -1594,6 +1640,22 @@ _PROGRESS_PAGE_STYLE = """
             width: calc(100vw - 24px) !important;
             height: calc(100vh - 24px) !important;
         }
+        /* 去掉最外层任务卡片边框：内容直接落在页面背景上，减少一层套框 */
+        .tgs-prog-outer {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+            border-radius: 0 !important;
+            padding: 0 !important;
+        }
+        /* 内层卡片收紧内边距与圆角，窄屏节省空间 */
+        .q-card {
+            padding: 10px 12px !important;
+            border-radius: 10px !important;
+        }
+        /* 账号折叠面板头与内容内边距收紧 */
+        .q-expansion-item .q-item { min-height: 44px !important; padding: 6px 10px !important; }
+        .q-expansion-item__content { padding: 4px 8px 8px !important; }
         /* 进度内容行允许换行，长参数名/任务名不挤压值区（no-wrap 需 !important 覆盖） */
         .tgs-prog-head-row,
         .tgs-prog-sub-row { flex-wrap: wrap !important; row-gap: 2px; }
@@ -1604,17 +1666,20 @@ _PROGRESS_PAGE_STYLE = """
         }
         /* 子任务行里的弹性占位在窄屏去掉，把宽度让给标题，减少无谓折行 */
         .tgs-prog-sub-row .q-space { display: none !important; }
-        /* 参数行：参数名限宽，值占剩余宽度并可换行（避免固定 130px 挤压窄屏） */
+        /* 参数行：参数名限宽，值占剩余宽度并可换行（!important 覆盖 Tailwind 定宽类） */
         .tgs-prog-param-row { flex-wrap: wrap !important; row-gap: 2px; }
         .tgs-prog-param-row .tgs-prog-param-label {
             flex: 0 1 auto;
-            min-width: 0;
-            max-width: 42%;
+            min-width: 0 !important;
+            max-width: 40% !important;
         }
         .tgs-prog-param-row .tgs-prog-param-value {
             flex: 1 1 40%;
             min-width: 0;
         }
+        /* 日志区收紧内边距；标题行与按钮间距压缩 */
+        .tgs-prog-outer > .font-mono { padding: 8px !important; }
+        .nicegui-content .text-lg { font-size: 1.05rem !important; }
     }
 </style>
 """
