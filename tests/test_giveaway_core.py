@@ -2880,6 +2880,57 @@ def test_check_win_message_skips_draw_announcement(tmp_path):
     assert len(events2) == 1
 
 
+def test_check_win_message_ignores_nenmeibi_prize(tmp_path):
+    """奖品为「嫩妹币」的中奖消息不转发、不推送；说明段提及不误伤。"""
+    import asyncio
+
+    from tg_signer.giveaway_parsing import WIN_IGNORE_PRIZE_RE
+
+    # 真实样本：@RealSaberBot 私信，100 嫩妹币
+    real = (
+        "🎉🎊 恭喜您中奖了 🎊🎉\n\n"
+        "👑 中奖人：用户\n🆔 ID：8416628750\n\n"
+        "🎁 中奖奖品：100嫩妹币\n├─ 积分变化：+100\n"
+        "🎯 抽奖活动：秘宝猎人集结令\n\n"
+        "🔑 校验码：PxDEgwoxnouf3mT0VtdjGfWv"
+    )
+    assert WIN_IGNORE_PRIZE_RE.search(real)
+
+    engine, _state = _engine(tmp_path)
+    client = FakeClient(bot_users={"RealSaberBot"})
+    events: list = []
+    engine.on_event = events.append
+    asyncio.run(
+        engine._check_win_message(
+            "acc", client, "RealSaberBot", _msg(text=real, id=21)
+        )
+    )
+    assert client.forwarded == []
+    assert events == []
+
+    # 说明段提及「嫩妹币」但奖品是优惠券：仍按中奖处理
+    others = (
+        "💐💐💐 中奖提醒 💐💐💐\n\n"
+        "🔖 防伪编号：H179190232717\n\n"
+        "🎰 某抽奖活动\n\n"
+        "🎊 用户 恭喜您中奖了！\n\n"
+        "💰️ 获得奖品：p-100\n\n"
+        "⚠️ 抽奖说明：嫩妹币不计入本次活动奖品范围"
+    )
+    assert not WIN_IGNORE_PRIZE_RE.search(others)
+    engine2, _ = _engine(tmp_path)
+    client2 = FakeClient(bot_users={"LotteryBestBot"})
+    events2: list = []
+    engine2.on_event = events2.append
+    asyncio.run(
+        engine2._check_win_message(
+            "acc", client2, "LotteryBestBot", _msg(text=others, id=22)
+        )
+    )
+    assert len(client2.forwarded) == 1
+    assert len(events2) == 1
+
+
 def test_state_bots_for_orders_by_recency(tmp_path):
     """bots_for：按最近交互时间倒序返回账号参与过的 bot，大小写去重。"""
     state = GiveawayState(tmp_path)

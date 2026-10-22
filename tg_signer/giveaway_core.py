@@ -37,6 +37,7 @@ from tg_signer.giveaway_parsing import (
     SCORE_BUTTON_RE,
     SCORE_SPEND_RE,
     WIN_ANNOUNCE_RE,
+    WIN_IGNORE_PRIZE_RE,
     WIN_MESSAGE_RE,
     WIN_PERSONAL_RE,
     _extract_emoji_order,
@@ -1107,6 +1108,9 @@ class GiveawayEngine:
             return
         # 开奖结果公告（含防伪编号但恭喜的是别人）：跳过，不按中奖处理
         if WIN_ANNOUNCE_RE.search(text) and not WIN_PERSONAL_RE.search(text):
+            return
+        # 奖品为站内虚拟积分「嫩妹币」：不转发、不推送
+        if WIN_IGNORE_PRIZE_RE.search(text):
             return
         mid = getattr(message, "id", None)
         if not self._mark_win_handled(account, bot_username, mid, text):
