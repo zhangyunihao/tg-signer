@@ -1439,6 +1439,11 @@ class GiveawayEngine:
         if not self.win_detect or self._state is None:
             return
         bots = self._state.bots_for(account)
+        if self.source_type == "bot" and self.bot_username:
+            # 机器人类型任务只关心目标 bot 的中奖通知：不回扫账号历史上
+            # 参与过的其他 bot，避免启动阶段被十几个 bot 拖住几分钟
+            target = self.bot_username.lower()
+            bots = [b for b in bots if str(b).lower() == target]
         if not bots:
             # 无任何交互记录（含保留的 win: 去重）时没有回扫目标，等账号参与后重建
             self.log(f"[{account}] 回扫：暂无 bot 记录（等待账号参与后重建）")

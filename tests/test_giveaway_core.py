@@ -2503,6 +2503,30 @@ def test_bot_source_ignores_other_bot_links(tmp_path):
     assert client.started == []
 
 
+def test_bot_source_sweeps_only_target_bot(tmp_path):
+    """机器人类型任务启动回扫只扫目标 bot，不扫账号历史参与过的其他 bot。"""
+    import asyncio
+
+    engine, state = _bot_engine(tmp_path)
+    state.add("deux", "lotterybestbot", "p1")
+    state.add("deux", "BaibaoxiangCjBot", "p2")
+
+    class RecordingClient(FakeClient):
+        def __init__(self):
+            super().__init__(bot_users={"BaibaoxiangCjBot", "lotterybestbot"})
+            self.history_chats = []
+
+        def get_chat_history(self, chat, limit=None, max_id=0):
+            self.history_chats.append(str(chat))
+            return super().get_chat_history(chat, limit, max_id)
+
+    client = RecordingClient()
+
+    asyncio.run(engine._sweep_bot_wins("deux", client))
+
+    assert client.history_chats == ["BaibaoxiangCjBot"]
+
+
 def test_bot_source_scan_skips_membership_and_respects_limit(tmp_path):
     """机器人私聊扫描：不尝试加入监控对象，且只回扫指定条数。"""
     import asyncio
