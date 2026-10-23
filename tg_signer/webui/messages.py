@@ -6,6 +6,7 @@
 - 抽奖过程中记录的未完成发言任务（口令发送失败）：webui_speak_alerts.json
   （口令发送成功后由任务自动消除）
 - 报名成功后仍未达标的发言数任务（还需发言 N 条）：webui_speech_alerts.json
+- 账号频道/群组已满（自动触发退频道任务）：webui_channels_full_alerts.json
 
 主控台右上角铃铛只负责展示未读数徽标，点击在新标签页打开 /messages
 消息中心页面（支持按用户过滤、全部已读、10 秒轮询自动刷新）。
@@ -26,10 +27,12 @@ from tg_signer.utils import atomic_write_json
 from tg_signer.webui.common import state
 from tg_signer.webui.giveaway import (
     channel_title_map,
+    format_channels_full_alert,
     format_join_alert,
     format_speak_alert,
     format_speech_alert,
     format_win_alert,
+    load_channels_full_alerts,
     load_join_alerts,
     load_speak_alerts,
     load_speech_alerts,
@@ -103,7 +106,7 @@ def message_sort_key(m: dict, read_keys: Set[str]) -> tuple:
 
 
 def collect_messages(workdir) -> List[dict]:
-    """汇总全部消息：中奖提醒、加入失败提醒与未完成发言任务（排序见 message_sort_key）。"""
+    """汇总全部消息：中奖、加入失败、频道已满与未完成发言任务（排序见 message_sort_key）。"""
     wd = Path(workdir)
     messages: List[dict] = []
     # 0) 中奖提醒（最重要，置顶展示）
@@ -135,6 +138,20 @@ def collect_messages(workdir) -> List[dict]:
                 "account": acct,
                 "time": time_str,
                 "text": format_join_alert(a, title_map),
+            }
+        )
+    # 1.5) 账号已加入频道/群组达到 Telegram 上限（自动退频道任务已触发）
+    for a in load_channels_full_alerts(wd):
+        acct = str(a.get("account") or "")
+        time_str = str(a.get("time") or "")
+        messages.append(
+            {
+                "key": f"channels_full|{acct}|{time_str}",
+                "tag": "频道已满",
+                "color": "orange",
+                "account": acct,
+                "time": time_str,
+                "text": format_channels_full_alert(a),
             }
         )
     # 2) 抽奖过程记录的未完成发言任务（口令发送失败，发送成功后自动消除）

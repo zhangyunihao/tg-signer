@@ -11,7 +11,8 @@ spec 格式::
      "include_keywords": ["签到", ...], "exclude_keywords": ["抽奖", ...],
      "auto_leave": true}
 
-days 为不更新天数阈值，0 表示扫描全部频道/群组（此时不允许自动退出）。
+days 为不更新天数阈值（支持小数，如 0.5），0 表示扫描全部频道/群组
+（此时不允许自动退出）。
 
 scan_types 扫描范围："channel" 仅频道 / "group" 仅群组 / "both" 频道+群组
 （缺省时按旧字段 include_groups 推导，True→both、False→channel）。
@@ -30,7 +31,12 @@ from pathlib import Path
 from typing import Dict, List
 
 from tg_signer.core import get_client, safe_disconnect
-from tg_signer.webui.auto_leave import _scan_types_of, leave_one, scan_stale_chats
+from tg_signer.webui.auto_leave import (
+    _scan_types_of,
+    _to_days,
+    leave_one,
+    scan_stale_chats,
+)
 
 
 def filter_candidates(rows: List[Dict], exclude_keywords: List[str]) -> List[Dict]:
@@ -51,7 +57,7 @@ async def run_leave(spec: dict) -> int:
         print(msg, flush=True)
 
     d = spec.get("days")
-    days = max(0, int(d)) if d is not None else 7
+    days = _to_days(d, 7)
     rows = await scan_stale_chats(
         account,
         Path(str(spec.get("session_dir") or ".")),

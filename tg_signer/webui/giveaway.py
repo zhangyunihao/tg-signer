@@ -26,6 +26,7 @@ from tg_signer.giveaway_core import (
 from tg_signer.giveaway_parsing import DEFAULT_KEYWORDS
 from tg_signer.giveaway_state import GiveawayState
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui.auto_leave import create_auto_leave_task, run_auto_leave_task
 from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
@@ -65,6 +66,9 @@ SPEECH_ALERTS_MAX = 200
 # 中奖提醒（bot 私聊识别到中奖消息，持久化，不清除仅限量）
 WIN_ALERTS_FILE = "webui_win_alerts.json"
 WIN_ALERTS_MAX = 200
+# 账号已加入频道/群组达到 Telegram 上限的提醒（持久化，按账号去重）
+CHANNELS_FULL_ALERTS_FILE = "webui_channels_full_alerts.json"
+CHANNELS_FULL_ALERTS_MAX = 200
 # 中奖提醒全局设置（消息中心配置，所有任务共用）：转发目标 + Server酱 SendKey
 WIN_SETTINGS_FILE = "webui_win_settings.json"
 
@@ -72,8 +76,8 @@ WIN_SETTINGS_FILE = "webui_win_settings.json"
 class _AlertStore:
     """提醒列表的 JSON 持久化（统一格式：{"alerts": [...]}，超限截断）。
 
-    四类提醒（加入失败/未完成口令/未达标发言/中奖）字段不同，但读写逻辑一致，
-    统一收敛到这里，避免重复实现。
+    多类提醒（加入失败/未完成口令/未达标发言/中奖/频道已满）字段不同，
+    但读写逻辑一致，统一收敛到这里，避免重复实现。
     """
 
     def __init__(self, filename: str, limit: int, label: str) -> None:
@@ -124,6 +128,9 @@ _JOIN_ALERTS = _AlertStore(JOIN_ALERTS_FILE, JOIN_ALERTS_MAX, "加入失败提�
 _SPEAK_ALERTS = _AlertStore(SPEAK_ALERTS_FILE, SPEAK_ALERTS_MAX, "未完成发言任务")
 _SPEECH_ALERTS = _AlertStore(SPEECH_ALERTS_FILE, SPEECH_ALERTS_MAX, "未达标发言数任务")
 _WIN_ALERTS = _AlertStore(WIN_ALERTS_FILE, WIN_ALERTS_MAX, "中奖提醒")
+_CHANNELS_FULL_ALERTS = _AlertStore(
+    CHANNELS_FULL_ALERTS_FILE, CHANNELS_FULL_ALERTS_MAX, "频道已满提醒"
+)
 
 
 def load_join_alerts(workdir) -> List[dict]:
@@ -192,6 +199,24 @@ def format_win_alert(a: dict) -> str:
     return f"账号 {a.get('account')} 中奖（@{a.get('bot')}）：{text}（{a.get('time')}）"
 
 
+def load_channels_full_alerts(workdir) -> List[dict]:
+    return _CHANNELS_FULL_ALERTS.load(workdir)
+
+
+def save_channels_full_alerts(workdir, alerts: List[dict]) -> None:
+    _CHANNELS_FULL_ALERTS.save(workdir, alerts)
+
+
+def format_channels_full_alert(a: dict) -> str:
+    detail = str(a.get("detail") or "").strip()
+    where = f"（{detail}）" if detail else ""
+    return (
+        f"账号 {a.get('account')} 已加入的频道/群组达到 Telegram 上限{where}，"
+        "已自动创建并执行退频道任务（阈值 1 天，保护关键字默认，"
+        f"自动退出未命中保护字的频道）（{a.get('time')}）"
+    )
+
+
 def _alert_time() -> str:
     return f"{datetime.now():%m-%d %H:%M:%S}"
 
@@ -216,6 +241,29 @@ def _notify_alert(client, text: str, level: str, debug_msg: str) -> None:
 JOIN_ALERT_KEY = ("account", "chat")
 SPEAK_ALERT_KEY = ("account", "group", "password")
 SPEECH_ALERT_KEY = ("account", "bot", "group", "required", "title")
+CHANNELS_FULL_ALERT_KEY = ("account",)
+
+
+def _handle_channels_full_event(client, workdir, ev: dict) -> None:
+    """账号频道/群组已满：写消息中心并弹顶部提醒（按账号去重，只保留最新一条）。"""
+    acct = str(ev.get("account") or "")
+    if not acct:
+        return
+    alerts = _drop_alert(
+        load_channels_full_alerts(workdir), CHANNELS_FULL_ALERT_KEY, acct
+    )
+    alerts.insert(
+        0,
+        {
+            "account": acct,
+            "detail": str(ev.get("detail") or "")[:200],
+            "time": _alert_time(),
+        },
+    )
+    save_channels_full_alerts(workdir, alerts)
+    _notify_alert(
+        client, format_channels_full_alert(alerts[0]), "warning", "推送频道已满提醒失败"
+    )
 
 
 def _handle_win_event(client, workdir, ev: dict) -> None:
@@ -323,7 +371,7 @@ def _handle_speech_event(client, workdir, ev: dict) -> None:
 
 
 def handle_giveaway_event(client, workdir, ev: dict) -> None:
-    """引擎事件分发：中奖 / 加入失败或解除 / 口令未完成 / 发言数未达标。"""
+    """引擎事件分发：中奖 / 加入失败或解除 / 口令 / 发言数 / 频道已满。"""
     etype = ev.get("type")
     if etype == "win":
         _handle_win_event(client, workdir, ev)
@@ -333,6 +381,8 @@ def handle_giveaway_event(client, workdir, ev: dict) -> None:
         _handle_speak_event(client, workdir, ev)
     elif etype == "speech_required":
         _handle_speech_event(client, workdir, ev)
+    elif etype == "channels_full":
+        _handle_channels_full_event(client, workdir, ev)
 
 
 def load_win_forward_targets(workdir) -> List[str]:
@@ -850,9 +900,50 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             if cb is not None:
                 _apply_status(cb, False)
 
+        def _account_busy(acct: str) -> bool:
+            """该账号是否仍被其他运行中的抽奖任务占用（不能并行建立连接）。"""
+            for other, ocfg in tasks.items():
+                if other == name or acct not in (ocfg.get("accounts") or []):
+                    continue
+                eng = get_engine(other)
+                if eng is not None and eng.running:
+                    return True
+            return False
+
+        def _start_channels_full_leave(ev: dict) -> None:
+            """频道/群组已满：自动建退频道任务（阈值 1 天）并后台执行。"""
+            acct = str(ev.get("account") or "").strip()
+            if not acct:
+                return
+            busy = _account_busy(acct)
+            task = create_auto_leave_task(
+                workdir,
+                acct,
+                detail=str(ev.get("detail") or ""),
+                status="排队等待账号空闲" if busy else "待执行",
+            )
+            if task is None:
+                return
+            session_dir = Path(
+                str(ev.get("session_dir") or cfg.get("session_dir") or ".")
+            )
+
+            async def _run() -> None:
+                await run_auto_leave_task(
+                    workdir,
+                    session_dir,
+                    task["id"],
+                    wait_busy=lambda: _account_busy(acct),
+                    log=make_log("自动退频道"),
+                )
+
+            asyncio.create_task(_run())
+
         def _on_event(ev: dict) -> None:
             """引擎事件 → 顶部通知/消息中心 + 持久化（按事件类型分发，见 handle_giveaway_event）"""
             handle_giveaway_event(client, workdir, ev)
+            if ev.get("type") == "channels_full":
+                _start_channels_full_leave(ev)
 
         engine = ensure_engine(name)
         start_ts = time.time()

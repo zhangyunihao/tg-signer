@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
 from datetime import datetime
@@ -313,13 +314,13 @@ def _giveaway_title(message: Any, limit: int = 30) -> str:
 
 
 def extract_giveaway_title(message: Any, limit: int = 40) -> str:
-    """提取 bot 清单回复中的抽奖标题行（以 🎰 开头），取不到返回空串。"""
+    """提取抽奖标题行（以 🎰/🎉/🎊 开头），取不到返回空串。"""
     text = _message_text(message)
     for raw_line in text.split("\n"):
         line = raw_line.strip()
-        if not line.startswith("🎰"):
+        if not line.startswith(("🎰", "🎉", "🎊")):
             continue
-        title = line.lstrip("🎰").strip()
+        title = line.lstrip("🎰🎉🎊").strip()
         if title:
             return title if len(title) <= limit else title[:limit] + "…"
     return ""
@@ -832,6 +833,94 @@ def _extract_emoji_order(text: str) -> List[str]:
 def is_emoji_verify_message(message: Any) -> bool:
     """bot 回复是否为「防脚本验证」（要求按顺序点击 emoji 按钮）。"""
     return bool(EMOJI_VERIFY_RE.search(_message_text(message) or ""))
+
+
+# —— 算术验证（如 @mianfeichoujiang_bot）——
+# start 后 bot 回复「请计算：18 + 9 = ？直接回复答案数字。」，需在私聊里
+# 直接发送计算结果。题目每次随机生成，答案由本地安全求值得出（不用 eval
+# 执行任意输入，只允许 + - * / 与括号组成的算术表达式）。
+MATH_VERIFY_RE = re.compile(r"请计算|直接回复答案数字")
+
+# 题目表达式：中文提示后的数字/运算符，直到「= ？」为止；兼容全角字符
+_MATH_EXPR_RE = re.compile(
+    r"请计算\s*[:：]?\s*(?P<expr>[0-9０-９（(][0-9０-９+\-−＋－＊×xX✕÷/／％%（）()\s.]*?)"
+    r"\s*[=＝]\s*[?？]"
+)
+
+# 全角数字/运算符 → 半角（×÷ 也一并转换）
+_MATH_TRANSLATE = str.maketrans(
+    "０１２３４５６７８９＋－＝×÷（）％＊／", "0123456789+-=*/()%*/"
+)
+
+
+def is_math_verify_message(message: Any) -> bool:
+    """bot 回复是否为算术验证（要求直接回复答案数字）。"""
+    return bool(MATH_VERIFY_RE.search(_message_text(message) or ""))
+
+
+def extract_math_expression(message: Any) -> Optional[str]:
+    """从「请计算：18 + 9 = ？直接回复答案数字。」提取算式（归一化为半角）。"""
+    m = _MATH_EXPR_RE.search(_message_text(message) or "")
+    if not m:
+        return None
+    expr = m.group("expr").translate(_MATH_TRANSLATE)
+    expr = expr.replace("−", "-").replace("✕", "*").replace("×", "*")
+    expr = re.sub(r"[xX]", "*", expr).replace("÷", "/").strip()
+    return expr or None
+
+
+def solve_math_expression(expr: str) -> Optional[str]:
+    """安全求值四则运算表达式，返回答案字符串；无法解析时返回 None。
+
+    只放行数字常量、+ - * / 与括号（含一元正负号），不执行函数调用、
+    变量、幂运算等，避免把 bot 文本当代码执行。
+    """
+    expr = (expr or "").strip()
+    if not expr or len(expr) > 64:
+        return None
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except (SyntaxError, ValueError, TypeError):
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expression):
+            continue
+        # ast.walk 会单独遍历运算符节点（Add/Sub/…），需放行
+        if isinstance(
+            node,
+            (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.UAdd, ast.USub),
+        ):
+            continue
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)
+        ):
+            continue
+        if isinstance(node, ast.UnaryOp) and isinstance(
+            node.op, (ast.UAdd, ast.USub)
+        ):
+            continue
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            continue
+        return None
+    try:
+        result = eval(  # noqa: S307 - 已按 AST 白名单校验，仅四则运算
+            compile(tree, "<math-verify>", "eval"), {"__builtins__": {}}, {}
+        )
+    except Exception:
+        return None
+    if isinstance(result, float):
+        result = round(result, 6)
+        if result.is_integer():
+            result = int(result)
+    return str(result)
+
+
+def math_verify_answer(message: Any) -> Optional[str]:
+    """算术验证消息 → 应回复的答案字符串；非验证消息返回 None。"""
+    expr = extract_math_expression(message)
+    if not expr:
+        return None
+    return solve_math_expression(expr)
 
 
 

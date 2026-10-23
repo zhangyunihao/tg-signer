@@ -2,7 +2,7 @@
 
 新建任务（选择账号、不更新天数阈值、扫描范围、包含/保护关键字、自动退出开关），
 启动后按扫描范围（仅频道/仅群组/频道+群组）扫描所选账号超过 N 天未更新的对话
-（不更新天数阈值填 0 表示扫描全部对话，此时不允许自动退出）：
+（N 支持小数，如 0.5 天；填 0 表示扫描全部对话，此时不允许自动退出）：
 - 填写包含关键字时，标题命中任一关键字（或关系）的对话才进入扫描结果（留空不限制）；
 - 未命中保护关键字的对话：开关打开时自动退出（无需确认，仅扫描范围为「仅频道」时可选）；
 - 命中保护关键字的对话：始终展示在任务结果里，可手动勾选后退出。
@@ -14,7 +14,7 @@ import html as html_lib
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List
 
@@ -47,6 +47,33 @@ LEAVE_TASKS_FILE = "webui_leave_tasks.json"
 UNSELECT_KEYWORDS = ("抽奖", "嫩妹社", "野寻", "榜")
 
 DEFAULT_KEYWORDS = "抽奖,嫩妹社,野寻,榜"
+
+
+def _to_days(value, default: float) -> float:
+    """把天数阈值统一成非负浮点数；非法值回退到默认值。"""
+    try:
+        days = float(value)
+    except (TypeError, ValueError):
+        days = float(default)
+    return max(0.0, days)
+
+
+def _fmt_days(value) -> str:
+    """天数显示：整数不带小数位，小数原样显示（1.5 -> "1.5"）。"""
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """把消息时间统一成 UTC
+
+    Pyrogram 2.x 的 message.date 由 datetime.fromtimestamp(ts) 生成，
+    是「本地时区」的 naive datetime；naive 用 astimezone 会按系统本地时区解释，
+    正好对应其生成方式，aware datetime 也能直接转换。
+    """
+    return value.astimezone(timezone.utc)
 
 
 def _config_path(workdir) -> Path:
@@ -109,7 +136,7 @@ def load_leave_tasks(workdir) -> List[Dict]:
                 "id": f"leave_{datetime.now():%Y%m%d%H%M%S}",
                 "name": "默认退频道任务",
                 "accounts": list(cfg.get("accounts") or []),
-                "days": int(cfg.get("days") or 7),
+                "days": float(cfg.get("days") or 7),
                 "scan_types": _scan_types_of(cfg),
                 "skip_pinned": bool(cfg.get("skip_pinned", True)),
                 "keywords": list(UNSELECT_KEYWORDS),
@@ -127,6 +154,156 @@ def save_leave_tasks(workdir, tasks: List[Dict]) -> None:
         logger.debug("保存退频道任务列表失败", exc_info=True)
 
 
+# 频道/群组已满时自动创建的退频道任务：阈值 1 天、仅扫频道、未命中保护字自动退出
+CHANNELS_FULL_DAYS = 1
+_AUTO_TASK_ACTIVE_STATUSES = ("待执行", "排队等待账号空闲", "扫描中", "退出中")
+
+
+def tasks_mtime_ns(workdir) -> int:
+    """任务文件修改时间，供界面轮询外部（自动触发）任务的变化。"""
+    try:
+        return _tasks_path(workdir).stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _patch_leave_task(workdir, task_id: str, **fields) -> Dict | None:
+    """重新读取后更新单个任务，避免覆盖其他进程刚写入的字段。"""
+    tasks = load_leave_tasks(workdir)
+    task = next((t for t in tasks if t.get("id") == task_id), None)
+    if task is None:
+        return None
+    task.update(fields)
+    save_leave_tasks(workdir, tasks)
+    return task
+
+
+def create_auto_leave_task(
+    workdir,
+    account: str,
+    days: float = CHANNELS_FULL_DAYS,
+    detail: str = "",
+    status: str = "待执行",
+) -> Dict | None:
+    """频道/群组已满时创建退频道任务。
+
+    保护关键字取默认值（命中即保留待确认），未命中的频道自动退出；
+    同一账号已有排队/运行中的自动任务时不重复创建。
+    """
+    account = str(account or "").strip()
+    if not account:
+        return None
+    tasks = load_leave_tasks(workdir)
+    for t in tasks:
+        if t.get("trigger") != "channels_full":
+            continue
+        if account not in (t.get("accounts") or []):
+            continue
+        if str(t.get("status") or "") in _AUTO_TASK_ACTIVE_STATUSES:
+            return None
+    now = datetime.now()
+    task = {
+        "id": f"leave_{now:%Y%m%d%H%M%S%f}",
+        "name": f"退频道任务 {now:%m-%d %H:%M}（频道已满）",
+        "accounts": [account],
+        "days": float(days),
+        "scan_types": "channel",
+        "skip_pinned": True,
+        "keywords": list(UNSELECT_KEYWORDS),
+        "include_keywords": [],
+        "auto_leave": True,
+        "status": str(status or "待执行"),
+        "trigger": "channels_full",
+        "reason": str(detail or "")[:200],
+        "start_time": "",
+        "duration": "",
+        "rows": [],
+    }
+    tasks.append(task)
+    save_leave_tasks(workdir, tasks)
+    return task
+
+
+async def run_auto_leave_task(
+    workdir,
+    session_dir,
+    task_id: str,
+    wait_busy: Callable[[], bool] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> None:
+    """后台执行自动创建的退频道任务（不依赖界面，抽奖任务可直接调用）。"""
+    log_fn = log or logger.info
+    queued = False
+    while wait_busy is not None and wait_busy():
+        if not queued:
+            log_fn(f"账号仍被抽奖任务占用，排队等待空闲后执行退频道（{task_id}）")
+            queued = True
+        if _patch_leave_task(workdir, task_id, status="排队等待账号空闲") is None:
+            return
+        await asyncio.sleep(5)
+    task = _patch_leave_task(workdir, task_id)
+    if task is None:
+        return
+    days = _to_days(task.get("days"), CHANNELS_FULL_DAYS)
+    if days <= 0:
+        # 自动任务必须带阈值，避免 0（扫描全部）导致全量退出
+        days = float(CHANNELS_FULL_DAYS)
+    path = Path(str(session_dir or ".")) if session_dir else Path(".")
+    started = time.time()
+    auto_left = 0
+    rows: List[Dict] = []
+    status = ""
+    task = _patch_leave_task(
+        workdir,
+        task_id,
+        status="扫描中",
+        start_time=f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+        duration="",
+    )
+    if task is None:
+        return
+    task_name = str(task.get("name") or task_id)
+    log_fn(
+        f"[{task_name}] 启动：{', '.join(task.get('accounts') or [])}，"
+        f"阈值 {_fmt_days(days)} 天"
+    )
+    try:
+        for account in list(task.get("accounts") or []):
+            found = await scan_stale_chats(
+                account,
+                path,
+                days,
+                _scan_types_of(task),
+                bool(task.get("skip_pinned", True)),
+                log_fn,
+            )
+            auto_rows = [r for r in found if not _kw_hit(task, r["title"])]
+            kept = [r for r in found if _kw_hit(task, r["title"])]
+            if auto_rows:
+                _patch_leave_task(workdir, task_id, status="退出中", rows=rows + kept)
+                done = await _leave_rows(account, path, auto_rows, log_fn)
+                auto_left += len(done)
+            rows.extend(kept)
+            log_fn(
+                f"[{account}] 命中保护关键字 {len(kept)} 个（待手动确认），"
+                f"未命中 {len(auto_rows)} 个自动退出"
+            )
+        status = f"完成：自动退出 {auto_left} 个，待确认 {len(rows)} 个"
+    except Exception as exc:
+        status = f"异常：{exc}"
+        log_fn(f"自动退频道任务运行异常: {exc}")
+        logger.debug("自动退频道任务运行异常", exc_info=True)
+    finally:
+        _patch_leave_task(
+            workdir,
+            task_id,
+            status=status,
+            rows=[dict(r) for r in rows],
+            duration=format_duration(time.time() - started),
+        )
+        log_fn(f"[{task_name}] {status}")
+
+
 def _chat_type(chat) -> str:
     return str(getattr(chat, "type", "")).upper().replace("CHATTYPE.", "")
 
@@ -134,7 +311,7 @@ def _chat_type(chat) -> str:
 async def scan_stale_chats(
     account: str,
     session_dir: Path,
-    days: int,
+    days: float,
     scan_types: str = "both",
     skip_pinned: bool = True,
     log: Callable[[str], None] = None,
@@ -142,12 +319,12 @@ async def scan_stale_chats(
     """扫描单个账号，返回超过 days 天不更新的对话列表（只读，不做任何退出）
 
     scan_types: 扫描范围——"channel" 仅频道 / "group" 仅群组 / "both" 频道+群组
-    days: 不更新天数阈值，0 表示不按天数过滤（扫描全部符合条件的对话）
+    days: 不更新天数阈值（支持小数，如 0.5），0 表示不按天数过滤（扫描全部符合条件的对话）
     """
     scan_types = str(scan_types or "both")
     want_channel = scan_types in ("channel", "both")
     want_group = scan_types in ("group", "both")
-    days = max(0, int(days or 0))
+    days = _to_days(days, 0)
     found: List[Dict] = []
     client = None
     try:
@@ -156,7 +333,8 @@ async def scan_stale_chats(
         if not ok:
             log(f"[{account}] 会话未授权，跳过")
             return found
-        cutoff = datetime.utcnow() - timedelta(days=days) if days > 0 else None
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=days) if days > 0 else None
         scanned = 0
         # 逐项拉取套超时：代理僵死时明确失败，不永久挂起
         async for dialog in timeout_aiter(
@@ -181,8 +359,11 @@ async def scan_stale_chats(
             if top is None or getattr(top, "date", None) is None:
                 log(f"[{account}] 无最新消息信息，跳过：{title}")
                 continue
-            if cutoff is None or top.date < cutoff:
-                age_days = max(0, (datetime.utcnow() - top.date).days)
+            top_date = _as_utc(top.date)
+            if cutoff is None or top_date < cutoff:
+                age_days = round(
+                    max(0.0, (now - top_date).total_seconds() / 86400), 1
+                )
                 found.append(
                     {
                         "key": f"{account}:{chat.id}",
@@ -193,7 +374,9 @@ async def scan_stale_chats(
                         "age_days": age_days,
                     }
                 )
-        stale_desc = f"超过 {days} 天未更新" if days > 0 else "全部（未按天数过滤）"
+        stale_desc = (
+            f"超过 {_fmt_days(days)} 天未更新" if days > 0 else "全部（未按天数过滤）"
+        )
         log(f"[{account}] 扫描完成，共 {scanned} 个对话，{len(found)} 个{stale_desc}")
     except asyncio.TimeoutError:
         log(f"[{account}] 连接超时（30s），跳过")
@@ -356,10 +539,14 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         task["start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
         task["duration"] = ""
         render_list()
-        days = int(task["days"]) if task.get("days") is not None else 7
+        days = _to_days(task.get("days"), 7)
         log(
             f"[{task['name']}] 启动：{len(accounts)} 个账号，"
-            + (f"阈值 {days} 天" if days > 0 else "阈值 0 天（扫描全部）")
+            + (
+                f"阈值 {_fmt_days(days)} 天"
+                if days > 0
+                else "阈值 0 天（扫描全部）"
+            )
         )
         auto_leave_on = bool(task.get("auto_leave"))
         if auto_leave_on and days <= 0:
@@ -461,10 +648,13 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         with confirm_list:
             for row in selected[:50]:
                 ui.label(
-                    f"[{row['account']}] {row['title']}（{row['age_days']}天未更新）"
+                    f"[{row['account']}] {row['title']}"
+                    f"（{_fmt_days(row['age_days'])}天未更新）"
                 ).classes("text-sm")
             if len(selected) > 50:
                 ui.label(f"… 等共 {len(selected)} 个").classes("text-sm text-gray-500")
+        # 退出确认由明细弹窗发起：先关闭明细，再弹出确认，避免弹窗层叠
+        detail_dialog.close()
         confirm_dialog.open()
 
     async def _do_leave_selected() -> None:
@@ -479,6 +669,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             return
         st["running"] = True
         st["status"] = "退出中"
+        ui.notify("退出流程已启动，可在任务列表查看进度", type="positive")
         render_list()
         try:
             by_account: Dict[str, List[Dict]] = {}
@@ -542,7 +733,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         ] or None
         account_sel.update()
         d = prefill.get("days")
-        days_input.value = int(d) if d is not None else 7
+        days_input.value = float(d) if d is not None else 7
         scope_sel.value = _scan_types_of(prefill)
         sp.value = bool(prefill.get("skip_pinned", True))
         kw_input.value = ",".join(prefill.get("keywords") or []) or DEFAULT_KEYWORDS
@@ -558,7 +749,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             return
         scope = str(scope_sel.value or "both")
         d = days_input.value
-        days = max(0, int(d)) if d is not None else 7
+        days = _to_days(d, 7)
         task = {
             "id": f"leave_{datetime.now():%Y%m%d%H%M%S%f}",
             "name": f"退频道任务 {datetime.now():%m-%d %H:%M}",
@@ -582,7 +773,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
 
     def _short_status(st: Dict) -> str:
         full = str(st.get("status") or "—")
-        if st.get("running"):
+        if st.get("running") or full in _AUTO_TASK_ACTIVE_STATUSES:
             return "运行中"
         if full.startswith("完成") or full.startswith("退出完成"):
             return "已完成"
@@ -670,7 +861,11 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     )
                     ui.label(
                         f"{head['type']}　{len(group)} 个账号"
-                        + ("" if len(group) == 1 else f"　最多 {group_days} 天未更新")
+                        + (
+                            ""
+                            if len(group) == 1
+                            else f"　最多 {_fmt_days(group_days)} 天未更新"
+                        )
                     ).classes("text-xs text-gray-500")
             for row in group:
                 key = row["key"]
@@ -681,9 +876,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                             e, k, t
                         ),
                     ).props("dense")
-                    ui.label(f"{row['account']}（{row['age_days']}天未更新）").classes(
-                        "text-xs"
-                    ).style("overflow-wrap: anywhere;")
+                    ui.label(
+                        f"{row['account']}（{_fmt_days(row['age_days'])}天未更新）"
+                    ).classes("text-xs").style("overflow-wrap: anywhere;")
 
     def render_detail_rows(task_id: str, append: bool = False) -> None:
         body = detail_refs.get("body")
@@ -794,6 +989,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                         ui.label(f"任务 #{row['seq']}").classes(
                             "text-base font-semibold"
                         )
+                        if row.get("auto"):
+                            ui.badge("自动").props("color=teal")
                     ui.label(f"账号：{row['accounts']}").classes(
                         "text-xs text-gray-600"
                     )
@@ -854,6 +1051,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     "status": _short_status(st),
                     "result": str(st.get("status") or "—"),
                     "running": bool(st.get("running")),
+                    # 频道已满自动触发的任务，卡片/表格上标记「自动」
+                    "auto": task.get("trigger") == "channels_full",
                 }
             )
         leave_table.rows = rows
@@ -883,7 +1082,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     ui.label("批量退频道").classes("text-lg font-semibold")
     ui.label(
         "扫描所选账号超过指定天数没有新消息的频道（可选包含群组）并批量退出；"
-        "不更新天数阈值填 0 表示扫描全部频道/群组，此时不允许自动退出。"
+        "不更新天数阈值支持小数（如 0.5），填 0 表示扫描全部频道/群组，此时不允许自动退出。"
         "开启「自动退出未命中关键字」后，未命中保护关键字的频道自动退出；"
         "命中关键字的频道在「明细」中展示，需手动勾选退出。自己是创建者的对话永远不会被退出。"
     ).classes("text-sm text-gray-500")
@@ -954,13 +1153,16 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         .props("flat dense")
     )
     # 状态列渲染为彩色徽章：已完成=绿、失败=红、运行中=蓝、其他=灰
+    # 频道已满自动触发的任务额外带一个「自动」标记
     leave_table.add_slot(
         "body-cell-status",
         '<q-td :props="props">'
         "<q-badge :color=\"props.row.status === '已完成' ? 'positive' : "
         "props.row.status === '失败' ? 'negative' : "
         "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
-        "{{ props.row.status }}</q-badge></q-td>",
+        "{{ props.row.status }}</q-badge>"
+        '<q-badge v-if="props.row.auto" color="teal" class="q-ml-xs">自动</q-badge>'
+        "</q-td>",
     )
     # 账号列限宽：超长账号列表单行省略号截断，悬停显示完整内容
     leave_table.add_slot(
@@ -1006,8 +1208,11 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         attach_select_all(account_sel)
         with ui.row().classes("w-full items-end flex-wrap gap-2"):
             days_input = ui.number(
-                label="不更新天数阈值（0=全部）", value=7, min=0, step=1, format="%.0f"
-            ).classes("w-44")
+                label="不更新天数阈值（天，可填小数；0=全部）",
+                value=7,
+                min=0,
+                step=0.5,
+            ).classes("w-56")
             scope_sel = ui.select(
                 {"channel": "仅频道", "group": "仅群组", "both": "频道+群组"},
                 value="both",
@@ -1015,7 +1220,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             ).classes("w-40")
             sp = ui.checkbox("跳过置顶", value=True)
         ui.label(
-            "不更新天数阈值填 0 表示扫描全部频道/群组，此时不允许勾选自动退出"
+            "不更新天数阈值支持小数（如 0.5 天）；填 0 表示扫描全部频道/群组，"
+            "此时不允许勾选自动退出"
         ).classes("text-xs text-gray-500")
         kw_input = ui.input("保护关键字（逗号分隔）", value=DEFAULT_KEYWORDS).classes(
             "w-full"
@@ -1125,5 +1331,51 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
 
     def refresh() -> None:
         render_list()
+
+    # 轮询任务文件：抽奖任务因频道已满在后台自动创建/推进的任务也要显示在本页
+    last_mtime = {"v": tasks_mtime_ns(workdir)}
+
+    def _sync_from_disk() -> None:
+        disk = load_leave_tasks(workdir)
+        known = {t["id"]: t for t in tasks}
+        changed = False
+        for item in disk:
+            tid = item["id"]
+            local = known.get(tid)
+            if local is None:
+                tasks.append(item)
+                task_states[tid] = _default_state(item)
+                changed = True
+                continue
+            st = task_states.get(tid)
+            if st is None or st.get("running"):
+                continue  # 本页正在执行的任务以内存状态为准
+            local.update(item)
+            st["status"] = str(item.get("status") or "—")
+            st["rows"] = [
+                dict(r) for r in (item.get("rows") or []) if isinstance(r, dict)
+            ]
+            st["selected"] = {
+                r["key"]
+                for r in st["rows"]
+                if not _kw_hit(local, str(r.get("title") or ""))
+            }
+            changed = True
+        if changed:
+            render_list()
+
+    async def _poll_external_tasks() -> None:
+        while True:
+            await asyncio.sleep(3)
+            try:
+                mtime = tasks_mtime_ns(workdir)
+                if mtime == last_mtime["v"]:
+                    continue
+                last_mtime["v"] = mtime
+                _sync_from_disk()
+            except Exception:
+                logger.debug("同步退频道任务列表失败", exc_info=True)
+
+    asyncio.create_task(_poll_external_tasks())
 
     return refresh

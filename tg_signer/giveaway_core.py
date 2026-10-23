@@ -56,6 +56,8 @@ from tg_signer.giveaway_parsing import (
     extract_password_tasks,
     extract_speech_tasks,
     is_emoji_verify_message,
+    is_math_verify_message,
+    math_verify_answer,
     message_is_draw_announce,
     message_matches_keywords,
     message_region_allowed,
@@ -230,12 +232,17 @@ class GiveawayEngine:
         # 已处理过点击的防脚本验证消息：{account|bot|msg_id}，进程内去重
         # （重发 start 后旧验证消息仍在候选里，避免误点过期验证按钮）
         self._emoji_verify_handled: set = set()
+        # 已回复过答案的算术验证消息：{account|bot|msg_id}，进程内去重
+        # （重发 start 后旧验证题仍在候选里，避免重复回复过期题目）
+        self._math_verify_handled: set = set()
         # 自动加入频道的限流暂停：JoinChannel FLOOD_WAIT 后暂停该账号的加入
         # {account: 恢复时刻（monotonic 秒）}，只影响触发限流的账号
         self._join_suspended: Dict[str, float] = {}
         self._join_suspend_logged: set = set()
         # PEER_FLOOD 强制限流账号：本轮运行停止该账号的一切加入与参与
         self._peer_flood_accounts: set = set()
+        # 频道/群组已满提醒去重：本轮运行每账号只回报一次（WebUI 据此自动退频道）
+        self._channels_full_notified: set = set()
         # 加入频道时间日志（state 不可用时的内存兜底）{account: [epoch 秒...]}
         self._join_events: Dict[str, List[float]] = {}
         # 加入节奏与配额（任务级可配置，默认取模块常量）
@@ -1616,6 +1623,34 @@ class GiveawayEngine:
         """PEER_FLOOD 为不可重试的账号级强制限流（没有 wait 秒数）。"""
         return "PEER_FLOOD" in str(exc).upper()
 
+    @staticmethod
+    def _is_channels_too_much(exc: Exception) -> bool:
+        """账号已加入的频道/群组数达到 Telegram 上限（CHANNELS_TOO_MUCH）。"""
+        return "CHANNELS_TOO_MUCH" in str(exc).upper()
+
+    def _note_channels_full(
+        self, account: str, exc: Exception, where: str = ""
+    ) -> bool:
+        """识别账号频道/群组已满：每账号本轮只回报一次，交由 WebUI 自动退频道。"""
+        if not self._is_channels_too_much(exc):
+            return False
+        if account not in self._channels_full_notified:
+            self._channels_full_notified.add(account)
+            detail = f"（{where}）" if where else ""
+            self.log(
+                f"[{account}] 已加入的频道/群组达到 Telegram 上限，无法继续加入{detail}"
+            )
+            self._emit(
+                {
+                    "type": "channels_full",
+                    "account": account,
+                    "detail": where,
+                    "error": str(exc)[:120],
+                    "session_dir": str(self.session_dir or "."),
+                }
+            )
+        return True
+
     def _block_peer_flood(self, account: str, detail: str = "") -> None:
         """PEER_FLOOD 熔断：本轮运行停止该账号的一切加入与参与。"""
         if account in self._peer_flood_accounts:
@@ -2174,6 +2209,8 @@ class GiveawayEngine:
             if self._is_peer_flood(exc):
                 self._block_peer_flood(account, f"加入 {target}")
                 return False, True
+            if self._note_channels_full(account, exc, f"加入 {target}"):
+                return False, False
             if "ALREADY_PARTICIPANT" in msg or "already" in msg.lower():
                 self.log(f"[{account}] 已在 {target} 中，跳过加入")
             elif "INVITE_REQUEST_SENT" in msg:
@@ -2324,7 +2361,7 @@ class GiveawayEngine:
         invite_match = _INVITE_LINK_RE.match(str(target).strip())
         if invite_match:
             send_target = await self._resolve_invite_target(
-                client, invite_match.group(1), str(target).strip()
+                account, client, invite_match.group(1), str(target).strip()
             )
             if send_target is None:
                 self._log_password_group_join_failure(
@@ -2345,6 +2382,7 @@ class GiveawayEngine:
                 # 成员状态同步后再发言，避免 bot 侧校验不到
                 await asyncio.sleep(3)
             except Exception as exc:
+                self._note_channels_full(account, exc, f"加入口令群「{group_name}」")
                 self._log_password_group_join_failure(
                     account, group_name, password, str(exc)[:120]
                 )
@@ -2405,7 +2443,7 @@ class GiveawayEngine:
             )
 
     async def _resolve_invite_target(
-        self, client: Any, invite_hash: str, invite_link: str
+        self, account: str, client: Any, invite_hash: str, invite_link: str
     ) -> Optional[int]:
         """私有邀请链接 → 真实 chat id（未加入则先加入）。
 
@@ -2436,7 +2474,8 @@ class GiveawayEngine:
             if isinstance(chat, _raw.types.Chat):
                 return -chat.id
             return None
-        except Exception:
+        except Exception as exc:
+            self._note_channels_full(account, exc, "加入私有邀请链接")
             logger.debug("私有邀请链接解析口令群失败", exc_info=True)
             return None
 
@@ -2550,6 +2589,9 @@ class GiveawayEngine:
             self._block_peer_flood(account, f"加入监控对象 {chat}")
             self._join_cache.discard(key)  # 熔断不消耗尝试机会
             return True
+        if self._note_channels_full(account, exc, f"加入监控对象 {chat}"):
+            self._join_cache.add(key)  # 已满：本轮不再对该对象重试
+            return True
         if "ALREADY_PARTICIPANT" in msg or "already" in msg.lower():
             self._join_cache.add(key)
             self._emit({"type": "join_resolved", "account": account, "chat": str(chat)})
@@ -2619,6 +2661,80 @@ class GiveawayEngine:
         self.log(f"[{account}] @{username} 防脚本验证：按顺序点击 {' → '.join(order)}")
         await self._click_verify_buttons(account, client, username, message, targets)
         return True
+
+    async def _handle_math_verification(
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        messages: List[Any],
+        param: str = "",
+        attempt: int = 1,
+    ) -> bool:
+        """处理 bot 的「算术验证」（如 @mianfeichoujiang_bot）。
+
+        start 后 bot 回复「请计算：18 + 9 = ？直接回复答案数字。」，需在私聊
+        直接发送计算结果；题目随机变化，本地安全求值后回复。同一条验证消息
+        进程内只回复一次，避免重发 start 后重复回复过期题目。
+        bot 回复「验证过期」时重发一次 start 换取新题再答（attempt 限 2 次）。
+        """
+        verify_msgs = [m for m in messages if is_math_verify_message(m)]
+        if not verify_msgs:
+            return False
+        # 取最新一条，避免候选中残留的上一次题目被当成本次验证
+        message = max(verify_msgs, key=lambda m: getattr(m, "id", 0) or 0)
+        msg_key = f"{account}|{username}|{getattr(message, 'id', 0)}"
+        if msg_key in self._math_verify_handled:
+            return True
+        answer = math_verify_answer(message)
+        if answer is None:
+            self.log(f"[{account}] @{username} 算术验证：未能解析题目，跳过")
+            return True
+        self._math_verify_handled.add(msg_key)
+        try:
+            await client.send_message(username, answer)
+        except Exception as exc:
+            self.log(f"[{account}] @{username} 算术验证：回复 {answer} 失败: {exc}")
+            return True
+        self.log(f"[{account}] @{username} 算术验证：已回复答案 {answer}")
+        await asyncio.sleep(2)
+        fresh = await self._refresh_after_verify_reply(
+            account, client, username, messages
+        )
+        latest = next(
+            (m for m in fresh if not getattr(m, "outgoing", False)), None
+        )
+        if attempt <= 1 and "验证过期" in (_message_text(latest) or ""):
+            self.log(f"[{account}] @{username} 算术验证已过期，重发 start 换取新题")
+            try:
+                await self._start_bot(client, account, username, param)
+            except Exception as exc:
+                self.log(f"重新参与 @{username} 失败: {exc}")
+                return True
+            await asyncio.sleep(2)
+            await self._refresh_after_verify_reply(account, client, username, messages)
+            return await self._handle_math_verification(
+                account, client, username, messages, param, attempt + 1
+            )
+        return True
+
+    async def _refresh_after_verify_reply(
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        messages: List[Any],
+    ) -> List[Any]:
+        """验证回复后拉取 bot 最新消息并入候选（失败仅 debug 日志）。"""
+        fresh: List[Any] = []
+        try:
+            async for recent in client.get_chat_history(username, limit=2):
+                fresh.append(recent)
+                messages.append(recent)
+                await self._check_win_message(account, client, username, recent)
+        except Exception:
+            logger.debug("拉取验证回复后的 bot 消息失败", exc_info=True)
+        return fresh
 
     def _collect_verify_targets(
         self, account: str, username: str, message: Any, order: List[str]
@@ -2755,7 +2871,7 @@ class GiveawayEngine:
         # 「防脚本验证」（如 @dbchoujiang123_bot）：按正文顺序点击 emoji 按钮
         # 完成人机校验，再刷新候选，让后续加入/确认流程看到验证后的消息
         await self._refresh_candidates_after_verification(
-            account, client, username, candidates
+            account, client, username, candidates, param
         )
         if self.auto_join:
             stop, had_join_targets, candidates = await self._auto_join_and_restart(
@@ -2819,15 +2935,29 @@ class GiveawayEngine:
                 return True
             if any(self._find_confirm_button(m) is not None for m in candidates):
                 break
-            # 防脚本验证消息没有确认按钮：提前结束轮询交给验证处理
-            if any(is_emoji_verify_message(m) for m in candidates):
+            # 防脚本验证/算术验证消息没有确认按钮：提前结束轮询交给验证处理
+            if any(is_emoji_verify_message(m) for m in candidates) or any(
+                is_math_verify_message(m) for m in candidates
+            ):
                 break
         return False
 
     async def _refresh_candidates_after_verification(
-        self, account: str, client: Any, username: str, candidates: List[Any]
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        candidates: List[Any],
+        param: str = "",
     ) -> None:
-        if await self._handle_emoji_verification(account, client, username, candidates):
+        handled = await self._handle_math_verification(
+            account, client, username, candidates, param
+        )
+        if not handled:
+            handled = await self._handle_emoji_verification(
+                account, client, username, candidates
+            )
+        if handled:
             await asyncio.sleep(2)
             await self._append_recent_bot_messages(
                 account, client, username, candidates
@@ -2951,10 +3081,15 @@ class GiveawayEngine:
                 candidates.append(recent)
                 await self._check_win_message(account, client, username, recent)
             candidates.extend(pre_restart)
-            # 重发 start 可能再次触发防脚本验证：完成后刷新候选
-            if await self._handle_emoji_verification(
-                account, client, username, candidates
-            ):
+            # 重发 start 可能再次触发防脚本/算术验证：完成后刷新候选
+            handled = await self._handle_math_verification(
+                account, client, username, candidates, param
+            )
+            if not handled:
+                handled = await self._handle_emoji_verification(
+                    account, client, username, candidates
+                )
+            if handled:
                 await asyncio.sleep(2)
                 await self._append_recent_bot_messages(
                     account, client, username, candidates

@@ -251,13 +251,12 @@ def _leave_config_params(task_name: str, workdir) -> list[tuple[str, str]] | Non
         return None
     scan = str(task.get("scan_types") or "")
     days = task.get("days")
+    days_text = "—" if days is None else f"{float(days):g}"
     return [
         ("账号", _fmt_param_value(task.get("accounts"))),
         (
             "不更新天数阈值",
-            f"{days}（全部）"
-            if days == 0
-            else (str(days) if days is not None else "—"),
+            f"{days_text}（全部）" if days == 0 else days_text,
         ),
         ("扫描范围", SCAN_TYPE_DESC.get(scan, scan or "—")),
         ("跳过置顶对话", _fmt_param_value(task.get("skip_pinned", True))),

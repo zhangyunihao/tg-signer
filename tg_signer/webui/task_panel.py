@@ -93,7 +93,7 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
                     "account": account,
                     "session_dir": str(workdir),
                     "days": (
-                        int(leave_task["days"])
+                        float(leave_task["days"])
                         if leave_task.get("days") is not None
                         else 7
                     ),
@@ -114,7 +114,7 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
             "spec": {
                 "account": account,
                 "session_dir": str(workdir),
-                "days": int(cfg["days"]) if cfg.get("days") is not None else 7,
+                "days": float(cfg["days"]) if cfg.get("days") is not None else 7,
                 "scan_types": _leave_scan_types(cfg),
                 "include_groups": bool(cfg.get("include_groups")),
                 "skip_pinned": bool(cfg.get("skip_pinned", True)),
@@ -618,9 +618,11 @@ class TaskRunnerBlock:
                 if not name or not t.get("auto_leave"):
                     continue
                 accs = "、".join(str(a) for a in (t.get("accounts") or []))
+                days = t.get("days")
+                days_text = "—" if days is None else f"{float(days):g}"
                 opts[name] = (
                     f"{total - j}｜{name}"
-                    f"（{t.get('days')}天｜自动退出｜账号：{accs or '未设置'}）"
+                    f"（{days_text}天｜自动退出｜账号：{accs or '未设置'}）"
                 )
             return opts
         return self._get_task_names(task_type)

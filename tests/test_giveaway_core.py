@@ -3479,3 +3479,181 @@ def test_click_confirm_solves_verification_then_confirms(tmp_path, monkeypatch):
     assert clicked == [b"v1", b"v2", b"v3", b"go"]
     assert any("防脚本验证" in line for line in logs)
     assert any("已点击" in line for line in logs)
+
+
+# ---------------- 算术验证（直接回复答案数字） ----------------
+
+MATH_VERIFY_TEXT = "请计算：18 + 9 = ？直接回复答案数字。"
+
+
+def test_is_math_verify_message():
+    from tg_signer.giveaway_parsing import is_math_verify_message
+
+    assert is_math_verify_message(_msg(text=MATH_VERIFY_TEXT))
+    assert is_math_verify_message(_msg(text="请计算 19+6 = ?"))
+    assert not is_math_verify_message(_msg(text="欢迎参加抽奖"))
+    assert not is_math_verify_message(_msg(caption=None, text=""))
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (MATH_VERIFY_TEXT, "18 + 9"),
+        ("请计算: 19+6=?", "19+6"),
+        ("请计算：１２ ＋ ３ ＝ ？直接回复答案数字。", "12 + 3"),
+        ("请计算：6 × 7 = ？直接回复答案数字。", "6 * 7"),
+        ("请计算：7 ÷ 2 = ？直接回复答案数字。", "7 / 2"),
+    ],
+)
+def test_extract_math_expression(text, expected):
+    from tg_signer.giveaway_parsing import extract_math_expression
+
+    assert extract_math_expression(_msg(text=text)) == expected
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (MATH_VERIFY_TEXT, "27"),
+        ("请计算：19 + 6 = ？直接回复答案数字。", "25"),
+        ("请计算：１２ ＋ ３ ＝ ？直接回复答案数字。", "15"),
+        ("请计算：6 × 7 = ？直接回复答案数字。", "42"),
+        ("请计算：7 ÷ 2 = ？直接回复答案数字。", "3.5"),
+        ("请计算：3.5 + 1.5 = ？直接回复答案数字。", "5"),
+        ("请计算：（2 + 3）× 4 = ？直接回复答案数字。", "20"),
+    ],
+)
+def test_math_verify_answer(text, expected):
+    from tg_signer.giveaway_parsing import math_verify_answer
+
+    assert math_verify_answer(_msg(text=text)) == expected
+
+
+def test_solve_math_expression_rejects_non_arithmetic():
+    from tg_signer.giveaway_parsing import solve_math_expression
+
+    assert solve_math_expression("18 + 9") == "27"
+    assert solve_math_expression("-5 + 2") == "-3"
+    # 只允许四则运算：函数调用/变量/幂运算一律拒绝
+    assert solve_math_expression("__import__('os')") is None
+    assert solve_math_expression("2 ** 8") is None
+    assert solve_math_expression("abc") is None
+    assert solve_math_expression("") is None
+
+
+def test_handle_math_verification_sends_answer(tmp_path, monkeypatch):
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"MianfeichoujiangBot"})
+    handled = asyncio.run(
+        engine._handle_math_verification(
+            "acc",
+            client,
+            "mianfeichoujiang_bot",
+            [_msg(id=99, text=MATH_VERIFY_TEXT)],
+        )
+    )
+    assert handled is True
+    assert client.sent == [("mianfeichoujiang_bot", "27")]
+    assert any("已回复答案 27" in line for line in logs)
+
+
+def test_handle_math_verification_dedup_same_message(tmp_path, monkeypatch):
+    """同一条验证消息进程内只回复一次答案（重发 start 后旧题不重复答）。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    engine.log = lambda *a, **k: None
+    client = FakeClient(bot_users={"MianfeichoujiangBot"})
+    message = _msg(id=99, text=MATH_VERIFY_TEXT)
+    for _ in range(2):
+        asyncio.run(
+            engine._handle_math_verification(
+                "acc", client, "mianfeichoujiang_bot", [message]
+            )
+        )
+    assert client.sent == [("mianfeichoujiang_bot", "27")]
+
+
+class _MathVerifyClient(FakeClient):
+    """send_message/start_bot 后按脚本切换历史，模拟 bot 的验证回复。"""
+
+    def __init__(self):
+        super().__init__(bot_users={"MianfeichoujiangBot"})
+        self.send_replies = []
+        self.after_start = None
+
+    async def send_message(self, chat_id, text):
+        self.sent.append((chat_id, text))
+        if self.send_replies:
+            self.history = list(self.send_replies.pop(0))
+        return SimpleNamespace(id=1)
+
+    async def start_bot(self, username, param):
+        self.started.append((username, param))
+        if self.after_start is not None:
+            self.history = [self.after_start]
+        return None
+
+
+def test_handle_math_verification_expired_restarts_and_answers_new(
+    tmp_path, monkeypatch
+):
+    """答题后 bot 回「验证过期」：重发 start 换新题并再答一次。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _MathVerifyClient()
+    client.send_replies = [
+        [_msg(id=101, text="验证过期，请重新参与")],
+        [_msg(id=103, text="验证成功，点击下方按钮参与抽奖")],
+    ]
+    client.after_start = _msg(id=102, text="请计算：19 + 6 = ？直接回复答案数字。")
+    handled = asyncio.run(
+        engine._handle_math_verification(
+            "acc",
+            client,
+            "mianfeichoujiang_bot",
+            [_msg(id=99, text=MATH_VERIFY_TEXT)],
+            "p1",
+        )
+    )
+    assert handled is True
+    assert client.started == [("mianfeichoujiang_bot", "p1")]
+    assert client.sent == [("mianfeichoujiang_bot", "27"), ("mianfeichoujiang_bot", "25")]
+    assert any("验证已过期" in line for line in logs)
+
+
+def test_extract_giveaway_title_accepts_party_emoji():
+    """天天免费抽奖 的帖子标题以 🎉 开头（不是 🎰），也应能取到标题。"""
+    from tg_signer.giveaway_parsing import extract_giveaway_title
+
+    msg = _msg(
+        text="🎉 秋季校园招生福利抽奖大放送（L1792657025976c0958d1b）\n\n📝 抽奖说明："
+    )
+    assert extract_giveaway_title(msg).startswith("秋季校园招生福利抽奖大放送")
+    assert extract_giveaway_title(_msg(text="🎰 周末福利")) == "周末福利"
+    assert extract_giveaway_title(_msg(text="普通消息")) == ""
