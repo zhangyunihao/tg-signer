@@ -361,9 +361,7 @@ async def scan_stale_chats(
                 continue
             top_date = _as_utc(top.date)
             if cutoff is None or top_date < cutoff:
-                age_days = round(
-                    max(0.0, (now - top_date).total_seconds() / 86400), 1
-                )
+                age_days = round(max(0.0, (now - top_date).total_seconds() / 86400), 1)
                 found.append(
                     {
                         "key": f"{account}:{chat.id}",
@@ -497,7 +495,6 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     log_lines: List[str] = []
     # 页面级持久弹窗的引用与状态（弹窗不在事件槽位里动态创建）
     detail_refs: Dict = {"task_id": None, "body": None, "count": None}
-    leave_confirm: Dict = {"task_id": None, "selected": []}
     delete_state: Dict = {"task_id": None}
     cards_limit = {"n": 5}
 
@@ -542,11 +539,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         days = _to_days(task.get("days"), 7)
         log(
             f"[{task['name']}] 启动：{len(accounts)} 个账号，"
-            + (
-                f"阈值 {_fmt_days(days)} 天"
-                if days > 0
-                else "阈值 0 天（扫描全部）"
-            )
+            + (f"阈值 {_fmt_days(days)} 天" if days > 0 else "阈值 0 天（扫描全部）")
         )
         auto_leave_on = bool(task.get("auto_leave"))
         if auto_leave_on and days <= 0:
@@ -640,33 +633,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         if not selected:
             ui.notify("请先勾选要退出的对话", type="warning")
             return
-        # 填充页面级持久确认弹窗（不在事件槽位里动态创建弹窗）
-        leave_confirm["task_id"] = task_id
-        leave_confirm["selected"] = selected
-        confirm_title.text = f"确认退出以下 {len(selected)} 个对话？"
-        confirm_list.clear()
-        with confirm_list:
-            for row in selected[:50]:
-                ui.label(
-                    f"[{row['account']}] {row['title']}"
-                    f"（{_fmt_days(row['age_days'])}天未更新）"
-                ).classes("text-sm")
-            if len(selected) > 50:
-                ui.label(f"… 等共 {len(selected)} 个").classes("text-sm text-gray-500")
-        # 退出确认由明细弹窗发起：先关闭明细，再弹出确认，避免弹窗层叠
+        # 不需要二次确认：关闭明细弹窗后直接启动退出
         detail_dialog.close()
-        confirm_dialog.open()
-
-    async def _do_leave_selected() -> None:
-        task_id = leave_confirm.get("task_id")
-        task = find_task(task_id) if task_id else None
-        st = task_states.get(task_id) if task_id else None
-        confirm_dialog.close()
-        if not task or not st:
-            return
-        selected = list(leave_confirm.get("selected") or [])
-        if not selected:
-            return
         st["running"] = True
         st["status"] = "退出中"
         ui.notify("退出流程已启动，可在任务列表查看进度", type="positive")
@@ -1266,20 +1234,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         detail_title = ui.label("任务明细").classes("text-lg font-semibold")
         ui.label(
             "未命中保护关键字的对话已默认勾选，命中关键字的保持不勾；"
-            "核对后点「退出所选」手动退出。明细已持久化，任务完成后重新打开仍可见。"
+            "核对后点「退出所选」立即退出（无需二次确认）。明细已持久化，任务完成后重新打开仍可见。"
         ).classes("text-xs text-gray-500")
         detail_body = ui.column().classes("w-full gap-2")
-
-    with ui.dialog() as confirm_dialog, ui.card():
-        add_dialog_close_button(confirm_dialog)
-        confirm_title = ui.label("确认退出？").classes("text-lg font-semibold")
-        ui.label("退出后需要重新搜索/加群才能回来，请仔细核对！").classes(
-            "text-sm text-orange-600"
-        )
-        confirm_list = ui.column().classes("max-h-60 overflow-auto w-full")
-        with ui.row().classes("w-full justify-end"):
-            ui.button("取消", on_click=confirm_dialog.close).props("flat")
-            ui.button("确认退出", on_click=_do_leave_selected).props("color=negative")
 
     with ui.dialog() as delete_dialog, ui.card():
         add_dialog_close_button(delete_dialog)
