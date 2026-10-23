@@ -43,6 +43,21 @@ _GLOBAL_STATUS_CBS: Dict[str, Callable[[bool], None]] = {}
 _TASKS_FILE = "random_chat_tasks.json"
 
 
+async def stop_all_random_chat_tasks(workdir) -> int:
+    """停止当前工作目录下所有运行中的随机发言任务，返回请求停止的数量。"""
+    prefix = f"{Path(workdir).resolve()}|"
+    count = 0
+    for key, engine in list(_GLOBAL_ENGINES.items()):
+        if not key.startswith(prefix) or engine is None or not engine.running:
+            continue
+        try:
+            await engine.stop()
+            count += 1
+        except Exception:
+            logger.debug("停止随机发言任务失败", exc_info=True)
+    return count
+
+
 def list_session_names(session_dir: Union[Path, str], workdir=None) -> List[str]:
     """列出会话目录下所有 .session 文件对应的账号名（排除停用账户，按账户管理中拖动的顺序排列）"""
     base = Path(session_dir)
@@ -252,6 +267,12 @@ def parse_chat_id(raw) -> Optional[Union[int, str]]:
         return text
 
 
+def is_db_locked_error(exc: BaseException) -> bool:
+    """判断异常是否为 session 数据库被其他任务占用（sqlite database is locked）"""
+    text = str(exc).lower()
+    return "database is locked" in text or "database table is locked" in text
+
+
 class RandomChatEngine:
     """后台随机发言任务：每个账号各自按间隔发送随机语料"""
 
@@ -261,16 +282,32 @@ class RandomChatEngine:
     # 任务运行硬上限（秒）：无论如何，任务运行达到该时长后自动终止
     MAX_RUNTIME_SECONDS = 20 * 60
 
+    # 到点执行时发现 session 数据库被其他任务占用，延后该时长后重试
+    LOCK_RETRY_SECONDS = 20 * 60
+
+    # 数据库被占用时的最大重试次数，超过后结束任务
+    LOCK_MAX_RETRIES = 3
+
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
         self._stop: Optional[asyncio.Event] = None
         self._stopping: bool = False
-        # 运行截止时间（time.monotonic），start 时设置
+        # 本轮运行截止时间（time.monotonic），每轮开始时重设
         self._deadline: float | None = None
-        # 运行进度：{account: 已发送条数}，供任务表格状态列展示
+        # 运行进度：{account: 本轮已发送条数}，供任务表格状态列展示
         self.progress: Dict[str, int] = {}
         self._total_accounts: int = 0
         self._total_count: int = 0
+        # 第几轮 / 总轮数（重复执行：总轮数 = 重复次数 + 1）
+        self._round: int = 0
+        self._rounds: int = 1
+        # 轮次等待截止时间（time.monotonic）；非 None 表示正在等待下一轮，
+        # 此时所有客户端已断开，不占用 session 数据库
+        self._next_round_at: Optional[float] = None
+        # 数据库被占用后的重试等待截止时间（time.monotonic）
+        self._lock_wait_until: Optional[float] = None
+        # 累计已发送条数（跨轮次）
+        self._total_sent: int = 0
         # 本任务实际使用的语库：任务自定义语库非空时用自定义，否则用内置语库
         self.pool: List[str] = list(PHRASES)
         self.using_custom_pool: bool = False
@@ -280,12 +317,23 @@ class RandomChatEngine:
         return self._task is not None and not self._task.done()
 
     def progress_text(self) -> Optional[str]:
-        """运行中返回带进度的状态文本（如 "运行中 (18/100)"），未运行返回 None"""
+        """运行中返回带进度的状态文本（如 "运行中 (18/100)"），未运行返回 None
+
+        状态文本必须以「运行中」开头：任务表格据此判断显示「停止」还是「启动」。
+        """
         if not self.running:
             return None
         if self._stopping:
             return "停止中"
+        if self._lock_wait_until is not None:
+            remain = max(0, int(self._lock_wait_until - time.monotonic()))
+            return f"运行中 (数据库占用 剩{remain}s后重试)"
+        if self._next_round_at is not None:
+            remain = max(0, int(self._next_round_at - time.monotonic()))
+            return f"运行中 (等待第{self._round + 1}轮 剩{remain}s)"
         sent = sum(self.progress.values())
+        if self._rounds > 1:
+            return f"运行中 (第{self._round}/{self._rounds}轮 已发{sent}条)"
         if self._total_count and self._total_accounts:
             return f"运行中 ({sent}/{self._total_count * self._total_accounts})"
         return f"运行中 (已发{sent}条)"
@@ -301,6 +349,8 @@ class RandomChatEngine:
         total_count: int = 50,
         on_finish: Optional[Callable[[], None]] = None,
         phrases: Optional[List[str]] = None,
+        repeat_count: int = 0,
+        repeat_interval: int = 0,
     ) -> bool:
         if self.running:
             log("任务已在运行中")
@@ -309,13 +359,27 @@ class RandomChatEngine:
         self._stopping = False
         self._total_accounts = len(accounts)
         self._total_count = total_count
+        self._round = 0
+        self._rounds = max(1, repeat_count + 1)
+        self._next_round_at = None
+        self._lock_wait_until = None
+        self._total_sent = 0
         self.using_custom_pool = bool(phrases)
         self.pool = list(phrases) if phrases else list(PHRASES)
+        # 截止时间按轮次在 _loop 内重设；这里先给首轮一个上限
         self._deadline = time.monotonic() + self.MAX_RUNTIME_SECONDS
         self._stop = asyncio.Event()
         self._task = asyncio.create_task(
             self._loop(
-                accounts, chat_id, interval, session_dir, log, delete_after, total_count
+                accounts,
+                chat_id,
+                interval,
+                session_dir,
+                log,
+                delete_after,
+                total_count,
+                repeat_count=max(0, repeat_count),
+                repeat_interval=max(0, repeat_interval),
             )
         )
         if on_finish is not None:
@@ -436,10 +500,16 @@ class RandomChatEngine:
                         f"删除收尾超时，未确认删除的消息保留在群里可手动处理"
                     )
 
-    async def _loop(
-        self, accounts, chat_id, interval, session_dir, log, delete_after, total_count
-    ) -> None:
-        clients = {}
+    async def _connect_all(
+        self, accounts, session_dir, log
+    ) -> tuple[Dict[str, object], List[str]]:
+        """连接本轮的账号。
+
+        返回 (可用客户端, 数据库被占用的账号列表)。被占用的账号不视为失败，
+        调用方会延后重试；其余异常账号跳过并记录原因。
+        """
+        clients: Dict[str, object] = {}
+        locked: List[str] = []
         for account in accounts:
             if self._stop.is_set():
                 break
@@ -467,25 +537,118 @@ class RandomChatEngine:
                 if client is not None:
                     await safe_disconnect(client)
             except Exception as exc:
-                log(f"「{account}」连接失败: {exc}")
-        if not clients:
-            log("没有可用账号，任务结束")
-            return
+                if is_db_locked_error(exc):
+                    locked.append(account)
+                    log(f"「{account}」session 数据库被占用，稍后重试")
+                else:
+                    log(f"「{account}」连接失败: {exc}")
+                if client is not None:
+                    await safe_disconnect(client)
+        return clients, locked
+
+    async def _wait_lock_retry(
+        self, round_no: int, accounts: List[str], attempt: int, log
+    ) -> bool:
+        """数据库被占用：延后 LOCK_RETRY_SECONDS 重试本轮；返回 True 表示等待中被停止"""
+        wait = max(0.05, float(self.LOCK_RETRY_SECONDS))
+        self._lock_wait_until = time.monotonic() + wait
+        try:
+            log(
+                f"{datetime.now():%H:%M:%S} 「{', '.join(accounts)}」数据库被其他任务占用，"
+                f"第 {round_no} 轮延后 {format_wait(wait)} 后重试"
+                f"（第 {attempt}/{self.LOCK_MAX_RETRIES} 次，期间不连接 Telegram）"
+            )
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=wait)
+                return True
+            except TimeoutError:
+                return False
+        finally:
+            self._lock_wait_until = None
+
+    async def _wait_next_round(self, wait: int, round_no: int, log) -> bool:
+        """等待下一轮（期间客户端已断开）；返回 True 表示等待中被停止"""
+        if wait <= 0:
+            return self._stop.is_set()
+        self._next_round_at = time.monotonic() + wait
+        try:
+            log(
+                f"{datetime.now():%H:%M:%S} 第 {round_no} 轮结束，已断开所有账号，"
+                f"等待 {format_wait(wait)} 后开始第 {round_no + 1} 轮"
+                f"（等待期间不占用 session 数据库）"
+            )
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=wait)
+                return True
+            except TimeoutError:
+                return False
+        finally:
+            self._next_round_at = None
+
+    async def _loop(
+        self,
+        accounts,
+        chat_id,
+        interval,
+        session_dir,
+        log,
+        delete_after,
+        total_count,
+        repeat_count: int = 0,
+        repeat_interval: int = 0,
+    ) -> None:
+        rounds = max(1, repeat_count + 1)
+        self._rounds = rounds
         count_label = f"每账号 {total_count} 条" if total_count else "不限条数"
         pool_label = (
             f"任务自定义语库 {len(self.pool)} 条"
             if self.using_custom_pool
             else f"内置语库 {len(self.pool)} 条"
         )
-        log(
-            f"开始随机发言：{len(clients)} 个账号 -> {chat_id}，"
-            f"每账号独立计时，间隔 {interval}~{interval + 3} 秒，{count_label}，"
-            f"使用{pool_label}"
-        )
-        try:
-            # 硬性兜底：即使账号循环因网络异常卡住，到期也强制取消，保证任务不超过上限
-            # 额外放宽 delete_after + 65，给停止后的延迟撤回收尾留足时间
-            if self._deadline is not None:
+        if rounds > 1:
+            log(
+                f"任务共 {rounds} 轮，每轮结束断开全部账号，"
+                f"间隔 {format_wait(repeat_interval)} 后执行下一轮"
+            )
+        round_no = 1
+        lock_retries = 0
+        while round_no <= rounds:
+            if self._stop.is_set():
+                break
+            self._round = round_no
+            self.progress = {}
+            # 每轮独立计算 20 分钟硬上限，轮次间隔的等待时间不计入其中
+            self._deadline = time.monotonic() + self.MAX_RUNTIME_SECONDS
+            clients, locked = await self._connect_all(accounts, session_dir, log)
+            if not clients:
+                if locked:
+                    # 到点执行时数据库仍被占用：本轮不结束，延后重试（有次数上限）
+                    if lock_retries >= self.LOCK_MAX_RETRIES:
+                        log(
+                            f"「{', '.join(locked)}」数据库持续被占用，"
+                            f"已重试 {lock_retries} 次，任务结束"
+                        )
+                        return
+                    lock_retries += 1
+                    if await self._wait_lock_retry(round_no, locked, lock_retries, log):
+                        break
+                    continue
+                log("没有可用账号，任务结束")
+                return
+            lock_retries = 0
+            if locked:
+                log(f"「{', '.join(locked)}」数据库被占用，本轮暂不参与，下一轮再试")
+            if rounds > 1:
+                log(f"—— 第 {round_no}/{rounds} 轮开始 ——")
+            log(
+                f"开始随机发言：{len(clients)} 个账号 -> {chat_id}，"
+                f"每账号独立计时，间隔 {interval}~{interval + 3} 秒，{count_label}，"
+                f"使用{pool_label}"
+            )
+            round_timed_out = False
+            try:
+                # 硬性兜底：即使账号循环因网络异常卡住，到期也强制取消，保证任务不超过上限
+                # 额外放宽 delete_after + 65，给停止后的延迟撤回收尾留足时间
                 backstop = (
                     max(self._deadline - time.monotonic(), 0)
                     + interval
@@ -514,36 +677,45 @@ class RandomChatEngine:
                 except asyncio.TimeoutError:
                     self._stop.set()
                     log(
-                        f"{datetime.now():%H:%M:%S} [超时] 任务达到 "
+                        f"{datetime.now():%H:%M:%S} [超时] 本轮达到 "
                         f"{self.MAX_RUNTIME_SECONDS // 60} 分钟硬性上限，已强制终止"
                     )
-            else:
-                await asyncio.gather(
-                    *[
-                        self._account_loop(
-                            client,
-                            account,
-                            chat_id,
-                            interval,
-                            log,
-                            delete_after,
-                            total_count,
-                        )
-                        for account, client in clients.items()
-                    ]
-                )
-            if self._deadline is not None and time.monotonic() >= self._deadline:
-                log(
-                    f"{datetime.now():%H:%M:%S} [超时] 任务运行达到 "
-                    f"{self.MAX_RUNTIME_SECONDS // 60} 分钟上限，自动结束"
-                )
-            elif total_count:
-                summary = ", ".join(f"{a}:{total_count}" for a in sorted(clients))
-                log(f"每个账号均已发满 {total_count} 条（{summary}），任务完成")
-        finally:
-            for client in clients.values():
-                await safe_disconnect(client)
+                if self._deadline is not None and time.monotonic() >= self._deadline:
+                    round_timed_out = True
+                    log(
+                        f"{datetime.now():%H:%M:%S} [超时] 本轮运行达到 "
+                        f"{self.MAX_RUNTIME_SECONDS // 60} 分钟上限，自动结束"
+                    )
+                elif total_count and not self._stop.is_set():
+                    summary = ", ".join(f"{a}:{total_count}" for a in sorted(clients))
+                    log(f"每个账号均已发满 {total_count} 条（{summary}）")
+            finally:
+                # 本轮结束立即断开所有账号，释放 session 数据库占用
+                for client in clients.values():
+                    await safe_disconnect(client)
+                self._total_sent += sum(self.progress.values())
+            if round_timed_out or self._stop.is_set():
+                break
+            round_no += 1
+            if round_no <= rounds:
+                if await self._wait_next_round(repeat_interval, round_no - 1, log):
+                    break
+        if self._stop.is_set():
             log("随机发言已停止")
+        else:
+            summary = f"，累计发送 {self._total_sent} 条" if rounds > 1 else ""
+            log(f"随机发言任务完成{summary}")
+
+
+def format_wait(seconds: int) -> str:
+    """把秒数转换成便于阅读的等待时长（如 30秒 / 15分钟 / 2小时）"""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}秒"
+    if seconds < 3600:
+        return f"{seconds // 60}分钟"
+    hours, remain = divmod(seconds, 3600)
+    return f"{hours}小时{remain // 60}分钟" if remain >= 60 else f"{hours}小时"
 
 
 def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], None]:
@@ -557,6 +729,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             cleaned = [str(a).replace(" ⚠️未授权", "") for a in cfg["accounts"]]
             if cleaned != cfg["accounts"]:
                 cfg["accounts"] = cleaned
+        # 旧任务没有重复字段：默认只执行一次
+        cfg.setdefault("repeat_count", 0)
+        cfg.setdefault("repeat_interval", 0)
     store["tasks"] = {
         name: {k: v for k, v in cfg.items() if not k.startswith("_")}
         for name, cfg in tasks.items()
@@ -576,6 +751,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 "interval": cfg["interval"],
                 "delete_after": cfg["delete_after"],
                 "total_count": cfg["total_count"],
+                "repeat_count": int(cfg.get("repeat_count") or 0),
+                "repeat_interval": int(cfg.get("repeat_interval") or 0),
                 "session_dir": str(cfg["session_dir"]),
                 "custom_phrases": list(cfg.get("custom_phrases") or []),
                 # 上次执行的开始时间与时长（运行结束或停止时写入时长）
@@ -673,6 +850,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         interval_input.value = cfg["interval"]
         delete_input.value = cfg["delete_after"]
         total_input.value = cfg["total_count"]
+        repeat_input.value = int(cfg.get("repeat_count") or 0)
+        repeat_interval_input.value = int(cfg.get("repeat_interval") or 0)
         phrases_input.value = "\n".join(cfg.get("custom_phrases") or [])
         for el in (
             session_dir_input,
@@ -681,6 +860,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             interval_input,
             delete_input,
             total_input,
+            repeat_input,
+            repeat_interval_input,
             phrases_input,
         ):
             el.update()
@@ -727,6 +908,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             total_count=cfg["total_count"],
             on_finish=_on_finish,
             phrases=list(cfg.get("custom_phrases") or []),
+            repeat_count=int(cfg.get("repeat_count") or 0),
+            repeat_interval=int(cfg.get("repeat_interval") or 0),
         )
         if started:
             cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
@@ -779,6 +962,10 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             "total_count": max(
                 0, int(total_input.value if total_input.value is not None else 50)
             ),
+            # 重复次数=首次之后的额外轮数；0 表示只执行一次
+            "repeat_count": max(0, int(repeat_input.value or 0)),
+            # 轮次间的等待时间（秒），等待期间全部账号已断开，不占用数据库
+            "repeat_interval": max(0, int(repeat_interval_input.value or 0)),
             "session_dir": str(Path(session_dir_input.value or ".")),
             # 空列表 = 发送时使用内置语库
             "custom_phrases": custom_phrases,
@@ -830,6 +1017,12 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                     "name": "total",
                     "label": "每账号条数",
                     "field": "total",
+                    "align": "left",
+                },
+                {
+                    "name": "repeat",
+                    "label": "重复",
+                    "field": "repeat",
                     "align": "left",
                 },
                 {
@@ -893,6 +1086,12 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                         "total": str(cfg["total_count"])
                         if cfg["total_count"]
                         else "不限",
+                        "repeat": (
+                            f"{int(cfg.get('repeat_count') or 0)}次 / "
+                            f"{format_wait(int(cfg.get('repeat_interval') or 0))}"
+                            if int(cfg.get("repeat_count") or 0)
+                            else "不重复"
+                        ),
                         "phrases": phrase_pool_label(cfg),
                         "last_time": str(cfg.get("last_start_time") or "") or "—",
                         "duration": duration_text,
@@ -1031,6 +1230,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                         ui.label(
                             f"每账号条数：{row['total']}　语库：{row['phrases']}"
                         ).classes("text-xs text-gray-600")
+                        ui.label(f"重复：{row['repeat']}").classes(
+                            "text-xs text-gray-600"
+                        )
                         ui.label(
                             f"执行时间：{row['last_time']}　执行时长：{row['duration']}"
                         ).classes("text-xs text-gray-600")
@@ -1086,7 +1288,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
     ui.label(
         f"由所选账号发送消息到目标群组，发送内容默认从内置 {len(PHRASES)} 条语库中随机抽取，"
         "也可在添加任务时配置该任务专属语库（每行一条）。发送后可在指定秒数自动删除"
-        "（删除延迟填 0 或留空则不删除）。支持添加多个任务并行运行。"
+        "（删除延迟填 0 或留空则不删除）。支持添加多个任务并行运行；设置重复次数后"
+        "会循环执行，每轮结束断开所有账号，等待间隔期间不占用数据库。"
     ).classes("text-sm text-gray-500")
 
     # —— 任务列表（置顶） ——
@@ -1284,6 +1487,26 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 max=1000000,
                 format="%d",
             ).classes("w-48")
+
+        with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+            repeat_input = ui.number(
+                label="重复次数（0=不重复）",
+                value=0,
+                min=0,
+                max=1000,
+                format="%d",
+            ).classes("w-40")
+            repeat_interval_input = ui.number(
+                label="重复间隔（秒）",
+                value=1800,
+                min=0,
+                max=604800,
+                format="%d",
+            ).classes("w-40")
+            ui.label(
+                "重复执行：首次执行完成并断开所有账号后，等待设定的间隔再执行下一轮，"
+                "等待期间不占用 session 数据库（可被其他任务使用）。"
+            ).classes("text-xs text-gray-500 flex-1 min-w-[240px]")
 
         phrases_input = (
             ui.textarea(

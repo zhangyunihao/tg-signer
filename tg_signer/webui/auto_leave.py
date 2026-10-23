@@ -48,6 +48,25 @@ UNSELECT_KEYWORDS = ("抽奖", "嫩妹社", "野寻", "榜")
 
 DEFAULT_KEYWORDS = "抽奖,嫩妹社,野寻,榜"
 
+# 运行中任务的停止开关（跨浏览器标签页共享，供「停止所有任务」使用）
+# {workdir|task_id|token -> stop_fn}
+_ACTIVE_STOPS: Dict[str, Callable[[], None]] = {}
+
+
+def stop_all_leave_tasks(workdir) -> int:
+    """请求停止当前工作目录下所有运行中的退频道任务，返回请求停止的数量。"""
+    prefix = f"{Path(workdir).resolve()}|"
+    count = 0
+    for key, stop in list(_ACTIVE_STOPS.items()):
+        if not key.startswith(prefix):
+            continue
+        try:
+            stop()
+            count += 1
+        except Exception:
+            logger.debug("停止退频道任务失败", exc_info=True)
+    return count
+
 
 def _to_days(value, default: float) -> float:
     """把天数阈值统一成非负浮点数；非法值回退到默认值。"""
@@ -267,8 +286,13 @@ async def run_auto_leave_task(
         f"[{task_name}] 启动：{', '.join(task.get('accounts') or [])}，"
         f"阈值 {_fmt_days(days)} 天"
     )
+    stop_flag = {"stop": False}
+    stop_key = f"{Path(workdir).resolve()}|{task_id}|auto"
+    _ACTIVE_STOPS[stop_key] = lambda: stop_flag.__setitem__("stop", True)
     try:
         for account in list(task.get("accounts") or []):
+            if stop_flag["stop"]:
+                break
             found = await scan_stale_chats(
                 account,
                 path,
@@ -281,19 +305,30 @@ async def run_auto_leave_task(
             kept = [r for r in found if _kw_hit(task, r["title"])]
             if auto_rows:
                 _patch_leave_task(workdir, task_id, status="退出中", rows=rows + kept)
-                done = await _leave_rows(account, path, auto_rows, log_fn)
+                done = await _leave_rows(
+                    account,
+                    path,
+                    auto_rows,
+                    log_fn,
+                    should_stop=lambda: stop_flag["stop"],
+                )
                 auto_left += len(done)
             rows.extend(kept)
             log_fn(
                 f"[{account}] 命中保护关键字 {len(kept)} 个（待手动确认），"
                 f"未命中 {len(auto_rows)} 个自动退出"
             )
-        status = f"完成：自动退出 {auto_left} 个，待确认 {len(rows)} 个"
+        status = (
+            "已停止"
+            if stop_flag["stop"]
+            else f"完成：自动退出 {auto_left} 个，待确认 {len(rows)} 个"
+        )
     except Exception as exc:
         status = f"异常：{exc}"
         log_fn(f"自动退频道任务运行异常: {exc}")
         logger.debug("自动退频道任务运行异常", exc_info=True)
     finally:
+        _ACTIVE_STOPS.pop(stop_key, None)
         _patch_leave_task(
             workdir,
             task_id,
@@ -471,6 +506,7 @@ def _kw_hit(task: Dict, title: str) -> bool:
 def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], None]:
     """构建「批量退频道」标签页内容，返回刷新函数以纳入全局刷新。"""
     session_dir = Path(default_session_dir or ".")
+    wd_key = str(Path(workdir).resolve())
     tasks = load_leave_tasks(workdir)
     if tasks:
         save_leave_tasks(workdir, tasks)  # 旧配置迁移后立即落盘
@@ -533,6 +569,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         st["auto_left"] = 0
         st["status"] = "扫描中"
         st["start_ts"] = time.time()
+        stop_key = f"{wd_key}|{task_id}|run|{id(st)}"
+        _ACTIVE_STOPS[stop_key] = lambda: st.__setitem__("stop", True)
         task["start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
         task["duration"] = ""
         render_list()
@@ -610,6 +648,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             log(f"[{task['name']}] 运行异常: {exc}")
             logger.debug("退频道任务运行异常", exc_info=True)
         finally:
+            _ACTIVE_STOPS.pop(stop_key, None)
             st["running"] = False
             # 终态与命中频道写回记录并持久化，刷新页面后仍可见
             task["status"] = st["status"]
@@ -636,7 +675,10 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         # 不需要二次确认：关闭明细弹窗后直接启动退出
         detail_dialog.close()
         st["running"] = True
+        st["stop"] = False
         st["status"] = "退出中"
+        stop_key = f"{wd_key}|{task_id}|leave|{id(st)}"
+        _ACTIVE_STOPS[stop_key] = lambda: st.__setitem__("stop", True)
         ui.notify("退出流程已启动，可在任务列表查看进度", type="positive")
         render_list()
         try:
@@ -645,16 +687,27 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 by_account.setdefault(row["account"], []).append(row)
             done_keys: set = set()
             for account, items in by_account.items():
-                done_keys |= await _leave_rows(account, session_dir, items, log)
+                if st["stop"]:
+                    break
+                done_keys |= await _leave_rows(
+                    account,
+                    session_dir,
+                    items,
+                    log,
+                    should_stop=lambda: st["stop"],
+                )
             if done_keys:
                 st["rows"] = [r for r in st["rows"] if r["key"] not in done_keys]
                 st["selected"].difference_update(done_keys)
-            st["status"] = f"退出完成，剩余待确认 {len(st['rows'])} 个"
+            st["status"] = (
+                "已停止" if st["stop"] else f"退出完成，剩余待确认 {len(st['rows'])} 个"
+            )
         except Exception as exc:
             st["status"] = f"异常：{exc}"
             log(f"[{task['name']}] 退出异常: {exc}")
             logger.debug("退频道手动退出异常", exc_info=True)
         finally:
+            _ACTIVE_STOPS.pop(stop_key, None)
             st["running"] = False
             task["status"] = st["status"]
             task["rows"] = [dict(r) for r in st["rows"]]

@@ -50,6 +50,7 @@ from tg_signer.webui.sign import (
     flush_task_history,
     user_info_block,
 )
+from tg_signer.webui.stop_all import stop_all_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -421,6 +422,19 @@ def _build_dashboard(container) -> None:
                     )
             dialog.open()
 
+        async def _stop_all_tasks() -> None:
+            """一键停止所有面板运行中的任务，释放会话/数据库占用。"""
+            counts = await stop_all_tasks(state.workdir)
+            total = sum(counts.values())
+            if total <= 0:
+                ui.notify("当前没有运行中的任务", type="info")
+                return
+            detail = "，".join(f"{name} {n} 个" for name, n in counts.items() if n)
+            ui.notify(
+                f"已停止 {total} 个任务（{detail}），会话/数据库占用已释放",
+                type="positive",
+            )
+
         with ui.row().classes("w-full items-center justify-between gap-2 no-wrap"):
             with (
                 ui.tabs()
@@ -470,6 +484,8 @@ def _build_dashboard(container) -> None:
                 ui.menu_item(
                     "日志", on_click=lambda: (_ensure_logs(), logs_dialog.open())
                 )
+                ui.separator()
+                ui.menu_item("停止所有任务并解锁数据库", on_click=_stop_all_tasks)
 
         # 移动端 tab 短标签：按 tab 顺序给每个 label 写入 data-short 短名，
         # 宽度<=640px 时由媒体查询用短名替换全名（桌面端不受影响）。

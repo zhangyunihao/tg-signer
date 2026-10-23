@@ -53,6 +53,22 @@ _GLOBAL_ENGINES: Dict[str, GiveawayProcess] = {}
 _GLOBAL_LOGS: Dict[str, List[str]] = {}
 _GLOBAL_STATUS_CBS: Dict[str, Callable[[bool], None]] = {}
 
+
+def stop_all_giveaway_tasks(workdir) -> int:
+    """停止当前工作目录下所有运行中的抽奖子进程，返回请求停止的数量。"""
+    prefix = f"{Path(workdir).resolve()}|"
+    count = 0
+    for key, engine in list(_GLOBAL_ENGINES.items()):
+        if not key.startswith(prefix) or engine is None or not engine.running:
+            continue
+        try:
+            engine.stop()
+            count += 1
+        except Exception:
+            logger.debug("停止自动抽奖任务失败", exc_info=True)
+    return count
+
+
 _TASKS_FILE = "giveaway_tasks.json"
 # 账号未加入监控对象且自动加入失败的提醒（持久化，加入成功后自动消除）
 JOIN_ALERTS_FILE = "webui_join_alerts.json"

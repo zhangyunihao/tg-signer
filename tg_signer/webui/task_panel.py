@@ -262,6 +262,16 @@ def stop_run_core(record_id: str) -> tuple[str, Optional[dict]]:
     return "stopped", record
 
 
+def stop_all_runs() -> int:
+    """停止所有运行中的签到/自动化/组合任务，返回实际停止的数量。"""
+    count = 0
+    for record_id in list(TaskRunnerBlock.runs.keys()):
+        outcome, _ = stop_run_core(record_id)
+        if outcome == "stopped":
+            count += 1
+    return count
+
+
 class TaskRunnerBlock:
     """签到页执行面板：运行签到/自动化任务；组合任务由「组合任务」tab 复用 _launch 执行"""
 
