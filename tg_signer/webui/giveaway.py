@@ -53,6 +53,23 @@ _GLOBAL_ENGINES: Dict[str, GiveawayProcess] = {}
 _GLOBAL_LOGS: Dict[str, List[str]] = {}
 _GLOBAL_STATUS_CBS: Dict[str, Callable[[bool], None]] = {}
 
+# 日志文件达到该大小后滚动为 *.1，避免超限后静默停止落盘
+LOG_FILE_MAX_BYTES = 2_000_000
+
+
+def append_log_file(log_file: Path, line: str) -> None:
+    """追加一行日志；文件超过上限时先滚动，保证新日志始终能落盘。"""
+    if log_file.exists() and log_file.stat().st_size >= LOG_FILE_MAX_BYTES:
+        backup = log_file.with_name(log_file.name + ".1")
+        try:
+            if backup.exists():
+                backup.unlink()
+            log_file.replace(backup)
+        except OSError:
+            logger.debug("滚动抽奖日志失败", exc_info=True)
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
 
 def stop_all_giveaway_tasks(workdir) -> int:
     """停止当前工作目录下所有运行中的抽奖子进程，返回请求停止的数量。"""
@@ -713,6 +730,19 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     def get_engine(name: str) -> Optional[GiveawayProcess]:
         return _GLOBAL_ENGINES.get(engine_key(name))
 
+    def capture_engine_stats(name: str) -> bool:
+        """把当前运行统计写回任务配置（不落盘），供运行中/停止后展示与持久化。"""
+        cfg = tasks.get(name)
+        eng = get_engine(name)
+        if cfg is None or eng is None:
+            return False
+        cfg["last_joined"] = int(eng.joined)
+        cfg["last_joined_by_account"] = dict(eng.joined_by_account)
+        cfg["last_joined_by_account_chat"] = {
+            k: dict(v) for k, v in eng.joined_by_account_chat.items()
+        }
+        return True
+
     def ensure_engine(name: str) -> GiveawayProcess:
         engine = get_engine(name)
         if engine is None:
@@ -745,11 +775,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 del buf[:-300]
             if from_child:
                 return
-            # 同时落盘，便于服务重启后仍可追溯（单文件上限约 2MB）
+            # 同时落盘，便于服务重启后仍可追溯
             try:
-                if not log_file.exists() or log_file.stat().st_size < 2_000_000:
-                    with open(log_file, "a", encoding="utf-8") as f:
-                        f.write(line + "\n")
+                append_log_file(log_file, line)
             except OSError:
                 logger.debug("写入抽奖日志文件失败", exc_info=True)
 
@@ -910,6 +938,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 return
             eng = get_engine(_n)
             if eng is not None and eng.running:
+                if capture_engine_stats(_n):
+                    _persist()
                 try:
                     eng.stop()
                 except Exception:
@@ -933,22 +963,40 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 )
                 return
 
+        # 运行中每次统计变化都写回配置并定期落盘，停止/重启后明细仍可查
+        last_saved = {"joined": -1, "ts": 0.0}
+
+        def _on_stats(payload: dict, _n: str = name) -> None:
+            cfg_now = tasks.get(_n)
+            if cfg_now is None:
+                return
+            joined = int(payload.get("joined") or 0)
+            cfg_now["last_joined"] = joined
+            cfg_now["last_joined_by_account"] = {
+                str(k): int(v)
+                for k, v in (payload.get("by_account") or {}).items()
+            }
+            cfg_now["last_joined_by_account_chat"] = {
+                str(k): {str(c): int(n) for c, n in (v or {}).items()}
+                for k, v in (payload.get("by_chat") or {}).items()
+            }
+            now = time.monotonic()
+            if joined == last_saved["joined"] and now - last_saved["ts"] < 30:
+                return
+            last_saved["joined"] = joined
+            last_saved["ts"] = now
+            _persist()
+
         def _on_finish(_n: str = name) -> None:
             # 运行结束/停止：按启动时间计算执行时长并持久化，
             # 同时保存本次新参与抽奖总数与各账号分布，供表格与明细展示
             cfg_done = tasks.get(_n)
-            eng = get_engine(_n)
             if cfg_done is not None:
                 if cfg_done.get("_start_ts"):
                     cfg_done["last_duration"] = format_duration(
                         time.time() - cfg_done["_start_ts"]
                     )
-                if eng is not None:
-                    cfg_done["last_joined"] = int(eng.joined)
-                    cfg_done["last_joined_by_account"] = dict(eng.joined_by_account)
-                    cfg_done["last_joined_by_account_chat"] = {
-                        k: dict(v) for k, v in eng.joined_by_account_chat.items()
-                    }
+                capture_engine_stats(_n)
                 _persist()
             cb = _GLOBAL_STATUS_CBS.get(engine_key(_n))
             if cb is not None:
@@ -1007,6 +1055,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             log=make_log(name),
             on_event=_on_event,
             on_finish=_on_finish,
+            on_stats=_on_stats,
         )
         if started:
             cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
@@ -1025,6 +1074,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     async def stop_task(name: str, set_status: Callable[[bool], None]) -> None:
         engine = get_engine(name)
         if engine is not None and engine.running:
+            # 停止前先把当前统计落盘，避免明细只存在于内存
+            if capture_engine_stats(name):
+                _persist()
             engine.stop()
         else:
             set_status(False)

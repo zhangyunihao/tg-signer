@@ -46,6 +46,8 @@ class GiveawayProcess:
         self._log: Optional[Callable[[str], None]] = None
         self._on_event: Optional[Callable[[dict], None]] = None
         self._on_finish: Optional[Callable[[], None]] = None
+        # 统计回报：便于上层把参与明细边跑边落盘，停止/重启后不丢
+        self._on_stats: Optional[Callable[[dict], None]] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._finished_cb_called = False
 
@@ -63,6 +65,7 @@ class GiveawayProcess:
         log: Callable[[str], None],
         on_event: Callable[[dict], None],
         on_finish: Callable[[], None],
+        on_stats: Optional[Callable[[dict], None]] = None,
     ) -> bool:
         """启动子进程；已在运行返回 False。"""
         if self.running:
@@ -70,6 +73,7 @@ class GiveawayProcess:
         self._log = log
         self._on_event = on_event
         self._on_finish = on_finish
+        self._on_stats = on_stats
         self._loop = asyncio.get_running_loop()
         self._finished_cb_called = False
         self.joined = 0
@@ -186,6 +190,9 @@ class GiveawayProcess:
             # 事件文件由子进程首次回报时创建，先等它出现
             while not path.exists():
                 if proc.poll() is not None:
+                    # 子进程没来得及回报就退出：仍需走结束回调，
+                    # 否则任务状态与统计不会落盘
+                    self._finalize()
                     return
                 time.sleep(EVENTS_POLL_INTERVAL)
             with open(path, "rb") as fp:
@@ -240,14 +247,24 @@ class GiveawayProcess:
                 for k, v in by_chat.items()
             }
         self._progress = str(payload.get("progress") or "")
+        cb = self._on_stats
+        if cb is not None and self._loop is not None:
+            try:
+                self._loop.call_soon_threadsafe(cb, payload)
+            except RuntimeError:
+                logger.debug("回报抽奖统计失败", exc_info=True)
 
     def _finalize(self) -> None:
         if self._finished_cb_called:
             return
         self._finished_cb_called = True
         self._cleanup_events_file()
-        if self._on_finish is not None and self._loop is not None:
+        if self._on_finish is None:
+            return
+        if self._loop is not None:
             self._loop.call_soon_threadsafe(self._on_finish)
+        else:
+            self._on_finish()
 
     def _cleanup_events_file(self) -> None:
         path = self._events_file

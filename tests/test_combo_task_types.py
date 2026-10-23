@@ -465,3 +465,58 @@ def test_giveaway_process_spec_and_stats(tmp_path):
     assert proc.joined_by_account_chat == {"alice": {"-100123": 2}}
     assert proc.progress_text() == "扫描中"
     assert not proc.running
+
+
+def test_giveaway_process_reports_stats_to_caller(tmp_path):
+    """统计回报会回调上层，便于参与明细边跑边落盘（不依赖运行结束）。"""
+    import asyncio
+
+    from tg_signer.webui.giveaway_process import GiveawayProcess
+
+    async def _run() -> list:
+        proc = GiveawayProcess("t1", tmp_path)
+        seen: list = []
+        proc._on_stats = seen.append
+        proc._loop = asyncio.get_running_loop()
+        proc._apply_stats(
+            {"joined": 2, "by_account": {"alice": 2}, "by_chat": {}, "progress": ""}
+        )
+        await asyncio.sleep(0)
+        return seen
+
+    seen = asyncio.run(_run())
+    assert seen and seen[0]["joined"] == 2
+
+
+def test_giveaway_process_finalizes_without_events_file(tmp_path):
+    """子进程没来得及写 events 文件就退出时，也要触发结束回调。"""
+
+    class _DeadProc:
+        def poll(self):
+            return 0
+
+    from tg_signer.webui.giveaway_process import GiveawayProcess
+
+    proc = GiveawayProcess("t1", tmp_path)
+    proc.proc = _DeadProc()
+    proc._events_file = tmp_path / "missing.jsonl"
+    called = []
+    proc._on_finish = lambda: called.append(True)
+    proc._read_events()
+    assert called == [True]
+
+
+def test_make_log_rotates_instead_of_dropping(tmp_path, monkeypatch):
+    """日志超过上限时滚动为 .1，而不是静默停止写入。"""
+    from tg_signer import giveaway_runner
+
+    monkeypatch.setattr(giveaway_runner, "LOG_FILE_MAX_BYTES", 10)
+    log = giveaway_runner._make_log(str(tmp_path), "1")
+    log("第一条")
+    log_file = tmp_path / "logs" / "giveaway.log"
+    assert log_file.exists() and log_file.stat().st_size >= 10
+
+    log("第二条")
+    backup = tmp_path / "logs" / "giveaway.log.1"
+    assert backup.exists()
+    assert "第二条" in log_file.read_text(encoding="utf-8")

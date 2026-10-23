@@ -34,6 +34,9 @@ from tg_signer.giveaway_state import GiveawayState
 # 已自带 HH:MM:SS 时间戳的消息不重复加前缀
 _TS_RE = re.compile(r"^\d{2}:\d{2}:\d{2}")
 
+# 日志文件达到该大小后滚动为 *.1，避免超限后静默停止落盘
+LOG_FILE_MAX_BYTES = 2_000_000
+
 
 def engine_kwargs_from_spec(spec: dict) -> Dict[str, Any]:
     """把 JSON spec 映射为 GiveawayEngine.start 的关键字参数（纯函数，便于测试）。"""
@@ -111,9 +114,16 @@ def _make_log(workdir: str, task: str) -> Callable[[str], None]:
         line = f"[#{task}] {msg}"
         print(line, flush=True)
         try:
-            if not log_file.exists() or log_file.stat().st_size < 2_000_000:
-                with open(log_file, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
+            if log_file.exists() and log_file.stat().st_size >= LOG_FILE_MAX_BYTES:
+                backup = log_file.with_name(log_file.name + ".1")
+                try:
+                    if backup.exists():
+                        backup.unlink()
+                    log_file.replace(backup)
+                except OSError:
+                    pass
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
         except OSError:
             pass
 
