@@ -262,12 +262,18 @@ class _TimeoutClient:
                 return result
 
     async def _throttled_aiter(self, agen: Any, name: str) -> Any:
-        """带统一节流的异步迭代器（get_chat_history 等）。"""
-        async with self._lock:
-            await self._wait_min_interval()
-            await self._wait_transport_cooldown()
-            await self._throttled_enter()
-            while True:
+        """带统一节流的异步迭代器（get_chat_history 等）。
+
+        锁只覆盖单次拉取，yield 放在锁外：调用方会在遍历循环体内发起
+        同账号的其它 API 请求（如 get_users/start_bot），若整段迭代都持锁，
+        循环体内的请求会等待自己未释放的锁而永久挂起（asyncio.Lock 不可重入，
+        且等锁不触发网络超时）。
+        """
+        while True:
+            async with self._lock:
+                await self._wait_min_interval()
+                await self._wait_transport_cooldown()
+                await self._throttled_enter()
                 try:
                     item = await asyncio.wait_for(agen.__anext__(), self._timeout)
                 except StopAsyncIteration:
@@ -282,7 +288,7 @@ class _TimeoutClient:
                     self._on_call_exception(exc)
                     raise
                 _CLIENT_API_LAST_CALL[self._account] = self._loop_time()
-                yield item
+            yield item
 
     # —— 节流内部辅助 ——
 

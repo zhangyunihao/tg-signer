@@ -3676,6 +3676,41 @@ def test_handle_math_verification_expired_restarts_and_answers_new(
     assert any("验证已过期" in line for line in logs)
 
 
+def test_timeout_client_history_iteration_allows_api_calls_inside_loop():
+    """回归：历史迭代循环体内再发同账号 API 不能死锁。
+
+    历史扫描在 async for 循环体里调用 get_users/start_bot 等 API。若迭代器
+    整段持有账号锁，循环体内的请求会等待自己未释放的锁而永久挂起，表现为
+    日志停在「命中」之后再无输出（等锁不触发网络超时）。
+    """
+    import asyncio
+
+    from tg_signer.giveaway_core import _TimeoutClient
+
+    class _HistoryClient:
+        def get_chat_history(self, chat, limit=None, max_id=0):
+            return self._history()
+
+        async def _history(self):
+            for i in range(3):
+                yield SimpleNamespace(id=i + 1)
+
+        async def get_users(self, username):
+            return SimpleNamespace(is_bot=True)
+
+    async def _main():
+        client = _TimeoutClient(_HistoryClient(), account="test-lock-reentrant-history")
+        seen = []
+        async for message in client.get_chat_history("chat"):
+            seen.append(message.id)
+            # 修复前会在这里永久等待账号锁
+            await client.get_users("SomeBot")
+        return seen
+
+    seen = asyncio.run(asyncio.wait_for(_main(), timeout=5))
+    assert seen == [1, 2, 3]
+
+
 def test_extract_giveaway_title_accepts_party_emoji():
     """天天免费抽奖 的帖子标题以 🎉 开头（不是 🎰），也应能取到标题。"""
     from tg_signer.giveaway_parsing import extract_giveaway_title
