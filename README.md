@@ -97,7 +97,7 @@ tg-signer-plus
 
 ![批量退频道](./assets/webui_leave.png)
 
-- 设置「不更新天数阈值」、选择账号（可多选）后「扫描预览」，列出长期不更新的频道/群组及最后消息时间；阈值填 0 表示扫描全部频道/群组（此时不允许自动退出）
+- 设置「不更新天数阈值」、选择账号（可多选）后「扫描预览」，列出长期不更新的频道/群组及最后消息时间；阈值支持小数（如 0.5 天），填 0 表示扫描全部频道/群组（此时不允许自动退出）
 - 扫描结果**仅预览不执行**：勾选对话并二次确认后才会批量退出
 - 默认不勾选名称包含「抽奖」「嫩妹社」「野寻」「榜」等关键词的对话，防止误退
 
@@ -108,3 +108,31 @@ tg-signer-plus
 - 在线查看 / 编辑 / 删除 signer 配置（JSON 编辑），打开页面默认加载第一个配置
 - 「导出全部配置」下载 ZIP 备份：含签到配置、账户状态与排序、最近聊天/用户信息缓存、批量退频道配置；**不含** session 登录凭据、随机发言任务与任务历史
 - 「导入配置」支持 ZIP 备份与 JSON 配置两种格式，同名配置覆盖；迁移到新设备时 session 文件需另行复制
+
+## 本地发布到 PyPI（不依赖 GitHub）
+
+GitHub Actions 不可用时（被停用、额度超限、推送后不触发等），在本机直接构建并上传：
+
+```bash
+# 升 patch 版本 → 构建 → twine check → 上传 → 打本地 tag vX.Y.Z
+python scripts/release_pypi.py --bump patch
+
+# 只构建校验，不上传（先用它确认产物）
+python scripts/release_pypi.py --dry-run
+
+# 上传后同时推送 main 与 tag
+python scripts/release_pypi.py --bump patch --push
+```
+
+- 凭据从项目根目录 `.pypirc` 读取（已 gitignore，用户名固定 `__token__`），缺失时脚本直接报错
+- 上传前会查 PyPI 是否已存在该版本，存在则退出，避免重复上传报错
+- 构建前会删除 `build/`，避免残留的嵌套目录被打进 wheel
+- 上传成功后只暂存版本号文件并提交、打 tag；`--skip-tag` 可跳过这步
+- 手动等价命令：
+
+```bash
+rm -rf build && python -m build --wheel --sdist
+python -m twine check dist/*
+python -m twine upload --config-file .pypirc dist/*
+git tag v$(python -c "import tg_signer;print(tg_signer.__version__)")
+```
