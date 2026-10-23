@@ -9,9 +9,10 @@ import logging
 import random
 import re
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Deque, Dict, List, Optional, Union
 
 from nicegui import ui
 
@@ -288,6 +289,9 @@ class RandomChatEngine:
     # 数据库被占用时的最大重试次数，超过后结束任务
     LOCK_MAX_RETRIES = 3
 
+    # 最近已抽到的条数：该窗口内的语料不再重复抽取（窗口跨账号共享）
+    RECENT_WINDOW = 30
+
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
         self._stop: Optional[asyncio.Event] = None
@@ -311,6 +315,57 @@ class RandomChatEngine:
         # 本任务实际使用的语库：任务自定义语库非空时用自定义，否则用内置语库
         self.pool: List[str] = list(PHRASES)
         self.using_custom_pool: bool = False
+        # 最近抽到的语料（按抽取顺序），窗口内的条目不再重复抽取
+        self._recent: Deque[str] = deque(maxlen=self.RECENT_WINDOW)
+        # 落盘位置与键：同一任务跨运行共享最近窗口；为空表示不落盘
+        self._recent_path: Optional[Path] = None
+        self._recent_key: Optional[str] = None
+
+    def _pick_text(self) -> str:
+        """从语库中抽取一条，避开最近 RECENT_WINDOW 次已抽到的条目"""
+        recent = set(self._recent)
+        candidates = [p for p in self.pool if p not in recent]
+        if not candidates:
+            # 语库不足窗口长度时退化为全库随机，避免无候选
+            candidates = self.pool
+        text = random.choice(candidates)
+        self._recent.append(text)
+        self._save_recent()
+        return text
+
+    def _load_recent(self) -> List[str]:
+        """从落盘文件读取该任务的最近语料；文件缺失/损坏时返回空列表"""
+        if self._recent_path is None or self._recent_key is None:
+            return []
+        try:
+            data = json.loads(self._recent_path.read_text(encoding="utf-8"))
+            values = data.get(self._recent_key) if isinstance(data, dict) else None
+            if not isinstance(values, list):
+                return []
+            return [str(v) for v in values][-self.RECENT_WINDOW :]
+        except FileNotFoundError:
+            return []
+        except Exception:
+            logger.debug("读取随机发言近期语料失败", exc_info=True)
+            return []
+
+    def _save_recent(self) -> None:
+        """把最近窗口写回落盘文件，保留其他任务的记录"""
+        if self._recent_path is None or self._recent_key is None:
+            return
+        data = {}
+        try:
+            if self._recent_path.exists():
+                loaded = json.loads(self._recent_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+        except Exception:
+            logger.debug("读取随机发言近期语料失败，将覆盖写入", exc_info=True)
+        data[self._recent_key] = list(self._recent)
+        try:
+            atomic_write_json(self._recent_path, data)
+        except Exception:
+            logger.debug("保存随机发言近期语料失败", exc_info=True)
 
     @property
     def running(self) -> bool:
@@ -351,6 +406,8 @@ class RandomChatEngine:
         phrases: Optional[List[str]] = None,
         repeat_count: int = 0,
         repeat_interval: int = 0,
+        recent_path: Optional[Path] = None,
+        recent_key: Optional[str] = None,
     ) -> bool:
         if self.running:
             log("任务已在运行中")
@@ -366,6 +423,10 @@ class RandomChatEngine:
         self._total_sent = 0
         self.using_custom_pool = bool(phrases)
         self.pool = list(phrases) if phrases else list(PHRASES)
+        # 最近窗口落盘：按任务键读写，任务重启后继续沿用
+        self._recent_path = Path(recent_path) if recent_path else None
+        self._recent_key = recent_key
+        self._recent = deque(self._load_recent(), maxlen=self.RECENT_WINDOW)
         # 截止时间按轮次在 _loop 内重设；这里先给首轮一个上限
         self._deadline = time.monotonic() + self.MAX_RUNTIME_SECONDS
         self._stop = asyncio.Event()
@@ -436,7 +497,7 @@ class RandomChatEngine:
                         f"{self.MAX_RUNTIME_SECONDS // 60} 分钟上限，自动停止发送"
                     )
                     break
-                text = random.choice(self.pool)
+                text = self._pick_text()
                 try:
                     # 限时 90 秒：代理僵死时不永久卡住发送循环（否则任务无法停止）
                     message = await asyncio.wait_for(
@@ -851,7 +912,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         delete_input.value = cfg["delete_after"]
         total_input.value = cfg["total_count"]
         repeat_input.value = int(cfg.get("repeat_count") or 0)
-        repeat_interval_input.value = int(cfg.get("repeat_interval") or 0)
+        # 存储单位是秒，界面按分钟填写
+        repeat_interval_input.value = int(cfg.get("repeat_interval") or 0) // 60
         phrases_input.value = "\n".join(cfg.get("custom_phrases") or [])
         for el in (
             session_dir_input,
@@ -910,6 +972,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             phrases=list(cfg.get("custom_phrases") or []),
             repeat_count=int(cfg.get("repeat_count") or 0),
             repeat_interval=int(cfg.get("repeat_interval") or 0),
+            recent_path=Path(workdir) / "random_chat_recent.json",
+            recent_key=str(name),
         )
         if started:
             cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
@@ -964,8 +1028,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             ),
             # 重复次数=首次之后的额外轮数；0 表示只执行一次
             "repeat_count": max(0, int(repeat_input.value or 0)),
-            # 轮次间的等待时间（秒），等待期间全部账号已断开，不占用数据库
-            "repeat_interval": max(0, int(repeat_interval_input.value or 0)),
+            # 轮次间的等待时间：界面按分钟填写，落盘统一存秒
+            # （等待期间全部账号已断开，不占用数据库）
+            "repeat_interval": max(0, int(repeat_interval_input.value or 0)) * 60,
             "session_dir": str(Path(session_dir_input.value or ".")),
             # 空列表 = 发送时使用内置语库
             "custom_phrases": custom_phrases,
@@ -1497,15 +1562,15 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 format="%d",
             ).classes("w-40")
             repeat_interval_input = ui.number(
-                label="重复间隔（秒）",
-                value=1800,
+                label="重复间隔（分钟）",
+                value=30,
                 min=0,
-                max=604800,
+                max=10080,
                 format="%d",
             ).classes("w-40")
             ui.label(
-                "重复执行：首次执行完成并断开所有账号后，等待设定的间隔再执行下一轮，"
-                "等待期间不占用 session 数据库（可被其他任务使用）。"
+                "重复执行：首次执行完成并断开所有账号后，等待设定的间隔（分钟）"
+                "再执行下一轮，等待期间不占用 session 数据库（可被其他任务使用）。"
             ).classes("text-xs text-gray-500 flex-1 min-w-[240px]")
 
         phrases_input = (
