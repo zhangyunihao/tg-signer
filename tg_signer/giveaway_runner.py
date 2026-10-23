@@ -65,6 +65,10 @@ def engine_kwargs_from_spec(spec: dict) -> Dict[str, Any]:
         "chats": [str(c) for c in (spec.get("chats") or [])],
         "session_dir": Path(str(spec.get("session_dir") or ".")),
         "keywords": [str(k) for k in (spec.get("keywords") or [])],
+        # 任务类型：channel=频道/群组，bot=抽奖机器人私聊
+        "source_type": str(spec.get("source_type") or "channel"),
+        "bot_username": str(spec.get("bot_username") or ""),
+        "scan_limit": spec.get("scan_limit"),
         "auto_scan": bool(spec.get("auto_scan", True)),
         "auto_join": bool(spec.get("auto_join", True)),
         "ignore_history": bool(spec.get("ignore_history", True)),
@@ -170,6 +174,9 @@ async def run_giveaway(spec: dict) -> int:
 
     emit = _event_writer(spec.get("events_file"))
     kwargs = engine_kwargs_from_spec(spec)
+    if kwargs["source_type"] == "bot" and kwargs["bot_username"]:
+        # 机器人私聊来源：监控对象固定为该机器人本身
+        kwargs["chats"] = [kwargs["bot_username"]]
     kwargs["chats"] = [
         parse_chat_id(c) if parse_chat_id(c) is not None else c for c in kwargs["chats"]
     ]

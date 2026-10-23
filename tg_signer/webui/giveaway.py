@@ -70,6 +70,14 @@ def stop_all_giveaway_tasks(workdir) -> int:
 
 
 _TASKS_FILE = "giveaway_tasks.json"
+# 任务来源类型：channel=监控频道/群组消息，bot=直接监控抽奖机器人私聊
+SOURCE_CHANNEL = "channel"
+SOURCE_BOT = "bot"
+SOURCE_TYPE_LABELS = {SOURCE_CHANNEL: "频道/群组", SOURCE_BOT: "百宝箱机器人"}
+# 百宝箱机器人任务默认监控对象与关键词（已达标消息才可点「点击参与抽奖」）
+BAIBAOXIANG_BOT = "BaibaoxiangCjBot"
+BAIBAOXIANG_KEYWORD = "您已获得抽奖资格（已达标）"
+BAIBAOXIANG_SCAN_LIMIT = 200
 # 账号未加入监控对象且自动加入失败的提醒（持久化，加入成功后自动消除）
 JOIN_ALERTS_FILE = "webui_join_alerts.json"
 JOIN_ALERTS_MAX = 200
@@ -518,6 +526,10 @@ _CFG_FIELDS = {
     "accounts": list,
     "chats": list,
     "session_dir": str,
+    # 任务来源类型：channel=频道/群组，bot=抽奖机器人私聊
+    "source_type": lambda: SOURCE_CHANNEL,
+    "bot_username": lambda: "",
+    "scan_limit": lambda: None,
     "keywords": lambda: list(DEFAULT_KEYWORDS),
     "auto_scan": lambda: True,
     "auto_join": lambda: True,
@@ -641,10 +653,24 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     def _persist() -> None:
         clean = {}
         for name, cfg in tasks.items():
+            source_type = str(cfg.get("source_type") or SOURCE_CHANNEL)
+            bot_username = str(cfg.get("bot_username") or "").lstrip("@").strip()
+            chats = (
+                [bot_username]
+                if source_type == SOURCE_BOT and bot_username
+                else [str(c) for c in (cfg.get("chats") or [])]
+            )
             clean[name] = {
                 "accounts": list(cfg.get("accounts") or []),
-                "chats": [str(c) for c in (cfg.get("chats") or [])],
+                "chats": chats,
                 "session_dir": str(cfg.get("session_dir") or "."),
+                "source_type": source_type,
+                "bot_username": bot_username,
+                "scan_limit": (
+                    max(1, int(cfg.get("scan_limit") or 0))
+                    if cfg.get("scan_limit")
+                    else None
+                ),
                 "keywords": list(cfg.get("keywords") or []),
                 "auto_scan": bool(cfg.get("auto_scan", True)),
                 "auto_join": bool(cfg.get("auto_join", True)),
@@ -812,10 +838,18 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
     def duplicate_task(name: str) -> None:
         cfg = tasks[name]
+        source_type = str(cfg.get("source_type") or SOURCE_CHANNEL)
         session_dir_input.value = str(cfg["session_dir"])
         account_select.value = list(cfg["accounts"])
         refresh_options()
-        channel_select.value = [str(c) for c in cfg["chats"]]
+        source_type_toggle.value = source_type
+        bot_username_input.value = cfg.get("bot_username") or BAIBAOXIANG_BOT
+        bot_scan_limit_input.value = (
+            cfg.get("scan_limit") or BAIBAOXIANG_SCAN_LIMIT
+        )
+        channel_select.value = (
+            [] if source_type == SOURCE_BOT else [str(c) for c in cfg["chats"]]
+        )
         manual_chats_input.value = ""
         keywords_input.value = "，".join(cfg.get("keywords") or [])
         max_joins_input.value = cfg.get("max_joins") or None
@@ -836,9 +870,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         resolve_pace_min_input.value = cfg.get("resolve_pace_min")
         resolve_pace_max_input.value = cfg.get("resolve_pace_max")
         _apply_rescue_visibility()
+        _apply_source_visibility()
         for el in (
             session_dir_input,
             account_select,
+            source_type_toggle,
+            bot_username_input,
+            bot_scan_limit_input,
             channel_select,
             manual_chats_input,
             keywords_input,
@@ -1004,16 +1042,24 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         if not accounts:
             ui.notify("请至少选择一个账号", type="warning")
             return
+        source_type = str(source_type_toggle.value or SOURCE_CHANNEL)
+        bot_username = str(bot_username_input.value or "").lstrip("@").strip()
         chats: List[str] = []
-        for cid in list(channel_select.value or []):
-            chats.append(str(cid))
-        for raw in _split_items(manual_chats_input.value or ""):
-            parsed = parse_chat_id(raw)
-            if parsed is not None and str(parsed) not in chats:
-                chats.append(str(parsed))
-        if not chats:
-            ui.notify("请至少选择或手动填写一个监控对象", type="warning")
-            return
+        if source_type == SOURCE_BOT:
+            if not bot_username:
+                ui.notify("请填写要监控的机器人用户名", type="warning")
+                return
+            chats = [bot_username]
+        else:
+            for cid in list(channel_select.value or []):
+                chats.append(str(cid))
+            for raw in _split_items(manual_chats_input.value or ""):
+                parsed = parse_chat_id(raw)
+                if parsed is not None and str(parsed) not in chats:
+                    chats.append(str(parsed))
+            if not chats:
+                ui.notify("请至少选择或手动填写一个监控对象", type="warning")
+                return
         keywords = _split_items(keywords_input.value or "")
         try:
             max_joins = (
@@ -1036,6 +1082,11 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             join_flood_buffer = max(0, int(join_flood_buffer_input.value or 0))
             resolve_pace_min = max(0, int(resolve_pace_min_input.value or 0))
             resolve_pace_max = max(0, int(resolve_pace_max_input.value or 0))
+            scan_limit = (
+                max(1, int(bot_scan_limit_input.value or BAIBAOXIANG_SCAN_LIMIT))
+                if source_type == SOURCE_BOT
+                else None
+            )
         except (TypeError, ValueError):
             ui.notify("参与上限/延迟/补漏/限流参数需为数字", type="warning")
             return
@@ -1045,16 +1096,26 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             join_pace_min, join_pace_max = join_pace_max, join_pace_min
         if resolve_pace_min > resolve_pace_max:
             resolve_pace_min, resolve_pace_max = resolve_pace_max, resolve_pace_min
+        if source_type == SOURCE_BOT:
+            # 机器人任务只处理已达标消息，自动加入无意义且可能误加推广目标
+            if not keywords:
+                keywords = [BAIBAOXIANG_KEYWORD]
+            auto_join = False
+        else:
+            auto_join = bool(auto_join_switch.value)
         name = str(store["seq"])
         store["seq"] += 1
         tasks[name] = {
             "accounts": accounts,
             "chats": chats,
             "session_dir": str(Path(session_dir_input.value or ".")),
+            "source_type": source_type,
+            "bot_username": bot_username if source_type == SOURCE_BOT else "",
+            "scan_limit": scan_limit,
             "keywords": keywords,
             "max_joins": max_joins,
             "auto_scan": bool(auto_scan_switch.value),
-            "auto_join": bool(auto_join_switch.value),
+            "auto_join": auto_join,
             "ignore_history": bool(ignore_hist_switch.value),
             "delay_min": delay_min,
             "delay_max": delay_max,
@@ -1088,6 +1149,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 return
             columns = [
                 {"name": "name", "label": "任务", "field": "name", "align": "left"},
+                {
+                    "name": "task_type",
+                    "label": "类型",
+                    "field": "task_type",
+                    "align": "left",
+                },
                 {
                     "name": "accounts",
                     "label": "账号",
@@ -1158,7 +1225,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 reverse=True,
             ):
                 cfg = tasks[name]
-                chat_names = [chat_display(c) for c in cfg["chats"]]
+                is_bot = str(cfg.get("source_type") or SOURCE_CHANNEL) == SOURCE_BOT
+                bot_username = str(cfg.get("bot_username") or "").lstrip("@")
+                chat_names = (
+                    [f"@{bot_username}"]
+                    if is_bot and bot_username
+                    else [chat_display(c) for c in cfg["chats"]]
+                )
                 running_now = task_running(name)
                 start_ts = cfg.get("_start_ts")
                 duration_text = (
@@ -1169,8 +1242,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 rows.append(
                     {
                         "name": str(name),
+                        "task_type": SOURCE_TYPE_LABELS.get(
+                            str(cfg.get("source_type") or SOURCE_CHANNEL),
+                            SOURCE_TYPE_LABELS[SOURCE_CHANNEL],
+                        ),
                         "accounts": ", ".join(cfg["accounts"]),
-                        "chats": f"{len(cfg['chats'])} 个："
+                        "chats": f"{len(chat_names)} 个："
                         + "、".join(chat_names[:3])
                         + ("…" if len(chat_names) > 3 else ""),
                         "keywords": "、".join(cfg.get("keywords") or []) or "全部链接",
@@ -1322,10 +1399,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                 f"color={'info' if running else 'grey-6'}"
                             )
                             card_badges[n] = badge
+                        ui.label(f"类型：{row['task_type']}").classes(
+                            "text-xs text-gray-600"
+                        )
                         ui.label(f"账号：{row['accounts']}").classes(
                             "text-xs text-gray-600"
                         )
-                        ui.label(f"频道：{row['chats']}").classes(
+                        ui.label(f"监控对象：{row['chats']}").classes(
                             "text-xs text-gray-600"
                         )
                         ui.label(
@@ -1639,6 +1719,23 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         add_dialog_close_button(add_dlg)
         ui.label("添加任务").classes("text-lg font-semibold")
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+            source_type_toggle = ui.toggle(
+                {SOURCE_CHANNEL: "频道/群组", SOURCE_BOT: "百宝箱机器人"},
+                value=SOURCE_CHANNEL,
+                on_change=lambda _: _apply_source_visibility(),
+            ).props("dense")
+            bot_username_input = ui.input(
+                label="机器人用户名",
+                value=BAIBAOXIANG_BOT,
+            ).classes("w-56")
+            bot_scan_limit_input = ui.number(
+                label="回扫消息条数",
+                value=BAIBAOXIANG_SCAN_LIMIT,
+                min=1,
+                max=1000,
+                format="%d",
+            ).classes("w-44")
+        with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             session_dir_input = ui.input(
                 label="会话目录（.session 所在目录）", value=default_session_dir
             ).classes("w-56")
@@ -1685,7 +1782,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "outline"
             )
 
-        with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+        with ui.row().classes(
+            "items-end w-full gap-3 flex-wrap"
+        ) as channel_pick_row:
             channel_select = (
                 ui.select(
                     label="选择监控频道/群组（可混选，输入关键字过滤）",
@@ -1827,12 +1926,41 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             rescue_interval_input.visible = visible
             rescue_limit_input.visible = visible
 
+        def _apply_source_visibility() -> None:
+            """按任务类型切换表单项：机器人任务只保留机器人/关键词/回扫参数。"""
+            is_bot = str(source_type_toggle.value or SOURCE_CHANNEL) == SOURCE_BOT
+            bot_username_input.visible = is_bot
+            bot_scan_limit_input.visible = is_bot
+            channel_pick_row.visible = not is_bot
+            auto_join_switch.visible = not is_bot
+            if is_bot:
+                default_kw = "，".join(DEFAULT_KEYWORDS)
+                if not (keywords_input.value or "").strip() or (
+                    keywords_input.value == default_kw
+                ):
+                    keywords_input.value = BAIBAOXIANG_KEYWORD
+                auto_join_switch.value = False
+            for el in (
+                bot_username_input,
+                bot_scan_limit_input,
+                channel_pick_row,
+                auto_join_switch,
+                keywords_input,
+            ):
+                try:
+                    el.update()
+                except Exception:
+                    logger.debug("切换任务类型表单项失败", exc_info=True)
+
         _apply_rescue_visibility()
+        _apply_source_visibility()
 
         ui.label(
             "提示：参与 = 以账号身份向抽奖机器人发送 /start（等同手动点开链接）；"
             "机器人若弹出「确认参与」类按钮会自动点击；开启自动加入后，"
             "机器人回复消息中出现的频道/群组链接会被逐一加入（激进模式，可能误加）。"
+            "「百宝箱机器人」类型直接扫描该 bot 私聊里的「您已获得抽奖资格（已达标）」"
+            "消息并点击「点击参与抽奖」，无需监控频道、也不会自动加群。"
             "补漏扫描会按设定间隔重拉各频道最近若干条消息，"
             "捞回此前因网络异常/中断漏掉的抽奖帖，连续多轮拉取失败会自动暂停一段时间。"
             "中奖识别会在 bot 私聊出现中奖消息时转发提醒并写入消息中心，"

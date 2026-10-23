@@ -418,6 +418,12 @@ class GiveawayEngine:
         # 标记为「双向」的账户集合：发言数要求类抽奖自动跳过
         self.two_way_accounts: set = set()
         self.chats: List = []
+        # 监控来源类型：channel=频道/群组（默认），bot=抽奖机器人私聊
+        self.source_type = "channel"
+        # 机器人私聊来源时的目标用户名（不含 @），只参与该 bot 的抽奖链接
+        self.bot_username = ""
+        # 机器人私聊来源时的历史回扫条数上限（None=沿用 SCAN_HARD_CAP）
+        self.scan_limit: Optional[int] = None
         self.keywords: Tuple[str, ...] = DEFAULT_KEYWORDS
         self.max_joins: Optional[int] = None
         self.rescue_interval = RESCUE_INTERVAL
@@ -467,6 +473,9 @@ class GiveawayEngine:
         log: Callable[[str], None],
         *,
         keywords: Optional[Iterable[str]] = None,
+        source_type: str = "channel",
+        bot_username: Optional[str] = None,
+        scan_limit: Optional[int] = None,
         auto_scan: bool = True,
         auto_join: bool = True,
         max_joins: Optional[int] = None,
@@ -494,13 +503,18 @@ class GiveawayEngine:
             log("任务已在运行中")
             return False
         self._state = state or self._state
+        self.source_type = str(source_type or "channel").strip().lower()
+        self.bot_username = str(bot_username or "").lstrip("@").strip()
+        self.scan_limit = max(1, int(scan_limit)) if scan_limit else None
         self.chats = list(chats)
         self.keywords = tuple(
             str(k).strip() for k in (keywords or ()) if str(k).strip()
         )
         self.confirm_keywords = tuple(confirm_keywords or DEFAULT_CONFIRM_KEYWORDS)
         self.confirm_wait = max(0, int(confirm_wait))
-        self.auto_join = bool(auto_join)
+        # 机器人私聊来源不做自动加入：消息里的 ✅ 清单与推广链接都不是
+        # 本次任务的加入目标，避免误加频道/群组
+        self.auto_join = bool(auto_join) and self.source_type != "bot"
         # 忽略历史成功记录：开启后已参与过的抽奖链接允许重新参与
         self.ignore_history = bool(ignore_history)
         # 中奖识别配置：转发目标列表，"me" = 收藏夹（Saved Messages），
@@ -681,8 +695,13 @@ class GiveawayEngine:
                 self.log("没有可用账号，任务结束")
                 return
             mode_kw = "，".join(self.keywords) if self.keywords else "全部 bot 链接"
+            source_desc = (
+                f"机器人 @{self.bot_username}"
+                if self.source_type == "bot"
+                else f"{len(self.chats)} 个监控对象"
+            )
             self.log(
-                f"任务已启动：{len(self._clients)} 个账号、{len(self.chats)} 个监控对象，"
+                f"任务已启动：{len(self._clients)} 个账号、{source_desc}，"
                 f"关键词：{mode_kw}"
             )
             # 中奖回扫：开奖常在参与后数日，先补捡停机期间 bot 私聊的中奖通知
@@ -763,6 +782,12 @@ class GiveawayEngine:
         for chat in self.chats:
             if self._stop is not None and self._stop.is_set():
                 return
+            if self.source_type == "bot":
+                # 机器人私聊：无需加入，也不走群组置顶逻辑，直接回扫历史消息
+                done["n"] += 1
+                self.scan_text = f"({done['n']}/{total})"
+                await self._scan_chat_history(account, client, chat)
+                continue
             # 监控对象成员检查：账号未加入该频道/群组时自动尝试加入
             await self._ensure_monitor_membership(account, client, chat)
             done["n"] += 1
@@ -790,13 +815,19 @@ class GiveawayEngine:
         """单频道回溯扫描历史消息：水位线去重 + 处理，命中停止条件即止。"""
         expired_streak = 0
         scanned = 0
+        # 机器人私聊来源可单独限制回扫条数，避免翻遍全部历史私聊消息
+        hard_cap = (
+            min(SCAN_HARD_CAP, self.scan_limit)
+            if self.scan_limit is not None
+            else SCAN_HARD_CAP
+        )
         try:
             async for message in client.get_chat_history(chat):
                 scanned += 1
-                if scanned > SCAN_HARD_CAP:
+                if scanned > hard_cap:
                     self.log(
                         f"[{account}] {chat} 已扫描 "
-                        f"{SCAN_HARD_CAP} 条，停止该频道本轮扫描"
+                        f"{hard_cap} 条，停止该频道本轮扫描"
                     )
                     break
                 mid = getattr(message, "id", None)
@@ -1543,6 +1574,10 @@ class GiveawayEngine:
 
     def _chat_title(self, message: Any) -> str:
         chat = getattr(message, "chat", None)
+        if self.source_type == "bot":
+            username = getattr(chat, "username", None) or self.bot_username
+            if username:
+                return f"@{username}"
         return str(getattr(chat, "title", "") or getattr(chat, "id", "") or "")
 
     async def _process_message(
@@ -1589,7 +1624,16 @@ class GiveawayEngine:
         log_skips: bool,
     ) -> Optional[str]:
         """消息含抽奖链接时的过滤与参与流程。返回 "joined"/"expired"/None。"""
-        if self._message_filtered_out(account, message, tag, skip_keywords, log_skips):
+        if self.source_type == "bot":
+            # 机器人私聊的「已达标」消息已完成口令/发言/地区任务，
+            # 只按关键词与开奖时间过滤，不再套用频道帖的参与条件检查
+            if not skip_keywords and not message_matches_keywords(
+                message, self.keywords
+            ):
+                return None
+        elif self._message_filtered_out(
+            account, message, tag, skip_keywords, log_skips
+        ):
             return None
         channel = self._chat_title(message)
         title = _giveaway_title(message)
@@ -1627,11 +1671,16 @@ class GiveawayEngine:
             )
         )
 
-    @staticmethod
-    def _candidate_bot_links(message: Any) -> list:
+    def _candidate_bot_links(self, message: Any) -> list:
         links = extract_bot_links(message)
         # 黑名单 bot 的链接不作为抽奖链接（整条消息无可用链接时直接跳过）
-        return [ln for ln in links if not bot_is_blocked(ln[0])]
+        links = [ln for ln in links if not bot_is_blocked(ln[0])]
+        if self.source_type == "bot":
+            # 机器人私聊来源：只参与当前机器人自己的抽奖入口，
+            # 避免误点消息里夹带的其他推广 bot 链接
+            target = self.bot_username.lower()
+            links = [ln for ln in links if ln[0].lower() == target]
+        return links
 
     async def _handle_missing_bot_links(
         self,
@@ -1648,6 +1697,15 @@ class GiveawayEngine:
             # 群组置顶的「按钮型」抽奖：帖内无可 start 的 bot 链接
             # （或仅剩黑名单推广链接），但帖上带「参与抽奖」按钮，
             # 直接点击源帖按钮完成参与
+            await self._participate_via_source_button(account, client, message)
+            return
+        if self.source_type == "bot":
+            # 机器人私聊的「按钮型」抽奖（按钮为 callback，无 start 链接）：
+            # 与历史帖同一口径，先过关键词与开奖时间，再点击参与按钮
+            if not message_matches_keywords(message, self.keywords):
+                return
+            if self._expired_draw_status(account, message, tag) is not None:
+                return
             await self._participate_via_source_button(account, client, message)
 
     def _message_filtered_out(
@@ -1757,7 +1815,9 @@ class GiveawayEngine:
                 param,
                 channel,
                 title,
-                source_message=message,
+                # 机器人私聊消息本身就是参与入口（按钮即本次 start 参数），
+                # 不把它当作「参与条件帖」再做加入/重发跟进
+                source_message=None if self.source_type == "bot" else message,
             )
             if self.joined > before:
                 participated += 1

@@ -197,6 +197,7 @@ def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | 
     if not isinstance(cfg, dict):
         return None
     titles = channel_title_map(workdir)
+    is_bot = str(cfg.get("source_type") or "channel") == "bot"
     chats = [str(c) for c in (cfg.get("chats") or [])]
     chats_text = "\n".join(
         f"{titles.get(cid)} ({cid})" if titles.get(cid) else cid for cid in chats
@@ -205,7 +206,9 @@ def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | 
     rescue_min = int(cfg.get("rescue_interval_min") or 0)
     return [
         ("账号", _fmt_param_value(cfg.get("accounts"))),
-        ("监控频道/群组", chats_text or "—"),
+        ("任务类型", "百宝箱机器人" if is_bot else "频道/群组"),
+        ("监控机器人", f"@{cfg.get('bot_username')}" if is_bot else "—"),
+        ("监控频道/群组", ("—" if is_bot else chats_text) or "—"),
         ("会话目录", str(cfg.get("session_dir") or ".")),
         ("消息关键词", _fmt_param_value(cfg.get("keywords"))),
         ("启动时自动扫描", _fmt_param_value(cfg.get("auto_scan"))),

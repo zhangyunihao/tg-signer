@@ -2380,6 +2380,179 @@ def test_draw_announce_post_is_filtered(tmp_path):
     assert not any("跳过" in line for line in logs)
 
 
+# ---------------- 百宝箱机器人私聊任务类型 ----------------
+
+
+BAIBAOXIANG_ELIGIBLE = """您已获得抽奖资格（已达标）
+
+✅您已完成所有任务，请直接参与抽奖！
+
+🎰 上海市民网 浦东 星星 优惠福利  @xing5517
+
+🎫 已加入-星星的朋友圈 ✅
+🎫 已加入-上海市民网 ✅
+└ 🔑 发送口令﹝欢迎星星入驻上海市民网﹞ ✅
+
+💁 参与情况：109达标 / 124报名"""
+
+
+def _bot_engine(tmp_path):
+    engine, state = _engine(
+        tmp_path, keywords=("您已获得抽奖资格（已达标）",), delay_max=0.0
+    )
+    engine.source_type = "bot"
+    engine.bot_username = "BaibaoxiangCjBot"
+    return engine, state
+
+
+def test_bot_source_participates_eligible_button_message(tmp_path):
+    """机器人私聊来源：命中「已达标」关键词后按按钮 start 参数参与。"""
+    import asyncio
+
+    engine, state = _bot_engine(tmp_path)
+    client = FakeClient(bot_users={"BaibaoxiangCjBot"})
+    engine._clients = {"deux": client}
+    param = "participate_-1003984379574_8480110324_137"
+    msg = _msg(
+        text=BAIBAOXIANG_ELIGIBLE,
+        buttons=[
+            [
+                _btn(
+                    "点击参与抽奖",
+                    url=f"https://t.me/BaibaoxiangCjBot?start={param}",
+                )
+            ]
+        ],
+        id=11143,
+    )
+
+    result = asyncio.run(engine._process_message("deux", client, msg))
+
+    assert result == "joined"
+    assert client.started == [("BaibaoxiangCjBot", param)]
+    assert state.has("deux", "baibaoxiangcjbot", param)
+
+
+def test_bot_source_ignores_channel_post_conditions(tmp_path):
+    """「已达标」消息虽含「发送口令」「归属地」字样，双向账号也照常参与。"""
+    import asyncio
+
+    engine, _state = _bot_engine(tmp_path)
+    engine.two_way_accounts = {"deux"}
+    client = FakeClient(bot_users={"BaibaoxiangCjBot"})
+    param = "participate_-1003984379574_8480110324_137"
+    msg = _msg(
+        text=BAIBAOXIANG_ELIGIBLE + "\n🌏️ 归属地 上海\n📅 开奖时间：2099-12-31 23:59",
+        buttons=[
+            [
+                _btn(
+                    "点击参与抽奖",
+                    url=f"https://t.me/BaibaoxiangCjBot?start={param}",
+                )
+            ]
+        ],
+        id=11143,
+    )
+
+    result = asyncio.run(engine._process_message("deux", client, msg))
+
+    assert result == "joined"
+    assert client.started == [("BaibaoxiangCjBot", param)]
+
+
+def test_bot_source_skips_unqualified_message(tmp_path):
+    """机器人私聊来源：未达标消息不含资格关键词，不得点击参与按钮。"""
+    import asyncio
+
+    engine, _state = _bot_engine(tmp_path)
+    client = FakeClient(bot_users={"BaibaoxiangCjBot"})
+    param = "participate_-1002839891304_7357117687_408"
+    msg = _msg(
+        text="您已成功报名抽奖（未达标）\n❌您还需要完成激活任务才能抽奖！",
+        buttons=[
+            [
+                _btn(
+                    "点击参与抽奖",
+                    url=f"https://t.me/BaibaoxiangCjBot?start={param}",
+                )
+            ]
+        ],
+        id=11222,
+    )
+
+    result = asyncio.run(engine._process_message("deux", client, msg))
+
+    assert result is None
+    assert client.started == []
+
+
+def test_bot_source_ignores_other_bot_links(tmp_path):
+    """机器人私聊来源只认当前机器人自己的链接，避免误点推广 bot。"""
+    import asyncio
+
+    engine, _state = _bot_engine(tmp_path)
+    client = FakeClient(bot_users={"OtherBot"})
+    msg = _msg(
+        text=BAIBAOXIANG_ELIGIBLE + "\nhttps://t.me/OtherBot?start=promo",
+        id=11144,
+    )
+
+    result = asyncio.run(engine._process_message("deux", client, msg))
+
+    assert result is None
+    assert client.started == []
+
+
+def test_bot_source_scan_skips_membership_and_respects_limit(tmp_path):
+    """机器人私聊扫描：不尝试加入监控对象，且只回扫指定条数。"""
+    import asyncio
+
+    engine, _state = _bot_engine(tmp_path)
+    engine.scan_limit = 1
+    engine.chats = ["BaibaoxiangCjBot"]
+    client = FakeClient(bot_users={"BaibaoxiangCjBot"})
+    client.history = [
+        _msg(
+            text=BAIBAOXIANG_ELIGIBLE,
+            buttons=[
+                [
+                    _btn(
+                        "点击参与抽奖",
+                        url=(
+                            "https://t.me/BaibaoxiangCjBot?start="
+                            "participate_-1003984379574_8480110324_137"
+                        ),
+                    )
+                ]
+            ],
+            id=11143,
+        ),
+        _msg(
+            text=BAIBAOXIANG_ELIGIBLE,
+            buttons=[
+                [
+                    _btn(
+                        "点击参与抽奖",
+                        url=(
+                            "https://t.me/BaibaoxiangCjBot?start="
+                            "participate_-1003984379574_8480110324_136"
+                        ),
+                    )
+                ]
+            ],
+            id=11142,
+        ),
+    ]
+    engine._clients = {"deux": client}
+
+    asyncio.run(engine.scan_now())
+
+    assert client.joined_targets == []  # 机器人私聊不做成员检查/加入
+    assert client.started == [
+        ("BaibaoxiangCjBot", "participate_-1003984379574_8480110324_137")
+    ]
+
+
 def test_active_post_mentioning_announce_not_filtered(tmp_path):
     """活跃帖仅在「抽奖说明」段提及「开奖通知」时不被误过滤。"""
     import asyncio

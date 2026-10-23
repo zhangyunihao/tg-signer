@@ -136,6 +136,10 @@ class GiveawayProcess:
             "session_dir": str(cfg.get("session_dir") or "."),
             "chats": [str(c) for c in (cfg.get("chats") or [])],
             "keywords": [str(k) for k in (cfg.get("keywords") or [])],
+            # 任务类型：channel=频道/群组，bot=抽奖机器人私聊
+            "source_type": str(cfg.get("source_type") or "channel"),
+            "bot_username": str(cfg.get("bot_username") or ""),
+            "scan_limit": cfg.get("scan_limit"),
             "auto_scan": bool(cfg.get("auto_scan", True)),
             "auto_join": bool(cfg.get("auto_join", True)),
             "ignore_history": bool(cfg.get("ignore_history", True)),
