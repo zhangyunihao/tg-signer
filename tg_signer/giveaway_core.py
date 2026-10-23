@@ -92,9 +92,9 @@ START_MIN_INTERVAL = 8.0
 # —— 加入频道限流保护 ——
 # 抽奖参与通常要先加入条件频道；短时间大量 JoinChannel 会触发 FLOOD_WAIT，
 # 更严重时触发不可重试的 PEER_FLOOD（该账号数小时到数天不能加群/参与）。
-# 默认值沿用加限流保护之前的行为：不额外等待、不设配额（由任务配置按需开启）。
+# 默认开启节流（见下），配额默认 0=不限制。
 # 相邻两次 JoinChannel 的最小间隔（秒，区间内随机取值，模拟人工节奏）
-JOIN_PACE_RANGE = (0.0, 0.0)
+JOIN_PACE_RANGE = (2.0, 5.0)
 
 
 # 单账号滚动 1 小时内最多加入的频道/群组数（突发保护），0=不限制
@@ -111,8 +111,8 @@ JOIN_FLOOD_BUFFER = 10
 
 
 # 解析类调用（get_users/get_chat 等）的账号级最小间隔（秒），
-# 避免一条消息里十几条链接连续 resolve 触发限流；0=不节流
-RESOLVE_PACE_RANGE = (0.0, 0.0)
+# 避免一条消息里十几条链接连续 resolve 触发限流；默认开启
+RESOLVE_PACE_RANGE = (1.0, 2.0)
 
 
 # 同一 bot 累计收到该次数「抽奖已结束」类回复后，本轮运行熔断该 bot
@@ -163,7 +163,19 @@ WIN_SWEEP_PAGE_MAX = 20  # 增量回扫最多翻页数（防水位线异常时�
 # 半开连接（手机切换网络/代理僵死）下 Pyrogram 请求可能永久挂起，导致引擎
 # 任务协程卡死、WebUI 状态永不收敛。所有经引擎客户端发出的请求统一加超时：
 # 单次请求超过 NET_CALL_TIMEOUT 秒按网络异常抛错，由各调用点的既有异常处理兜底。
-NET_CALL_TIMEOUT = 90
+# 默认 30 秒（原 90 秒）：限流/网络故障时快速失败，避免单请求卡 90 秒
+# 导致连接堆积、触发更多超时请求形成雪崩。
+NET_CALL_TIMEOUT = 30
+
+# —— 账号级 API 统一节流（_TimeoutClient 层）——
+# GiveawayEngine 自建的 _TimeoutClient 直接包 Pyrogram，不走 core.py
+# BaseUserWorker._call_telegram_api 的统一限流。这里在 _TimeoutClient 层
+# 补齐：per-account 串行锁 + 最小调用间隔，以及 Transport flood 429
+# 识别与指数退避。
+_CLIENT_API_LOCKS: Dict[str, asyncio.Lock] = {}
+_CLIENT_API_LAST_CALL: Dict[str, float] = {}
+_CLIENT_API_MIN_INTERVAL = 0.35  # 相邻 API 调用最小间隔（秒）
+_CLIENT_TRANSPORT_FLOOD_BACKOFF = [5, 10, 20, 30]  # Transport 429 指数退避（秒）
 
 
 async def _timeout_aiter(agen: Any, timeout: float, name: str = "") -> Any:
@@ -180,12 +192,36 @@ async def _timeout_aiter(agen: Any, timeout: float, name: str = "") -> Any:
         yield item
 
 
-class _TimeoutClient:
-    """Pyrogram 客户端代理：协程调用与异步迭代统一套 NET_CALL_TIMEOUT 超时。"""
+def _is_transport_flood(exc: BaseException) -> bool:
+    """判断异常是否为 Telegram MTProto Transport flood 429 限流。
 
-    def __init__(self, client: Any, timeout: float = NET_CALL_TIMEOUT) -> None:
+    Transport flood 发生在协议层而非 API 层，Pyrogram 不会把它映射成
+    errors.FloodWait，错误消息里通常含 "429"、"Transport flood" 或
+    "Please slow down"。识别后可触发指数退避而非落入通用重试逻辑。
+    """
+    msg = str(exc).lower()
+    return any(k in msg for k in ("transport flood", "429", "please slow down"))
+
+
+class _TimeoutClient:
+    """Pyrogram 客户端代理：超时 + 账号级统一节流 + Transport flood 退避。
+
+    内置 per-account asyncio.Lock + 最小调用间隔，让 GiveawayEngine
+    的所有 API 调用都受统一节流（否则会绕过 core.py 的 _call_telegram_api）。
+    Transport flood 429 被识别后执行指数退避，避免重试风暴。
+    """
+
+    def __init__(
+        self, client: Any, timeout: float = NET_CALL_TIMEOUT, account: str = ""
+    ) -> None:
         self._raw = client
         self._timeout = timeout
+        self._account = account or "default"
+        # 每个 _TimeoutClient 实例共享 per-account 锁（GiveawayEngine
+        # 里通常一账号一 client，所以 key 就是 account）
+        self._lock = _CLIENT_API_LOCKS.setdefault(self._account, asyncio.Lock())
+        self._backoff_idx = 0  # 当前账号 Transport flood 退避等级
+        self._last_transport_flood_at = 0.0
 
     def __getattr__(self, item: str) -> Any:
         attr = getattr(self._raw, item)
@@ -195,20 +231,107 @@ class _TimeoutClient:
         def method(*args: Any, **kwargs: Any) -> Any:
             result = attr(*args, **kwargs)
             if hasattr(result, "__anext__"):
-                return _timeout_aiter(result, self._timeout, item)
+                return self._throttled_aiter(result, item)
             if inspect.isawaitable(result):
-                return self._bounded(result, item)
+                return self._throttled_bounded(result, item)
             return result
 
         return method
 
-    async def _bounded(self, coro: Any, name: str) -> Any:
-        try:
-            return await asyncio.wait_for(coro, self._timeout)
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"网络请求 {name} 超时（{self._timeout:.0f} 秒，网络异常）"
-            ) from None
+    async def _throttled_bounded(self, coro: Any, name: str) -> Any:
+        """带统一节流的单次 API 调用。"""
+        async with self._lock:
+            # 1) 最小间隔补齐
+            await self._wait_min_interval()
+            # 2) Transport flood 冷却期：如果刚被限流过，先 sleep
+            await self._wait_transport_cooldown()
+            # 3) 执行带超时的调用
+            await self._throttled_enter()
+            try:
+                result = await asyncio.wait_for(coro, self._timeout)
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"网络请求 {name} 超时（{self._timeout:.0f} 秒，网络异常）"
+                ) from None
+            except BaseException as exc:
+                self._on_call_exception(exc)
+                raise
+            else:
+                self._backoff_idx = 0
+                _CLIENT_API_LAST_CALL[self._account] = self._loop_time()
+                return result
+
+    async def _throttled_aiter(self, agen: Any, name: str) -> Any:
+        """带统一节流的异步迭代器（get_chat_history 等）。"""
+        async with self._lock:
+            await self._wait_min_interval()
+            await self._wait_transport_cooldown()
+            await self._throttled_enter()
+            while True:
+                try:
+                    item = await asyncio.wait_for(agen.__anext__(), self._timeout)
+                except StopAsyncIteration:
+                    self._backoff_idx = 0
+                    return
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"网络请求 {name or '数据拉取'} 超时"
+                        f"（{self._timeout:.0f} 秒，网络异常）"
+                    ) from None
+                except BaseException as exc:
+                    self._on_call_exception(exc)
+                    raise
+                _CLIENT_API_LAST_CALL[self._account] = self._loop_time()
+                yield item
+
+    # —— 节流内部辅助 ——
+
+    async def _wait_min_interval(self) -> None:
+        loop = asyncio.get_running_loop()
+        last = _CLIENT_API_LAST_CALL.get(self._account)
+        if last is not None:
+            gap = _CLIENT_API_MIN_INTERVAL - (loop.time() - last)
+            if gap > 0:
+                await asyncio.sleep(gap)
+
+    async def _wait_transport_cooldown(self) -> None:
+        """刚被 Transport flood 限流后，按指数退避等待。"""
+        now = time.monotonic()
+        idx = self._backoff_idx
+        if idx > 0 and idx - 1 < len(_CLIENT_TRANSPORT_FLOOD_BACKOFF):
+            # 距离上次 flood 不久才需要退避；过了就自然过期
+            since = now - self._last_transport_flood_at
+            need = _CLIENT_TRANSPORT_FLOOD_BACKOFF[
+                min(idx - 1, len(_CLIENT_TRANSPORT_FLOOD_BACKOFF) - 1)
+            ]
+            if since < need:
+                await asyncio.sleep(need - since)
+
+    def _on_call_exception(self, exc: BaseException) -> None:
+        """调用异常后更新状态：Transport flood 升级退避等级。"""
+        if _is_transport_flood(exc):
+            self._backoff_idx = min(
+                self._backoff_idx + 1, len(_CLIENT_TRANSPORT_FLOOD_BACKOFF)
+            )
+            self._last_transport_flood_at = time.monotonic()
+            level = min(self._backoff_idx, len(_CLIENT_TRANSPORT_FLOOD_BACKOFF))
+            wait = _CLIENT_TRANSPORT_FLOOD_BACKOFF[level - 1]
+            logger.warning(
+                "[%s] Transport flood 429 限流（第 %d 级退避 %d 秒）：%s",
+                self._account,
+                self._backoff_idx,
+                wait,
+                str(exc)[:80],
+            )
+
+    async def _throttled_enter(self) -> None:
+        """调用前的统一钩子（给子类/测试扩展用）。"""
+        pass
+
+    @staticmethod
+    def _loop_time() -> float:
+        loop = asyncio.get_running_loop()
+        return loop.time()
 
 
 class GiveawayEngine:
@@ -512,8 +635,9 @@ class GiveawayEngine:
                     await safe_disconnect(client)
                     return
                 # 连接成功即纳入账号表；昵称仅用于展示，获取失败不断开。
-                # 统一包一层网络超时代理，防半开连接永久挂起任务协程
-                self._clients[account] = _TimeoutClient(client)
+                # 统一包一层网络超时代理，防半开连接永久挂起任务协程；
+                # 传入 account 让 _TimeoutClient 复用账号级节流锁与最小调用间隔。
+                self._clients[account] = _TimeoutClient(client, account=account)
                 self._locks[account] = asyncio.Lock()
                 try:
                     me = await asyncio.wait_for(
@@ -565,7 +689,7 @@ class GiveawayEngine:
                 )
             if auto_scan and not self._stop.is_set():
                 await self.scan_now()
-                # 首扫后新增参与的 bot 需建回扫基线（清除记录后启动回扫无目标）
+                # 首扫后新增参与的 bot 需建回扫基线（此前无水位线会漏扫）
                 if not self._stop.is_set():
                     await asyncio.gather(
                         *[
@@ -599,12 +723,18 @@ class GiveawayEngine:
             total = len(self._clients) * max(1, len(self.chats))
             done: Dict[str, int] = {"n": 0}
             joined_before = self.joined
-            await asyncio.gather(
-                *[
-                    self._scan_one(account, client, done, total)
-                    for account, client in list(self._clients.items())
-                ]
-            )
+            account_items = list(self._clients.items())
+            # 多账号错峰启动：各账号协程自己先 sleep idx*5 秒，
+            # 避免 asyncio.gather 把所有账号的 API 调用同时打出去触发限流
+            tasks = []
+            for idx, (account, client) in enumerate(account_items):
+                if idx == 0:
+                    tasks.append(self._scan_one(account, client, done, total))
+                else:
+                    tasks.append(
+                        self._scan_one_delayed(idx, account, client, done, total)
+                    )
+            await asyncio.gather(*tasks)
             self.scan_text = ""
             gained = self.joined - joined_before
             self.log(
@@ -642,6 +772,13 @@ class GiveawayEngine:
                 # 群组只扫指定（置顶）消息；达到上限也不再扫历史
                 continue
             await self._scan_chat_history(account, client, chat)
+
+    async def _scan_one_delayed(
+        self, idx: int, account: str, client: Any, done: Dict[str, int], total: int
+    ) -> None:
+        """错峰启动：idx > 0 的账号先 sleep idx*5 秒再开始扫描。"""
+        await asyncio.sleep(idx * 5)
+        await self._scan_one(account, client, done, total)
 
     async def _scan_chat_history(self, account: str, client: Any, chat: Any) -> None:
         """单频道回溯扫描历史消息：水位线去重 + 处理，命中停止条件即止。"""
@@ -1043,12 +1180,20 @@ class GiveawayEngine:
         done = {"n": 0}
         self.scanning = True
         try:
-            await asyncio.gather(
-                *[
-                    self._rescue_one_account(account, client, failures, done, total)
-                    for account, client in list(self._clients.items())
-                ]
-            )
+            account_items = list(self._clients.items())
+            tasks = []
+            for idx, (account, client) in enumerate(account_items):
+                if idx == 0:
+                    tasks.append(
+                        self._rescue_one_account(account, client, failures, done, total)
+                    )
+                else:
+                    tasks.append(
+                        self._rescue_one_account_delayed(
+                            idx, account, client, failures, done, total
+                        )
+                    )
+            await asyncio.gather(*tasks)
             gained = self.joined - joined_before
             # 每轮必记一行，便于确认补漏循环在按间隔运行
             self.log(
@@ -1094,6 +1239,19 @@ class GiveawayEngine:
             await self._rescue_chat_safe(account, client, chat, failures)
         # 补漏轮顺带回扫 bot 私聊中奖消息（不依赖监控对象配置）
         await self._sweep_bot_wins(account, client)
+
+    async def _rescue_one_account_delayed(
+        self,
+        idx: int,
+        account: str,
+        client: Any,
+        failures: Dict[str, int],
+        done: Dict[str, int],
+        total: int,
+    ) -> None:
+        """错峰启动：idx > 0 的账号先 sleep idx*5 秒再开始补漏。"""
+        await asyncio.sleep(idx * 5)
+        await self._rescue_one_account(account, client, failures, done, total)
 
     async def _rescue_chat_safe(
         self, account: str, client: Any, chat: Any, failures: Dict[str, int]
@@ -1245,7 +1403,7 @@ class GiveawayEngine:
             return
         bots = self._state.bots_for(account)
         if not bots:
-            # 清除参与记录后 bot 列表为空，等账号重新参与后重建回扫目标
+            # 无任何交互记录（含保留的 win: 去重）时没有回扫目标，等账号参与后重建
             self.log(f"[{account}] 回扫：暂无 bot 记录（等待账号参与后重建）")
             return
         for bot in bots:
@@ -1818,12 +1976,18 @@ class GiveawayEngine:
         """统一登记一次 FLOOD_WAIT：计入熔断次数、按 bot 级别暂停、持久化冷却。
 
         返回 True 表示确是限流异常（调用方据此跳过后续跟进而不要当普通错误）。
+        Transport flood 429 也按 FLOOD_WAIT 处理：Pyrogram 不会把它映射成
+        errors.FloodWait，需要显式识别并给默认等待秒数。
         """
         # PEER_FLOOD 没有 wait 秒数、重试也不会恢复：按账号整体熔断
         if self._is_peer_flood(exc):
             self._block_peer_flood(account, f"{label} @{username}")
             return True
         wait = self._flood_seconds(exc)
+        if wait <= 0 and _is_transport_flood(exc):
+            # Transport flood 429：协议层限流，默认等 30 秒（指数退避已由
+            # _TimeoutClient 在上游执行，这里只需要登记熔断计数避免继续打）
+            wait = 30
         if wait <= 0:
             return False
         fkey = self._flood_key(account, username)
@@ -2219,7 +2383,7 @@ class GiveawayEngine:
                     "（私有群/频道，待管理员审批）"
                 )
                 return True, False
-            elif "FLOOD_WAIT" in msg:
+            elif "FLOOD_WAIT" in msg or _is_transport_flood(exc):
                 wait = self._flood_seconds(exc) or 60
                 self._suspend_joins(account, wait, target)
                 return False, True
@@ -2603,7 +2767,7 @@ class GiveawayEngine:
             )
             self._emit({"type": "join_resolved", "account": account, "chat": str(chat)})
             return True
-        if "FLOOD_WAIT" in msg:
+        if "FLOOD_WAIT" in msg or _is_transport_flood(exc):
             wait = self._flood_seconds(exc) or 60
             self._suspend_joins(account, wait, f"监控对象 {chat}")
             self._emit(
@@ -2701,9 +2865,7 @@ class GiveawayEngine:
         fresh = await self._refresh_after_verify_reply(
             account, client, username, messages
         )
-        latest = next(
-            (m for m in fresh if not getattr(m, "outgoing", False)), None
-        )
+        latest = next((m for m in fresh if not getattr(m, "outgoing", False)), None)
         if attempt <= 1 and "验证过期" in (_message_text(latest) or ""):
             self.log(f"[{account}] @{username} 算术验证已过期，重发 start 换取新题")
             try:

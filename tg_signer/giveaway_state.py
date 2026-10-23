@@ -29,6 +29,12 @@ FLOOD_COOLDOWN = 3600
 JOIN_LOG_WINDOW = 48 * 3600
 
 
+def _is_win_record(key: str, rec: dict) -> bool:
+    """是否为中奖消息去重记录（参与记录键为 bot|win:<msg_id>）。"""
+    param = str((rec or {}).get("param") or key.split("|", 1)[-1])
+    return param.startswith("win:")
+
+
 class GiveawayState:
     """按账号持久化已参与记录：{accounts: {account: {"bot|param": record}}}。
 
@@ -199,28 +205,45 @@ class GiveawayState:
         self._dirty = True
 
     def count(self, account: Optional[str] = None) -> int:
-        if account is not None:
-            return len(self._data.get(account, {}))
-        return sum(len(v) for v in self._data.values())
+        """已参与抽奖记录条数，不含中奖消息去重记录（win:）。"""
+        buckets = (
+            [self._data.get(account, {})]
+            if account is not None
+            else self._data.values()
+        )
+        return sum(
+            1
+            for bucket in buckets
+            for key, rec in bucket.items()
+            if not _is_win_record(key, rec)
+        )
 
     def clear(self) -> int:
-        """清空所有账号的已参与记录（含中奖消息去重与回扫水位线）并立即落盘。
+        """清空所有账号的已参与抽奖记录并立即落盘。
 
-        返回清除的参与记录条数。win: 去重记录存于 _data 一并清除；
-        回扫水位线（每账号 × bot 扫到的位置）同步重置，下轮回扫从
-        新基线（回扫条数）重建。
+        只清除参与记录；中奖消息去重记录（win:<msg_id>）与各账号 × bot 的
+        回扫水位线保留，避免清除后回扫把已提醒过的旧中奖消息再推送一次。
+        返回清除的参与记录条数。
         """
-        total = self.count()
-        self._data = {}
-        self._win_wm = {}
+        cleared = 0
+        for account, bucket in list(self._data.items()):
+            kept = {key: rec for key, rec in bucket.items() if _is_win_record(key, rec)}
+            cleared += len(bucket) - len(kept)
+            if kept:
+                self._data[account] = kept
+            else:
+                self._data.pop(account, None)
+        if not cleared:
+            return 0
         self._dirty = True
-        # save 会从磁盘合并回来，先删文件确保清空真正生效
+        # save 会从磁盘合并回来，先删文件确保清除真正生效（保留的记录
+        # 仍在内存里，随后由 save 写回）
         try:
             self.path.unlink()
         except OSError:
             pass
         self.save(force=True)
-        return total
+        return cleared
 
     def bots_for(self, account: str) -> List[str]:
         """该账号有过交互记录的全部 bot 用户名（按最近交互时间倒序）。

@@ -3065,6 +3065,28 @@ def test_state_bots_for_orders_by_recency(tmp_path):
     assert state.bots_for("other") == []
 
 
+def test_state_clear_keeps_win_records_and_watermark(tmp_path):
+    """清除参与记录：中奖去重记录与回扫水位线保留，旧中奖不会重复推送。"""
+    state = GiveawayState(tmp_path)
+    state.add("acc", "BotAAA", "p1")
+    state.add("acc", "BotAAA", "win:7", note="win")
+    state.set_win_watermark("acc", "BotAAA", 7)
+    state.save()
+
+    assert state.count() == 1  # 不含 win: 去重记录
+    assert state.clear() == 1
+    assert state.count() == 0
+    assert not state.has("acc", "BotAAA", "p1")
+    assert state.has("acc", "BotAAA", "win:7")
+    assert state.win_watermark("acc", "BotAAA") == 7
+
+    # 落盘后重新读取：保留项仍在
+    reloaded = GiveawayState(tmp_path)
+    assert reloaded.count() == 0
+    assert reloaded.has("acc", "BotAAA", "win:7")
+    assert reloaded.win_watermark("acc", "BotAAA") == 7
+
+
 def test_check_win_message_forwards_emits_and_dedups(tmp_path):
     """中奖消息：转发到收藏夹 + 发 win 事件 + 状态记录；同实例重复检测不重复转发。"""
     import asyncio
@@ -3643,7 +3665,10 @@ def test_handle_math_verification_expired_restarts_and_answers_new(
     )
     assert handled is True
     assert client.started == [("mianfeichoujiang_bot", "p1")]
-    assert client.sent == [("mianfeichoujiang_bot", "27"), ("mianfeichoujiang_bot", "25")]
+    assert client.sent == [
+        ("mianfeichoujiang_bot", "27"),
+        ("mianfeichoujiang_bot", "25"),
+    ]
     assert any("验证已过期" in line for line in logs)
 
 

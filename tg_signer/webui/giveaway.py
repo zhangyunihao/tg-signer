@@ -1390,8 +1390,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         clear_count_label.text = (
             f"当前共 {total} 条已参与记录（覆盖所有账号）。"
             "清除后，相同抽奖链接对所有账号都视为未参与，下次扫描将重新参与；"
-            "中奖消息去重记录与各账号 × bot 的回扫进度（水位线）也一并清除，"
-            "回扫目标会在账号重新参与后重建。"
+            "中奖消息去重记录与各账号 × bot 的回扫进度（水位线）保留，"
+            "已提醒过的旧中奖消息不会被重复推送。"
             "此操作不可恢复，确定清除？"
         )
         clear_records_dlg.open()
@@ -1423,7 +1423,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 icon="delete_sweep",
                 on_click=open_clear_records_dlg,
             ).props("outline color=negative").tooltip(
-                "删除所有账号的已参与抽奖记录、中奖消息去重记录与回扫进度，"
+                "删除所有账号的已参与抽奖记录（保留中奖消息去重与回扫进度），"
                 "清除后相同链接可再次参与"
             )
             ui.button("添加任务", icon="add", on_click=lambda: add_dlg.open()).props(
