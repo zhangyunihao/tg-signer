@@ -325,7 +325,7 @@ def test_state_dedup_and_persistence(tmp_path):
     reloaded = GiveawayState(tmp_path)
     assert reloaded.has("acc1", "SomeBot", "p1")
     assert reloaded.count() == 1
-    record = reloaded._data["acc1"]["somebot|p1"]
+    record = reloaded.record("acc1", "SomeBot", "p1")
     assert record["bot"] == "SomeBot"
     assert record["channel"] == "频道A"
 
@@ -342,7 +342,7 @@ def test_state_caps_per_account(tmp_path):
         state2 = GiveawayState(tmp_path)
         for i in range(10, 20):
             state2.add("acc", f"Bot{i:05d}", "p")
-        assert len(state2._data["acc"]) == 5
+        assert state2.count("acc") == 5
     finally:
         state_mod.MAX_STATE_PER_ACCOUNT = old_cap
 
@@ -1022,16 +1022,23 @@ def test_flood_does_not_overwrite_joined_record(tmp_path):
     assert not state.is_blocked("acc", "LotteryBot", "act1")
 
 
-def test_state_flood_wait_cooldown_expiry(tmp_path):
+def test_state_flood_wait_cooldown_expiry(tmp_path, monkeypatch):
     from datetime import datetime, timedelta
+
+    import tg_signer.giveaway_state as state_mod
 
     state = GiveawayState(tmp_path)
     state.add("acc", "Bot", "p1", note="flood_wait:2688")
-    # 手动把时间戳改到冷却期之前
-    old = (datetime.now() - timedelta(seconds=FLOOD_COOLDOWN + 1)).isoformat(
-        timespec="seconds"
-    )
-    state._data["acc"][state._key("Bot", "p1")]["ts"] = old
+    assert state.is_blocked("acc", "Bot", "p1")
+    # 把「当前时间」推到冷却期之后：记录仍在，但不再视为阻塞
+    real_now = datetime.now()
+
+    class _AfterCooldown(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_now + timedelta(seconds=FLOOD_COOLDOWN + 1)
+
+    monkeypatch.setattr(state_mod, "datetime", _AfterCooldown)
     assert not state.is_blocked("acc", "Bot", "p1")
     # 已参与记录不受影响
     state.add("acc", "Bot", "p2", note="joined")
@@ -3054,13 +3061,10 @@ def test_check_win_message_ignores_nenmeibi_prize(tmp_path):
 def test_state_bots_for_orders_by_recency(tmp_path):
     """bots_for：按最近交互时间倒序返回账号参与过的 bot，大小写去重。"""
     state = GiveawayState(tmp_path)
-    state.add("acc", "BotAAA", "p1")
+    # AAA 最后一条后写入（同一秒内按 rowid 决胜负），排在最前
     state.add("acc", "BotBBB", "p2")
     state.add("acc", "BotAAA", "p3")
-    # 直接改 ts 模拟时间先后：p3(AAA) 最旧，BBB 居中，p1(AAA) 最新
-    state._data["acc"]["botaaa|p3"]["ts"] = "2026-10-01T10:00:00"
-    state._data["acc"]["botbbb|p2"]["ts"] = "2026-10-03T10:00:00"
-    state._data["acc"]["botaaa|p1"]["ts"] = "2026-10-05T10:00:00"
+    state.add("acc", "BotAAA", "p1")
     assert state.bots_for("acc") == ["BotAAA", "BotBBB"]
     assert state.bots_for("other") == []
 
