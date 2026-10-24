@@ -2527,6 +2527,22 @@ def test_bot_source_sweeps_only_target_bot(tmp_path):
     assert client.history_chats == ["BaibaoxiangCjBot"]
 
 
+def test_bot_source_click_confirm_without_auto_join(tmp_path):
+    """机器人任务强制关闭自动加群：跟进确认时未走加群分支也不应报未赋值。"""
+    import asyncio
+
+    engine, _state = _bot_engine(tmp_path)
+    engine.auto_join = False
+    client = FakeClient(bot_users={"BaibaoxiangCjBot"})
+    msg = _msg(
+        text=f"{BAIBAOXIANG_ELIGIBLE}\n📢 https://t.me/xing5517",
+        buttons=[[_btn("点击参与抽奖", callback_data="join")]],
+        id=11143,
+    )
+
+    asyncio.run(engine._click_confirm("deux", client, "BaibaoxiangCjBot", msg, "p1"))
+
+
 def test_bot_source_scan_skips_membership_and_respects_limit(tmp_path):
     """机器人私聊扫描：不尝试加入监控对象，且只回扫指定条数。"""
     import asyncio

@@ -3106,6 +3106,9 @@ class GiveawayEngine:
         await self._refresh_candidates_after_verification(
             account, client, username, candidates, param
         )
+        # 关闭自动加群时不会走 _auto_join_and_restart，这里必须先有默认值，
+        # 否则后面读取会触发 UnboundLocalError（机器人类型任务即此路径）
+        had_join_targets = False
         if self.auto_join:
             stop, had_join_targets, candidates = await self._auto_join_and_restart(
                 account, client, username, param, source_message, candidates
