@@ -637,6 +637,30 @@ def test_scan_now_stops_on_max_joins(tmp_path):
     assert any("本次参与 1 个" in line for line in logs)
 
 
+def test_scan_now_stops_at_scan_cap_when_keywords_miss(tmp_path):
+    """关键词全部未命中时按扫描上限截断，并发出 scan_cap 事件。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.scan_cap = 3
+    engine.chats = [123]
+    client = FakeClient(bot_users={"LotteryBot", "OtherBot"})
+    engine._clients = {"acc": client}
+    logs: list = []
+    engine.log = logs.append
+    events: list = []
+    engine.on_event = events.append
+    # 均不含关键词「抽奖」：不会触发已开奖止损，只能靠扫描上限截断
+    client.history = [
+        _msg(text=f"推广 https://t.me/LotteryBot?start=k{i}", id=i) for i in range(1, 6)
+    ]
+    asyncio.run(engine.scan_now())
+    assert client.started == []
+    assert any("已扫描 3 条" in line for line in logs)
+    caps = [e for e in events if e.get("type") == "scan_cap"]
+    assert caps == [{"type": "scan_cap", "account": "acc", "chat": "123", "cap": 3}]
+
+
 def test_scan_now_enumerates_all_pinned_messages(tmp_path):
     """群组可置顶多条消息：全部枚举处理并打印数量，get_chat 只给最新一条。"""
     import asyncio
@@ -1253,6 +1277,28 @@ def test_join_flood_wait_suspends_only_that_account(tmp_path):
     assert not engine._join_paused("other")
 
 
+def test_invite_flood_only_pauses_invite_links(tmp_path):
+    """私有邀请链接触发限流时只跳过邀请链接，@username 加入照常。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    engine._suspend_joins("acc", 259, "https://t.me/+T8kdoFXKC5o2NjY5")
+    assert not engine._join_paused("acc")
+    assert engine._invite_blocked("acc", "https://t.me/+AbCdEf123")
+    client = JoinClient()
+    msg = _msg(text="请先加入 https://t.me/+AbCdEf123 和 @ChanA")
+    joined_any, blocked = asyncio.run(
+        engine._join_from_message("acc", client, "LotteryBot", msg)
+    )
+    assert client.joined == ["ChanA"]
+    assert joined_any is True
+    assert blocked is False
+    assert any("邀请链接" in line and "259" in line for line in logs)
+    assert any("邀请链接加入限流中" in line for line in logs)
+
+
 def test_click_confirm_restarts_any_bot_with_join_targets(tmp_path, monkeypatch):
     """通用策略：任何 bot 消息含加入要求时，加入后自动重发一次 start。"""
     import asyncio
@@ -1460,7 +1506,7 @@ def test_click_confirm_join_paused_reports_incomplete(tmp_path, monkeypatch):
     logs: list = []
     engine.log = logs.append
     client = _CallbackClient(bot_users={"BaibaoxiangCjBot"})
-    engine._suspend_joins("acc", 259, "https://t.me/+T8kdoFXKC5o2NjY5")
+    engine._suspend_joins("acc", 259, "xbd5252a")
     msg = _msg(
         text="请先加入 https://t.me/NeedJoinCh 后重新参与",
         buttons=[
@@ -1507,7 +1553,7 @@ def test_participate_join_paused_not_recorded_as_participated(tmp_path, monkeypa
     engine.on_event = events.append
     engine.max_joins = 5
     client = _JoinRequiredReplyClient(bot_users={"BaibaoxiangCjBot"})
-    engine._suspend_joins("acc", 259, "https://t.me/+T8kdoFXKC5o2NjY5")
+    engine._suspend_joins("acc", 259, "xbd5252a")
 
     asyncio.run(engine._participate("acc", client, "BaibaoxiangCjBot", "hh1", "导航频道"))
 
@@ -3634,6 +3680,25 @@ def test_win_settings_roundtrip(tmp_path):
     assert load_win_forward_targets(tmp_path) == ["me"]
     (tmp_path / "webui_win_settings.json").write_text("{bad", encoding="utf-8")
     assert load_win_forward_targets(tmp_path) == ["me"]
+
+
+def test_scan_cap_setting_roundtrip(tmp_path):
+    """单频道扫描上限（全局设置）：默认 500，保存/读取往返，损坏文件回退默认。"""
+    from tg_signer.giveaway_core import DEFAULT_SCAN_CAP
+    from tg_signer.webui.giveaway import (
+        load_giveaway_scan_cap,
+        save_giveaway_scan_cap,
+    )
+
+    assert DEFAULT_SCAN_CAP == 500
+    assert load_giveaway_scan_cap(tmp_path) == 500
+    save_giveaway_scan_cap(tmp_path, 800)
+    assert load_giveaway_scan_cap(tmp_path) == 800
+    # 非法值（0/负数）回退为 1，避免上限失效
+    save_giveaway_scan_cap(tmp_path, 0)
+    assert load_giveaway_scan_cap(tmp_path) == 1
+    (tmp_path / "webui_win_settings.json").write_text("{bad", encoding="utf-8")
+    assert load_giveaway_scan_cap(tmp_path) == 500
 
 
 # ---------------- 防脚本验证（按顺序点击 emoji） ----------------

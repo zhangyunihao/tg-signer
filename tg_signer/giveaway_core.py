@@ -372,6 +372,9 @@ class GiveawayEngine:
         # {account: 恢复时刻（monotonic 秒）}，只影响触发限流的账号
         self._join_suspended: Dict[str, float] = {}
         self._join_suspend_logged: set = set()
+        # 私有邀请链接（+hash）单独计数：这类加入被限时不暂停 @username 加入
+        self._invite_suspended: Dict[str, float] = {}
+        self._invite_suspend_logged: set = set()
         # PEER_FLOOD 强制限流账号：本轮运行停止该账号的一切加入与参与
         self._peer_flood_accounts: set = set()
         # 频道/群组已满提醒去重：本轮运行每账号只回报一次（WebUI 据此自动退频道）
@@ -578,6 +581,8 @@ class GiveawayEngine:
         self._join_cache.clear()
         self._join_suspended.clear()
         self._join_suspend_logged.clear()
+        self._invite_suspended.clear()
+        self._invite_suspend_logged.clear()
         self._peer_flood_accounts.clear()
         self._join_events.clear()
         self._last_resolve_at.clear()
@@ -840,8 +845,7 @@ class GiveawayEngine:
                 scanned += 1
                 if scanned > hard_cap:
                     self.log(
-                        f"[{account}] {chat} 已扫描 "
-                        f"{hard_cap} 条，停止该频道本轮扫描"
+                        f"[{account}] {chat} 已扫描 {hard_cap} 条，停止该频道本轮扫描"
                     )
                     if self.source_type != "bot":
                         # 达到全局扫描上限：通知消息中心，避免任务静默截断
@@ -1958,21 +1962,61 @@ class GiveawayEngine:
         else:
             self._join_events.setdefault(account, []).append(time.time())
 
+    @staticmethod
+    def _is_invite_target(target: Any) -> bool:
+        """私有邀请链接（t.me/+hash、joinchat、http(s)://）目标。"""
+        text = str(target or "").strip().lower()
+        return text.startswith(("http://", "https://")) or "joinchat" in text
+
     def _suspend_joins(self, account: str, wait: int, target: Any = "") -> None:
-        """加入触发 FLOOD_WAIT：只暂停该账号的加入，其它账号照常。"""
+        """加入触发 FLOOD_WAIT：只暂停该账号的加入，其它账号照常。
+
+        私有邀请链接的限流通常只作用于 ImportChatInvite，不波及 @username
+        的 JoinChannel，因此单独暂停：期间邀请链接跳过，用户名加入继续。
+        """
         pause = max(1, int(wait)) + self.join_flood_buffer
         until = time.monotonic() + pause
+        resume_at = datetime.now() + timedelta(seconds=pause)
+        if self._is_invite_target(target):
+            self._invite_suspended[account] = max(
+                self._invite_suspended.get(account, 0.0), until
+            )
+            self._invite_suspend_logged.discard(account)
+            self.log(
+                f"[{account}] 邀请链接加入 {target} 触发限流（需等待 {wait} 秒），"
+                f"邀请链接暂停至 {resume_at:%H:%M}（@username 加入照常）"
+            )
+            return
         self._join_suspended[account] = max(
             self._join_suspended.get(account, 0.0), until
         )
         self._join_suspend_logged.discard(account)
-        resume_at = datetime.now() + timedelta(seconds=pause)
         self.log(
             f"[{account}] 加入 {target} 触发限流（需等待 {wait} 秒），"
             f"本账号自动加入暂停至 {resume_at:%H:%M}"
         )
 
-    async def _join_ready(self, account: str) -> bool:
+    def _invite_blocked(self, account: str, target: Any) -> bool:
+        """该目标是否因邀请链接限流而被挡住（仅影响邀请链接目标）。"""
+        if not self._is_invite_target(target):
+            return False
+        until = self._invite_suspended.get(account)
+        if until is None:
+            return False
+        left = until - time.monotonic()
+        if left <= 0:
+            self._invite_suspended.pop(account, None)
+            return False
+        if account not in self._invite_suspend_logged:
+            self._invite_suspend_logged.add(account)
+            resume_at = datetime.now() + timedelta(seconds=left)
+            self.log(
+                f"[{account}] 邀请链接加入限流暂停中，恢复时间 "
+                f"{resume_at:%H:%M}（期间只跳过邀请链接，@username 照常）"
+            )
+        return True
+
+    async def _join_ready(self, account: str, target: Any = "") -> bool:
         """加入前统一闸门，返回是否允许本次加入（需要时已按节奏等待）。
 
         - PEER_FLOOD 账号：直接拒绝
@@ -1981,6 +2025,8 @@ class GiveawayEngine:
         - 相邻两次加入的最小随机间隔：不足则先 sleep 补齐
         """
         if account in self._peer_flood_accounts:
+            return False
+        if self._invite_blocked(account, target):
             return False
         until = self._join_suspended.get(account)
         if until is not None:
@@ -2502,7 +2548,14 @@ class GiveawayEngine:
         self, account: str, client: Any, target: str, label: str
     ) -> Tuple[bool, bool]:
         """加入单个目标，返回（是否发生加入，是否因限流/配额中断后续目标）。"""
-        if not await self._join_ready(account):
+        if not await self._join_ready(account, target):
+            if self._invite_blocked(account, target):
+                # 邀请链接限流只挡这一条，继续处理后面的 @username 目标
+                self.log(
+                    f"[{account}] 邀请链接加入限流中，跳过 {target}"
+                    "（@username 加入照常）"
+                )
+                return False, False
             return False, True
         # 闸门放行后先记账：Telegram 按请求次数限流，失败请求同样消耗额度
         self._note_join_attempt(account)
@@ -2856,7 +2909,9 @@ class GiveawayEngine:
         last_exc: Optional[Exception] = None
         for cand in candidates:
             # 与消息链接加入共用同一闸门：配额/限流期间整体暂停，恢复后重试
-            if not await self._join_ready(account):
+            if not await self._join_ready(account, cand):
+                if self._invite_blocked(account, cand):
+                    continue  # 仅邀请链接被限，继续试下一个候选（如 @username）
                 return
             self._note_join_attempt(account)
             try:
