@@ -34,9 +34,11 @@ from tg_signer.webui.data import (
 from tg_signer.webui.giveaway import (
     giveaway_block,
     list_known_channels,
+    load_giveaway_scan_cap,
     load_giveaway_timeout_min,
     load_win_forward_targets,
     load_win_sweep_limit,
+    save_giveaway_scan_cap,
     save_giveaway_timeout_min,
     save_win_forward_targets,
     save_win_sweep_limit,
@@ -60,13 +62,13 @@ AUTH_STORAGE_KEY = "tg_signer_gui_auth_code"
 
 def log_block(card: Optional[ui.card] = None) -> Callable[[], None]:
     """日志查看卡片；传入外部弹窗卡片（card）时提供全屏显示切换。"""
-    with ui.card().classes("w-full shadow-sm"):
+    with ui.card().classes("w-full shadow-sm tgs-log-card"):
         ui.label("日志查看").classes("text-md font-semibold")
         ui.label("查看最新日志行，可自定义文件路径和行数。").classes(
             "text-sm text-gray-500 mb-1"
         )
 
-        with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+        with ui.row().classes("tgs-log-controls items-end w-full gap-3 flex-wrap"):
             limit_input = ui.number(
                 label="日志行数",
                 value=state.log_limit,
@@ -332,7 +334,6 @@ def _build_dashboard(container) -> None:
             _logs_built = True
             with logs_card:
                 ui.label("日志").classes("text-lg font-semibold")
-                ui.label("查看日志文件的最新行。").classes("text-gray-600")
                 logs_refresh = log_block(logs_card)
                 refreshers.append(logs_refresh)
                 logs_refresh()
@@ -400,6 +401,20 @@ def _build_dashboard(container) -> None:
                     max=10080,
                     precision=0,
                 ).classes("w-full")
+                # 单频道扫描上限（全局）：关键词未命中时也按该条数截断
+                ui.label("单频道扫描上限（条）").classes("text-lg font-semibold mt-2")
+                ui.label(
+                    "每个频道/群组每轮最多回溯多少条历史消息"
+                    "（关键词未命中时同样生效，达到上限会写入消息中心提醒，"
+                    "默认 500）。"
+                ).classes("text-xs text-gray-500")
+                scan_cap_input = ui.number(
+                    label="扫描上限（条）",
+                    value=load_giveaway_scan_cap(state.workdir),
+                    min=1,
+                    max=10000,
+                    precision=0,
+                ).classes("w-full")
                 with ui.row().classes("w-full justify-end gap-2"):
                     ui.button("取消", on_click=dialog.close).props("outline")
                     ui.button(
@@ -414,6 +429,7 @@ def _build_dashboard(container) -> None:
                             save_giveaway_timeout_min(
                                 state.workdir, timeout_input.value
                             ),
+                            save_giveaway_scan_cap(state.workdir, scan_cap_input.value),
                             ui.notify(
                                 "设置已保存，新启动的抽奖任务生效", type="positive"
                             ),
@@ -582,14 +598,14 @@ def _build_dashboard(container) -> None:
             with panel_random:
                 ui.label(
                     "多账号随机发言：选择账号与目标群组，按固定间隔从内置语库随机发送消息。"
-                ).classes("text-gray-600")
+                ).classes("text-gray-600 tgs-tab-intro")
                 refreshers.append(random_chat_block(state.workdir))
 
         def _build_leave_panel() -> None:
             with panel_leave:
                 ui.label(
                     "批量退出长期不更新的频道：扫描账号对话，预览确认后并发批量退出。"
-                ).classes("text-gray-600")
+                ).classes("text-gray-600 tgs-tab-intro")
                 refreshers.append(auto_leave_block(state.workdir))
 
         def _build_giveaway_panel() -> None:
@@ -597,7 +613,7 @@ def _build_dashboard(container) -> None:
                 ui.label(
                     "自动参与频道抽奖：监听 t.me 抽奖机器人链接（?start= 参数），"
                     "实时新帖与手动扫描两种方式触发，支持多账号与指定频道列表。"
-                ).classes("text-gray-600")
+                ).classes("text-gray-600 tgs-tab-intro")
                 refreshers.append(giveaway_block(state.workdir))
 
         def _ensure_configs() -> None:
@@ -954,6 +970,63 @@ def build_ui(auth_code: str = None) -> None:
             .tgs-mobile-cards { display: none !important; }
             @media (max-width: 640px) {
                 .nicegui-content { padding: 8px !important; }
+                /* 移动端排版压缩：说明文字与页面标题各缩一档，区块间距收紧 */
+                .nicegui-content .text-sm {
+                    font-size: 12.5px;
+                    line-height: 1.5;
+                }
+                .nicegui-content .text-lg { font-size: 17px; line-height: 1.4; }
+                .q-dialog .text-lg { font-size: 17px; }
+                .nicegui-content .gap-3 { gap: 8px !important; }
+                /* 弹窗内各区块间距由 16px 收到 10px，一屏能看到更多设置项 */
+                .q-dialog .q-card { gap: 10px; }
+                /* 弹窗里嵌套的卡片去掉阴影与内边距，直接铺在弹窗白底上 */
+                .q-dialog .tgs-log-card,
+                .q-dialog .tgs-account-card {
+                    box-shadow: none !important;
+                    background: transparent !important;
+                    border: 0 !important;
+                    padding: 0 !important;
+                }
+                /* 顶部与区块内说明重复，移动端隐藏 tab 级提示，省出首屏空间 */
+                .tgs-tab-intro { display: none !important; }
+                /* 子任务明细行：移动端允许换行，长群名/ID 不再横向截断 */
+                .tgs-detail-line {
+                    white-space: pre-wrap !important;
+                    overflow-wrap: anywhere;
+                    line-height: 1.4;
+                }
+                /* 日志控件全部整行铺开，输入框与级别按钮不再挤在一起 */
+                .tgs-log-controls {
+                    display: grid !important;
+                    grid-template-columns: minmax(0, 1fr);
+                    gap: 6px !important;
+                    align-items: stretch;
+                }
+                .tgs-log-controls > * { width: 100% !important; min-width: 0 !important; }
+                .tgs-log-controls .q-btn-group { width: 100%; }
+                .tgs-log-controls .q-btn-group > .q-btn {
+                    flex: 1 1 0;
+                    padding: 0 2px;
+                    font-size: 12px;
+                }
+                /* 日志弹窗内日志区随视口收缩，让操作按钮尽量留在首屏 */
+                .q-dialog .tgs-log-area { max-height: 42dvh !important; }
+                /* 账户卡片首行不换行：名称可省略，图标按钮固定在右侧 */
+                .account-card-head { gap: 2px; }
+                .account-card-head .q-toggle { flex: 1 1 auto; min-width: 0; }
+                .account-card-head .q-toggle__label {
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                }
+                .account-card-head > .q-btn { flex: 0 0 auto; }
+                .accounts-grid .q-btn {
+                    min-width: 30px;
+                    min-height: 30px;
+                    padding: 3px;
+                }
+                .accounts-grid > div { padding: 6px 8px !important; gap: 2px !important; }
                 /* 移动端：隐藏横滑宽表，改显纵向卡片列表 */
                 .tgs-desktop-table { display: none !important; }
                 .tgs-mobile-cards { display: flex !important; }
@@ -962,6 +1035,32 @@ def build_ui(auth_code: str = None) -> None:
                 .mobile-list-card .q-card__section { padding: 0; }
                 .mobile-card-actions { gap: 6px; }
                 .mobile-card-actions .q-btn { flex: 1 1 0; min-width: 0; }
+                /* 卡片字段网格：短字段两列并排、长字段整行，标签定宽供上下对齐 */
+                .tgs-fields {
+                    display: grid;
+                    width: 100%;
+                    grid-template-columns: repeat(2, minmax(0, 1fr));
+                    column-gap: 12px;
+                    row-gap: 1px;
+                }
+                .tgs-field {
+                    display: flex;
+                    align-items: flex-start;
+                    gap: 6px;
+                    min-width: 0;
+                    font-size: 12px;
+                    line-height: 1.45;
+                }
+                .tgs-field-full { grid-column: 1 / -1; }
+                .tgs-field-k { flex: 0 0 52px; color: #6b7280; }
+                .tgs-field-v {
+                    flex: 1 1 auto;
+                    min-width: 0;
+                    color: #374151;
+                    overflow-wrap: anywhere;
+                }
+                .tgs-field-pre { white-space: pre-line; }
+                .mobile-card-actions { margin-top: 2px; }
                 /* 顶部主标签：tab 与右上三点按钮同行（flex 布局自动分配宽度），
                    tab 栏占满剩余空间，隐藏版本号让出空间 */
                 .tgs-header-version { display: none; }

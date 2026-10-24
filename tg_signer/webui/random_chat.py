@@ -24,6 +24,7 @@ from tg_signer.webui.common import (
     attach_select_all,
     copy_text_to_clipboard,
     format_duration,
+    mobile_card_fields,
     with_select_all,
 )
 from tg_signer.webui.data import (
@@ -849,7 +850,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         return _log
 
     def _set_account_options() -> None:
-        session_dir = Path(session_dir_input.value or ".")
+        session_dir = Path(default_session_dir or ".")
         names = list_session_names(session_dir, workdir)
         account_select.options = with_select_all(
             build_account_options(session_dir, names)
@@ -857,7 +858,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         account_select.update()
 
     def refresh_options() -> None:
-        session_dir = Path(session_dir_input.value or ".")
+        session_dir = Path(default_session_dir or ".")
         _set_account_options()
         names = list_session_names(session_dir, workdir)
         # 后台懒检测未授权账户，完成后刷新 ⚠️ 标注
@@ -905,7 +906,6 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
 
     def duplicate_task(name: str) -> None:
         cfg = tasks[name]
-        session_dir_input.value = str(cfg["session_dir"])
         account_select.value = list(cfg["accounts"])
         chat_input.value = str(cfg["chat_id"])
         interval_input.value = cfg["interval"]
@@ -916,7 +916,6 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         repeat_interval_input.value = int(cfg.get("repeat_interval") or 0) // 60
         phrases_input.value = "\n".join(cfg.get("custom_phrases") or [])
         for el in (
-            session_dir_input,
             account_select,
             chat_input,
             interval_input,
@@ -1031,7 +1030,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             # 轮次间的等待时间：界面按分钟填写，落盘统一存秒
             # （等待期间全部账号已断开，不占用数据库）
             "repeat_interval": max(0, int(repeat_interval_input.value or 0)) * 60,
-            "session_dir": str(Path(session_dir_input.value or ".")),
+            "session_dir": str(Path(default_session_dir or ".")),
             # 空列表 = 发送时使用内置语库
             "custom_phrases": custom_phrases,
         }
@@ -1283,24 +1282,19 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                                 f"color={'info' if running else 'grey-6'}"
                             )
                             card_badges[n] = badge
-                        ui.label(f"账号：{row['accounts']}").classes(
-                            "text-xs text-gray-600"
+                        mobile_card_fields(
+                            [
+                                ("账号", row["accounts"], True),
+                                ("群组", row["chat"], True),
+                                ("间隔", row["interval"]),
+                                ("删除延迟", row["delete_after"]),
+                                ("账号条数", row["total"]),
+                                ("语库", row["phrases"]),
+                                ("重复", row["repeat"]),
+                                ("执行时长", row["duration"]),
+                                ("执行时间", row["last_time"], True),
+                            ]
                         )
-                        ui.label(f"群组：{row['chat']}").classes(
-                            "text-xs text-gray-600"
-                        )
-                        ui.label(
-                            f"间隔：{row['interval']}　删除延迟：{row['delete_after']}"
-                        ).classes("text-xs text-gray-600")
-                        ui.label(
-                            f"每账号条数：{row['total']}　语库：{row['phrases']}"
-                        ).classes("text-xs text-gray-600")
-                        ui.label(f"重复：{row['repeat']}").classes(
-                            "text-xs text-gray-600"
-                        )
-                        ui.label(
-                            f"执行时间：{row['last_time']}　执行时长：{row['duration']}"
-                        ).classes("text-xs text-gray-600")
                         with ui.row().classes("w-full mobile-card-actions"):
                             if not running:
                                 ui.button(
@@ -1478,9 +1472,6 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         add_dialog_close_button(add_dlg)
         ui.label("添加任务").classes("text-lg font-semibold")
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
-            session_dir_input = ui.input(
-                label="会话目录（.session 所在目录）", value=default_session_dir
-            ).classes("w-56")
             account_select = (
                 ui.select(
                     label="选择账号（可多选）",
@@ -1499,7 +1490,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 accounts = list(account_select.value or [])
                 if not accounts:
                     accounts = list_session_names(
-                        Path(session_dir_input.value or "."), workdir
+                        Path(default_session_dir or "."), workdir
                     )
                 if not accounts:
                     ui.notify("没有可用账号", type="warning")
@@ -1513,7 +1504,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                     _log(f"开始从 Telegram 更新 {len(accounts)} 个账号的群组列表...")
                     for a in accounts:
                         await update_account_chats(
-                            a, Path(session_dir_input.value or "."), workdir, _log
+                            a, Path(default_session_dir or "."), workdir, _log
                         )
                     refresh_options()
                     ui.notify("群组列表已从 Telegram 更新", type="positive")

@@ -30,11 +30,13 @@ from tg_signer.webui.giveaway import (
     channel_title_map,
     format_channels_full_alert,
     format_join_alert,
+    format_scan_cap_alert,
     format_speak_alert,
     format_speech_alert,
     format_win_alert,
     load_channels_full_alerts,
     load_join_alerts,
+    load_scan_cap_alerts,
     load_speak_alerts,
     load_speech_alerts,
     load_win_alerts,
@@ -187,6 +189,21 @@ def collect_messages(workdir) -> List[dict]:
                 "account": acct,
                 "time": time_str,
                 "text": format_channels_full_alert(a),
+            }
+        )
+    # 1.6) 单频道扫描达到全局上限（本轮扫描已截断）
+    for a in load_scan_cap_alerts(wd):
+        acct = str(a.get("account") or "")
+        chat = str(a.get("chat") or "")
+        time_str = str(a.get("time") or "")
+        messages.append(
+            {
+                "key": f"scan_cap|{acct}|{chat}|{time_str}",
+                "tag": "扫描上限",
+                "color": "orange",
+                "account": acct,
+                "time": time_str,
+                "text": format_scan_cap_alert(a),
             }
         )
     # 2) 抽奖过程记录的未完成发言任务（口令发送失败，发送成功后自动消除）

@@ -177,6 +177,7 @@ async def run_giveaway(spec: dict) -> int:
         return 2
     from tg_signer.webui.data import chat_username_map, load_two_way_accounts
     from tg_signer.webui.giveaway import (
+        load_giveaway_scan_cap,
         load_win_forward_targets,
         load_win_sweep_limit,
     )
@@ -198,6 +199,8 @@ async def run_giveaway(spec: dict) -> int:
     ]
     # 中奖回扫条数：全局设置，回扫各 bot 私聊最近 N 条消息找中奖通知
     kwargs["win_sweep_limit"] = load_win_sweep_limit(workdir)
+    # 频道/群组单轮扫描上限：全局设置，关键词未命中时也按此条数截断
+    kwargs["scan_cap"] = load_giveaway_scan_cap(workdir)
     engine = GiveawayEngine()
     finished = asyncio.Event()
 
@@ -227,6 +230,12 @@ async def run_giveaway(spec: dict) -> int:
 
 
 def main() -> None:
+    # Windows 下 stdout 为管道时默认按 GBK 编码，WebUI 侧按 UTF-8 解码会导致中文日志乱码
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     if len(sys.argv) < 2:
         print("缺少自动抽奖任务参数", flush=True)
         raise SystemExit(2)

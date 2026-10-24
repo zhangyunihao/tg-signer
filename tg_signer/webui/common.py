@@ -147,6 +147,42 @@ def add_dialog_close_button(dlg: ui.dialog) -> None:
             ).classes("dialog-close-fab")
 
 
+def mobile_card_fields(fields: list[tuple]) -> None:
+    """移动端卡片字段网格：两列排布，标签定宽浅灰、内容深灰自动换行。
+
+    每项为 (标签, 内容, 是否整行)；内容按纯文本转义，None/空串显示为「—」。
+    """
+    from html import escape
+
+    cells = []
+    for item in fields:
+        label, value = item[0], item[1]
+        full = bool(item[2]) if len(item) > 2 else False
+        text = "—" if value is None or value == "" else str(value)
+        cls = "tgs-field tgs-field-full" if full else "tgs-field"
+        cells.append(
+            f'<div class="{cls}">'
+            f'<span class="tgs-field-k">{escape(str(label))}</span>'
+            f'<span class="tgs-field-v">{escape(text)}</span>'
+            "</div>"
+        )
+    ui.html(f'<div class="tgs-fields">{"".join(cells)}</div>').classes("w-full")
+
+
+def mobile_card_result(label: str, text: object, *, runres: str = "") -> None:
+    """移动端卡片整行结果字段：保留换行，runres 用于运行中按任务 id 实时改写。"""
+    from html import escape
+
+    attr = f' data-runres="{escape(str(runres), quote=True)}"' if runres else ""
+    ui.html(
+        '<div class="tgs-field tgs-field-full">'
+        f'<span class="tgs-field-k">{escape(str(label))}</span>'
+        f'<span class="tgs-field-v tgs-field-pre"{attr}>'
+        f"{escape('' if text is None else str(text))}</span>"
+        "</div>"
+    ).classes("w-full tgs-result")
+
+
 # 账号多选下拉的「全选」虚拟项：出现在选项最顶部，勾选后自动展开为全部账号
 SELECT_ALL_KEY = "__select_all__"
 

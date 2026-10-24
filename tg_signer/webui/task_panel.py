@@ -1,5 +1,4 @@
 import asyncio
-import html as html_lib
 import json
 import logging
 import os
@@ -29,6 +28,8 @@ from tg_signer.webui.common import (
     attach_select_all,
     build_debug_report,
     copy_text_to_clipboard,
+    mobile_card_fields,
+    mobile_card_result,
     notify_error,
     pretty_json,
     read_file_tail,
@@ -731,27 +732,30 @@ class TaskRunnerBlock:
             shown = self.history_rows[: self._cards_limit]
             if not shown:
                 ui.label("暂无记录").classes("text-sm text-gray-400")
-            for row in shown:
+            for idx, row in enumerate(shown, 1):
                 with ui.card().classes("w-full mobile-list-card border"):
-                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                        status = row.get("status") or "未知"
-                        ui.badge(status).props(f"color={self._status_color(status)}")
-                        ui.label(row.get("task") or "-").classes(
-                            "text-base font-semibold"
+                    with ui.row().classes(
+                        "w-full items-center gap-2 no-wrap justify-between"
+                    ):
+                        ui.label(f"任务 #{idx} · {row.get('task') or '-'}").classes(
+                            "text-base font-semibold truncate min-w-0"
                         )
-                    ui.label(row.get("time") or "").classes("text-xs text-gray-400")
-                    ui.label(f"执行时长：{row.get('duration') or '—'}").classes(
-                        "text-xs text-gray-600"
+                        status = row.get("status") or "未知"
+                        ui.badge(status).props(
+                            f"color={self._status_color(status)}"
+                        ).classes("shrink-0")
+                    mobile_card_fields(
+                        [
+                            ("类型", row.get("type")),
+                            ("执行时长", row.get("duration")),
+                            ("账号", row.get("accounts"), True),
+                            ("执行时间", row.get("time"), True),
+                        ]
                     )
-                    ui.label(
-                        f"类型：{row.get('type') or '-'}　账号：{row.get('accounts') or '-'}"
-                    ).classes("text-xs text-gray-600")
-                    result = row.get("result") or ""
-                    ui.html(
-                        '<div class="text-xs text-gray-700" '
-                        f'data-runres="{html_lib.escape(str(row.get("id") or ""), quote=True)}" '
-                        f'style="white-space: pre-line; overflow-wrap: anywhere;">'
-                        f"{html_lib.escape(result)}</div>"
+                    mobile_card_result(
+                        "结果",
+                        row.get("result") or "",
+                        runres=str(row.get("id") or ""),
                     )
                     with ui.row().classes("w-full mobile-card-actions"):
                         ui.button(
@@ -1365,7 +1369,9 @@ class TaskRunnerBlock:
                         )
                         ui.label(
                             f"{mark} {d.get('account', '')} → {d.get('chat', '')}：{status}"
-                        ).classes(f"text-sm py-0.5 {color}").style("white-space: pre;")
+                        ).classes(f"text-sm py-0.5 tgs-detail-line {color}").style(
+                            "white-space: pre;"
+                        )
                 list_container.update()
 
             render()

@@ -368,7 +368,7 @@ def user_info_block() -> Callable[[], None]:
         two_ways = load_two_way_accounts(state.workdir)
         with container:
             # —— 账户管理 ——
-            with ui.card().classes("w-full shadow-sm"):
+            with ui.card().classes("w-full shadow-sm tgs-account-card"):
                 with ui.row().classes("w-full items-center justify-between"):
                     with ui.row().classes("items-center gap-1"):
                         ui.label("账户管理").classes("text-lg font-semibold")
@@ -525,7 +525,8 @@ def user_info_block() -> Callable[[], None]:
                         for pos, name in enumerate(names):
                             with ui.column().classes("border rounded p-2 gap-1"):
                                 with ui.row().classes(
-                                    "w-full items-center justify-between"
+                                    "w-full items-center justify-between no-wrap "
+                                    "account-card-head"
                                 ):
                                     ui.switch(
                                         name,

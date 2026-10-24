@@ -10,7 +10,6 @@
 """
 
 import asyncio
-import html as html_lib
 import json
 import logging
 import time
@@ -28,6 +27,8 @@ from tg_signer.webui.common import (
     attach_select_all,
     copy_text_to_clipboard,
     format_duration,
+    mobile_card_fields,
+    mobile_card_result,
     with_select_all,
 )
 from tg_signer.webui.random_chat import (
@@ -1003,26 +1004,37 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 )
             for row in shown:
                 with ui.card().classes("w-full mobile-list-card border"):
-                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    with ui.row().classes(
+                        "w-full items-center gap-2 no-wrap justify-between"
+                    ):
+                        with ui.row().classes("items-center gap-2 no-wrap min-w-0"):
+                            ui.label(f"任务 #{row['seq']}").classes(
+                                "text-base font-semibold"
+                            )
+                            if row.get("auto"):
+                                ui.badge("自动").props("color=teal")
                         ui.badge(row["status"]).props(
                             f"color={_status_color(row['status'])}"
                         )
-                        ui.label(f"任务 #{row['seq']}").classes(
-                            "text-base font-semibold"
-                        )
-                        if row.get("auto"):
-                            ui.badge("自动").props("color=teal")
-                    ui.label(f"账号：{row['accounts']}").classes(
-                        "text-xs text-gray-600"
+                    duration = row["duration"]
+                    time_text = (
+                        f"{row['start_time']}（耗时 {duration}）"
+                        if duration and duration != "—"
+                        else row["start_time"]
                     )
-                    ui.label(
-                        f"执行时间：{row['start_time']}　执行时长：{row['duration']}"
-                    ).classes("text-xs text-gray-600")
-                    ui.html(
-                        '<div class="text-xs text-gray-700" '
-                        f'data-runres="{html_lib.escape(str(row["id"] or ""), quote=True)}" '
-                        'style="white-space: pre-line; overflow-wrap: anywhere;">'
-                        f"{html_lib.escape(str(row['result'] or ''))}</div>"
+                    mobile_card_fields(
+                        [
+                            ("账号", row["accounts"], True),
+                            ("执行时间", time_text, True),
+                        ]
+                    )
+                    result_text = str(row["result"] or "")
+                    if result_text.startswith("完成："):
+                        result_text = result_text.removeprefix("完成：")
+                    mobile_card_result(
+                        "结果",
+                        result_text,
+                        runres=str(row["id"] or ""),
                     )
                     with ui.row().classes("w-full mobile-card-actions"):
                         ui.button(

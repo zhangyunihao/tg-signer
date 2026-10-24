@@ -16,6 +16,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from nicegui import ui
 
 from tg_signer.giveaway_core import (
+    DEFAULT_SCAN_CAP,
     JOIN_DAILY_CAP,
     JOIN_FLOOD_BUFFER,
     JOIN_HOURLY_CAP,
@@ -33,6 +34,7 @@ from tg_signer.webui.common import (
     build_debug_report,
     copy_text_to_clipboard,
     format_duration,
+    mobile_card_fields,
     pretty_json,
     read_file_tail,
     with_select_all,
@@ -110,6 +112,9 @@ WIN_ALERTS_MAX = 200
 # 账号已加入频道/群组达到 Telegram 上限的提醒（持久化，按账号去重）
 CHANNELS_FULL_ALERTS_FILE = "webui_channels_full_alerts.json"
 CHANNELS_FULL_ALERTS_MAX = 200
+# 单频道扫描达到上限的提醒（持久化，按账号+频道去重，只保留最新一条）
+SCAN_CAP_ALERTS_FILE = "webui_scan_cap_alerts.json"
+SCAN_CAP_ALERTS_MAX = 200
 # 中奖提醒全局设置（消息中心配置，所有任务共用）：转发目标 + Server酱 SendKey
 WIN_SETTINGS_FILE = "webui_win_settings.json"
 
@@ -171,6 +176,9 @@ _SPEECH_ALERTS = _AlertStore(SPEECH_ALERTS_FILE, SPEECH_ALERTS_MAX, "未达标�
 _WIN_ALERTS = _AlertStore(WIN_ALERTS_FILE, WIN_ALERTS_MAX, "中奖提醒")
 _CHANNELS_FULL_ALERTS = _AlertStore(
     CHANNELS_FULL_ALERTS_FILE, CHANNELS_FULL_ALERTS_MAX, "频道已满提醒"
+)
+_SCAN_CAP_ALERTS = _AlertStore(
+    SCAN_CAP_ALERTS_FILE, SCAN_CAP_ALERTS_MAX, "扫描上限提醒"
 )
 
 
@@ -258,6 +266,21 @@ def format_channels_full_alert(a: dict) -> str:
     )
 
 
+def load_scan_cap_alerts(workdir) -> List[dict]:
+    return _SCAN_CAP_ALERTS.load(workdir)
+
+
+def save_scan_cap_alerts(workdir, alerts: List[dict]) -> None:
+    _SCAN_CAP_ALERTS.save(workdir, alerts)
+
+
+def format_scan_cap_alert(a: dict) -> str:
+    return (
+        f"账号 {a.get('account')} 扫描「{a.get('chat')}」达到单轮上限 "
+        f"{a.get('cap')} 条，已停止该频道本轮扫描（{a.get('time')}）"
+    )
+
+
 def _alert_time() -> str:
     return f"{datetime.now():%m-%d %H:%M:%S}"
 
@@ -283,6 +306,30 @@ JOIN_ALERT_KEY = ("account", "chat")
 SPEAK_ALERT_KEY = ("account", "group", "password")
 SPEECH_ALERT_KEY = ("account", "bot", "group", "required", "title")
 CHANNELS_FULL_ALERT_KEY = ("account",)
+SCAN_CAP_ALERT_KEY = ("account", "chat")
+
+
+def _handle_scan_cap_event(client, workdir, ev: dict) -> None:
+    """单频道扫描达到上限：写入消息中心并弹顶部提醒（按账号+频道去重）。"""
+    acct = str(ev.get("account") or "")
+    chat = str(ev.get("chat") or "")
+    try:
+        cap = int(ev.get("cap"))
+    except (TypeError, ValueError):
+        return
+    if not acct or not chat:
+        return
+    alerts = _drop_alert(
+        load_scan_cap_alerts(workdir), SCAN_CAP_ALERT_KEY, f"{acct}|{chat}"
+    )
+    alerts.insert(
+        0,
+        {"account": acct, "chat": chat, "cap": cap, "time": _alert_time()},
+    )
+    save_scan_cap_alerts(workdir, alerts)
+    _notify_alert(
+        client, format_scan_cap_alert(alerts[0]), "warning", "推送扫描上限提醒失败"
+    )
 
 
 def _handle_channels_full_event(client, workdir, ev: dict) -> None:
@@ -412,7 +459,7 @@ def _handle_speech_event(client, workdir, ev: dict) -> None:
 
 
 def handle_giveaway_event(client, workdir, ev: dict) -> None:
-    """引擎事件分发：中奖 / 加入失败或解除 / 口令 / 发言数 / 频道已满。"""
+    """引擎事件分发：中奖 / 加入失败或解除 / 口令 / 发言数 / 频道已满 / 扫描上限。"""
     etype = ev.get("type")
     if etype == "win":
         _handle_win_event(client, workdir, ev)
@@ -424,6 +471,8 @@ def handle_giveaway_event(client, workdir, ev: dict) -> None:
         _handle_speech_event(client, workdir, ev)
     elif etype == "channels_full":
         _handle_channels_full_event(client, workdir, ev)
+    elif etype == "scan_cap":
+        _handle_scan_cap_event(client, workdir, ev)
 
 
 def load_win_forward_targets(workdir) -> List[str]:
@@ -536,6 +585,36 @@ def save_giveaway_timeout_min(workdir, val) -> None:
         atomic_write_json(path, data)
     except (OSError, ValueError):
         logger.debug("写入抽奖任务超时失败", exc_info=True)
+
+
+def load_giveaway_scan_cap(workdir) -> int:
+    """频道/群组单轮单频道扫描上限（全局设置），默认 DEFAULT_SCAN_CAP。"""
+    path = Path(workdir) / WIN_SETTINGS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return DEFAULT_SCAN_CAP
+    try:
+        val = int(data.get("giveaway_scan_cap"))  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return DEFAULT_SCAN_CAP
+    return val if val > 0 else DEFAULT_SCAN_CAP
+
+
+def save_giveaway_scan_cap(workdir, val) -> None:
+    """保存单频道扫描上限（条），保留文件中其他键。"""
+    path = Path(workdir) / WIN_SETTINGS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    try:
+        data["giveaway_scan_cap"] = max(1, int(val))
+        atomic_write_json(path, data)
+    except (OSError, ValueError):
+        logger.debug("写入单频道扫描上限失败", exc_info=True)
 
 
 # 任务配置字段 -> 默认值，加载旧配置时补齐缺失字段
@@ -752,7 +831,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
     def chat_display(cid) -> str:
         title = chat_title_map.get(str(cid))
-        return f"{title} ({cid})" if title else str(cid)
+        # 监控对象只展示标题，不附带会话 id，避免移动端卡片被长 id 挤占
+        return title or str(cid)
 
     def make_log(name: str) -> Callable[[str], None]:
         log_file = Path(workdir) / "logs" / "giveaway.log"
@@ -784,7 +864,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         return _log
 
     def _set_account_options() -> None:
-        session_dir = Path(session_dir_input.value or ".")
+        session_dir = Path(default_session_dir or ".")
         names = list_session_names(session_dir, workdir)
         account_select.options = with_select_all(
             build_account_options(session_dir, names)
@@ -809,7 +889,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         channel_select.update()
 
     def refresh_options() -> None:
-        session_dir = Path(session_dir_input.value or ".")
+        session_dir = Path(default_session_dir or ".")
         _set_account_options()
         names = list_session_names(session_dir, workdir)
         schedule_auth_checks(session_dir, names, on_done=_set_account_options)
@@ -867,7 +947,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     def duplicate_task(name: str) -> None:
         cfg = tasks[name]
         source_type = str(cfg.get("source_type") or SOURCE_CHANNEL)
-        session_dir_input.value = str(cfg["session_dir"])
         account_select.value = list(cfg["accounts"])
         refresh_options()
         source_type_toggle.value = source_type
@@ -900,7 +979,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         _apply_rescue_visibility()
         _apply_source_visibility()
         for el in (
-            session_dir_input,
             account_select,
             source_type_toggle,
             bot_username_input,
@@ -1160,7 +1238,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         tasks[name] = {
             "accounts": accounts,
             "chats": chats,
-            "session_dir": str(Path(session_dir_input.value or ".")),
+            "session_dir": str(Path(default_session_dir or ".")),
             "source_type": source_type,
             "bot_username": bot_username if source_type == SOURCE_BOT else "",
             "scan_limit": scan_limit,
@@ -1442,6 +1520,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     n = str(row["name"])
                     running = row["status"] != "未运行"
                     set_status = make_set_status(n)
+                    duration = row["duration"]
+                    time_text = (
+                        f"{row['last_time']}（耗时 {duration}）"
+                        if duration and duration != "—"
+                        else row["last_time"]
+                    )
                     with ui.card().classes("w-full mobile-list-card border"):
                         with ui.row().classes(
                             "w-full items-center gap-2 no-wrap justify-between"
@@ -1451,23 +1535,18 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                 f"color={'info' if running else 'grey-6'}"
                             )
                             card_badges[n] = badge
-                        ui.label(f"类型：{row['task_type']}").classes(
-                            "text-xs text-gray-600"
+                        mobile_card_fields(
+                            [
+                                ("类型", row["task_type"]),
+                                ("重复参与", row["ignore_hist"]),
+                                ("账号", row["accounts"], True),
+                                ("监控对象", row["chats"], True),
+                                ("关键词", row["keywords"], True),
+                                ("参与上限", row["scan"]),
+                                ("新参加", f"{row['joined']}抽奖"),
+                                ("执行时间", time_text, True),
+                            ]
                         )
-                        ui.label(f"账号：{row['accounts']}").classes(
-                            "text-xs text-gray-600"
-                        )
-                        ui.label(f"监控对象：{row['chats']}").classes(
-                            "text-xs text-gray-600"
-                        )
-                        ui.label(
-                            f"关键词：{row['keywords']}　参与上限：{row['scan']}　"
-                            f"允许重复参与：{row['ignore_hist']}"
-                        ).classes("text-xs text-gray-600")
-                        ui.label(
-                            f"新参加：{row['joined']}抽奖　"
-                            f"执行时间：{row['last_time']}　执行时长：{row['duration']}"
-                        ).classes("text-xs text-gray-600")
                         with ui.row().classes("w-full mobile-card-actions"):
                             if not running:
                                 ui.button(
@@ -1788,9 +1867,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 format="%d",
             ).classes("w-44")
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
-            session_dir_input = ui.input(
-                label="会话目录（.session 所在目录）", value=default_session_dir
-            ).classes("w-56")
             account_select = (
                 ui.select(
                     label="选择账号（可多选）",
@@ -1809,7 +1885,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 accounts = list(account_select.value or [])
                 if not accounts:
                     accounts = list_session_names(
-                        Path(session_dir_input.value or "."), workdir
+                        Path(default_session_dir or "."), workdir
                     )
                 if not accounts:
                     ui.notify("没有可用账号", type="warning")
@@ -1823,7 +1899,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     _log(f"开始从 Telegram 更新 {len(accounts)} 个账号的对话列表...")
                     for a in accounts:
                         await update_account_chats(
-                            a, Path(session_dir_input.value or "."), workdir, _log
+                            a, Path(default_session_dir or "."), workdir, _log
                         )
                     refresh_options()
                     ui.notify("频道列表已从 Telegram 更新", type="positive")
@@ -1883,13 +1959,31 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 on_change=lambda: _apply_rescue_visibility(),
             ).classes("pt-6")
 
+        def _range_inputs(
+            title: str,
+            *,
+            low: int,
+            high: int,
+            max_value: int,
+            low_cls: str = "w-24",
+            high_cls: str = "w-24",
+        ) -> tuple[ui.number, ui.number]:
+            """上下限共用一个标签：左侧为下限、右侧为上限，用输入框前缀区分。"""
+            with ui.row().classes("items-center gap-1 no-wrap"):
+                ui.label(title).classes("text-sm text-gray-600 shrink-0")
+                low_input = ui.number(
+                    value=low, min=0, max=max_value, format="%d"
+                ).props('prefix="下限"').classes(low_cls)
+                ui.label("～").classes("text-gray-400 shrink-0")
+                high_input = ui.number(
+                    value=high, min=0, max=max_value, format="%d"
+                ).props('prefix="上限"').classes(high_cls)
+            return low_input, high_input
+
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
-            delay_min_input = ui.number(
-                label="参与前随机延迟下限（秒）", value=3, min=0, max=600, format="%d"
-            ).classes("w-44")
-            delay_max_input = ui.number(
-                label="延迟上限（秒）", value=10, min=0, max=600, format="%d"
-            ).classes("w-36")
+            delay_min_input, delay_max_input = _range_inputs(
+                "参与前随机延迟（秒）", low=3, high=10, max_value=600
+            )
 
             rescue_interval_input = ui.number(
                 label="补漏扫描间隔（分钟）",
@@ -1910,20 +2004,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "w-full"
         ):
             with ui.row().classes("items-end w-full gap-3 flex-wrap"):
-                join_pace_min_input = ui.number(
-                    label="加入间隔下限（秒）",
-                    value=int(JOIN_PACE_RANGE[0]),
-                    min=0,
-                    max=3600,
-                    format="%d",
-                ).classes("w-44")
-                join_pace_max_input = ui.number(
-                    label="加入间隔上限（秒）",
-                    value=int(JOIN_PACE_RANGE[1]),
-                    min=0,
-                    max=3600,
-                    format="%d",
-                ).classes("w-40")
+                join_pace_min_input, join_pace_max_input = _range_inputs(
+                    "加入间隔（秒）",
+                    low=int(JOIN_PACE_RANGE[0]),
+                    high=int(JOIN_PACE_RANGE[1]),
+                    max_value=3600,
+                )
                 join_hourly_cap_input = ui.number(
                     label="每账号 1 小时加入上限（0=不限）",
                     value=JOIN_HOURLY_CAP,
@@ -1939,20 +2025,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     format="%d",
                 ).classes("w-64")
             with ui.row().classes("items-end w-full gap-3 flex-wrap"):
-                resolve_pace_min_input = ui.number(
-                    label="解析间隔下限（秒）",
-                    value=int(RESOLVE_PACE_RANGE[0]),
-                    min=0,
-                    max=600,
-                    format="%d",
-                ).classes("w-44")
-                resolve_pace_max_input = ui.number(
-                    label="解析间隔上限（秒）",
-                    value=int(RESOLVE_PACE_RANGE[1]),
-                    min=0,
-                    max=600,
-                    format="%d",
-                ).classes("w-40")
+                resolve_pace_min_input, resolve_pace_max_input = _range_inputs(
+                    "解析间隔（秒）",
+                    low=int(RESOLVE_PACE_RANGE[0]),
+                    high=int(RESOLVE_PACE_RANGE[1]),
+                    max_value=600,
+                )
                 join_flood_buffer_input = ui.number(
                     label="限流额外缓冲（秒）",
                     value=JOIN_FLOOD_BUFFER,

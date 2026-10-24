@@ -21,6 +21,8 @@ from tg_signer.webui.common import (
     attach_select_all,
     copy_text_to_clipboard,
     format_duration,
+    mobile_card_fields,
+    mobile_card_result,
     state,
     with_select_all,
 )
@@ -213,8 +215,10 @@ def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | 
         ("消息关键词", _fmt_param_value(cfg.get("keywords"))),
         ("启动时自动扫描", _fmt_param_value(cfg.get("auto_scan"))),
         ("自动加入频道链接", _fmt_param_value(cfg.get("auto_join"))),
-        ("参与前随机延迟下限（秒）", str(cfg.get("delay_min") or 0)),
-        ("参与前随机延迟上限（秒）", str(cfg.get("delay_max") or 0)),
+        (
+            "参与前随机延迟（秒）",
+            f"{cfg.get('delay_min') or 0}–{cfg.get('delay_max') or 0}",
+        ),
         ("确认等待（秒）", str(cfg.get("confirm_wait") or 0)),
         ("参与条数上限", str(max_joins) if max_joins else "不限"),
         ("允许重复参与", _fmt_param_value(cfg.get("ignore_history", True))),
@@ -597,18 +601,32 @@ class ComboTaskBlock:
                 rid = str(rec.get("id") or "")
                 status = self._record_status(rec)
                 seq = page * page_size + i + 1  # 全量序号（跨页连续）
-                with ui.card().classes("w-full border"):
-                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                        ui.label(f"#{seq}").classes(
-                            "text-xs font-semibold text-gray-500 shrink-0"
-                        )
+                with ui.card().classes("w-full mobile-list-card border"):
+                    with ui.row().classes(
+                        "w-full items-center gap-2 no-wrap justify-between"
+                    ):
+                        ui.label(
+                            f"任务 #{seq} · {rec.get('task_name') or '-'}"
+                        ).classes("text-base font-semibold truncate min-w-0")
                         ui.badge(status).props(
-                            f"color={self.STATUS_COLOR.get(status, 'grey-6')} outline"
-                        )
-                        ui.label(str(rec.get("task_name") or "-")).classes(
-                            "text-sm font-medium"
-                        )
-                        ui.space()
+                            f"color={self.STATUS_COLOR.get(status, 'grey-6')}"
+                        ).classes("shrink-0")
+                    duration = str(rec.get("duration") or "")
+                    start_text = str(rec.get("start_time") or "—")
+                    time_text = (
+                        f"{start_text}（耗时 {duration}）"
+                        if duration and duration != "—"
+                        else start_text
+                    )
+                    mobile_card_fields(
+                        [
+                            ("开始时间", time_text, True),
+                            ("账号", rec.get("accounts"), True),
+                        ]
+                    )
+                    if rec.get("result"):
+                        mobile_card_result("结果", str(rec["result"]))
+                    with ui.row().classes("w-full mobile-card-actions"):
                         if self.runner.runs.get(rid) is not None:
                             ui.button(
                                 "停止", on_click=lambda r=rid: self._stop(r)
@@ -621,15 +639,6 @@ class ComboTaskBlock:
                             "查看进度",
                             on_click=lambda r=rec: self.open_progress_page(r),
                         ).props("flat dense color=primary")
-                    ui.label(
-                        f"开始：{rec.get('start_time') or '—'}　"
-                        f"时长：{rec.get('duration') or '—'}　"
-                        f"账号：{rec.get('accounts') or '—'}"
-                    ).classes("text-xs text-gray-600")
-                    if rec.get("result"):
-                        ui.label(f"结果：{rec['result']}").classes(
-                            "text-xs text-gray-600"
-                        )
             # 分页控件：仅超过一页时显示
             if total_pages > 1:
                 with ui.row().classes("w-full items-center justify-center gap-1 mt-1"):
