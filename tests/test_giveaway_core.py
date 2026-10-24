@@ -1521,6 +1521,49 @@ def test_participate_join_paused_not_recorded_as_participated(tmp_path, monkeypa
     assert events and events[-1]["ok"] is False
 
 
+class _StillNeedsJoinClient(_CallbackClient):
+    """加入成功，但重发 start 后 bot 仍回复「请先加入频道」。"""
+
+    async def start_bot(self, username, param):
+        self.started.append((username, param))
+        msg = _msg(
+            text="请先加入 https://t.me/NeedJoinCh 后重新参与",
+            buttons=[
+                [_btn("🎟️ 点击参与抽奖", url=f"https://t.me/{username}?start={param}")]
+            ],
+        )
+        self.history = [msg]
+        return msg
+
+
+def test_participate_bot_still_requires_join_not_recorded(tmp_path, monkeypatch):
+    """已加入、但点击后 bot 仍要求先加入频道：本次未生效，不能记「已参与」。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, state = _engine(tmp_path)
+    logs: list = []
+    events: list = []
+    engine.log = logs.append
+    engine.on_event = events.append
+    engine.max_joins = 5
+    client = _StillNeedsJoinClient(bot_users={"BaibaoxiangCjBot"})
+
+    asyncio.run(engine._participate("acc", client, "BaibaoxiangCjBot", "hh2", "导航频道"))
+
+    assert client.joined_targets == ["NeedJoinCh"]
+    assert not state.has("acc", "BaibaoxiangCjBot", "hh2")
+    assert engine.joined == 0
+    assert any("[未参与]" in line for line in logs)
+    assert not any("[已参与]" in line for line in logs)
+    assert events and events[-1]["ok"] is False
+
+
 def test_click_confirm_flood_records_strike_and_blocks_bot(tmp_path, monkeypatch):
     """确认按钮里的 StartBot 触发长限流时，同样登记熔断（旧版此处直接吞异常）。"""
     import asyncio
