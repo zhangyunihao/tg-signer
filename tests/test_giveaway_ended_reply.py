@@ -30,7 +30,7 @@ def test_click_confirm_returns_on_ended_start_reply(monkeypatch):
 
     async def fake_join(*a, **k):
         calls.append("join")
-        return False
+        return False, False
 
     async def fake_start(*a, **k):
         calls.append("start")
@@ -57,7 +57,7 @@ def test_click_confirm_stops_on_ended_restart_reply(monkeypatch):
     clicked: list = []
 
     async def fake_join(*a, **k):
-        return False
+        return False, False
 
     async def fake_start_bot(username, param):
         return _Msg("该抽奖活动已结束")

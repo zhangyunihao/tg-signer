@@ -37,7 +37,7 @@ def test_click_confirm_joins_from_source_message(monkeypatch):
 
     async def fake_join(account, client, bot_username, message):
         seen_messages.append(message)
-        return False
+        return False, False
 
     monkeypatch.setattr(engine, "_join_from_message", fake_join)
 
@@ -57,7 +57,7 @@ def test_click_confirm_without_source_keeps_old_behavior(monkeypatch):
 
     async def fake_join(account, client, bot_username, message):
         seen_messages.append(message)
-        return False
+        return False, False
 
     monkeypatch.setattr(engine, "_join_from_message", fake_join)
 

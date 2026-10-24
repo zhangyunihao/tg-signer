@@ -1043,7 +1043,10 @@ class GiveawayEngine:
         # 先按帖内频道/群组链接自动加入：按钮型抽奖点击后 bot 会校验
         # 「您未加入 XXX」，不先加入则点击无效
         if self.auto_join:
-            if await self._join_from_message(account, client, "", message):
+            joined, _blocked = await self._join_from_message(
+                account, client, "", message
+            )
+            if joined:
                 await asyncio.sleep(2)
         # 模拟人工点击节奏，避免连点触发风控
         lo, hi = self.delay_range
@@ -2190,11 +2193,16 @@ class GiveawayEngine:
         if reply_says_ended(start_msg):
             self._handle_start_ended(account, username, param, channel, title, reserved)
             return
+        completed = await self._click_confirm(
+            account, client, username, start_msg, param, source_message=source_message
+        )
+        if not completed:
+            # bot 要求加入频道，但账号加入被限流/配额暂停：点击跟进未完成，
+            # 不能记「已参与」（否则后续扫描会把它当成功跳过，用户看到假成功）
+            self._handle_join_blocked(account, username, channel, title, reserved)
+            return
         self._record_participate_success(
             account, username, param, channel, title, reserved
-        )
-        await self._click_confirm(
-            account, client, username, start_msg, param, source_message=source_message
         )
 
     def _participate_start_failed(
@@ -2291,14 +2299,53 @@ class GiveawayEngine:
             }
         )
 
+    def _handle_join_blocked(
+        self,
+        account: str,
+        username: str,
+        channel: str,
+        title: str,
+        reserved: bool,
+    ) -> None:
+        """加入被限流/配额暂停导致跟进未完成：归还名额、不记成功，保留重试。
+
+        bot 要求先加入频道再参与时，若本账号此刻无法加入（FLOOD_WAIT 暂停、
+        滚动配额用尽、PEER_FLOOD），重发 start 与点按钮都不会生效。这里按
+        未参与处理：不写参与记录，后续扫描/重跑可直接重试。
+        """
+        if reserved:
+            self.joined -= 1
+        self.failed += 1
+        from_part = f"来自 {channel or '未知频道'}"
+        if title:
+            from_part += f"：{title}"
+        self.log(
+            f"{datetime.now():%H:%M:%S} [未参与] {account} -> @{username} "
+            f"（{from_part}）: 需加入频道但自动加入被暂停，稍后重试"
+        )
+        self._emit(
+            {
+                "account": account,
+                "bot": username,
+                "channel": channel,
+                "title": title,
+                "ok": False,
+                "error": "自动加入被限流/配额暂停，参与未完成",
+            }
+        )
+
     async def _join_from_message(
         self, account: str, client: Any, bot_username: str, message: Any
-    ) -> bool:
-        """激进模式：把消息中出现的频道/群组链接逐个加入。返回是否发生加入。"""
+    ) -> Tuple[bool, bool]:
+        """激进模式：把消息中出现的频道/群组链接逐个加入。
+
+        返回（是否发生加入，是否因限流/配额拦截而未能完成加入）。
+        """
         joined_any = False
+        blocked = False
         label = f"@{bot_username}" if bot_username else "置顶抽奖帖"
         if self._join_paused(account):
-            return False
+            return False, True
         targets = self._join_targets(account, bot_username, message)
         for target in targets:
             if target.lower().lstrip("@") == bot_username.lower():
@@ -2317,8 +2364,9 @@ class GiveawayEngine:
             if flood_paused:
                 # 限流/配额拦截不消耗尝试机会：恢复后（下一轮扫描）重试
                 self._join_cache.discard(key)
+                blocked = True
                 break
-        return joined_any
+        return joined_any, blocked
 
     def _join_paused(self, account: str) -> bool:
         if account in self._peer_flood_accounts:
@@ -3089,18 +3137,22 @@ class GiveawayEngine:
         start_msg: Any,
         param: str = "",
         source_message: Any = None,
-    ) -> None:
-        """start 后跟进：自动加入 bot 消息中的频道（若开启），并点确认按钮。"""
+    ) -> bool:
+        """start 后跟进：自动加入 bot 消息中的频道（若开启），并点确认按钮。
+
+        返回 False 表示 bot 要求加入频道但本账号加入被暂停，跟进未完成；
+        其余情况返回 True（含已结束终态，由调用方沿用原有成功口径）。
+        """
         ended, candidates = self._initial_confirm_candidates(
             account, username, start_msg, source_message
         )
         if ended:
-            return
+            return True
         if self.confirm_wait > 0:
             if await self._poll_confirm_candidates(
                 account, client, username, candidates
             ):
-                return
+                return True
         # 「防脚本验证」（如 @dbchoujiang123_bot）：按正文顺序点击 emoji 按钮
         # 完成人机校验，再刷新候选，让后续加入/确认流程看到验证后的消息
         await self._refresh_candidates_after_verification(
@@ -3110,11 +3162,15 @@ class GiveawayEngine:
         # 否则后面读取会触发 UnboundLocalError（机器人类型任务即此路径）
         had_join_targets = False
         if self.auto_join:
-            stop, had_join_targets, candidates = await self._auto_join_and_restart(
-                account, client, username, param, source_message, candidates
+            stop, had_join_targets, candidates, join_blocked = (
+                await self._auto_join_and_restart(
+                    account, client, username, param, source_message, candidates
+                )
             )
             if stop:
-                return
+                return True
+            if join_blocked:
+                return False
         stop_set = self._stop is not None and self._stop.is_set()
         if had_join_targets and not stop_set:
             # 加入频道后稍等再点确认按钮，给 bot 侧成员状态同步留时间，
@@ -3123,6 +3179,7 @@ class GiveawayEngine:
         await self._click_first_confirm_button(
             account, client, username, candidates, param
         )
+        return True
 
     def _initial_confirm_candidates(
         self,
@@ -3207,14 +3264,24 @@ class GiveawayEngine:
         param: str,
         source_message: Any,
         candidates: List[Any],
-    ) -> Tuple[bool, bool, List[Any]]:
+    ) -> Tuple[bool, bool, List[Any], bool]:
         """自动加入候选消息中的目标，必要时重发 start。
 
-        返回（是否应直接结束跟进，是否存在加入目标，更新后的候选）。
+        返回（是否应直接结束跟进，是否存在加入目标，更新后的候选，
+        加入是否被限流/配额阻塞导致跟进未完成）。
         """
-        did_join, had_join_targets = await self._auto_join_candidates(
+        did_join, had_join_targets, blocked = await self._auto_join_candidates(
             account, client, username, candidates
         )
+        if had_join_targets and blocked:
+            # 加入被暂停时重发 start/点按钮都不会生效（bot 仍判定未加入），
+            # 还会白白消耗一次 start 并触发重复按钮跳过；直接按未完成返回，
+            # 由上层归还名额且不记「已参与」，等恢复后重试
+            self.log(
+                f"[{account}] @{username} 需要加入频道才能参与，"
+                "但本账号自动加入已暂停（限流/配额），本次跳过，稍后重试"
+            )
+            return False, had_join_targets, candidates, True
         if did_join:
             # 加入后稍等，再拉一轮消息（bot 可能更新了按钮/提示）
             await asyncio.sleep(3)
@@ -3238,24 +3305,27 @@ class GiveawayEngine:
             if await self._click_join_retry_button(
                 account, client, username, candidates
             ):
-                return True, had_join_targets, candidates
+                return True, had_join_targets, candidates, False
             self.log(f"[{account}] @{username} 要求加入频道后重新参与，再次发送 start")
-            return await self._restart_after_join(
+            stop, had_join_targets, candidates = await self._restart_after_join(
                 account, client, username, param, candidates, had_join_targets
             )
+            return stop, had_join_targets, candidates, False
         if bot_policy(username).restart_after_join:
             # 强制名单：无加入要求也重发一次
             self.log(f"[{account}] @{username} 加入校验完成，重新发送 start")
-            return await self._restart_after_join(
+            stop, had_join_targets, candidates = await self._restart_after_join(
                 account, client, username, param, candidates, had_join_targets
             )
-        return False, had_join_targets, candidates
+            return stop, had_join_targets, candidates, False
+        return False, had_join_targets, candidates, False
 
     async def _auto_join_candidates(
         self, account: str, client: Any, username: str, candidates: List[Any]
-    ) -> Tuple[bool, bool]:
+    ) -> Tuple[bool, bool, bool]:
         did_join = False
         had_join_targets = False
+        blocked = False
         for message in candidates:
             # 排除指向当前 bot 自身的 t.me 链接（按钮「点击参与抽奖」等）：
             # 那是参与入口不是加入目标，交给下方 URL 按钮点击逻辑处理
@@ -3269,9 +3339,14 @@ class GiveawayEngine:
                 and extract_join_status_targets(message)
             ):
                 had_join_targets = True
-            if await self._join_from_message(account, client, username, message):
+            joined, message_blocked = await self._join_from_message(
+                account, client, username, message
+            )
+            if joined:
                 did_join = True
-        return did_join, had_join_targets
+            if message_blocked:
+                blocked = True
+        return did_join, had_join_targets, blocked
 
     async def _restart_after_join(
         self,

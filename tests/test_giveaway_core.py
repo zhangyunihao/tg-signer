@@ -1439,6 +1439,85 @@ def test_click_confirm_skips_duplicate_same_param_start(tmp_path, monkeypatch):
     assert any("跳过重复 start" in line for line in logs)
 
 
+def test_click_confirm_join_paused_reports_incomplete(tmp_path, monkeypatch):
+    """账号加入被 FLOOD_WAIT 暂停期间，bot 要求加入频道才能参与：
+
+    旧版仍会重发 start，随后因按钮参数相同「跳过重复 start」，却照样记成
+    已参与（真实日志中的欢欢/小琳琳假成功）。现在应直接判定跟进未完成。
+    """
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _CallbackClient(bot_users={"BaibaoxiangCjBot"})
+    engine._suspend_joins("acc", 259, "https://t.me/+T8kdoFXKC5o2NjY5")
+    msg = _msg(
+        text="请先加入 https://t.me/NeedJoinCh 后重新参与",
+        buttons=[
+            [_btn("🎟️ 点击参与抽奖", url="https://t.me/BaibaoxiangCjBot?start=p1")]
+        ],
+    )
+    completed = asyncio.run(
+        engine._click_confirm("acc", client, "BaibaoxiangCjBot", msg, "p1")
+    )
+    assert completed is False
+    assert client.started == []
+    assert client.callback_clicks == []
+    assert client.joined_targets == []
+    assert any("自动加入已暂停" in line for line in logs)
+
+
+class _JoinRequiredReplyClient(_CallbackClient):
+    """start 后回复「请先加入频道」，并带同参数参与按钮。"""
+
+    async def start_bot(self, username, param):
+        self.started.append((username, param))
+        return _msg(
+            text="请先加入 https://t.me/NeedJoinCh 后重新参与",
+            buttons=[
+                [_btn("🎟️ 点击参与抽奖", url=f"https://t.me/{username}?start={param}")]
+            ],
+        )
+
+
+def test_participate_join_paused_not_recorded_as_participated(tmp_path, monkeypatch):
+    """加入暂停期间的参与不能记为成功，否则后续扫描直接跳过、用户永远漏参与。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, state = _engine(tmp_path)
+    logs: list = []
+    events: list = []
+    engine.log = logs.append
+    engine.on_event = events.append
+    engine.max_joins = 5
+    client = _JoinRequiredReplyClient(bot_users={"BaibaoxiangCjBot"})
+    engine._suspend_joins("acc", 259, "https://t.me/+T8kdoFXKC5o2NjY5")
+
+    asyncio.run(engine._participate("acc", client, "BaibaoxiangCjBot", "hh1", "导航频道"))
+
+    # 未记成功：状态库无记录、名额已归还、计入失败
+    assert not state.has("acc", "BaibaoxiangCjBot", "hh1")
+    assert engine.joined == 0
+    assert engine.failed == 1
+    assert any("[未参与]" in line for line in logs)
+    assert not any("[已参与]" in line for line in logs)
+    assert client.started == [("BaibaoxiangCjBot", "hh1")]  # 只发了原始 start
+    assert events and events[-1]["ok"] is False
+
+
 def test_click_confirm_flood_records_strike_and_blocks_bot(tmp_path, monkeypatch):
     """确认按钮里的 StartBot 触发长限流时，同样登记熔断（旧版此处直接吞异常）。"""
     import asyncio
@@ -1730,10 +1809,11 @@ def test_engine_join_invite_request_sent_is_not_failure(tmp_path):
     engine.log = logs.append
     client = RequestClient()
     msg = _msg(text="加入 https://t.me/+AbCdEfGh123 参与")
-    joined_any = asyncio.run(
+    joined_any, blocked = asyncio.run(
         engine._join_from_message("acc", client, "LotteryBot", msg)
     )
     assert joined_any is True
+    assert blocked is False
     assert any("已提交加入" in line and "待管理员审批" in line for line in logs)
     assert not any("失败" in line for line in logs)
 
@@ -1811,11 +1891,12 @@ def test_engine_join_flood_wait_suspends(tmp_path):
     assert any("触发限流" in line and "163" in line for line in logs)
     # 暂停期间：后续消息的所有加入被跳过（只提示一次）
     msg2 = _msg(text="加入 @ChanC 和 @ChanD")
-    joined_any = asyncio.run(
+    joined_any, paused_blocked = asyncio.run(
         engine._join_from_message("acc", client, "LotteryBot", msg2)
     )
     assert client.calls == ["ChanA"]
     assert joined_any is False
+    assert paused_blocked is True
     assert any("自动加入被限流暂停中" in line for line in logs)
     # 暂停恢复后正常加入
     engine._join_suspended.clear()
