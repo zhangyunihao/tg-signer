@@ -1415,9 +1415,12 @@ def test_click_confirm_clicks_plain_same_bot_url_button(tmp_path, monkeypatch):
     assert client.started == [("SomeGiveBot", "")]
 
 
-def test_click_confirm_skips_duplicate_same_param_start(tmp_path, monkeypatch):
-    """URL 按钮的 start 链接与本次已发 start 完全一致：视为已完成，
-    不再重复调用 StartBot（避免连续请求触发账号级限流）。"""
+def test_click_confirm_resends_duplicate_same_param_start(tmp_path, monkeypatch):
+    """URL 按钮的 start 链接与本次已发 start 一致也照样再发一次。
+
+    百宝箱等 bot 要求「加入频道后重新参与」，加入生效后正是这次 start
+    才真正报名成功；旧版跳过会导致显示已参与、实际没进抽奖。
+    """
     import asyncio
 
     import tg_signer.giveaway_core as gc
@@ -1435,8 +1438,8 @@ def test_click_confirm_skips_duplicate_same_param_start(tmp_path, monkeypatch):
         buttons=[[_btn("🎟️ 点击参与抽奖", url="https://t.me/SameLinkBot?start=p1")]],
     )
     asyncio.run(engine._click_confirm("acc", client, "SameLinkBot", msg, "p1"))
-    assert client.started == []
-    assert any("跳过重复 start" in line for line in logs)
+    assert client.started == [("SameLinkBot", "p1")]
+    assert not any("跳过重复 start" in line for line in logs)
 
 
 def test_click_confirm_join_paused_reports_incomplete(tmp_path, monkeypatch):

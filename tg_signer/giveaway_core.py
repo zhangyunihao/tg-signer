@@ -127,6 +127,10 @@ EXPIRED_STOP_STREAK = 5
 # 单频道单次扫描的硬上限（条），防止无开奖日期标注时无限回溯
 SCAN_HARD_CAP = 1000
 
+# 频道/群组单轮每频道的默认扫描上限（条）：全局设置可覆盖
+# （关键词未命中时不会触发「连续已开奖」止损，靠该上限兜底）
+DEFAULT_SCAN_CAP = 500
+
 
 # —— 历史补漏 ——
 # 周期性重拉各频道最近若干条消息，捞回此前扫描失败/中断漏掉的抽奖帖
@@ -424,6 +428,8 @@ class GiveawayEngine:
         self.bot_username = ""
         # 机器人私聊来源时的历史回扫条数上限（None=沿用 SCAN_HARD_CAP）
         self.scan_limit: Optional[int] = None
+        # 频道/群组每轮每频道的扫描上限（全局设置，默认 DEFAULT_SCAN_CAP）
+        self.scan_cap: int = DEFAULT_SCAN_CAP
         self.keywords: Tuple[str, ...] = DEFAULT_KEYWORDS
         self.max_joins: Optional[int] = None
         self.rescue_interval = RESCUE_INTERVAL
@@ -476,6 +482,7 @@ class GiveawayEngine:
         source_type: str = "channel",
         bot_username: Optional[str] = None,
         scan_limit: Optional[int] = None,
+        scan_cap: Optional[int] = None,
         auto_scan: bool = True,
         auto_join: bool = True,
         max_joins: Optional[int] = None,
@@ -506,6 +513,8 @@ class GiveawayEngine:
         self.source_type = str(source_type or "channel").strip().lower()
         self.bot_username = str(bot_username or "").lstrip("@").strip()
         self.scan_limit = max(1, int(scan_limit)) if scan_limit else None
+        # 频道/群组单轮扫描上限：全局设置为空时沿用默认值
+        self.scan_cap = max(1, int(scan_cap)) if scan_cap else DEFAULT_SCAN_CAP
         self.chats = list(chats)
         self.keywords = tuple(
             str(k).strip() for k in (keywords or ()) if str(k).strip()
@@ -739,7 +748,8 @@ class GiveawayEngine:
         每个频道持续向前扫描，直到满足任一停止条件：
           - 参与数达到参与条数上限（若设置）
           - 连续 EXPIRED_STOP_STREAK 条已开奖的抽奖帖（再往前都是旧抽奖）
-          - 达到单频道硬上限 SCAN_HARD_CAP 条（无开奖日期标注时兜底）
+          - 达到单频道扫描上限（全局设置，默认 DEFAULT_SCAN_CAP 条；
+            关键词未命中时同样生效，防止翻完整个频道历史）
         """
         if self.scanning or not self._clients:
             return
@@ -815,12 +825,16 @@ class GiveawayEngine:
         """单频道回溯扫描历史消息：水位线去重 + 处理，命中停止条件即止。"""
         expired_streak = 0
         scanned = 0
-        # 机器人私聊来源可单独限制回扫条数，避免翻遍全部历史私聊消息
-        hard_cap = (
-            min(SCAN_HARD_CAP, self.scan_limit)
-            if self.scan_limit is not None
-            else SCAN_HARD_CAP
-        )
+        # 机器人私聊来源可单独限制回扫条数；频道/群组按全局扫描上限兜底，
+        # 关键词未命中时不会触发「连续已开奖」止损，仍需按条数截断
+        if self.source_type == "bot":
+            hard_cap = (
+                min(SCAN_HARD_CAP, self.scan_limit)
+                if self.scan_limit is not None
+                else SCAN_HARD_CAP
+            )
+        else:
+            hard_cap = self.scan_cap
         try:
             async for message in client.get_chat_history(chat):
                 scanned += 1
@@ -829,6 +843,16 @@ class GiveawayEngine:
                         f"[{account}] {chat} 已扫描 "
                         f"{hard_cap} 条，停止该频道本轮扫描"
                     )
+                    if self.source_type != "bot":
+                        # 达到全局扫描上限：通知消息中心，避免任务静默截断
+                        self._emit(
+                            {
+                                "type": "scan_cap",
+                                "account": account,
+                                "chat": str(chat),
+                                "cap": hard_cap,
+                            }
+                        )
                     break
                 mid = getattr(message, "id", None)
                 if mid is not None:
@@ -3472,13 +3496,9 @@ class GiveawayEngine:
                 if m and not (m.group("rest") or ""):
                     plain_same_bot = m.group("name").lower() == username.lower()
             if link is not None and link[0].lower() == username.lower():
-                if param and link[1] == param:
-                    # 与本次已发出的 start 完全一致：重复调用只会加速触发
-                    # 账号级 FLOOD_WAIT，直接视为已完成
-                    self.log(
-                        f"[{account}] @{username} 参与按钮与本次 start 相同，跳过重复 start"
-                    )
-                    return True
+                # 参数与本次已发的 start 相同也照样再发一次：百宝箱这类 bot
+                # 要求「加入频道后重新参与」，加入生效后正是这次 start 才真正
+                # 报名成功，跳过会导致显示已参与、实际没进抽奖
                 await self._start_bot(client, account, username, link[1])
                 self.log(
                     f"已点击 @{username} 的参与按钮「{btn.text}」（按链接参数重新参与）"
@@ -3486,11 +3506,6 @@ class GiveawayEngine:
                 await self._verify_after_click(account, client, username, candidates)
                 return True
             if plain_same_bot:
-                if not param:
-                    self.log(
-                        f"[{account}] @{username} 参与按钮与本次 start 相同，跳过重复 start"
-                    )
-                    return True
                 await self._start_bot(client, account, username, "")
                 self.log(f"已点击 @{username} 的参与按钮「{btn.text}」（重发 start）")
                 await self._verify_after_click(account, client, username, candidates)
