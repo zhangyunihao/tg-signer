@@ -9,8 +9,9 @@
 - 账号频道/群组已满（自动触发退频道任务）：webui_channels_full_alerts.json
 
 主控台右上角铃铛只负责展示未读数徽标，点击在新标签页打开 /messages
-消息中心页面（支持按用户过滤、全部已读、10 秒轮询自动刷新）。
+消息中心页面（支持按用户过滤、全部已读、消息置顶、10 秒轮询自动刷新）。
 已读状态按消息键持久化在工作目录 webui_message_read.json，
+置顶状态按消息键持久化在工作目录 webui_message_pin.json，
 刷新页面、重启服务、更换浏览器后依然保留。
 """
 
@@ -44,6 +45,10 @@ logger = logging.getLogger(__name__)
 # 已读状态文件与容量上限（防止长期运行膨胀）
 READ_STATE_FILE = "webui_message_read.json"
 READ_STATE_MAX = 1000
+
+# 置顶状态文件与容量上限（置顶消息始终排在列表最前）
+PIN_STATE_FILE = "webui_message_pin.json"
+PIN_STATE_MAX = 200
 
 # 用户过滤下拉的「全部」哨兵值（clearable 清空后 value 为 None，同样视为全部）
 ALL_ACCOUNTS = ""
@@ -81,6 +86,32 @@ def save_read_keys(workdir, keys: Set[str]) -> None:
         logger.debug("写入消息已读状态失败", exc_info=True)
 
 
+def _pin_state_path(workdir) -> Path:
+    return Path(workdir) / PIN_STATE_FILE
+
+
+def load_pin_keys(workdir) -> Set[str]:
+    path = _pin_state_path(workdir)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        keys = data.get("pinned") if isinstance(data, dict) else None
+        return {str(k) for k in (keys or [])}
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError):
+        logger.debug("读取消息置顶状态失败", exc_info=True)
+        return set()
+
+
+def save_pin_keys(workdir, keys: Set[str]) -> None:
+    try:
+        atomic_write_json(
+            _pin_state_path(workdir), {"pinned": sorted(keys)[:PIN_STATE_MAX]}
+        )
+    except OSError:
+        logger.debug("写入消息置顶状态失败", exc_info=True)
+
+
 def _time_sort_value(m: dict) -> int:
     """把消息时间（%m-%d %H:%M:%S）转为可比较整数，便于跨分类按新旧排序。"""
     time_str = str(m.get("time") or "")
@@ -95,10 +126,14 @@ def _time_sort_value(m: dict) -> int:
     )
 
 
-def message_sort_key(m: dict, read_keys: Set[str]) -> tuple:
-    """排序规则：未读优先于已读；未读内部中奖消息最优先；同组内新消息在前。"""
+def message_sort_key(
+    m: dict, read_keys: Set[str], pin_keys: Set[str] = frozenset()
+) -> tuple:
+    """排序规则：置顶最优先；其次未读优先于已读，未读内部中奖最优先；同组内新消息在前。"""
+    pinned = m["key"] in pin_keys
     unread = m["key"] not in read_keys
     return (
+        0 if pinned else 1,
         0 if unread else 1,
         (0 if m["tag"] == "中奖" else 1) if unread else 1,
         -_time_sort_value(m),
@@ -300,20 +335,34 @@ def _build_center_page() -> None:
         app.storage.user[FILTER_STORAGE_KEY] = str(filter_sel.value or "")
         render_list()
 
+    def toggle_pin(key: str) -> None:
+        pin_keys = load_pin_keys(state.workdir)
+        if key in pin_keys:
+            pin_keys.discard(key)
+        else:
+            pin_keys.add(key)
+        save_pin_keys(state.workdir, pin_keys)
+        render_list()
+
     def render_list() -> None:
         list_container.clear()
         messages = visible_messages()
-        # 未读在前；未读内部中奖消息置顶；同组内按新消息优先（时间倒序）
-        messages.sort(key=lambda m: message_sort_key(m, read_keys))
+        pin_keys = load_pin_keys(state.workdir)
+        # 置顶最优先；未读次之；未读内部中奖消息最优先；同组内按新消息优先（时间倒序）
+        messages.sort(key=lambda m: message_sort_key(m, read_keys, pin_keys))
         with list_container:
             if not messages:
                 ui.label("暂无消息").classes("text-sm text-gray-400")
                 return
             for m in messages:
                 unread = m["key"] not in read_keys
+                pinned = m["key"] in pin_keys
 
                 def _on_row_click(*_args, _key: str = m["key"]) -> None:
                     mark_one(_key)
+
+                def _on_pin_click(*_args, _key: str = m["key"]) -> None:
+                    toggle_pin(_key)
 
                 with (
                     ui.row()
@@ -336,6 +385,13 @@ def _build_center_page() -> None:
                         "text-sm flex-1 min-w-0 "
                         + ("text-gray-900" if unread else "text-gray-500")
                     )
+                    # click.stop 阻止冒泡，避免点图钉时同时把消息标记为已读
+                    ui.button(icon="push_pin").props(
+                        "flat round dense size=sm "
+                        + ("color=orange" if pinned else "color=grey-5")
+                    ).on("click.stop", _on_pin_click).tooltip(
+                        "取消置顶" if pinned else "置顶"
+                    )
 
     def refresh_all() -> None:
         # 重建过滤选项（未读账号置前并刷新未读数标注），选中项失效时回落「全部用户」
@@ -355,9 +411,13 @@ def _build_center_page() -> None:
         unread_badge.set_visibility(count > 0)
 
     def _fingerprint() -> str:
-        """列表内容指纹：消息集合 + 已读状态变化时才重渲染，避免轮询打断滚动位置。"""
+        """列表内容指纹：消息集合 + 已读/置顶状态变化时才重渲染，避免轮询打断滚动位置。"""
+        pin_keys = load_pin_keys(state.workdir)
         return json.dumps(
-            [[m["key"], m["key"] in read_keys] for m in collect_messages(state.workdir)]
+            [
+                [m["key"], m["key"] in read_keys, m["key"] in pin_keys]
+                for m in collect_messages(state.workdir)
+            ]
         )
 
     with ui.column().classes("w-full gap-3"):
@@ -372,7 +432,8 @@ def _build_center_page() -> None:
             ui.button(icon="refresh").props("flat round dense").on_click(refresh_all)
         ui.label(
             "汇总抽奖中奖提醒、监控对象加入失败提醒与抽奖过程中未完成的发言任务"
-            "（口令发送失败/发言数未达标，显示还需发言条数），点击消息标记为已读。"
+            "（口令发送失败/发言数未达标，显示还需发言条数），点击消息标记为已读，"
+            "点击右侧图钉可置顶/取消置顶（置顶消息始终排在最前）。"
         ).classes("text-xs text-gray-500")
         # 恢复上次选择的过滤用户（刷新页面、重开标签页后仍保留）
         options = _filter_options(read_keys)
