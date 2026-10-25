@@ -22,6 +22,7 @@ from pyrogram.errors import FloodWait, RPCError
 
 from tg_signer.core import get_client, safe_disconnect, timeout_aiter
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui.activity import should_poll
 from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
@@ -1386,9 +1387,14 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         if changed:
             render_list()
 
+    poll_client = ui.context.client
+
     async def _poll_external_tasks() -> None:
         while True:
             await asyncio.sleep(3)
+            # 页面不可见或不在该 tab 时跳过磁盘检查，切回后自动恢复
+            if not should_poll(poll_client, "leave"):
+                continue
             try:
                 mtime = tasks_mtime_ns(workdir)
                 if mtime == last_mtime["v"]:

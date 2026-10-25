@@ -25,6 +25,7 @@ from typing import Callable, List, Set
 from nicegui import app, ui
 
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui.activity import should_poll
 from tg_signer.webui.common import state
 from tg_signer.webui.giveaway import (
     channel_title_map,
@@ -278,6 +279,9 @@ def message_center_button() -> Callable[[], None]:
             await asyncio.sleep(10)
             if not client.has_socket_connection:
                 return
+            # 铃铛在所有 tab 可见，只需页面可见；页面隐藏时跳过汇总
+            if not should_poll(client):
+                continue
             try:
                 refresh_badge()
             except Exception:

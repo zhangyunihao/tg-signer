@@ -19,6 +19,7 @@ from nicegui import ui
 from tg_signer.core import get_client, safe_disconnect
 from tg_signer.phrases import PHRASES, parse_custom_phrases, phrase_pool_label
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui.activity import should_poll
 from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
@@ -1423,10 +1424,14 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
 
     async def _poll_loop() -> None:
         while True:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(2.0)
             if not client.has_socket_connection:
                 return
-            # 每秒刷新运行中任务的进度状态列（如 "运行中 (18/100)"）与实时执行时长
+            if not should_poll(client, "random"):
+                # 页面不可见/不在该 tab 时跳过刷新，仅推进日志游标（保留最近 200 行）
+                _seen["n"] = max(_seen["n"], len(log_buf) - 200)
+                continue
+            # 刷新运行中任务的进度状态列（如 "运行中 (18/100)"）与实时执行时长
             table = table_ref["table"]
             if table is not None:
                 try:

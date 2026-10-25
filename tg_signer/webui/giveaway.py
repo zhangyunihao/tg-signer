@@ -10,6 +10,7 @@ import logging
 import re
 import time
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -27,6 +28,7 @@ from tg_signer.giveaway_core import (
 from tg_signer.giveaway_parsing import DEFAULT_KEYWORDS
 from tg_signer.giveaway_state import GiveawayState
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui.activity import should_poll
 from tg_signer.webui.auto_leave import create_auto_leave_task, run_auto_leave_task
 from tg_signer.webui.common import (
     add_dialog_close_button,
@@ -745,6 +747,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     chat_title_map: Dict[str, str] = {}
     kind_map: Dict[str, str] = {}
     table_ref: Dict[str, object] = {"table": None}
+    # 移动端卡片「执行时间」元素：运行中按启动时间每秒刷新耗时
+    card_time_els: Dict[str, ui.html] = {}
+    card_time_texts: Dict[str, str] = {}
 
     def _persist() -> None:
         clean = {}
@@ -958,9 +963,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         refresh_options()
         source_type_toggle.value = source_type
         bot_username_input.value = cfg.get("bot_username") or BAIBAOXIANG_BOT
-        bot_scan_limit_input.value = (
-            cfg.get("scan_limit") or BAIBAOXIANG_SCAN_LIMIT
-        )
+        bot_scan_limit_input.value = cfg.get("scan_limit") or BAIBAOXIANG_SCAN_LIMIT
         channel_select.value = (
             [] if source_type == SOURCE_BOT else [str(c) for c in cfg["chats"]]
         )
@@ -1060,8 +1063,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             joined = int(payload.get("joined") or 0)
             cfg_now["last_joined"] = joined
             cfg_now["last_joined_by_account"] = {
-                str(k): int(v)
-                for k, v in (payload.get("by_account") or {}).items()
+                str(k): int(v) for k, v in (payload.get("by_account") or {}).items()
             }
             cfg_now["last_joined_by_account_chat"] = {
                 str(k): {str(c): int(n) for c, n in (v or {}).items()}
@@ -1289,9 +1291,41 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         ui.notify(f"任务 #{name} 已添加，正在启动...", type="positive")
         asyncio.create_task(start_task(name, tasks[name]["_set_status"]))
 
+    def _card_time_html(text: str) -> str:
+        return (
+            '<div class="tgs-fields">'
+            '<div class="tgs-field tgs-field-full">'
+            '<span class="tgs-field-k">执行时间</span>'
+            f'<span class="tgs-field-v">{escape(str(text))}</span>'
+            "</div></div>"
+        )
+
+    def _card_time_text(name: str, running: bool) -> str:
+        """卡片「执行时间」文案：运行中实时计算耗时，结束后用持久化时长。"""
+        cfg = tasks.get(name) or {}
+        start = str(cfg.get("last_start_time") or "") or "—"
+        if running:
+            start_ts = cfg.get("_start_ts")
+            dur = format_duration(time.time() - start_ts) if start_ts else ""
+        else:
+            dur = str(cfg.get("last_duration") or "")
+        return f"{start}（耗时 {dur}）" if dur and dur != "—" else start
+
+    def _update_card_time(name: str, text: str) -> None:
+        el = card_time_els.get(name)
+        if el is None or card_time_texts.get(name) == text:
+            return
+        card_time_texts[name] = text
+        try:
+            el.content = _card_time_html(text)
+        except Exception:
+            logger.debug("刷新卡片执行时间失败", exc_info=True)
+
     def render_tasks() -> None:
         task_list_container.clear()
         table_ref["table"] = None
+        card_time_els.clear()
+        card_time_texts.clear()
         with task_list_container:
             if not tasks:
                 ui.label("暂无任务，请点击「添加任务」创建。").classes(
@@ -1496,6 +1530,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             badge.update()
                         except Exception:
                             logger.debug("刷新任务状态徽标 UI 失败", exc_info=True)
+                    _update_card_time(str(n), _card_time_text(str(n), running))
                     sweep_label = card_sweeps.get(str(n))
                     if sweep_label is not None:
                         try:
@@ -1559,12 +1594,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     n = str(row["name"])
                     running = row["status"] != "未运行"
                     set_status = make_set_status(n)
-                    duration = row["duration"]
-                    time_text = (
-                        f"{row['last_time']}（耗时 {duration}）"
-                        if duration and duration != "—"
-                        else row["last_time"]
-                    )
+                    time_text = _card_time_text(n, running)
                     with ui.card().classes("w-full mobile-list-card border"):
                         with ui.row().classes(
                             "w-full items-center gap-2 no-wrap justify-between"
@@ -1591,9 +1621,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                 ("关键词", row["keywords"], True),
                                 ("参与上限", row["scan"]),
                                 ("新参加", f"{row['joined']}抽奖"),
-                                ("执行时间", time_text, True),
                             ]
                         )
+                        # 执行时间单独渲染，运行中由状态回调/轮询每秒刷新耗时
+                        card_time_els[n] = ui.html(_card_time_html(time_text)).classes(
+                            "w-full"
+                        )
+                        card_time_texts[n] = time_text
                         with ui.row().classes("w-full mobile-card-actions"):
                             if not running:
                                 ui.button(
@@ -1805,9 +1839,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
     async def _poll_loop() -> None:
         while True:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(2.0)
             if not client.has_socket_connection:
                 return
+            if not should_poll(client, "giveaway"):
+                # 页面不可见/不在该 tab 时跳过刷新，仅推进日志游标（保留最近 200 行）
+                _seen["n"] = max(_seen["n"], len(log_buf) - 200)
+                continue
             table = table_ref["table"]
             if table is not None:
                 try:
@@ -1830,6 +1868,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                 if r.get("duration") != dur:
                                     r["duration"] = dur
                                     changed = True
+                            # 移动端卡片：运行中每秒刷新耗时，结束后显示持久化时长
+                            _update_card_time(n, _card_time_text(n, task_running(n)))
                     if changed:
                         table.update()
                 except Exception:
@@ -1919,6 +1959,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     label="选择账号（可多选）",
                     options=[],
                     multiple=True,
+                    clearable=True,
                 )
                 .classes("min-w-[260px]")
                 .props("use-chips")
@@ -1957,9 +1998,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "outline"
             )
 
-        with ui.row().classes(
-            "items-end w-full gap-3 flex-wrap"
-        ) as channel_pick_row:
+        with ui.row().classes("items-end w-full gap-3 flex-wrap") as channel_pick_row:
             channel_select = (
                 ui.select(
                     label="选择监控频道/群组（可混选，输入关键字过滤）",
@@ -2018,13 +2057,17 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             """上下限共用一个标签：左侧为下限、右侧为上限，用输入框前缀区分。"""
             with ui.row().classes("items-center gap-1 no-wrap"):
                 ui.label(title).classes("text-sm text-gray-600 shrink-0")
-                low_input = ui.number(
-                    value=low, min=0, max=max_value, format="%d"
-                ).props('prefix="下限"').classes(low_cls)
+                low_input = (
+                    ui.number(value=low, min=0, max=max_value, format="%d")
+                    .props('prefix="下限"')
+                    .classes(low_cls)
+                )
                 ui.label("～").classes("text-gray-400 shrink-0")
-                high_input = ui.number(
-                    value=high, min=0, max=max_value, format="%d"
-                ).props('prefix="上限"').classes(high_cls)
+                high_input = (
+                    ui.number(value=high, min=0, max=max_value, format="%d")
+                    .props('prefix="上限"')
+                    .classes(high_cls)
+                )
             return low_input, high_input
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):

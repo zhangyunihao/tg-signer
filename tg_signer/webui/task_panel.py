@@ -15,6 +15,7 @@ from typing import Dict, Optional
 
 from nicegui import ui
 
+from tg_signer.webui.activity import should_poll
 from tg_signer.webui.auto_leave import UNSELECT_KEYWORDS as _LEAVE_EXCLUDE_KEYWORDS
 from tg_signer.webui.auto_leave import _scan_types_of as _leave_scan_types
 from tg_signer.webui.auto_leave import load_config as _load_leave_config
@@ -1519,7 +1520,10 @@ class TaskRunnerBlock:
                 max(TaskRunnerBlock._line_seq - TaskRunnerBlock.MAX_RENDER_LINES, 0)
             )
         else:
-            pending = self._lines_since(self._last_render_seq)
+            # 页面不可见期间积压的新行可能很多，恢复时只补最近的部分，避免一次性灌入
+            pending = self._lines_since(self._last_render_seq)[
+                -TaskRunnerBlock.MAX_RENDER_LINES :
+            ]
         self._last_render_seq = TaskRunnerBlock._line_seq
         if pending:
             with self.log_list:
@@ -1561,10 +1565,13 @@ class TaskRunnerBlock:
     async def _poll_forever(self) -> None:
         """替代 ui.timer 的轮询循环：断连自动退出，UI 更新包裹在 client 上下文。"""
         while True:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
             if not self._poll_client.has_socket_connection:
                 return
             if not self._poll_enabled:
+                continue
+            # 页面不可见或已切到其他 tab 时跳过刷新，切回后自动恢复
+            if not should_poll(self._poll_client, "run"):
                 continue
             try:
                 with self._poll_client:

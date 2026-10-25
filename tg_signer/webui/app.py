@@ -5,13 +5,15 @@ import os
 import sqlite3
 import time
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from typing import Callable, Optional
 
-from nicegui import app, ui
+from nicegui import app, run, ui
 
 from tg_signer import __version__
 from tg_signer.core import get_proxy
+from tg_signer.webui.activity import install_activity_tracking, set_active_tab
 from tg_signer.webui.auto_leave import auto_leave_block
 from tg_signer.webui.combo import combo_block
 from tg_signer.webui.common import (
@@ -183,10 +185,14 @@ def log_block(card: Optional[ui.card] = None) -> Callable[[], None]:
                     refresh_status(f"未找到日志文件: {path}")
                 return
 
+            # 整段日志用一个 <pre> 渲染：几千行时元素数从「每行一个」降为 1，
+            # 显著减少 websocket 序列化与浏览器 DOM 压力
+            body = "\n".join(
+                f'<span class="{classify_line(line)}">{escape(line)}</span>'
+                for line in lines
+            )
             with log_list:
-                for line in lines:
-                    color = classify_line(line)
-                    ui.label(line).classes(f"w-full {color}").style("white-space: pre;")
+                ui.html(f'<pre class="tgs-log-pre">{body}</pre>').classes("w-full")
             current_lines = lines
             log_list.update()
             suffix = "（已过滤）" if filtering else ""
@@ -275,6 +281,8 @@ def _apply_paths(workdir_input, on_refresh: Callable[[], None]) -> None:
 
 
 def _build_dashboard(container) -> None:
+    # 跟踪浏览器会话的可见性与当前 tab，供各面板轮询门控使用
+    install_activity_tracking()
     with container:
         refreshers: list[Callable[[], None]] = []
 
@@ -340,7 +348,19 @@ def _build_dashboard(container) -> None:
                 with ui.row().classes("w-full justify-end"):
                     ui.button("关闭", on_click=logs_dialog.close).props("outline")
 
-        def open_settings() -> None:
+        async def open_settings() -> None:
+            # 扫描各账号最近会话（list_known_channels）与读取多个状态文件都是磁盘
+            # 密集操作，放到线程池执行，避免卡住事件循环里的其他轮询/请求
+            target_options = {"me": "收藏夹 (me)"}
+            target_options.update(
+                await run.io_bound(list_known_channels, state.workdir)
+            )
+            current_targets = await run.io_bound(
+                load_win_forward_targets, state.workdir
+            )
+            sweep_limit = await run.io_bound(load_win_sweep_limit, state.workdir)
+            timeout_min = await run.io_bound(load_giveaway_timeout_min, state.workdir)
+            scan_cap = await run.io_bound(load_giveaway_scan_cap, state.workdir)
             with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
                 add_dialog_close_button(dialog)
                 ui.label("设置").classes("text-lg font-semibold")
@@ -356,9 +376,6 @@ def _build_dashboard(container) -> None:
                     "抽奖引擎识别到中奖消息后，用各账号把中奖原消息转发到这里"
                     "（可多选，需为该账号已加入的群组/频道），修改后新启动的任务生效。"
                 ).classes("text-xs text-gray-500")
-                target_options = {"me": "收藏夹 (me)"}
-                target_options.update(list_known_channels(state.workdir))
-                current_targets = load_win_forward_targets(state.workdir)
                 for tid in current_targets:
                     if tid not in target_options:
                         target_options[tid] = tid
@@ -382,7 +399,7 @@ def _build_dashboard(container) -> None:
                 ).classes("text-xs text-gray-500")
                 sweep_input = ui.number(
                     label="回扫条数",
-                    value=load_win_sweep_limit(state.workdir),
+                    value=sweep_limit,
                     min=1,
                     max=1000,
                     precision=0,
@@ -396,7 +413,7 @@ def _build_dashboard(container) -> None:
                 ).classes("text-xs text-gray-500")
                 timeout_input = ui.number(
                     label="超时（分钟，0=不限）",
-                    value=load_giveaway_timeout_min(state.workdir),
+                    value=timeout_min,
                     min=0,
                     max=10080,
                     precision=0,
@@ -410,32 +427,41 @@ def _build_dashboard(container) -> None:
                 ).classes("text-xs text-gray-500")
                 scan_cap_input = ui.number(
                     label="扫描上限（条）",
-                    value=load_giveaway_scan_cap(state.workdir),
+                    value=scan_cap,
                     min=1,
                     max=10000,
                     precision=0,
                 ).classes("w-full")
+
+                async def apply_settings() -> None:
+                    # 先切换工作目录并刷新界面，再在后台线程落盘各项设置
+                    _apply_paths(workdir_input, refresh_all)
+                    try:
+                        await run.io_bound(
+                            save_win_forward_targets,
+                            state.workdir,
+                            list(target_select.value or []),
+                        )
+                        await run.io_bound(
+                            save_win_sweep_limit, state.workdir, sweep_input.value
+                        )
+                        await run.io_bound(
+                            save_giveaway_timeout_min,
+                            state.workdir,
+                            timeout_input.value,
+                        )
+                        await run.io_bound(
+                            save_giveaway_scan_cap, state.workdir, scan_cap_input.value
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        notify_error(exc)
+                        return
+                    ui.notify("设置已保存，新启动的抽奖任务生效", type="positive")
+                    dialog.close()
+
                 with ui.row().classes("w-full justify-end gap-2"):
                     ui.button("取消", on_click=dialog.close).props("outline")
-                    ui.button(
-                        "应用并刷新",
-                        color="primary",
-                        on_click=lambda: (
-                            _apply_paths(workdir_input, refresh_all),
-                            save_win_forward_targets(
-                                state.workdir, list(target_select.value or [])
-                            ),
-                            save_win_sweep_limit(state.workdir, sweep_input.value),
-                            save_giveaway_timeout_min(
-                                state.workdir, timeout_input.value
-                            ),
-                            save_giveaway_scan_cap(state.workdir, scan_cap_input.value),
-                            ui.notify(
-                                "设置已保存，新启动的抽奖任务生效", type="positive"
-                            ),
-                            dialog.close(),
-                        ),
-                    )
+                    ui.button("应用并刷新", color="primary", on_click=apply_settings)
             dialog.open()
 
         async def _stop_all_tasks() -> None:
@@ -475,6 +501,7 @@ def _build_dashboard(container) -> None:
         # 默认选中「签到」：未选中任何 tab（首次访问、localStorage 无记录或值失效）时，
         # 面板区域不显示任何内容，这里显式设为 run 保证默认面板有内容
         tabs.value = "run"
+        set_active_tab("run", tabs.client)
 
         # 「菜单」按钮的下拉项（点击按钮展开）
         with header_btn:
@@ -535,6 +562,8 @@ def _build_dashboard(container) -> None:
         def _on_tab_change(e) -> None:
             name = _tab_name(e.value)
             if name in valid_tabs:
+                # 记录当前激活 tab：非激活 tab 的轮询会跳过，切回时自动恢复
+                set_active_tab(name, tabs.client)
                 _ensure_panel(name)
                 ui.run_javascript(
                     f'localStorage.setItem("tg_signer_tab", {json.dumps(name)})'
@@ -629,9 +658,10 @@ def _build_dashboard(container) -> None:
                 )
 
                 # ---- 配置导入导出（用于备份或迁移到其他设备） ----
-                def export_configs() -> None:
+                async def export_configs() -> None:
                     try:
-                        data = export_backup(state.workdir)
+                        # 打包 zip 是同步磁盘操作，放入线程池避免阻塞事件循环
+                        data = await run.io_bound(export_backup, state.workdir)
                         ui.download(
                             data,
                             f"tg-signer-backup-{datetime.now():%Y%m%d-%H%M%S}.zip",
@@ -648,7 +678,8 @@ def _build_dashboard(container) -> None:
                     try:
                         # NiceGUI 3.13：上传内容在 e.file（FileUpload），read() 为异步
                         raw = await e.file.read()
-                        counts = import_backup(raw, state.workdir)
+                        # 解包 zip 并逐个写配置同样是同步磁盘操作
+                        counts = await run.io_bound(import_backup, raw, state.workdir)
                     except Exception as exc:  # noqa: BLE001
                         notify_error(exc)
                         return
@@ -884,6 +915,14 @@ def build_ui(auth_code: str = None) -> None:
                 flex-direction: column;
             }
             .tgs-log-fullscreen > * { flex-shrink: 0; }
+            /* 日志整段渲染：保留换行与等宽字体，去掉 pre 默认外边距 */
+            .tgs-log-pre {
+                margin: 0;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                font-size: 13px;
+                line-height: 1.5;
+                white-space: pre;
+            }
             .tgs-log-fullscreen .tgs-log-area {
                 flex: 1 1 auto !important;
                 min-height: 0;

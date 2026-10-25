@@ -15,6 +15,7 @@ from typing import Callable
 from nicegui import app, ui
 
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui.activity import should_poll
 from tg_signer.webui.auto_leave import load_leave_tasks
 from tg_signer.webui.common import (
     add_dialog_close_button,
@@ -504,6 +505,7 @@ class ComboTaskBlock:
         self._live_names: dict[str, str] = {}
         self._snap_sigs: dict[str, tuple] = {}
         self._render_history()
+        self._poll_client = ui.context.client
         # 轮询刷新：历史状态变化时刷新列表，同时落盘运行中任务的进度快照
         ui.timer(2.0, self._tick)
 
@@ -1038,6 +1040,9 @@ class ComboTaskBlock:
 
     def _tick(self) -> None:
         """每 2 秒轮询：落盘进度快照；历史状态变化时刷新列表。"""
+        # 页面不可见或已切到其他 tab 时跳过，切回后自动恢复
+        if not should_poll(self._poll_client, "combo"):
+            return
         # 进度快照落盘：运行中每 2 秒更新，停止/结束后保留最终状态
         self._sync_progress_snapshots()
         # 历史列表：仅状态/记录数变化时重渲染，避免每秒重建
