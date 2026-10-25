@@ -9,7 +9,7 @@
 - 账号频道/群组已满（自动触发退频道任务）：webui_channels_full_alerts.json
 
 主控台右上角铃铛只负责展示未读数徽标，点击在新标签页打开 /messages
-消息中心页面（支持按用户过滤、全部已读、消息置顶、10 秒轮询自动刷新）。
+消息中心页面（支持按用户/消息类型过滤、全部已读、消息置顶、10 秒轮询自动刷新）。
 已读状态按消息键持久化在工作目录 webui_message_read.json，
 置顶状态按消息键持久化在工作目录 webui_message_pin.json，
 刷新页面、重启服务、更换浏览器后依然保留。
@@ -56,11 +56,17 @@ PIN_STATE_MAX = 200
 # 用户过滤下拉的「全部」哨兵值（clearable 清空后 value 为 None，同样视为全部）
 ALL_ACCOUNTS = ""
 
+# 消息类型过滤下拉的「全部」哨兵值
+ALL_TYPES = ""
+
 # 消息中心独立页面路由（右上角铃铛在新标签页打开）
 MESSAGES_PAGE_PATH = "/messages"
 
 # 消息中心用户过滤条件在 app.storage.user 中的持久化键（刷新页面后保留）
 FILTER_STORAGE_KEY = "tg_signer_messages_filter"
+
+# 消息中心类型过滤条件在 app.storage.user 中的持久化键（刷新页面后保留）
+TYPE_FILTER_STORAGE_KEY = "tg_signer_messages_type_filter"
 
 
 def _read_state_path(workdir) -> Path:
@@ -312,6 +318,16 @@ def _filter_options(read_keys: Set[str]) -> dict:
     }
 
 
+def _type_filter_options() -> dict:
+    """构建消息类型过滤下拉选项：全部类型 + 当前消息中出现过的类型（按列表顺序）。"""
+    tags: List[str] = []
+    for m in collect_messages(state.workdir):
+        tag = str(m.get("tag") or "")
+        if tag and tag not in tags:
+            tags.append(tag)
+    return {ALL_TYPES: "全部类型", **{tag: tag for tag in tags}}
+
+
 # 消息中心独立页面：与主控台同源的浅色渐变背景 + 白色卡片风格
 _PAGE_HEAD_STYLE = """
 <style>
@@ -331,11 +347,14 @@ def _build_center_page() -> None:
     last_fp = {"value": ""}
 
     def visible_messages() -> List[dict]:
-        """按当前用户过滤条件取可见消息（未排序）。"""
+        """按当前用户/类型过滤条件取可见消息（未排序）。"""
         messages = collect_messages(state.workdir)
         sel = str(filter_sel.value or "")
         if sel:
             messages = [m for m in messages if m.get("account") == sel]
+        type_sel_value = str(type_sel.value or "")
+        if type_sel_value:
+            messages = [m for m in messages if m.get("tag") == type_sel_value]
         return messages
 
     def mark_one(key: str) -> None:
@@ -356,6 +375,10 @@ def _build_center_page() -> None:
     def _on_filter_change(_e) -> None:
         # 持久化过滤选择：刷新页面、重开标签页后仍保留（clearable 清空存为「全部」）
         app.storage.user[FILTER_STORAGE_KEY] = str(filter_sel.value or "")
+        render_list()
+
+    def _on_type_filter_change(_e) -> None:
+        app.storage.user[TYPE_FILTER_STORAGE_KEY] = str(type_sel.value or "")
         render_list()
 
     def toggle_pin(key: str) -> None:
@@ -423,6 +446,12 @@ def _build_center_page() -> None:
             filter_sel.value = ALL_ACCOUNTS
             app.storage.user[FILTER_STORAGE_KEY] = ALL_ACCOUNTS
         filter_sel.update()
+        # 消息类型选项随当前消息集合变化，失效时回落「全部类型」
+        type_sel.options = _type_filter_options()
+        if str(type_sel.value or "") not in type_sel.options:
+            type_sel.value = ALL_TYPES
+            app.storage.user[TYPE_FILTER_STORAGE_KEY] = ALL_TYPES
+        type_sel.update()
         render_list()
         refresh_unread_badge()
 
@@ -458,19 +487,32 @@ def _build_center_page() -> None:
             "（口令发送失败/发言数未达标，显示还需发言条数），点击消息标记为已读，"
             "点击右侧图钉可置顶/取消置顶（置顶消息始终排在最前）。"
         ).classes("text-xs text-gray-500")
-        # 恢复上次选择的过滤用户（刷新页面、重开标签页后仍保留）
+        # 恢复上次选择的过滤用户/消息类型（刷新页面、重开标签页后仍保留）
         options = _filter_options(read_keys)
         saved = str(app.storage.user.get(FILTER_STORAGE_KEY) or "")
-        filter_sel = (
-            ui.select(
-                options,
-                value=saved if saved in options else ALL_ACCOUNTS,
-                label="按用户过滤",
-                on_change=_on_filter_change,
+        type_options = _type_filter_options()
+        saved_type = str(app.storage.user.get(TYPE_FILTER_STORAGE_KEY) or "")
+        with ui.row().classes("w-full items-center gap-2 no-wrap"):
+            filter_sel = (
+                ui.select(
+                    options,
+                    value=saved if saved in options else ALL_ACCOUNTS,
+                    label="按用户过滤",
+                    on_change=_on_filter_change,
+                )
+                .props("dense outlined clearable options-dense")
+                .classes("w-48")
             )
-            .props("dense outlined clearable options-dense")
-            .classes("w-48")
-        )
+            type_sel = (
+                ui.select(
+                    type_options,
+                    value=saved_type if saved_type in type_options else ALL_TYPES,
+                    label="按类型过滤",
+                    on_change=_on_type_filter_change,
+                )
+                .props("dense outlined clearable options-dense")
+                .classes("w-48")
+            )
         list_container = ui.column().classes("w-full gap-2")
 
     refresh_all()
