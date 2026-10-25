@@ -10,6 +10,8 @@ from nicegui import ui
 
 # key: client.id, value: {"hidden": bool, "tab": str}
 _STATE: dict[str, dict] = {}
+# 已安装可见性监听的 client.id：主控台与页内对话框可能重复调用，只安装一次
+_INSTALLED: set[str] = set()
 
 
 def _entry(client) -> dict:
@@ -23,6 +25,9 @@ def install_activity_tracking(client=None) -> None:
     id 为 0），这里在其上注册事件处理器更新内存状态。
     """
     client = client or ui.context.client
+    if client.id in _INSTALLED:
+        return
+    _INSTALLED.add(client.id)
     entry = _entry(client)
 
     def _set_hidden(hidden: bool) -> None:
@@ -30,7 +35,12 @@ def install_activity_tracking(client=None) -> None:
 
     client.layout.on("tgsPageHidden", lambda _e=None: _set_hidden(True))
     client.layout.on("tgsPageVisible", lambda _e=None: _set_hidden(False))
-    client.on_delete(lambda *_: _STATE.pop(client.id, None))
+
+    def _cleanup(*_args) -> None:
+        _STATE.pop(client.id, None)
+        _INSTALLED.discard(client.id)
+
+    client.on_delete(_cleanup)
     ui.run_javascript(
         "(function () {"
         "  const report = () => emitEvent("

@@ -1142,6 +1142,46 @@ class TaskRunnerBlock:
                 pos = stats["current_pos"]
                 if pos is not None and detail_rows[pos]["status"] == "进行中":
                     detail_rows[pos]["status"] = "失败"
+            elif (
+                not combo
+                and "║" in stripped
+                and (
+                    "Chat ID:" in stripped
+                    or "Name:" in stripped
+                    or "Message Thread ID:" in stripped
+                )
+            ):
+                # 「开始执行」/「签到失败」日志随后会打印频道信息框，据此把明细
+                # 行补成真实的 Chat ID/名称，重跑失败频道时才能准确定位
+                pos = stats.get("current_pos")
+                if pos is not None and 0 <= pos < len(detail_rows):
+                    row = detail_rows[pos]
+                    if "Chat ID:" in stripped:
+                        row["chat_id"] = (
+                            stripped.split("Chat ID:", 1)[1].strip().rstrip("║").strip()
+                        )
+                    elif "Message Thread ID:" in stripped:
+                        thread = (
+                            stripped.split("Message Thread ID:", 1)[1]
+                            .strip()
+                            .rstrip("║")
+                            .strip()
+                        )
+                        row["message_thread_id"] = (
+                            None if thread in ("", "-") else thread
+                        )
+                    elif "Name:" in stripped:
+                        row["chat_name"] = (
+                            stripped.split("Name:", 1)[1].strip().rstrip("║").strip()
+                        )
+                    chat_id_text = str(row.get("chat_id") or "").strip()
+                    if chat_id_text:
+                        name_text = str(row.get("chat_name") or "").strip()
+                        row["chat"] = (
+                            f"{name_text}({chat_id_text})"
+                            if name_text and name_text != "-"
+                            else chat_id_text
+                        )
             elif "上次执行时间:" in stripped:
                 # 形如：上次执行时间: 2026-10-14 00:44:22.965904+08:00
                 stats["last_sign"] = stripped.split("上次执行时间:", 1)[1].strip()
@@ -1191,6 +1231,173 @@ class TaskRunnerBlock:
                         _set_note(note)
             q.put(prefix + line.rstrip("\r\n"))
 
+    def _launch_join(
+        self,
+        task_name: str,
+        account_chats: dict[str, list[dict]],
+    ) -> bool:
+        """把勾选的失败频道重新加入：每账号一个 join_runner 子进程。
+
+        ``account_chats`` 为 {账号: [{"token": "chat_id#thread", "label": "名称(id)"}]}。
+        """
+        accounts = [a for a in account_chats if account_chats[a]]
+        if not accounts:
+            ui.notify("没有可重新加入的频道", type="warning")
+            return False
+        random.shuffle(accounts)
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(SOURCE_ROOT)
+        stagger_delays: Dict[str, int] = {}
+        if len(accounts) > 1:
+            gap = ACCOUNT_STAGGER_SPREAD / len(accounts)
+            for i, account in enumerate(accounts):
+                stagger_delays[account] = int(i * gap + random.uniform(0, gap * 0.5))
+        record = {
+            "id": f"{time.time_ns()}",
+            "start_time": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+            "task_type": "加群 (重新加入)",
+            "task_name": task_name,
+            "accounts": ", ".join(accounts),
+            "status": "运行中",
+            "duration": "",
+            "result": "重新加入勾选的失败频道中…",
+        }
+        procs: list[dict] = []
+        run_queue: queue.Queue = queue.Queue()
+        detail_rows: list[dict] = []
+        for account in accounts:
+            chats = list(account_chats[account])
+            # 明细行先按勾选结果建好，子进程连不上时也能看到每一项的失败原因
+            rows = [
+                {
+                    "account": account,
+                    "chat": str(c.get("label") or c.get("token") or ""),
+                    "status": "进行中",
+                }
+                for c in chats
+            ]
+            detail_rows.extend(rows)
+            spec = {
+                "account": account,
+                # 会话文件在 WebUI 进程的 CWD，配置在 state.workdir/signs 下
+                "session_dir": ".",
+                "workdir": str(state.workdir),
+                "task": task_name,
+                "chats": chats,
+            }
+            cmd = [
+                sys.executable,
+                "-m",
+                "tg_signer.join_runner",
+                json.dumps(spec, ensure_ascii=False),
+            ]
+            stats = {"started": 0, "failed": 0, "current_pos": None, "join_index": 0}
+            proc_env = env
+            start_delay = stagger_delays.get(account, 0)
+            if start_delay > 0:
+                proc_env = env.copy()
+                proc_env["TG_SIGNER_START_DELAY"] = str(start_delay)
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    env=proc_env,
+                )
+                _assign_to_job(proc)
+            except Exception as exc:
+                notify_error(exc)
+                for row in rows:
+                    row["status"] = "失败"
+                    row["note"] = "子进程启动失败"
+                continue
+            reader = threading.Thread(
+                target=self._join_reader,
+                args=(proc, task_name, account, run_queue, stats, rows),
+                daemon=True,
+            )
+            reader.start()
+            procs.append(
+                {
+                    "proc": proc,
+                    "reader": reader,
+                    "account": account,
+                    "stats": stats,
+                    "sub_labels": [],
+                }
+            )
+        if not procs:
+            ui.notify("未能启动加群任务", type="negative")
+            return False
+        record["accounts"] = ", ".join(i["account"] for i in procs)
+        self.runs[record["id"]] = {
+            "record": record,
+            "procs": procs,
+            "queue": run_queue,
+            "start_ts": time.time(),
+            "total_chats": len(detail_rows),
+            "details": detail_rows,
+            "combo_subs": [],
+        }
+        append_task_history(record)
+        self._refresh_history_table()
+        self._poll_enabled = True
+        self._update_status()
+        ui.notify(
+            f"已开始重新加入: {task_name}（{len(procs)} 个账号）", type="positive"
+        )
+        return True
+
+    def _join_reader(
+        self,
+        proc: subprocess.Popen,
+        task_name: str,
+        account: str,
+        q: "queue.Queue",
+        stats: dict,
+        rows: list[dict],
+    ) -> None:
+        """读取 join_runner 的标记行，更新该账号的明细行状态。"""
+        prefix = f"[{task_name}:{account}] "
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            stripped = line.lstrip()
+            if ">>> 加群开始:" in stripped:
+                pos = stats["join_index"]
+                if pos < len(rows):
+                    rows[pos]["status"] = "进行中"
+                    stats["current_pos"] = pos
+                    stats["join_index"] = pos + 1
+                    stats["started"] += 1
+            elif ">>> 加群成功:" in stripped:
+                pos = stats.get("current_pos")
+                if pos is not None and pos < len(rows):
+                    rows[pos]["status"] = "成功"
+                    if "审批" in stripped:
+                        rows[pos]["note"] = "已发送加入申请，等待审批"
+            elif ">>> 加群失败:" in stripped:
+                pos = stats.get("current_pos")
+                if pos is not None and pos < len(rows):
+                    rows[pos]["status"] = "失败"
+                    reason = stripped.split(">>> 加群失败:", 1)[1]
+                    if ":" in reason:
+                        reason = reason.split(":", 1)[1]
+                    rows[pos]["note"] = reason.strip()
+                stats["failed"] += 1
+            q.put(prefix + line.rstrip("\r\n"))
+        # 进程提前退出（如账号未授权）：没走到的频道统一标记失败
+        for row in rows:
+            if row["status"] == "进行中":
+                row["status"] = "失败"
+                row.setdefault("note", "未执行（账号连接失败或进程退出）")
+                stats["failed"] += 1
+
     def _chat_labels(self, task_name: str) -> list[str]:
         """读取签到配置的聊天标签（名称+chat_id），读取失败返回空列表。"""
         try:
@@ -1218,7 +1425,9 @@ class TaskRunnerBlock:
             completed += max(0, s["started"] - (1 if alive else 0))
         ok = max(0, completed - failed)
         task_type = run["record"].get("task_type", "")
-        if total > 0 and ("run-once" in task_type or "组合" in task_type):
+        if total > 0 and (
+            "run-once" in task_type or "组合" in task_type or "加群" in task_type
+        ):
             return f"进度 {ok}/{total} · 失败 {failed}"
         if started > 0:
             return f"已完成 {ok} 个聊天 · 失败 {failed}"
@@ -1271,16 +1480,26 @@ class TaskRunnerBlock:
             self._detail_row(row)
 
     def _detail_row(self, row: dict) -> None:
-        """查看某条任务记录的子任务（账号 × 聊天）成功/失败明细"""
+        """查看某条任务记录的子任务（账号 × 聊天）成功/失败明细。
+
+        签到类任务的明细是「账号 × 频道」，失败项可勾选后立即重跑。
+        """
         rid = str(row.get("id") or "")
+        record: dict | None = None
         details: list[dict] = []
         if rid in self.runs:
+            record = self.runs[rid]["record"]
             details = list(self.runs[rid]["details"])
         else:
             for r in load_task_history():
                 if str(r.get("id")) == rid:
+                    record = r
                     details = list(r.get("details") or [])
                     break
+        task_type = str((record or {}).get("task_type") or "")
+        task_name = str((record or {}).get("task_name") or row.get("task") or "")
+        # 只有签到类（非组合）明细是「账号 × 频道」，支持勾选失败频道重跑
+        can_rerun = "签到" in task_type and "组合" not in task_type and bool(task_name)
         counts = {"成功": 0, "失败": 0, "进行中": 0, "中断": 0}
         for d in details:
             counts[d.get("status", "中断")] = counts.get(d.get("status", "中断"), 0) + 1
@@ -1298,6 +1517,8 @@ class TaskRunnerBlock:
             }
             for acc in accounts
         }
+        # 勾选状态按明细行下标保存，切换筛选/重新渲染后仍保留
+        selected: set[int] = set()
         with ui.dialog() as dlg, ui.card().classes("w-full max-w-xl"):
             add_dialog_close_button(dlg)
             ui.label(f"子任务明细 — {row.get('task', '')}").classes(
@@ -1307,6 +1528,11 @@ class TaskRunnerBlock:
                 f"共 {len(details)} 个子任务 | 成功 {counts['成功']} · 失败 {counts['失败']}"
                 f" · 进行中 {counts['进行中']} · 中断 {counts['中断']}"
             ).classes("text-sm text-gray-600")
+            if can_rerun:
+                ui.label(
+                    "勾选失败的频道后点「重新加入」，将立即让对应账号重新加入这些群组/频道"
+                    "（签到失败常因账号已不在群里）。"
+                ).classes("text-xs text-gray-500")
             # 分账号失败统计：点击可直接筛选该账号
             if acc_stats:
                 with ui.row().classes("w-full gap-1 flex-wrap items-center"):
@@ -1342,13 +1568,89 @@ class TaskRunnerBlock:
             count_label = ui.label("").classes("text-sm text-gray-500")
             with ui.scroll_area().classes("w-full max-h-96 border rounded-lg"):
                 list_container = ui.column().classes("w-full gap-0 p-1")
+            # 底部：勾选统计 + 重新加入 / 关闭
+            with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+                sel_label = ui.label("已选 0 个失败频道").classes(
+                    "text-sm text-gray-600"
+                )
+                ui.button(
+                    "全选失败",
+                    on_click=lambda: select_all_failed(),
+                ).props("flat dense size=sm")
+                ui.button(
+                    "清空选择",
+                    on_click=lambda: clear_selection(),
+                ).props("flat dense size=sm")
+                with ui.row().classes("ml-auto gap-2"):
+                    rerun_btn = ui.button(
+                        "重新加入", color="primary", on_click=lambda: rerun_failed()
+                    )
+                    rerun_btn.set_enabled(False)
+                    ui.button("关闭", on_click=dlg.close).props("flat")
+
+            def refresh_selection() -> None:
+                n = len([i for i in selected if details[i].get("status") == "失败"])
+                sel_label.text = f"已选 {n} 个失败频道"
+                sel_label.update()
+                rerun_btn.set_enabled(n > 0)
+
+            def toggle(index: int, checked: bool) -> None:
+                if checked:
+                    selected.add(index)
+                else:
+                    selected.discard(index)
+                refresh_selection()
+
+            def select_all_failed() -> None:
+                for i, d in enumerate(details):
+                    if d.get("status") == "失败":
+                        selected.add(i)
+                render()
+
+            def clear_selection() -> None:
+                selected.clear()
+                render()
+
+            def rerun_failed() -> None:
+                picked = [
+                    (i, details[i])
+                    for i in sorted(selected)
+                    if details[i].get("status") == "失败"
+                ]
+                if not picked:
+                    ui.notify("请先勾选要重新加入的失败频道", type="warning")
+                    return
+                by_account: dict[str, list[dict]] = {}
+                skipped = 0
+                for _, d in picked:
+                    account = str(d.get("account") or "")
+                    item = self._detail_join_item(d)
+                    if not account or item is None:
+                        skipped += 1
+                        continue
+                    bucket = by_account.setdefault(account, [])
+                    if all(x["token"] != item["token"] for x in bucket):
+                        bucket.append(item)
+                if not by_account:
+                    ui.notify(
+                        "失败项缺少 Chat ID，无法定位频道（请等新的任务执行后再试）",
+                        type="negative",
+                    )
+                    return
+                total = sum(len(v) for v in by_account.values())
+                if self._launch_join(task_name, by_account):
+                    dlg.close()
+                    msg = f"已重新加入 {total} 个失败频道"
+                    if skipped:
+                        msg += f"，另有 {skipped} 条缺少 Chat ID 未加入"
+                    ui.notify(msg, type="positive" if not skipped else "warning")
 
             def render() -> None:
                 st = status_sel.value
                 acc = account_sel.value
                 filtered = [
-                    d
-                    for d in details
+                    (i, d)
+                    for i, d in enumerate(details)
                     if (st == "全部" or d.get("status", "") == st)
                     and (acc == "全部账号" or d.get("account", "") == acc)
                 ]
@@ -1358,7 +1660,7 @@ class TaskRunnerBlock:
                 with list_container:
                     if not filtered:
                         ui.label("无匹配的子任务").classes("text-sm text-gray-500 p-2")
-                    for d in filtered:
+                    for i, d in filtered:
                         status = d.get("status", "")
                         color = {
                             "成功": "text-green-700",
@@ -1368,17 +1670,63 @@ class TaskRunnerBlock:
                         mark = {"成功": "✓", "失败": "✗", "进行中": "…"}.get(
                             status, "−"
                         )
-                        ui.label(
-                            f"{mark} {d.get('account', '')} → {d.get('chat', '')}：{status}"
-                        ).classes(f"text-sm py-0.5 tgs-detail-line {color}").style(
-                            "white-space: pre;"
-                        )
+                        with ui.row().classes("w-full items-start gap-1 no-wrap"):
+                            if can_rerun and status == "失败":
+                                ui.checkbox(
+                                    value=i in selected,
+                                    on_change=lambda e, idx=i: toggle(
+                                        idx, bool(e.value)
+                                    ),
+                                ).props("dense size=sm").classes("shrink-0")
+                            else:
+                                ui.element("div").style("width: 30px; min-width: 30px;")
+                            note = str(d.get("note") or "").strip()
+                            note_text = (
+                                f"（{note}）" if note and status != "进行中" else ""
+                            )
+                            ui.label(
+                                f"{mark} {d.get('account', '')} → {d.get('chat', '')}："
+                                f"{status}{note_text}"
+                            ).classes(f"text-sm py-0.5 tgs-detail-line {color}").style(
+                                "white-space: pre-wrap; overflow-wrap: anywhere;"
+                            )
                 list_container.update()
 
             render()
-            with ui.row().classes("w-full justify-end"):
-                ui.button("关闭", on_click=dlg.close).props("flat")
+            refresh_selection()
         dlg.open()
+
+    @staticmethod
+    def _detail_chat_token(detail: dict) -> str:
+        """把明细行转成重跑用的频道定位串（chat_id 或 chat_id#thread_id）。"""
+        chat_id = str(detail.get("chat_id") or "").strip()
+        if not chat_id:
+            # 兼容旧记录：标签形如「名称(chat_id)」或纯 chat_id
+            label = str(detail.get("chat") or "").strip()
+            if label.endswith(")") and "(" in label:
+                chat_id = label.rsplit("(", 1)[1][:-1].strip()
+            elif label and not label.startswith("第"):
+                chat_id = label
+        if not chat_id:
+            return ""
+        thread = str(detail.get("message_thread_id") or "").strip()
+        if thread and thread != "-":
+            return f"{chat_id}#{thread}"
+        return chat_id
+
+    def _detail_join_item(self, detail: dict) -> Optional[dict]:
+        """把明细行转成 join_runner 的频道条目（token + 标签）。
+
+        token 用于匹配签到配置里的 chat_id，label 用于旧记录或配置里是
+        @username/邀请链接时兜底匹配；两者都定位不到时返回 None。
+        """
+        label = str(detail.get("chat") or "").strip()
+        if label.startswith("第"):
+            label = ""
+        token = self._detail_chat_token(detail)
+        if not token and not label:
+            return None
+        return {"token": token or label, "label": label or token}
 
     def _on_duplicate_event(self, e) -> None:
         """桌面表格「复制」按钮事件入口。"""

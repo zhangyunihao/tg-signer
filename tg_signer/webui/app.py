@@ -15,6 +15,7 @@ from tg_signer import __version__
 from tg_signer.core import get_proxy
 from tg_signer.webui.activity import install_activity_tracking, set_active_tab
 from tg_signer.webui.auto_leave import auto_leave_block
+from tg_signer.webui.channel_stats import channel_stats_block
 from tg_signer.webui.combo import combo_block
 from tg_signer.webui.common import (
     add_dialog_close_button,
@@ -312,9 +313,17 @@ def _build_dashboard(container) -> None:
             pass
         add_dialog_close_button(configs_dialog)
 
+        with (
+            ui.dialog() as stats_dialog,
+            ui.card().classes("w-full max-w-4xl") as stats_card,
+        ):
+            pass
+        add_dialog_close_button(stats_dialog)
+
         _users_built = False
         _logs_built = False
         _configs_built = False
+        _stats_built = False
 
         def _ensure_users() -> None:
             """用户信息对话框内容懒构建（仅首次）。"""
@@ -347,6 +356,18 @@ def _build_dashboard(container) -> None:
                 logs_refresh()
                 with ui.row().classes("w-full justify-end"):
                     ui.button("关闭", on_click=logs_dialog.close).props("outline")
+
+        def _ensure_stats() -> None:
+            """频道统计对话框内容懒构建（仅首次）。"""
+            nonlocal _stats_built
+            if _stats_built:
+                return
+            _stats_built = True
+            with stats_card:
+                ui.label("频道 / 群组统计").classes("text-lg font-semibold")
+                channel_stats_block(state.workdir)
+                with ui.row().classes("w-full justify-end"):
+                    ui.button("关闭", on_click=stats_dialog.close).props("outline")
 
         async def open_settings() -> None:
             # 扫描各账号最近会话（list_known_channels）与读取多个状态文件都是磁盘
@@ -432,6 +453,17 @@ def _build_dashboard(container) -> None:
                     max=10000,
                     precision=0,
                 ).classes("w-full")
+                # 频道统计：独立页面展示各账号已加入频道/超级群组数量
+                ui.label("账号频道统计").classes("text-lg font-semibold mt-2")
+                ui.label(
+                    "统计每个账号已加入的频道与超级群组数量（计入 500/1000 上限），"
+                    "以柱形图展示各账号占用情况。"
+                ).classes("text-xs text-gray-500")
+                ui.button(
+                    "打开频道统计",
+                    icon="bar_chart",
+                    on_click=lambda: (_ensure_stats(), stats_dialog.open()),
+                ).props("outline")
 
                 async def apply_settings() -> None:
                     # 先切换工作目录并刷新界面，再在后台线程落盘各项设置
@@ -921,7 +953,9 @@ def build_ui(auth_code: str = None) -> None:
                 font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
                 font-size: 13px;
                 line-height: 1.5;
-                white-space: pre;
+                /* 保留缩进的换行与空格，超长行自动折行，避免手机端横向滚动 */
+                white-space: pre-wrap;
+                overflow-wrap: anywhere;
             }
             .tgs-log-fullscreen .tgs-log-area {
                 flex: 1 1 auto !important;

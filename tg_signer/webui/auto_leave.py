@@ -109,6 +109,8 @@ def load_config(workdir) -> Dict:
         "accounts": [],
         "include_groups": False,
         "skip_pinned": True,
+        # 页面级「扫描跳过」配置：标题命中任一关键字的频道/群组直接跳过
+        "skip_keywords": [],
     }
     try:
         data = json.loads(_config_path(workdir).read_text(encoding="utf-8"))
@@ -124,6 +126,15 @@ def save_config(workdir, cfg: Dict) -> None:
         atomic_write_json(_config_path(workdir), cfg)
     except Exception:
         logger.debug("保存自动退群配置文件失败", exc_info=True)
+
+
+def load_skip_keywords(workdir) -> List[str]:
+    """读取页面级「扫描跳过」关键字（标题命中即跳过扫描结果）。"""
+    return [
+        str(kw).strip()
+        for kw in (load_config(workdir).get("skip_keywords") or [])
+        if str(kw).strip()
+    ]
 
 
 def _tasks_path(workdir) -> Path:
@@ -284,6 +295,7 @@ async def run_auto_leave_task(
     if task is None:
         return
     task_name = str(task.get("name") or task_id)
+    skip_keywords = load_skip_keywords(workdir)
     log_fn(
         f"[{task_name}] 启动：{', '.join(task.get('accounts') or [])}，"
         f"阈值 {_fmt_days(days)} 天"
@@ -302,6 +314,7 @@ async def run_auto_leave_task(
                 _scan_types_of(task),
                 bool(task.get("skip_pinned", True)),
                 log_fn,
+                skip_keywords=skip_keywords,
             )
             auto_rows = [r for r in found if not _kw_hit(task, r["title"])]
             kept = [r for r in found if _kw_hit(task, r["title"])]
@@ -352,16 +365,19 @@ async def scan_stale_chats(
     scan_types: str = "both",
     skip_pinned: bool = True,
     log: Callable[[str], None] = None,
+    skip_keywords: List[str] | None = None,
 ) -> List[Dict]:
     """扫描单个账号，返回超过 days 天不更新的对话列表（只读，不做任何退出）
 
     scan_types: 扫描范围——"channel" 仅频道 / "group" 仅群组 / "both" 频道+群组
     days: 不更新天数阈值（支持小数，如 0.5），0 表示不按天数过滤（扫描全部符合条件的对话）
+    skip_keywords: 页面级跳过关键字，标题命中即直接跳过（不进入结果）
     """
     scan_types = str(scan_types or "both")
     want_channel = scan_types in ("channel", "both")
     want_group = scan_types in ("group", "both")
     days = _to_days(days, 0)
+    skip_keywords = [str(kw).strip() for kw in (skip_keywords or []) if str(kw).strip()]
     found: List[Dict] = []
     client = None
     try:
@@ -389,6 +405,12 @@ async def scan_stale_chats(
             title = getattr(chat, "title", None) or "N/A"
             if getattr(chat, "is_creator", False):
                 continue  # 自己是创建者，绝不退出
+            # 页面级跳过配置：标题命中即直接跳过，不进入扫描结果
+            if skip_keywords and any(
+                kw.lower() in str(title).lower() for kw in skip_keywords
+            ):
+                log(f"[{account}] 跳过指定频道/群组：{title}")
+                continue
             if skip_pinned and getattr(dialog, "pinned_message", None) is not None:
                 log(f"[{account}] 跳过置顶对话：{title}")
                 continue
@@ -546,6 +568,10 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         except Exception:
             logger.debug("推送日志到界面日志区失败", exc_info=True)
 
+    def _skip_btn_text() -> str:
+        n = len(load_skip_keywords(workdir))
+        return f"跳过设置（{n}）" if n else "跳过设置"
+
     def find_task(task_id: str) -> Dict | None:
         return next((t for t in tasks if t["id"] == task_id), None)
 
@@ -575,8 +601,17 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         _ACTIVE_STOPS[stop_key] = lambda: st.__setitem__("stop", True)
         task["start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
         task["duration"] = ""
+        # 运行期间立即落盘状态：其他标签页/刷新后仍能看到「扫描中」而不是「—」
+        _patch_leave_task(
+            workdir,
+            task_id,
+            status=st["status"],
+            start_time=task["start_time"],
+            duration="",
+        )
         render_list()
         days = _to_days(task.get("days"), 7)
+        skip_keywords = load_skip_keywords(workdir)
         log(
             f"[{task['name']}] 启动：{len(accounts)} 个账号，"
             + (f"阈值 {_fmt_days(days)} 天" if days > 0 else "阈值 0 天（扫描全部）")
@@ -604,6 +639,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     _scan_types_of(task),
                     bool(task.get("skip_pinned", True)),
                     log,
+                    skip_keywords=skip_keywords,
                 )
                 inc_kws = [str(k) for k in (task.get("include_keywords") or []) if k]
                 if inc_kws:
@@ -657,7 +693,13 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             task["rows"] = [dict(r) for r in st["rows"]]
             if st.get("start_ts"):
                 task["duration"] = format_duration(time.time() - st["start_ts"])
-            save_leave_tasks(workdir, tasks)
+            _patch_leave_task(
+                workdir,
+                task_id,
+                status=task["status"],
+                rows=task["rows"],
+                duration=task["duration"],
+            )
             render_list()
 
     def stop_task(task_id: str) -> None:
@@ -681,6 +723,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         st["status"] = "退出中"
         stop_key = f"{wd_key}|{task_id}|leave|{id(st)}"
         _ACTIVE_STOPS[stop_key] = lambda: st.__setitem__("stop", True)
+        # 运行期间立即落盘状态：其他标签页/刷新后仍能看到「退出中」
+        _patch_leave_task(workdir, task_id, status=st["status"])
         ui.notify("退出流程已启动，可在任务列表查看进度", type="positive")
         render_list()
         try:
@@ -713,7 +757,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             st["running"] = False
             task["status"] = st["status"]
             task["rows"] = [dict(r) for r in st["rows"]]
-            save_leave_tasks(workdir, tasks)
+            _patch_leave_task(
+                workdir, task_id, status=task["status"], rows=task["rows"]
+            )
             _refresh_detail(task_id)
             render_list()
 
@@ -1128,6 +1174,11 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         ui.label(
             "每次执行都会在列表新增一条记录，可复制配置再次执行；点击「明细」查看命中的频道"
         ).classes("text-xs text-gray-500 ml-auto")
+        skip_btn = (
+            ui.button(_skip_btn_text(), on_click=lambda: open_skip_dialog())
+            .props("flat dense color=primary")
+            .tooltip("扫描时直接跳过指定频道/群组（标题命中即跳过，不展示也不退出）")
+        )
 
     leave_table = (
         ui.table(
@@ -1310,6 +1361,42 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         with ui.row().classes("w-full justify-end"):
             ui.button("取消", on_click=delete_dialog.close).props("flat")
             ui.button("删除", on_click=_do_delete).props("color=negative")
+
+    # ---- 扫描跳过设置：页面级配置，标题命中的频道/群组扫描时直接跳过 ----
+
+    def open_skip_dialog() -> None:
+        skip_input.value = ", ".join(load_skip_keywords(workdir))
+        skip_input.update()
+        skip_dialog.open()
+
+    def _save_skip() -> None:
+        kws = _split_keywords(str(skip_input.value or "").replace("\n", ","))
+        cfg = load_config(workdir)
+        cfg["skip_keywords"] = kws
+        save_config(workdir, cfg)
+        skip_btn.text = _skip_btn_text()
+        skip_btn.update()
+        skip_dialog.close()
+        log("扫描跳过设置已更新：" + (", ".join(kws) if kws else "（空）"))
+
+    with (
+        ui.dialog() as skip_dialog,
+        ui.card().classes("w-[520px] max-w-[96vw]"),
+    ):
+        add_dialog_close_button(skip_dialog)
+        ui.label("扫描跳过设置").classes("text-lg font-semibold")
+        ui.label(
+            "标题命中任一名称/关键字的频道、群组在扫描时直接跳过（不展示、不自动退出）；"
+            "多个用逗号或换行分隔，对所有退频道任务（含自动/组合）生效。"
+        ).classes("text-xs text-gray-500")
+        skip_input = (
+            ui.textarea("跳过的频道/群组名称", value="")
+            .classes("w-full")
+            .props("outlined autogrow")
+        )
+        with ui.row().classes("w-full justify-end"):
+            ui.button("取消", on_click=skip_dialog.close).props("flat")
+            ui.button("保存", on_click=_save_skip).props("color=primary")
 
     def copy_log() -> None:
         if not log_lines:

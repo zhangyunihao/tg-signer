@@ -9,13 +9,14 @@ import json
 import logging
 import time
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from typing import Callable
 
 from nicegui import app, ui
 
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.activity import should_poll
+from tg_signer.webui.activity import install_activity_tracking, should_poll
 from tg_signer.webui.auto_leave import load_leave_tasks
 from tg_signer.webui.common import (
     add_dialog_close_button,
@@ -896,10 +897,12 @@ class ComboTaskBlock:
             ):
                 if not lines:
                     ui.label("暂无日志输出").classes("text-xs text-gray-400")
-                for line in lines[-200:]:
-                    ui.label(line).classes("w-full").style(
-                        "white-space: pre-wrap; overflow-wrap: anywhere;"
-                    )
+                else:
+                    # 整段日志用一个 <pre> 渲染：200 行时元素数从 200 降为 1，
+                    # 且进度页每秒重绘时序列化体积与 DOM 压力都显著降低
+                    body = "\n".join(escape(line) for line in lines[-200:])
+                    # 字体/折行继承外层日志列样式，这里只去掉 pre 默认外边距
+                    ui.html(f"<pre>{body}</pre>").classes("w-full").style("margin: 0")
             # 退出全屏悬浮按钮：仅全屏时 fixed 显示在视口右上角，平时不占布局
             if getattr(self, "_combo_log_full", False):
                 ui.button(icon="close", on_click=_toggle_log_fullscreen).props(
@@ -1764,6 +1767,8 @@ _PROGRESS_PAGE_STYLE = """
 
 def _build_progress_page(record_id: str) -> None:
     """渲染任务进度页内容；容器每次轮询变化时清空重绘。"""
+    install_activity_tracking()
+    page_client = ui.context.client
     view = ComboTaskBlock.headless(state.workdir, rerender=lambda: render_content())
     record = next(
         (
@@ -1857,6 +1862,9 @@ def _build_progress_page(record_id: str) -> None:
         try:
             # 页面独立打开时也持续落盘快照，不依赖主控台是否开着
             view._sync_progress_snapshots()
+            # 页面隐藏（手机锁屏/切后台）时跳过重绘；快照落盘不受影响，切回后自动补上
+            if not should_poll(page_client):
+                return
             sig = live_sig()
             if sig != last_sig["value"]:
                 last_sig["value"] = sig

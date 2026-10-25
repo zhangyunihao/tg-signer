@@ -25,7 +25,7 @@ from typing import Callable, List, Set
 from nicegui import app, ui
 
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.activity import should_poll
+from tg_signer.webui.activity import install_activity_tracking, should_poll
 from tg_signer.webui.common import state
 from tg_signer.webui.giveaway import (
     channel_title_map,
@@ -269,7 +269,7 @@ def message_center_button() -> Callable[[], None]:
         )
 
     with ui.button(icon="notifications").props("flat round dense") as msg_btn:
-        badge = ui.badge("0").props("floating color=red").classes("text-[10px]")
+        badge = ui.badge("0").props("floating color=grey-6").classes("text-[10px]")
 
     msg_btn.on_click(lambda: ui.navigate.to(MESSAGES_PAGE_PATH, new_tab=True))
     refresh_badge()
@@ -325,6 +325,8 @@ _PAGE_HEAD_STYLE = """
 
 def _build_center_page() -> None:
     """在当前页面上下文渲染消息中心内容（过滤、已读标记、列表、轮询刷新）。"""
+    # 主控台对话框与独立页面都走这里；重复调用会被去重，只安装一次
+    install_activity_tracking()
     read_keys: Set[str] = load_read_keys(state.workdir)
     last_fp = {"value": ""}
 
@@ -480,6 +482,9 @@ def _build_center_page() -> None:
             await asyncio.sleep(10)
             if not client.has_socket_connection:
                 return
+            # 页面隐藏（手机锁屏/切后台）时跳过汇总，切回后自动恢复
+            if not should_poll(client):
+                continue
             try:
                 fp = _fingerprint()
                 if fp != last_fp["value"]:

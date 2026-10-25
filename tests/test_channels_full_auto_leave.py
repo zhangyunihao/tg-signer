@@ -101,12 +101,15 @@ def test_run_auto_leave_task_leaves_unprotected(tmp_path, monkeypatch):
     ]
     calls = {}
 
-    async def fake_scan(account, session_dir, days, scan_types, skip_pinned, log):
+    async def fake_scan(
+        account, session_dir, days, scan_types, skip_pinned, log, skip_keywords=None
+    ):
         calls.update(
             account=account,
             days=days,
             scan_types=scan_types,
             skip_pinned=skip_pinned,
+            skip_keywords=skip_keywords,
         )
         return [dict(r) for r in found]
 
@@ -133,7 +136,9 @@ def test_days_threshold_supports_fractional_values(tmp_path, monkeypatch):
     assert task["days"] == 0.5
     calls = {}
 
-    async def fake_scan(account, session_dir, days, scan_types, skip_pinned, log):
+    async def fake_scan(
+        account, session_dir, days, scan_types, skip_pinned, log, skip_keywords=None
+    ):
         calls["days"] = days
         return []
 
@@ -174,3 +179,71 @@ def test_channels_full_alert_message_deduped(tmp_path):
     assert len(msgs) == 1
     assert "alice" in msgs[0]["text"]
     assert "退频道任务" in msgs[0]["text"]
+
+
+class _FakeChat:
+    def __init__(self, chat_id, title, ctype="CHANNEL", creator=False):
+        self.id = chat_id
+        self.title = title
+        self.type = f"ChatType.{ctype}"
+        self.is_creator = creator
+
+
+class _FakeDialog:
+    def __init__(self, chat, days_ago=5):
+        self.chat = chat
+        self.pinned_message = None
+        self.top_message = type(
+            "_Msg", (), {"date": datetime.now(timezone.utc) - timedelta(days=days_ago)}
+        )()
+
+
+class _FakeDialogsClient:
+    def __init__(self, dialogs):
+        self._dialogs = dialogs
+
+    async def connect(self):
+        return True
+
+    async def get_dialogs(self):
+        for dialog in self._dialogs:
+            yield dialog
+
+
+def test_skip_keywords_config_roundtrip(tmp_path):
+    assert auto_leave.load_skip_keywords(tmp_path) == []
+    cfg = auto_leave.load_config(tmp_path)
+    cfg["skip_keywords"] = ["鲸鱼", "yy"]
+    auto_leave.save_config(tmp_path, cfg)
+    assert auto_leave.load_skip_keywords(tmp_path) == ["鲸鱼", "yy"]
+
+
+def test_scan_stale_chats_skips_configured_titles(tmp_path, monkeypatch):
+    dialogs = [
+        _FakeDialog(_FakeChat(1, "鲸鱼福利频道")),
+        _FakeDialog(_FakeChat(2, "YY 通知")),
+        _FakeDialog(_FakeChat(3, "普通频道")),
+    ]
+    logs = []
+    monkeypatch.setattr(
+        auto_leave, "get_client", lambda *a, **k: _FakeDialogsClient(dialogs)
+    )
+
+    async def _noop_disconnect(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(auto_leave, "safe_disconnect", _noop_disconnect)
+
+    rows = asyncio.run(
+        auto_leave.scan_stale_chats(
+            "alice",
+            tmp_path,
+            1,
+            "channel",
+            True,
+            logs.append,
+            skip_keywords=["鲸鱼", "yy"],
+        )
+    )
+    assert [r["title"] for r in rows] == ["普通频道"]
+    assert any("跳过指定频道/群组" in line for line in logs)

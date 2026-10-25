@@ -4,6 +4,7 @@ import logging
 import os
 import pathlib
 import random
+import sqlite3
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
@@ -233,10 +234,55 @@ _NET_ERRORS = (asyncio.TimeoutError, TimeoutError, OSError)
 RouteKey = tuple[ChatId, Optional[int]]
 get_timezone = _get_timezone
 
+# session 数据库等待锁的最长时间（秒）：并发任务短暂冲突时排队等待而不是直接报错
+_SESSION_DB_TIMEOUT_SECONDS = 30.0
+
+
+class ResilientSQLiteStorage(SQLiteStorage):
+    """session 数据库：WAL + 长等待，避免并发任务互相报 "database is locked"。
+
+    Pyrogram 默认 ``timeout=1`` 秒、DELETE 日志模式，而且每次打开数据库都会
+    执行一次 ``VACUUM``（需要独占锁）。只要另一个任务或另一个 WebUI 实例
+    正持有同一个 session，启动就会立刻抛 "database is locked"。
+    这里改为 WAL（读写不互斥）+ busy_timeout，并跳过每次打开的 VACUUM。
+    """
+
+    async def open(self) -> None:
+        if self.in_memory or self.session_string:
+            return await super().open()
+        path = self.database
+        file_exists = isinstance(path, pathlib.Path) and path.is_file()
+        self.conn = sqlite3.connect(
+            str(path), timeout=_SESSION_DB_TIMEOUT_SECONDS, check_same_thread=False
+        )
+        self.conn.execute(
+            f"PRAGMA busy_timeout={int(_SESSION_DB_TIMEOUT_SECONDS * 1000)}"
+        )
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            # 只读介质等场景无法切换：保持原有日志模式即可
+            logger.debug("session 数据库切换到 WAL 失败", exc_info=True)
+        if file_exists:
+            await self.update()
+        else:
+            await self.create()
+
 
 class Client(SafeGetForumTopics, BaseClient):
     def __init__(self, name: str, *args, **kwargs):
         key = kwargs.pop("key", None)
+        # session 数据库改用 WAL + 长等待（见 ResilientSQLiteStorage）；
+        # 内存 session / session_string 场景仍走 Pyrogram 默认实现
+        if (
+            not kwargs.get("in_memory")
+            and not kwargs.get("session_string")
+            and not kwargs.get("storage_engine")
+            and "workdir" in kwargs
+        ):
+            kwargs["storage_engine"] = ResilientSQLiteStorage(
+                name=name, workdir=pathlib.Path(kwargs["workdir"])
+            )
         super().__init__(name, *args, **kwargs)
         self.key = key or str(pathlib.Path(self.workdir).joinpath(self.name).resolve())
         if self.in_memory and not self.session_string:
@@ -1062,7 +1108,6 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         self,
         chat: SignChatV3,
     ):
-        self.log(f"开始执行: \n{chat}")
         for action in chat.actions:
             self.log(f"等待处理动作: {action}")
             await self.wait_for(chat, action)
@@ -1139,6 +1184,8 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
             for chat in chats:
                 route_key = None
                 try:
+                    # 频道解析前先输出频道信息：解析失败时明细里也能定位到该频道
+                    self.log(f"开始执行: \n{chat}")
                     route_key = await self.resolve_chat_route_key(chat)
                     self.context.sign_chats[route_key].append(chat)
                     await self.sign_a_chat(chat)

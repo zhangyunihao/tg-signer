@@ -35,6 +35,7 @@ from tg_signer.webui.auto_leave import (
     _scan_types_of,
     _to_days,
     leave_one,
+    load_skip_keywords,
     scan_stale_chats,
 )
 
@@ -58,13 +59,15 @@ async def run_leave(spec: dict) -> int:
 
     d = spec.get("days")
     days = _to_days(d, 7)
+    session_dir = Path(str(spec.get("session_dir") or "."))
     rows = await scan_stale_chats(
         account,
-        Path(str(spec.get("session_dir") or ".")),
+        session_dir,
         days,
         _scan_types_of(spec),
         bool(spec.get("skip_pinned", True)),
         log,
+        skip_keywords=load_skip_keywords(session_dir),
     )
     inc_kws = [str(k) for k in (spec.get("include_keywords") or []) if k]
     if inc_kws:

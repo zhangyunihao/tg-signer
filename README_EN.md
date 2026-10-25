@@ -79,7 +79,7 @@ The same menu also contains: **Work Directory** (switch/view the `.signer` data 
   - **Check-in (run-once)**: run once immediately, even if already signed in today
   - **Check-in (run scheduled)**: long-running process that checks in daily at the configured time (`HH:MM:SS` or a crontab expression) plus a random jitter
   - **Automation**: run automation configs
-- The output area streams each account's log in real time; task history supports "stop / copy args / details", with per-account × per-chat success/failure breakdown
+- The output area streams each account's log in real time; task history supports "stop / copy args / details", with per-account × per-chat success/failure breakdown; in check-in details you can tick failed chats and click "re-join" to have those accounts re-join the groups/channels (check-in often fails because the account is no longer a member)
 - Running scheduled tasks show elapsed time, last run, and next expected run
 - Scheduled semantics: if today's check-in time has not come yet, it waits until then; if the time has passed and today is unsigned, it signs in immediately; no duplicate runs
 - **Auto-restore after restart**: scheduled check-in tasks that were running are re-launched when the page opens (run-once one-shot tasks are not); on Windows, task subprocesses terminate with the service
