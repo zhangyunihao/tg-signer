@@ -1326,9 +1326,7 @@ class GiveawayEngine:
     ) -> None:
         """错峰启动：idx > 0 的账号先 sleep idx*5 秒再开始补漏。"""
         await asyncio.sleep(idx * 5)
-        await self._rescue_one_account(
-            account, client, failures, done, total, sweep
-        )
+        await self._rescue_one_account(account, client, failures, done, total, sweep)
 
     async def _rescue_chat_safe(
         self, account: str, client: Any, chat: Any, failures: Dict[str, int]
@@ -1514,9 +1512,7 @@ class GiveawayEngine:
         try:
             await asyncio.gather(
                 *[
-                    self._sweep_bot_wins(
-                        account, client, bots=bots, progress=progress
-                    )
+                    self._sweep_bot_wins(account, client, bots=bots, progress=progress)
                     for account, client, bots in pairs
                 ]
             )
@@ -3312,10 +3308,13 @@ class GiveawayEngine:
         # 否则后面读取会触发 UnboundLocalError（机器人类型任务即此路径）
         had_join_targets = False
         if self.auto_join:
-            stop, had_join_targets, candidates, join_blocked = (
-                await self._auto_join_and_restart(
-                    account, client, username, param, source_message, candidates
-                )
+            (
+                stop,
+                had_join_targets,
+                candidates,
+                join_blocked,
+            ) = await self._auto_join_and_restart(
+                account, client, username, param, source_message, candidates
             )
             if stop:
                 return True

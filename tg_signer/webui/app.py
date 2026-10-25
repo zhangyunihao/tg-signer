@@ -453,17 +453,6 @@ def _build_dashboard(container) -> None:
                     max=10000,
                     precision=0,
                 ).classes("w-full")
-                # 频道统计：独立页面展示各账号已加入频道/超级群组数量
-                ui.label("账号频道统计").classes("text-lg font-semibold mt-2")
-                ui.label(
-                    "统计每个账号已加入的频道与超级群组数量（计入 500/1000 上限），"
-                    "以柱形图展示各账号占用情况。"
-                ).classes("text-xs text-gray-500")
-                ui.button(
-                    "打开频道统计",
-                    icon="bar_chart",
-                    on_click=lambda: (_ensure_stats(), stats_dialog.open()),
-                ).props("outline")
 
                 async def apply_settings() -> None:
                     # 先切换工作目录并刷新界面，再在后台线程落盘各项设置
@@ -555,6 +544,9 @@ def _build_dashboard(container) -> None:
                 ui.menu_item("设置", on_click=open_settings)
                 ui.menu_item(
                     "用户信息", on_click=lambda: (_ensure_users(), users_dialog.open())
+                )
+                ui.menu_item(
+                    "频道统计", on_click=lambda: (_ensure_stats(), stats_dialog.open())
                 )
                 ui.menu_item(
                     "日志", on_click=lambda: (_ensure_logs(), logs_dialog.open())

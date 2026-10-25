@@ -10,8 +10,8 @@ spec 格式::
      "chats": [{"token": "chat_id#thread_id", "label": "名称(chat_id)"}]}
 
 签到失败常见原因是账号已不在群里，这里对勾选的频道调用 join_chat 重新加入：
-优先使用签到任务配置里的原始 chat_id（可能是 @username 或邀请链接，私有群
-必须用邀请链接才能加入），找不到配置项时才退回明细里的 chat_id。
+优先使用签到任务配置里的原始 chat_id（数字 id 或 @username），找不到配置项时
+才退回明细里的 chat_id；群名里通常带 (@username)，数字 id 加入失败时会用它重试。
 
 日志为标记行，WebUI 据此写入任务明细::
 
@@ -127,7 +127,7 @@ async def join_one(client: Any, target: Any, label: str, log) -> bool:
         k in last_error
         for k in ("CHANNEL_INVALID", "CHANNEL_PRIVATE", "INVITE_HASH", "USER_NOT")
     ):
-        hint = "（私有群无法用数字 ID 加入，需先获取邀请链接手动加入）"
+        hint = "（该群无可用 @username，需要邀请链接才能加入，请手动处理）"
     log(f">>> 加群失败: {label}: {last_error}{hint}")
     return False
 
@@ -162,7 +162,13 @@ async def run_join(spec: dict) -> int:
     failed = 0
     try:
         client = get_client(account, workdir=str(session_dir))
-        ok = await asyncio.wait_for(client.connect(), 30)
+        try:
+            ok = await asyncio.wait_for(client.connect(), 30)
+        except Exception as exc:
+            # 网络/代理不可用等：明确退出，WebUI 会把未执行的频道标记为失败
+            reason = str(exc) or exc.__class__.__name__
+            log(f"[{account}] 连接 Telegram 失败：{reason}")
+            return 1
         if not ok:
             log(f"[{account}] 会话未授权，无法重新加入")
             return 1
@@ -171,6 +177,10 @@ async def run_join(spec: dict) -> int:
             if not await join_one(client, target, label, log):
                 failed += 1
         log(f"[{account}] 重新加入完成：成功 {len(items) - failed}/{len(items)}")
+    except Exception as exc:
+        reason = str(exc) or exc.__class__.__name__
+        log(f"[{account}] 加群任务异常：{reason}")
+        return 1
     finally:
         await safe_disconnect(client)
     return 0 if failed == 0 else 1

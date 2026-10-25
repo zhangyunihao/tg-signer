@@ -1698,7 +1698,7 @@ class TaskRunnerBlock:
 
     @staticmethod
     def _detail_chat_token(detail: dict) -> str:
-        """把明细行转成重跑用的频道定位串（chat_id 或 chat_id#thread_id）。"""
+        """把明细行转成加群用的频道定位串（chat_id 或 chat_id#thread_id）。"""
         chat_id = str(detail.get("chat_id") or "").strip()
         if not chat_id:
             # 兼容旧记录：标签形如「名称(chat_id)」或纯 chat_id
