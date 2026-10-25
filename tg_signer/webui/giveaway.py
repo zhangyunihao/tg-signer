@@ -911,6 +911,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             return "未运行"
         return engine.progress_text() or "运行中"
 
+    def _sweep_text(name: str) -> str:
+        """中奖消息回扫进度（与频道扫描分开展示），未在回扫时为空。"""
+        engine = get_engine(name)
+        if engine is None or not engine.running:
+            return ""
+        return (getattr(engine, "win_sweep_text", "") or "").strip()
+
     def joined_count(name: str) -> int:
         """本次运行（运行中实时）或上次运行（结束后持久化）新参与抽奖总数"""
         engine = get_engine(name)
@@ -1043,6 +1050,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
         # 运行中每次统计变化都写回配置并定期落盘，停止/重启后明细仍可查
         last_saved = {"joined": -1, "ts": 0.0}
+        # 卡片状态刷新的去重标记：进度没变就不重绘，避免每秒无谓更新
+        last_status = {"sig": None}
 
         def _on_stats(payload: dict, _n: str = name) -> None:
             cfg_now = tasks.get(_n)
@@ -1058,6 +1067,18 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 str(k): {str(c): int(n) for c, n in (v or {}).items()}
                 for k, v in (payload.get("by_chat") or {}).items()
             }
+            # 每秒刷新卡片/表格里的运行状态与扫描进度（如「扫描中 (3/12)」），
+            # 中奖消息回扫进度单独刷新
+            sig = (
+                joined,
+                str(payload.get("progress") or ""),
+                str(payload.get("sweep") or ""),
+            )
+            if sig != last_status["sig"] and task_running(_n):
+                last_status["sig"] = sig
+                cb_now = _GLOBAL_STATUS_CBS.get(engine_key(_n))
+                if cb_now is not None:
+                    _apply_status(cb_now, True)
             now = time.monotonic()
             if joined == last_saved["joined"] and now - last_saved["ts"] < 30:
                 return
@@ -1334,6 +1355,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     "align": "left",
                 },
                 {
+                    "name": "sweep",
+                    "label": "中奖回扫",
+                    "field": "sweep",
+                    "align": "left",
+                },
+                {
                     "name": "status",
                     "label": "状态",
                     "field": "status",
@@ -1390,6 +1417,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         "joined": f"{joined_count(name)} 个",
                         "last_time": str(cfg.get("last_start_time") or "") or "—",
                         "duration": duration_text,
+                        "sweep": _sweep_text(name),
                         "status": _status_text(name),
                     }
                 )
@@ -1405,6 +1433,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             )
             table_ref["table"] = table
             card_badges: dict = {}
+            card_sweeps: dict = {}
             # 「扫描中」也算运行态（info 蓝色）
             running_expr = (
                 "props.row.status.startsWith('运行中')"
@@ -1448,10 +1477,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         if running and start_ts
                         else (str(cfg_now.get("last_duration") or "") or "—")
                     )
+                    sweep = _sweep_text(n) if running else ""
                     for r in table.rows:
                         if r["name"] == str(n):
                             r["status"] = text
                             r["duration"] = dur
+                            r["sweep"] = sweep
                             try:
                                 table.update()
                             except Exception:
@@ -1465,6 +1496,14 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             badge.update()
                         except Exception:
                             logger.debug("刷新任务状态徽标 UI 失败", exc_info=True)
+                    sweep_label = card_sweeps.get(str(n))
+                    if sweep_label is not None:
+                        try:
+                            sweep_label.text = sweep
+                            sweep_label.set_visibility(bool(sweep))
+                            sweep_label.update()
+                        except Exception:
+                            logger.debug("刷新中奖回扫进度 UI 失败", exc_info=True)
 
                 return _set
 
@@ -1535,6 +1574,14 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                 f"color={'info' if running else 'grey-6'}"
                             )
                             card_badges[n] = badge
+                        sweep_label = ui.label("").classes(
+                            "text-xs text-primary no-wrap"
+                        )
+                        if not row["sweep"]:
+                            sweep_label.set_visibility(False)
+                        else:
+                            sweep_label.text = row["sweep"]
+                        card_sweeps[n] = sweep_label
                         mobile_card_fields(
                             [
                                 ("类型", row["task_type"]),

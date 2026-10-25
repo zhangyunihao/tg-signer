@@ -1497,8 +1497,18 @@ class ComboTaskBlock:
                 "text-xs text-gray-500"
             )
             self.new_task_template = ui.select(
-                {}, label="组合任务模板", with_input=True
+                {},
+                label="组合任务模板",
+                with_input=True,
+                on_change=lambda: self._render_new_task_subs(),
             ).classes("w-full")
+            ui.label("子任务（勾选本次要执行的，默认全部执行）").classes(
+                "text-sm text-gray-600"
+            )
+            self.new_task_subs_container = ui.column().classes(
+                "w-full gap-1 max-h-56 overflow-y-auto"
+            )
+            self._new_task_checks = {}
             self.new_task_accounts = ui.select(
                 label="账号（可选，选了则所有子任务仅用所选账号）",
                 options={},
@@ -1512,6 +1522,26 @@ class ComboTaskBlock:
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=self.new_task_dialog.close).props("outline")
                 ui.button("启动", color="primary", on_click=self._start_new_task)
+
+    def _render_new_task_subs(self) -> None:
+        """按当前所选模板重建子任务勾选列表（默认全部勾选）。"""
+        self.new_task_subs_container.clear()
+        self._new_task_checks = {}
+        name = str(self.new_task_template.value or "")
+        combo = next((c for c in self._load() if str(c.get("name")) == name), None)
+        subs = (combo or {}).get("subs") or []
+        with self.new_task_subs_container:
+            if not subs:
+                ui.label("请选择组合任务模板").classes("text-xs text-gray-400")
+                return
+            for i, sub in enumerate(subs):
+                label = f"{i + 1}. {sub.get('type') or '-'}"
+                display = _sub_task_display(sub, self.workdir)
+                if display:
+                    label += f" · {display}"
+                self._new_task_checks[i] = ui.checkbox(label, value=True).classes(
+                    "text-sm"
+                )
 
     def open_new_task_dialog(
         self, template: str | None = None, accounts: list[str] | None = None
@@ -1528,6 +1558,7 @@ class ComboTaskBlock:
         self.new_task_template.options = name_map
         self.new_task_template.value = template if template in name_map else None
         self.new_task_template.update()
+        self._render_new_task_subs()
         valid_accounts = list(self.runner._get_account_names())
         options = {a: a for a in valid_accounts}
         self.new_task_accounts.options = with_select_all(options)
@@ -1544,8 +1575,16 @@ class ComboTaskBlock:
         if not name:
             ui.notify("请选择组合任务模板", type="warning")
             return
+        sub_indexes = None
+        if self._new_task_checks:
+            sub_indexes = [i for i, cb in self._new_task_checks.items() if cb.value]
+            if not sub_indexes:
+                ui.notify("请至少勾选一个子任务", type="warning")
+                return
         accounts = [a for a in (self.new_task_accounts.value or []) if a]
-        if self.runner._launch("组合任务", str(name), accounts):
+        if self.runner._launch(
+            "组合任务", str(name), accounts, sub_indexes=sub_indexes
+        ):
             self.new_task_dialog.close()
             self._render_history()
 

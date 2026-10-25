@@ -154,6 +154,8 @@ def _stats_payload(engine: GiveawayEngine) -> Dict[str, Any]:
         "by_account": dict(engine.joined_by_account),
         "by_chat": {k: dict(v) for k, v in engine.joined_by_account_chat.items()},
         "progress": engine.progress_text() or "",
+        # 中奖消息回扫进度（与频道扫描分开显示）
+        "sweep": engine.win_sweep_text or "",
     }
 
 

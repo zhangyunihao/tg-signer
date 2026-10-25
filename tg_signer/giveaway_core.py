@@ -453,6 +453,11 @@ class GiveawayEngine:
         self.failed = 0
         self.scanning = False
         self.scan_text = ""
+        # 中奖回扫进度（与频道扫描分开显示）：分母=本轮待回扫的账号×bot 数，
+        # 分子=已回扫完成的 bot 数；不在回扫时为空
+        self.win_sweep_text = ""
+        self.win_sweep_done = 0
+        self.win_sweep_total = 0
         # 多账号并行：参与条数上限用同步名额预留保证不超额（_participate）；
         # 不对 bot 请求加串行锁——各账号与 bot 独立私聊、Telegram 限流按账号独立，
         # 请求错峰靠随机延迟实现
@@ -720,22 +725,12 @@ class GiveawayEngine:
             )
             # 中奖回扫：开奖常在参与后数日，先补捡停机期间 bot 私聊的中奖通知
             if not self._stop.is_set():
-                await asyncio.gather(
-                    *[
-                        self._sweep_bot_wins(account, client)
-                        for account, client in list(self._clients.items())
-                    ]
-                )
+                await self._sweep_all_accounts()
             if auto_scan and not self._stop.is_set():
                 await self.scan_now()
                 # 首扫后新增参与的 bot 需建回扫基线（此前无水位线会漏扫）
                 if not self._stop.is_set():
-                    await asyncio.gather(
-                        *[
-                            self._sweep_bot_wins(account, client)
-                            for account, client in list(self._clients.items())
-                        ]
-                    )
+                    await self._sweep_all_accounts()
             if self.rescue_interval > 0:
                 await self._rescue_loop()
             elif not self._stop.is_set():
@@ -1246,6 +1241,11 @@ class GiveawayEngine:
         joined_before = self.joined
         total = len(self._clients) * max(1, len(self.chats))
         done = {"n": 0}
+        # 中奖回扫与频道补漏分开计进度：分母为本轮全部账号待回扫的 bot 数
+        sweep = self._begin_win_sweep(
+            sum(len(self._win_sweep_bots(a)) for a in self._clients),
+            announce=False,
+        )
         self.scanning = True
         try:
             account_items = list(self._clients.items())
@@ -1253,12 +1253,14 @@ class GiveawayEngine:
             for idx, (account, client) in enumerate(account_items):
                 if idx == 0:
                     tasks.append(
-                        self._rescue_one_account(account, client, failures, done, total)
+                        self._rescue_one_account(
+                            account, client, failures, done, total, sweep
+                        )
                     )
                 else:
                     tasks.append(
                         self._rescue_one_account_delayed(
-                            idx, account, client, failures, done, total
+                            idx, account, client, failures, done, total, sweep
                         )
                     )
             await asyncio.gather(*tasks)
@@ -1271,6 +1273,7 @@ class GiveawayEngine:
         finally:
             self.scanning = False
             self.scan_text = ""
+            self._end_win_sweep()
             if self._state is not None:
                 self._state.save()
         if failures["n"] == 0:
@@ -1293,6 +1296,7 @@ class GiveawayEngine:
         failures: Dict[str, int],
         done: Dict[str, int],
         total: int,
+        sweep: Dict[str, int],
     ) -> None:
         """补漏单账号子任务：逐频道重拉最近消息，顺带回扫 bot 私聊中奖消息。"""
         if not await self._ensure_connected(client):
@@ -1306,7 +1310,9 @@ class GiveawayEngine:
             self.scan_text = f"补漏 ({done['n']}/{total})"
             await self._rescue_chat_safe(account, client, chat, failures)
         # 补漏轮顺带回扫 bot 私聊中奖消息（不依赖监控对象配置）
-        await self._sweep_bot_wins(account, client)
+        await self._sweep_bot_wins(
+            account, client, bots=self._win_sweep_bots(account), progress=sweep
+        )
 
     async def _rescue_one_account_delayed(
         self,
@@ -1316,10 +1322,13 @@ class GiveawayEngine:
         failures: Dict[str, int],
         done: Dict[str, int],
         total: int,
+        sweep: Dict[str, int],
     ) -> None:
         """错峰启动：idx > 0 的账号先 sleep idx*5 秒再开始补漏。"""
         await asyncio.sleep(idx * 5)
-        await self._rescue_one_account(account, client, failures, done, total)
+        await self._rescue_one_account(
+            account, client, failures, done, total, sweep
+        )
 
     async def _rescue_chat_safe(
         self, account: str, client: Any, chat: Any, failures: Dict[str, int]
@@ -1456,7 +1465,72 @@ class GiveawayEngine:
                 )
                 logger.debug("中奖消息转发失败", exc_info=True)
 
-    async def _sweep_bot_wins(self, account: str, client: Any) -> None:
+    def _win_sweep_bots(self, account: str) -> List[str]:
+        """该账号本轮待回扫的 bot 列表（机器人任务只回扫目标 bot）。"""
+        if self._state is None:
+            return []
+        bots = self._state.bots_for(account)
+        if self.source_type == "bot" and self.bot_username:
+            # 机器人类型任务只关心目标 bot 的中奖通知：不回扫账号历史上
+            # 参与过的其他 bot，避免启动阶段被十几个 bot 拖住几分钟
+            target = self.bot_username.lower()
+            bots = [b for b in bots if str(b).lower() == target]
+        return bots
+
+    def _begin_win_sweep(self, total: int, *, announce: bool = True) -> Dict[str, int]:
+        """开始一轮中奖回扫：记录分母，返回本轮已完成计数。"""
+        self.win_sweep_total = total
+        self.win_sweep_done = 0
+        self.win_sweep_text = f"中奖回扫 (0/{total})" if total and announce else ""
+        return {"n": 0}
+
+    def _advance_win_sweep(self, progress: Dict[str, int]) -> None:
+        """完成一个 bot 的回扫后推进中奖回扫进度。"""
+        progress["n"] += 1
+        self.win_sweep_done = progress["n"]
+        self.win_sweep_text = f"中奖回扫 ({progress['n']}/{self.win_sweep_total})"
+
+    def _end_win_sweep(self) -> None:
+        """本轮中奖回扫结束，清空独立进度展示。"""
+        self.win_sweep_text = ""
+        self.win_sweep_done = 0
+        self.win_sweep_total = 0
+
+    async def _sweep_all_accounts(self) -> None:
+        """全部已连接账号并行回扫中奖消息，并单独维护该轮进度。"""
+        if not self.win_detect or self._state is None:
+            return
+        pairs = [
+            (account, client, self._win_sweep_bots(account))
+            for account, client in list(self._clients.items())
+        ]
+        total = sum(len(bots) for _, _, bots in pairs)
+        if total == 0:
+            # 保留原有「暂无 bot 记录」日志
+            for account, client, _ in pairs:
+                await self._sweep_bot_wins(account, client, bots=[])
+            return
+        progress = self._begin_win_sweep(total)
+        try:
+            await asyncio.gather(
+                *[
+                    self._sweep_bot_wins(
+                        account, client, bots=bots, progress=progress
+                    )
+                    for account, client, bots in pairs
+                ]
+            )
+        finally:
+            self._end_win_sweep()
+
+    async def _sweep_bot_wins(
+        self,
+        account: str,
+        client: Any,
+        *,
+        bots: Optional[List[str]] = None,
+        progress: Optional[Dict[str, int]] = None,
+    ) -> None:
         """增量回扫该账号全部已知 bot 的私聊消息，补捡错过的中奖通知。
 
         在任务启动时与每个补漏轮执行：开奖常在参与后数日，中奖私信到达时
@@ -1469,12 +1543,8 @@ class GiveawayEngine:
         """
         if not self.win_detect or self._state is None:
             return
-        bots = self._state.bots_for(account)
-        if self.source_type == "bot" and self.bot_username:
-            # 机器人类型任务只关心目标 bot 的中奖通知：不回扫账号历史上
-            # 参与过的其他 bot，避免启动阶段被十几个 bot 拖住几分钟
-            target = self.bot_username.lower()
-            bots = [b for b in bots if str(b).lower() == target]
+        if bots is None:
+            bots = self._win_sweep_bots(account)
         if not bots:
             # 无任何交互记录（含保留的 win: 去重）时没有回扫目标，等账号参与后重建
             self.log(f"[{account}] 回扫：暂无 bot 记录（等待账号参与后重建）")
@@ -1483,6 +1553,8 @@ class GiveawayEngine:
             if self._stop is not None and self._stop.is_set():
                 return
             await self._sweep_bot_messages(account, client, bot)
+            if progress is not None:
+                self._advance_win_sweep(progress)
 
     async def _sweep_bot_messages(self, account: str, client: Any, bot: str) -> None:
         """回扫单个 bot 的私聊消息：拉取批次并按时间正序处理、推进水位线。

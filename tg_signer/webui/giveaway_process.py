@@ -42,6 +42,8 @@ class GiveawayProcess:
         self.joined_by_account: Dict[str, int] = {}
         self.joined_by_account_chat: Dict[str, Dict[str, int]] = {}
         self._progress = ""
+        # 中奖消息回扫进度（与频道扫描分开显示）
+        self.win_sweep_text = ""
         self._events_file: Optional[Path] = None
         self._log: Optional[Callable[[str], None]] = None
         self._on_event: Optional[Callable[[dict], None]] = None
@@ -80,6 +82,7 @@ class GiveawayProcess:
         self.joined_by_account = {}
         self.joined_by_account_chat = {}
         self._progress = ""
+        self.win_sweep_text = ""
 
         log_dir = self.workdir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -247,6 +250,7 @@ class GiveawayProcess:
                 for k, v in by_chat.items()
             }
         self._progress = str(payload.get("progress") or "")
+        self.win_sweep_text = str(payload.get("sweep") or "")
         cb = self._on_stats
         if cb is not None and self._loop is not None:
             try:
