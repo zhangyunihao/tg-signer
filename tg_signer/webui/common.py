@@ -150,7 +150,9 @@ def add_dialog_close_button(dlg: ui.dialog) -> None:
 def mobile_card_fields(fields: list[tuple]) -> None:
     """移动端卡片字段网格：两列排布，标签定宽浅灰、内容深灰自动换行。
 
-    每项为 (标签, 内容, 是否整行)；内容按纯文本转义，None/空串显示为「—」。
+    每项为 (标签, 内容, 是否整行, 是否单行省略, 点击展开的完整内容)；
+    内容按纯文本转义，None/空串显示为「—」。单行省略用于账号/监控对象
+    等长列表，点击时弹出完整内容。
     """
     from html import escape
 
@@ -158,12 +160,18 @@ def mobile_card_fields(fields: list[tuple]) -> None:
     for item in fields:
         label, value = item[0], item[1]
         full = bool(item[2]) if len(item) > 2 else False
+        one_line = bool(item[3]) if len(item) > 3 else False
         text = "—" if value is None or value == "" else str(value)
         cls = "tgs-field tgs-field-full" if full else "tgs-field"
+        attrs = ""
+        if one_line:
+            cls += " tgs-field-one"
+            long_text = text if len(item) <= 4 or item[4] is None else str(item[4])
+            attrs = f' data-full="{escape(long_text, quote=True)}"'
         cells.append(
             f'<div class="{cls}">'
             f'<span class="tgs-field-k">{escape(str(label))}</span>'
-            f'<span class="tgs-field-v">{escape(text)}</span>'
+            f'<span class="tgs-field-v"{attrs}>{escape(text)}</span>'
             "</div>"
         )
     ui.html(f'<div class="tgs-fields">{"".join(cells)}</div>').classes("w-full")

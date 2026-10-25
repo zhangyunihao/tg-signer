@@ -639,6 +639,7 @@ _CFG_FIELDS = {
     "rescue_interval_min": lambda: 0,  # 补漏扫描间隔（分钟），0=关闭（默认关闭）
     "rescue_limit": lambda: 10,  # 每次补漏每频道重拉条数
     "win_detect": lambda: True,  # 中奖识别：bot 私聊命中关键词时转发提醒
+    "pinned": lambda: False,  # 列表置顶：仅影响任务展示顺序
     # —— 限流保护（任务级）——
     "join_pace_min": lambda: int(JOIN_PACE_RANGE[0]),  # 相邻两次加入最小间隔（秒）
     "join_pace_max": lambda: int(JOIN_PACE_RANGE[1]),
@@ -784,6 +785,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "rescue_limit": max(1, int(cfg.get("rescue_limit") or 10)),
                 # 中奖识别配置（转发目标/Server酱为消息中心全局设置）
                 "win_detect": bool(cfg.get("win_detect", True)),
+                # 列表置顶（仅影响任务展示顺序）
+                "pinned": bool(cfg.get("pinned")),
                 # 限流保护：加入/解析节奏与配额（0=不限制，缺省用常量默认值）
                 "join_pace_min": max(0, int(cfg.get("join_pace_min") or 0)),
                 "join_pace_max": max(0, int(cfg.get("join_pace_max") or 0)),
@@ -955,6 +958,19 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         _GLOBAL_STATUS_CBS.pop(engine_key(name), None)
         _persist()
         render_tasks()
+
+    def toggle_pin(name: str) -> None:
+        """切换任务置顶：置顶任务在任务列表中排到最前（不影响运行状态）。"""
+        cfg = tasks.get(name)
+        if cfg is None:
+            return
+        cfg["pinned"] = not bool(cfg.get("pinned"))
+        _persist()
+        render_tasks()
+        ui.notify(
+            f"任务 #{name} 已{'置顶' if cfg['pinned'] else '取消置顶'}",
+            type="positive",
+        )
 
     def duplicate_task(name: str) -> None:
         cfg = tasks[name]
@@ -1276,6 +1292,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "rescue_interval_min": rescue_interval_min,
             "rescue_limit": rescue_limit,
             "win_detect": bool(win_switch.value),
+            "pinned": False,
             "join_pace_min": join_pace_min,
             "join_pace_max": join_pace_max,
             "join_hourly_cap": join_hourly_cap,
@@ -1320,6 +1337,15 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             el.content = _card_time_html(text)
         except Exception:
             logger.debug("刷新卡片执行时间失败", exc_info=True)
+
+    def _list_text(items: List[str], limit: Optional[int] = None) -> str:
+        """移动端展示用：数量 + 前 limit 项（None=全部），超出以省略号结尾。"""
+        items = [str(i) for i in items if str(i)]
+        if not items:
+            return "—"
+        shown = items if limit is None else items[:limit]
+        more = "…" if len(shown) < len(items) else ""
+        return f"{len(items)} 个：" + "、".join(shown) + more
 
     def render_tasks() -> None:
         task_list_container.clear()
@@ -1412,8 +1438,11 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             rows = []
             for name in sorted(
                 tasks,
-                key=lambda n: int(n) if str(n).isdigit() else 0,
-                reverse=True,
+                # 置顶任务在前，其余保持原有「编号大（新建）在前」顺序
+                key=lambda n: (
+                    0 if (tasks.get(n) or {}).get("pinned") else 1,
+                    -(int(n) if str(n).isdigit() else 0),
+                ),
             ):
                 cfg = tasks[name]
                 is_bot = str(cfg.get("source_type") or SOURCE_CHANNEL) == SOURCE_BOT
@@ -1433,14 +1462,20 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 rows.append(
                     {
                         "name": str(name),
+                        "pinned": bool(cfg.get("pinned")),
                         "task_type": SOURCE_TYPE_LABELS.get(
                             str(cfg.get("source_type") or SOURCE_CHANNEL),
                             SOURCE_TYPE_LABELS[SOURCE_CHANNEL],
                         ),
                         "accounts": ", ".join(cfg["accounts"]),
+                        # 移动端单行摘要（数量 + 前两项）+ 点击展开的完整列表
+                        "accounts_summary": _list_text(cfg["accounts"], 2),
+                        "accounts_full": _list_text(cfg["accounts"]),
                         "chats": f"{len(chat_names)} 个："
                         + "、".join(chat_names[:3])
                         + ("…" if len(chat_names) > 3 else ""),
+                        "chats_summary": _list_text(chat_names, 2),
+                        "chats_full": _list_text(chat_names),
                         "keywords": "、".join(cfg.get("keywords") or []) or "全部链接",
                         "scan": "不限"
                         if not cfg.get("max_joins")
@@ -1467,12 +1502,22 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             )
             table_ref["table"] = table
             card_badges: dict = {}
-            card_sweeps: dict = {}
-            # 「扫描中」也算运行态（info 蓝色）
+            # 移动端卡片操作按钮：随状态变化切换「启动/停止」显隐
+            card_start_btns: dict = {}
+            card_stop_btns: dict = {}
+            # 「扫描中」也算运行态（info 蓝色）；「常驻待命中」是开启补漏后的待命态
             running_expr = (
                 "props.row.status.startsWith('运行中')"
                 " || props.row.status.startsWith('扫描中')"
+                " || props.row.status.startsWith('常驻待命中')"
                 " || props.row.status.startsWith('停止中')"
+            )
+            table.add_slot(
+                "body-cell-name",
+                '<q-td :props="props">'
+                '<q-icon v-if="props.row.pinned" name="push_pin" color="primary" '
+                'size="16px" class="q-mr-xs" />'
+                "{{ props.row.name }}</q-td>",
             )
             table.add_slot(
                 "body-cell-status",
@@ -1487,6 +1532,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 'label="启动" @click="$parent.$emit(\'startTask\', props.row)" />'
                 f'<q-btn v-if="({running_expr})" flat dense color="negative" '
                 'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
+                '<q-btn flat dense color="primary" '
+                ":label=\"props.row.pinned ? '取消置顶' : '置顶'\" "
+                "@click=\"$parent.$emit('pinTask', props.row)\" />"
                 '<q-btn flat dense color="primary" '
                 'label="明细" @click="$parent.$emit(\'detailTask\', props.row)" />'
                 '<q-btn flat dense color="primary" '
@@ -1503,7 +1551,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         text = "未运行"
                     else:
                         engine = get_engine(n)
-                        text = engine.progress_text() if engine else "运行中"
+                        # 刚启动时子进程尚未回报进度，回退「运行中」避免状态为空
+                        text = (engine.progress_text() or "运行中") if engine else "运行中"
                     cfg_now = tasks.get(n) or {}
                     start_ts = cfg_now.get("_start_ts")
                     dur = (
@@ -1526,19 +1575,26 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     if badge is not None:
                         try:
                             badge.props(f"color={'info' if running else 'grey-6'}")
-                            badge.text = text
+                            badge.text = f"{text} · {sweep}" if sweep else text
                             badge.update()
                         except Exception:
                             logger.debug("刷新任务状态徽标 UI 失败", exc_info=True)
-                    _update_card_time(str(n), _card_time_text(str(n), running))
-                    sweep_label = card_sweeps.get(str(n))
-                    if sweep_label is not None:
+                    # 移动端卡片的「启动/停止」按钮随运行状态切换
+                    start_btn = card_start_btns.get(str(n))
+                    if start_btn is not None:
                         try:
-                            sweep_label.text = sweep
-                            sweep_label.set_visibility(bool(sweep))
-                            sweep_label.update()
+                            start_btn.set_visibility(not running)
+                            start_btn.update()
                         except Exception:
-                            logger.debug("刷新中奖回扫进度 UI 失败", exc_info=True)
+                            logger.debug("刷新卡片启动按钮失败", exc_info=True)
+                    stop_btn = card_stop_btns.get(str(n))
+                    if stop_btn is not None:
+                        try:
+                            stop_btn.set_visibility(running)
+                            stop_btn.update()
+                        except Exception:
+                            logger.debug("刷新卡片停止按钮失败", exc_info=True)
+                    _update_card_time(str(n), _card_time_text(str(n), running))
 
                 return _set
 
@@ -1571,11 +1627,17 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 if isinstance(row, dict) and row.get("name"):
                     remove_task(str(row["name"]))
 
+            def on_pin_event(e) -> None:
+                row = e.args
+                if isinstance(row, dict) and row.get("name"):
+                    toggle_pin(str(row["name"]))
+
             table.on("startTask", on_start_event)
             table.on("stopTask", on_stop_event)
             table.on("copyTask", on_copy_event)
             table.on("detailTask", on_detail_event)
             table.on("deleteTask", on_delete_event)
+            table.on("pinTask", on_pin_event)
 
             # —— 移动端卡片列表 ——
             mobile_cards = ui.column().classes("w-full gap-2 tgs-mobile-cards")
@@ -1599,25 +1661,30 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         with ui.row().classes(
                             "w-full items-center gap-2 no-wrap justify-between"
                         ):
-                            ui.label(f"任务 #{n}").classes("text-base font-semibold")
-                            badge = ui.badge(row["status"]).props(
+                            with ui.row().classes("items-center gap-1 no-wrap"):
+                                if row["pinned"]:
+                                    ui.icon("push_pin").classes("text-primary").props(
+                                        "size=16px"
+                                    )
+                                ui.label(f"任务 #{n}").classes(
+                                    "text-base font-semibold"
+                                )
+                            # 中奖回扫进度合并进状态徽标，回扫时显示「状态 · 回扫进度」
+                            badge_text = (
+                                f"{row['status']} · {row['sweep']}"
+                                if row["sweep"]
+                                else row["status"]
+                            )
+                            badge = ui.badge(badge_text).props(
                                 f"color={'info' if running else 'grey-6'}"
                             )
                             card_badges[n] = badge
-                        sweep_label = ui.label("").classes(
-                            "text-xs text-primary no-wrap"
-                        )
-                        if not row["sweep"]:
-                            sweep_label.set_visibility(False)
-                        else:
-                            sweep_label.text = row["sweep"]
-                        card_sweeps[n] = sweep_label
                         mobile_card_fields(
                             [
                                 ("类型", row["task_type"]),
                                 ("重复参与", row["ignore_hist"]),
-                                ("账号", row["accounts"], True),
-                                ("监控对象", row["chats"], True),
+                                ("账号", row["accounts_summary"], True, True, row["accounts_full"]),
+                                ("监控对象", row["chats_summary"], True, True, row["chats_full"]),
                                 ("关键词", row["keywords"], True),
                                 ("参与上限", row["scan"]),
                                 ("新参加", f"{row['joined']}抽奖"),
@@ -1629,22 +1696,31 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         )
                         card_time_texts[n] = time_text
                         with ui.row().classes("w-full mobile-card-actions"):
-                            if not running:
-                                ui.button(
-                                    "启动",
-                                    on_click=lambda nn=n,
-                                    cb=set_status: asyncio.create_task(
-                                        _card_start(nn, cb)
-                                    ),
-                                ).props("flat dense color=primary")
+                            # 启动/停止两个按钮都创建，按运行状态切换显隐（创建后自动启动也能跟着变）
+                            start_btn = ui.button(
+                                "启动",
+                                on_click=lambda nn=n,
+                                cb=set_status: asyncio.create_task(
+                                    _card_start(nn, cb)
+                                ),
+                            ).props("flat dense color=primary")
+                            stop_btn = ui.button(
+                                "停止",
+                                on_click=lambda nn=n,
+                                cb=set_status: asyncio.create_task(
+                                    _card_stop(nn, cb)
+                                ),
+                            ).props("flat dense color=negative")
+                            if running:
+                                start_btn.set_visibility(False)
                             else:
-                                ui.button(
-                                    "停止",
-                                    on_click=lambda nn=n,
-                                    cb=set_status: asyncio.create_task(
-                                        _card_stop(nn, cb)
-                                    ),
-                                ).props("flat dense color=negative")
+                                stop_btn.set_visibility(False)
+                            card_start_btns[n] = start_btn
+                            card_stop_btns[n] = stop_btn
+                            ui.button(
+                                "取消置顶" if row["pinned"] else "置顶",
+                                on_click=lambda nn=n: toggle_pin(nn),
+                            ).props("flat dense color=primary")
                             ui.button(
                                 "明细",
                                 on_click=lambda nn=n: open_detail(nn),

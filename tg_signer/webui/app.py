@@ -572,6 +572,35 @@ def _build_dashboard(container) -> None:
             "  if(done<labels.length&&tries++<30)setTimeout(apply,200);"
             "};apply();})();"
         )
+        # 移动端点击卡片里的单行字段（账号/监控对象等）弹出完整内容
+        ui.run_javascript(
+            "(function(){"
+            "  if(window.__tgsFieldClickBound)return;"
+            "  window.__tgsFieldClickBound=true;"
+            "  const show=(el)=>{"
+            "    const text=el.getAttribute('data-full')||'';if(!text)return;"
+            "    let mask=document.getElementById('tgs-lp-mask');"
+            "    if(!mask){"
+            "      mask=document.createElement('div');mask.id='tgs-lp-mask';"
+            "      mask.style.cssText='position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.45);"
+            "display:flex;align-items:center;justify-content:center;padding:24px;';"
+            "      const box=document.createElement('div');box.id='tgs-lp-box';"
+            "      box.style.cssText='max-width:90vw;max-height:70vh;overflow:auto;background:#fff;"
+            "color:#374151;border-radius:12px;padding:14px 16px;font-size:14px;line-height:1.6;"
+            "white-space:pre-wrap;word-break:break-all;box-shadow:0 8px 24px rgba(0,0,0,.2);';"
+            "      mask.appendChild(box);"
+            "      mask.addEventListener('click',()=>mask.remove());"
+            "      document.body.appendChild(mask);"
+            "    }"
+            "    document.getElementById('tgs-lp-box').textContent=text;"
+            "  };"
+            "  document.addEventListener('click',(e)=>{"
+            "    const el=e.target&&e.target.closest?e.target.closest('[data-full]'):null;"
+            "    if(!el)return;"
+            "    e.preventDefault();show(el);"
+            "  });"
+            "})();"
+        )
 
         valid_tabs = {"run", "combo", "random", "leave", "giveaway"}
 
@@ -1125,6 +1154,14 @@ def build_ui(auth_code: str = None) -> None:
                     overflow-wrap: anywhere;
                 }
                 .tgs-field-pre { white-space: pre-line; }
+                /* 账号/监控对象等长列表：强制单行，超出省略，避免把卡片撑高 */
+                .tgs-field-one { align-items: center; }
+                .tgs-field-one .tgs-field-v {
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    cursor: pointer;
+                }
                 .mobile-card-actions { margin-top: 2px; }
                 /* 顶部主标签：tab 与右上三点按钮同行（flex 布局自动分配宽度），
                    tab 栏占满剩余空间，隐藏版本号让出空间 */
