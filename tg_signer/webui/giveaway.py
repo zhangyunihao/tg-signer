@@ -808,6 +808,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     str(k): {str(ck): int(cv) for ck, cv in (v or {}).items()}
                     for k, v in (cfg.get("last_joined_by_account_chat") or {}).items()
                 },
+                # 上次中奖回扫进度（结束后继续展示）
+                "last_sweep": str(cfg.get("last_sweep") or ""),
             }
         save_task_store(workdir, {"seq": store["seq"], "tasks": clean})
 
@@ -828,6 +830,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         cfg["last_joined_by_account_chat"] = {
             k: dict(v) for k, v in eng.joined_by_account_chat.items()
         }
+        cfg["last_sweep"] = str(getattr(eng, "win_sweep_text", "") or "")
         return True
 
     def ensure_engine(name: str) -> GiveawayProcess:
@@ -920,11 +923,11 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         return engine.progress_text() or "运行中"
 
     def _sweep_text(name: str) -> str:
-        """中奖消息回扫进度（与频道扫描分开展示），未在回扫时为空。"""
+        """中奖消息回扫进度（与频道扫描分开展示），结束后展示上次完成进度。"""
         engine = get_engine(name)
-        if engine is None or not engine.running:
-            return ""
-        return (getattr(engine, "win_sweep_text", "") or "").strip()
+        if engine is not None and engine.running:
+            return (getattr(engine, "win_sweep_text", "") or "").strip()
+        return str((tasks.get(name) or {}).get("last_sweep") or "").strip()
 
     def joined_count(name: str) -> int:
         """本次运行（运行中实时）或上次运行（结束后持久化）新参与抽奖总数"""
@@ -1560,7 +1563,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         if running and start_ts
                         else (str(cfg_now.get("last_duration") or "") or "—")
                     )
-                    sweep = _sweep_text(n) if running else ""
+                    sweep = _sweep_text(n)
                     for r in table.rows:
                         if r["name"] == str(n):
                             r["status"] = text

@@ -379,6 +379,14 @@ class ComboTaskBlock:
         "失败": "negative",
         "已停止": "grey-6",
     }
+    # 进度单元（一个账号的一个子任务）状态配色，进度页各处共用
+    UNIT_STATUS_COLOR = {
+        "成功": "positive",
+        "失败": "negative",
+        "进行中": "info",
+        "中断": "orange",
+        "等待": "grey-6",
+    }
 
     def __init__(self, runner, workdir: Path | str | None = None) -> None:
         self.runner = runner  # TaskRunnerBlock 实例：复用 _launch/_stop_run/账号发现
@@ -516,7 +524,6 @@ class ComboTaskBlock:
         view = cls.__new__(cls)
         view.workdir = workdir
         view.runner = _SharedRunner()
-        view._acc_expand = {}
         view._combo_log_full = False
         view._live_ids = set()
         view._live_names = {}
@@ -745,46 +752,112 @@ class ComboTaskBlock:
         return "、".join(accs) if accs else "未绑定"
 
     @staticmethod
-    def _account_progress(run: dict, combo_subs: list[dict]) -> list[tuple[str, str]]:
-        """按账号汇总进度：(账号, 当前进行到哪步的描述)。
+    def _progress_summary(run: dict, combo_subs: list[dict]) -> dict:
+        """整体进度：一步 = 一个账号执行一个子任务，统计完成数与各状态数量。"""
+        labels = [f"{s.get('type')} · {s.get('task')}" for s in combo_subs]
+        label_set = set(labels)
+        rows = [
+            d
+            for d in (run.get("details") or [])
+            if str(d.get("chat") or "") in label_set
+        ]
+        procs = run.get("procs") or []
+        expected = 0
+        for p in procs:
+            sub_labels = [lb for lb in (p.get("sub_labels") or []) if lb in label_set]
+            # 旧版启动/快照没有 sub_labels 时，按该账号执行全部子任务计
+            expected += len(sub_labels) if sub_labels else len(labels)
+        if not procs:
+            accounts = {str(d.get("account") or "") for d in rows if d.get("account")}
+            expected = len(labels) * max(1, len(accounts))
+        counts = dict.fromkeys(("成功", "失败", "中断", "进行中"), 0)
+        for d in rows:
+            status = str(d.get("status") or "")
+            if status in counts:
+                counts[status] += 1
+        done = counts["成功"] + counts["失败"] + counts["中断"]
+        total = max(expected, done)
+        counts["等待"] = max(0, total - sum(counts.values()))
+        return {"total": total, "done": done, "counts": counts}
+
+    @staticmethod
+    def _account_progress(run: dict, combo_subs: list[dict]) -> list[dict]:
+        """按账号汇总执行进度：子任务顺序、当前步骤、完成数与进度备注。
 
         组合任务按账号串行执行子任务，明细行的 chat 即子任务标签。
         """
         labels = [f"{s.get('type')} · {s.get('task')}" for s in combo_subs]
-        idx = {label: i for i, label in enumerate(labels)}
-        by_acc: dict[str, dict[int, str]] = {}
-        for d in run["details"]:
+        label_set = set(labels)
+        status_by_acc: dict[str, dict[str, str]] = {}
+        notes: dict[tuple[str, str], str] = {}
+        for d in run.get("details") or []:
             acc = str(d.get("account") or "")
-            i = idx.get(str(d.get("chat") or ""))
-            if acc and i is not None:
-                by_acc.setdefault(acc, {})[i] = str(d.get("status") or "")
-        accounts = [str(p.get("account") or "") for p in (run.get("procs") or [])]
-        # 兼容旧版启动的运行（procs 无 sub_labels 时仍以明细里的账号兜底）
-        for acc in by_acc:
+            label = str(d.get("chat") or "")
+            if not acc or label not in label_set:
+                continue
+            status_by_acc.setdefault(acc, {})[label] = str(d.get("status") or "")
+            if d.get("note"):
+                notes[(acc, label)] = str(d["note"])
+        accounts: list[str] = []
+        acc_labels: dict[str, list[str]] = {}
+        for p in run.get("procs") or []:
+            acc = str(p.get("account") or "")
+            if acc and acc not in accounts:
+                accounts.append(acc)
+            sub_labels = [lb for lb in (p.get("sub_labels") or []) if lb in label_set]
+            if sub_labels:
+                acc_labels[acc] = sub_labels
+        # 兼容旧版启动/快照：procs 无 sub_labels 时以明细里出现过的账号与子任务兜底
+        for acc in status_by_acc:
             if acc not in accounts:
                 accounts.append(acc)
-        total = len(combo_subs)
-        result = []
+            acc_labels.setdefault(
+                acc, [lb for lb in labels if lb in status_by_acc[acc]]
+            )
+        entries = []
         for acc in accounts:
-            per = by_acc.get(acc) or {}
-            cur = next((i for i in sorted(per) if per[i] == "进行中"), None)
-            if cur is not None:
-                text = f"第 {cur + 1}/{total} 个 {labels[cur]}（进行中）"
+            planned = acc_labels.get(acc) or []
+            if not planned:
+                continue
+            per = status_by_acc.get(acc) or {}
+            statuses = [per.get(lb, "等待") for lb in planned]
+            finished = [
+                i for i, st in enumerate(statuses) if st in ("成功", "失败", "中断")
+            ]
+            done = len(finished)
+            total = len(planned)
+            current = next((i for i, st in enumerate(statuses) if st == "进行中"), None)
+            if current is not None:
+                status = "进行中"
+                text = f"第 {current + 1}/{total} 步 · {planned[current]}"
+                note = notes.get((acc, planned[current]), "")
             else:
-                done = [i for i in sorted(per) if per[i] in ("成功", "失败", "中断")]
-                stopped = sum(1 for i in done if per[i] == "中断")
-                if stopped:
-                    text = f"已停止（{stopped} 个子任务被中断）"
-                elif total and len(done) >= total:
-                    bad = sum(1 for i in done if per[i] == "失败")
-                    text = "已完成" + ("（有失败）" if bad else "")
-                elif done:
-                    last = done[-1]
-                    text = f"第 {last + 1}/{total} 个 {labels[last]} 已结束，准备下一个"
+                interrupted = sum(1 for st in statuses if st == "中断")
+                failed = sum(1 for st in statuses if st == "失败")
+                if interrupted:
+                    status = "中断"
+                    text = f"已停止（{interrupted} 个子任务被中断）"
+                elif total and done >= total:
+                    status = "失败" if failed else "成功"
+                    text = "已完成" + (f"（{failed} 个子任务失败）" if failed else "")
+                elif finished:
+                    status = "等待"
+                    text = f"第 {finished[-1] + 1}/{total} 步已结束，准备下一个"
                 else:
-                    text = "未开始"
-            result.append((acc, text))
-        return result
+                    status = "等待"
+                    text = "等待开始"
+                note = notes.get((acc, planned[finished[-1]]), "") if finished else ""
+            entries.append(
+                {
+                    "account": acc,
+                    "status": status,
+                    "text": text,
+                    "done": done,
+                    "total": total,
+                    "note": note,
+                }
+            )
+        return entries
 
     def _render_run_card(
         self,
@@ -800,7 +873,6 @@ class ComboTaskBlock:
         else:
             elapsed = str(rec.get("duration") or "—")
         combo_subs = self._run_subs(run)
-        subs_status = [self._sub_run_status(s, run) for s in combo_subs]
         with ui.card().classes("w-full border tgs-prog-outer"):
             with ui.row().classes(
                 "w-full items-center gap-2 no-wrap tgs-prog-head-row"
@@ -821,16 +893,27 @@ class ComboTaskBlock:
             ui.label(time_text).classes("text-xs text-gray-600")
             if not live and rec.get("result"):
                 ui.label(f"结果：{rec['result']}").classes("text-xs text-gray-600")
-            # 进度行：带序号显示当前进行到哪个子任务
-            counts = {
-                k: subs_status.count(k)
-                for k in ("成功", "失败", "中断", "进行中", "等待")
-            }
-            parts = [
-                f"{k} {counts[k]}"
-                for k in ("进行中", "成功", "失败", "中断", "等待")
-                if counts[k]
-            ]
+            # 整体进度：一步 = 一个账号执行一个子任务，配进度条与状态徽章
+            summary = self._progress_summary(run, combo_subs)
+            total_units = summary["total"]
+            done_units = summary["done"]
+            counts = summary["counts"]
+            ratio = done_units / total_units if total_units else 0.0
+            if counts["失败"]:
+                bar_color = "negative"
+            elif total_units and done_units >= total_units:
+                bar_color = "positive"
+            else:
+                bar_color = "primary"
+            with ui.row().classes("w-full items-center gap-2 mt-1"):
+                ui.label("整体进度").classes("text-sm font-semibold text-gray-800")
+                ui.space()
+                ui.label(
+                    f"{done_units}/{total_units} 步 · {int(ratio * 100)}%"
+                ).classes("text-xs text-gray-600")
+            ui.linear_progress(value=ratio, show_value=False).props(
+                f"rounded color={bar_color}"
+            ).classes("w-full").style("height: 8px")
             # 退频道/抽奖的累计成果（多账号求和，来自子进程日志解析计数）
             sub_types = " ".join(str(s.get("type") or "") for s in combo_subs)
             left_n = sum(
@@ -841,14 +924,32 @@ class ComboTaskBlock:
                 int((p.get("stats") or {}).get("joined_total") or 0)
                 for p in run.get("procs") or []
             )
-            if left_n and "退频道" in sub_types:
-                parts.append(f"已退频道 {left_n} 个")
-            if joined_n and "抽奖" in sub_types:
-                parts.append(f"已参与抽奖 {joined_n} 个")
-            text = f"子任务进度（{len(combo_subs)} 个）：{' · '.join(parts) or '—'}"
-            ui.label(text).classes("text-sm text-gray-800 font-medium")
-            # 按账号展开：每个账号一个折叠面板，展示该账号执行了哪些子任务及状态
-            self._render_account_sections(run, combo_subs)
+            with ui.row().classes("w-full items-center gap-1 flex-wrap mt-1"):
+                for key in ("进行中", "成功", "失败", "中断", "等待"):
+                    if counts.get(key):
+                        ui.badge(f"{key} {counts[key]}").props(
+                            f"color={self.UNIT_STATUS_COLOR.get(key, 'grey-6')} outline"
+                        )
+                if left_n and "退频道" in sub_types:
+                    ui.badge(f"已退频道 {left_n} 个").props("color=orange outline")
+                if joined_n and "抽奖" in sub_types:
+                    ui.badge(f"已参与抽奖 {joined_n} 个").props("color=orange outline")
+            # 账号执行进度：每个账号一行，展示当前步骤、完成数与进度条
+            ui.label("账号执行进度").classes("text-sm font-semibold text-gray-800 mt-2")
+            entries = self._account_progress(run, combo_subs)
+            if not entries:
+                ui.label("暂无账号执行记录").classes("text-xs text-gray-400")
+            else:
+                with ui.column().classes("w-full gap-1"):
+                    for entry in entries:
+                        self._render_account_progress_row(entry)
+            # 子任务卡片：按类型展示绑定任务的参数与各账号执行状态
+            ui.label(f"子任务（{len(combo_subs)} 个）").classes(
+                "text-sm font-semibold text-gray-800 mt-2"
+            )
+            with ui.element("div").classes("w-full tgs-combo-sub-grid"):
+                for i, sub in enumerate(combo_subs, 1):
+                    self._render_subtask_card(run, sub, i)
             # 运行日志区：只显示本组合任务的输出行；不再独立滚动，
             # 统一由进度页面的滚动承载（避免出现两条滚动条）
             if logs is None:
@@ -909,22 +1010,6 @@ class ComboTaskBlock:
                     "flat round dense unelevated"
                 ).classes("tgs-log-exit-full tgs-log-exit-visible")
 
-    def _acc_sub_labels(self, run: dict, acc: str, labels: list[str]) -> list[str]:
-        """某账号实际参与的子任务标签：优先读进程的 sub_labels，旧运行回退明细。"""
-        for p in run.get("procs") or []:
-            if str(p.get("account") or "") == acc and p.get("sub_labels"):
-                sub = [lb for lb in p["sub_labels"] if lb in labels]
-                if sub:
-                    return sub
-        return [
-            lb
-            for lb in labels
-            if any(
-                d.get("chat") == lb and str(d.get("account") or "") == acc
-                for d in run["details"]
-            )
-        ]
-
     def _acc_sub_status(self, run: dict, acc: str, label: str) -> str:
         """某账号在某个子任务上的状态；无明细但进程存在时视为等待。"""
         rows = [
@@ -937,109 +1022,104 @@ class ComboTaskBlock:
                 return st
         return "等待"
 
-    def _render_account_sections(self, run: dict, combo_subs: list[dict]) -> None:
-        """按账号折叠展开：面板头为账号+进度摘要，展开可见该账号的各子任务状态与参数。"""
-        labels = [f"{s.get('type')} · {s.get('task')}" for s in combo_subs]
-        sub_by_label = dict(zip(labels, combo_subs, strict=False))
-        status_color = {
-            "成功": "positive",
-            "失败": "negative",
-            "进行中": "info",
-            "中断": "orange",
-            "等待": "grey-6",
-        }
-        # 展开状态需跨轮询重建保留；默认仅展开当前「进行中」的账号
-        if not hasattr(self, "_acc_expand"):
-            self._acc_expand = {}
-        for acc, txt in self._account_progress(run, combo_subs):
-            acc_labels = self._acc_sub_labels(run, acc, labels)
-            default_open = "进行中" in txt
-            open_state = self._acc_expand.setdefault(acc, default_open)
-            with ui.expansion(acc, caption=txt, icon="person").classes(
-                "w-full border"
-            ) as exp:
-                exp.value = open_state
-                exp.on_value_change(
-                    lambda e, a=acc: self._acc_expand.__setitem__(a, e.value)
+    @staticmethod
+    def _sub_expected_accounts(run: dict, label: str) -> list[str]:
+        """某子任务的参与账号：优先进程的 sub_labels，旧数据回退明细里的账号。"""
+        accounts = [
+            str(p.get("account") or "")
+            for p in run.get("procs") or []
+            if label in (p.get("sub_labels") or [])
+        ]
+        if not accounts:
+            accounts = [
+                str(d.get("account") or "")
+                for d in run.get("details") or []
+                if str(d.get("chat") or "") == label
+            ]
+        return list(dict.fromkeys(a for a in accounts if a))
+
+    def _render_account_progress_row(self, entry: dict) -> None:
+        """账号进度行：账号、当前步骤、完成数与进度条。"""
+        status = str(entry.get("status") or "等待")
+        color = self.UNIT_STATUS_COLOR.get(status, "grey-6")
+        total = int(entry.get("total") or 0)
+        done = int(entry.get("done") or 0)
+        ratio = done / total if total else 0.0
+        with (
+            ui.card()
+            .classes("w-full border gap-1 tgs-combo-acc-card")
+            .style("padding: 6px 10px")
+        ):
+            with ui.row().classes("w-full items-center gap-2 tgs-prog-acc-row"):
+                ui.icon("person").classes("text-sm text-gray-500")
+                ui.label(str(entry.get("account") or "")).classes("text-sm font-medium")
+                ui.label(f"{done}/{total}").classes("text-xs text-gray-500")
+                ui.space()
+                ui.badge(status).props(f"color={color} outline")
+            ui.label(str(entry.get("text") or "")).classes("text-xs text-gray-600")
+            if entry.get("note"):
+                ui.label(str(entry["note"])).classes(
+                    "text-xs font-medium text-gray-500"
                 )
-                with ui.column().classes("w-full gap-1"):
-                    if not acc_labels:
-                        ui.label("暂无该账号的执行明细").classes(
-                            "text-xs text-gray-400"
-                        )
-                        continue
-                    for lb in acc_labels:
-                        sub = sub_by_label.get(lb) or {}
-                        st = self._acc_sub_status(run, acc, lb)
-                        # 该账号该子任务的进度备注（退频道已退数/抽奖参与数等）
-                        note = next(
-                            (
-                                str(d.get("note") or "")
-                                for d in run["details"]
-                                if d.get("chat") == lb
-                                and str(d.get("account") or "") == acc
-                                and d.get("note")
-                            ),
-                            "",
-                        )
-                        with (
-                            ui.card()
-                            .classes("w-full border gap-1")
-                            .style("background: #fafafa")
-                        ):
-                            with ui.row().classes(
-                                "w-full items-center gap-2 no-wrap tgs-prog-sub-row"
-                            ):
-                                idx = labels.index(lb) + 1
-                                ui.badge(str(idx)).props(
-                                    "color=positive"
-                                    if st == "成功"
-                                    else (
-                                        "color=orange"
-                                        if st == "中断"
-                                        else (
-                                            "color=negative"
-                                            if st == "失败"
-                                            else "color=primary"
-                                        )
-                                    )
-                                )
-                                ui.label(
-                                    f"{lb.split(' · ')[0]} · "
-                                    f"{_sub_task_display(sub, self.workdir)}"
-                                ).classes("text-sm font-medium tgs-prog-sub-title")
-                                ui.space()
-                                ui.badge(st).props(
-                                    f"color={status_color.get(st, 'grey-6')} outline"
-                                )
-                            if note:
-                                ui.label(note).classes(
-                                    "text-xs font-medium text-gray-500"
-                                )
-                            try:
-                                params = _sub_config_params_brief(sub, self.workdir)
-                            except Exception:
-                                params = []
-                            if params:
-                                with ui.column().classes("w-full gap-0 mt-1"):
-                                    for lbl, short, full in params:
-                                        with ui.row().classes(
-                                            "w-full items-start gap-3 no-wrap tgs-prog-param-row"
-                                        ):
-                                            ui.label(lbl).classes(
-                                                "text-xs text-gray-500 shrink-0 min-w-[130px] max-w-[200px] tgs-prog-param-label"
-                                            )
-                                            value = ui.label(short).classes(
-                                                "text-xs text-gray-800 whitespace-pre-line flex-grow tgs-prog-param-value"
-                                            )
-                                            if full != short:
-                                                value.tooltip(
-                                                    f"{lbl}（全部）：\n{full}"
-                                                )
-                            else:
-                                ui.label(
-                                    "未找到该任务的配置参数（任务可能已被删除）"
-                                ).classes("text-xs text-gray-500")
+            ui.linear_progress(value=ratio, show_value=False).props(
+                f"rounded color={color}"
+            ).classes("w-full").style("height: 5px")
+
+    def _render_subtask_card(self, run: dict, sub: dict, idx: int) -> None:
+        """子任务卡片：沿用其类型任务的展示字段，并附加各账号执行状态。"""
+        label = f"{sub.get('type')} · {sub.get('task')}"
+        status = self._sub_run_status(sub, run)
+        color = self.UNIT_STATUS_COLOR.get(status, "grey-6")
+        with ui.card().classes("w-full border gap-1 tgs-combo-sub-card"):
+            with ui.row().classes("w-full items-center gap-2 tgs-prog-sub-row"):
+                ui.badge(str(idx)).props(f"color={color}")
+                ui.label(str(sub.get("type") or "子任务")).classes(
+                    "text-sm font-semibold tgs-prog-sub-title"
+                )
+                ui.space()
+                ui.badge(status).props(f"color={color} outline")
+            ui.label(_sub_task_display(sub, self.workdir)).classes(
+                "text-xs font-medium text-gray-700"
+            )
+            try:
+                params = _sub_config_params_brief(sub, self.workdir) or []
+            except Exception:
+                params = []
+            for lbl, short, full in params:
+                with ui.row().classes("w-full items-start gap-2 tgs-prog-param-row"):
+                    ui.label(lbl).classes(
+                        "text-xs text-gray-500 shrink-0 tgs-prog-param-label"
+                    )
+                    value = ui.label(short).classes(
+                        "text-xs text-gray-800 flex-grow tgs-prog-param-value"
+                    )
+                    if full != short:
+                        value.tooltip(f"{lbl}（全部）：\n{full}")
+            accounts = self._sub_expected_accounts(run, label)
+            if not accounts:
+                ui.label("未绑定账号").classes("text-xs text-gray-400")
+                return
+            with ui.column().classes("w-full gap-0 mt-1"):
+                for acc in accounts:
+                    acc_status = self._acc_sub_status(run, acc, label)
+                    acc_color = self.UNIT_STATUS_COLOR.get(acc_status, "grey-6")
+                    note = next(
+                        (
+                            str(d.get("note") or "")
+                            for d in run.get("details") or []
+                            if d.get("chat") == label
+                            and str(d.get("account") or "") == acc
+                            and d.get("note")
+                        ),
+                        "",
+                    )
+                    with ui.row().classes("w-full items-center gap-1 tgs-prog-acc-row"):
+                        ui.icon("person").classes("text-xs text-gray-400")
+                        ui.label(acc).classes("text-xs text-gray-800")
+                        if note:
+                            ui.label(note).classes("text-xs font-medium text-gray-500")
+                        ui.space()
+                        ui.badge(acc_status).props(f"color={acc_color} outline")
 
     def _tick(self) -> None:
         """每 2 秒轮询：落盘进度快照；历史状态变化时刷新列表。"""
@@ -1191,6 +1271,7 @@ class ComboTaskBlock:
                     str(d.get("chat") or ""),
                     str(d.get("account") or ""),
                     str(d.get("status") or ""),
+                    str(d.get("note") or ""),
                 )
                 for d in snap.get("details") or []
             ),
@@ -1677,6 +1758,19 @@ _PROGRESS_PAGE_STYLE = """
     .q-layout, .q-page, .q-page-container, .nicegui-content { background: transparent !important; }
     .q-card { background: #ffffff; border-radius: 12px; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08); }
     .q-notifications__list--bottom { top: 72px !important; bottom: auto !important; }
+    /* 子任务卡片：桌面端自适应多列，参数值单行省略，悬停/长按看完整内容 */
+    .tgs-combo-sub-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+        gap: 8px;
+    }
+    .tgs-combo-sub-card { gap: 4px !important; }
+    .tgs-combo-sub-card .tgs-prog-param-value {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .tgs-combo-acc-card { box-shadow: none !important; }
     /* 页面头部（返回 / 标题 / 停止）吸顶，长页面滚动时仍可操作 */
     .tgs-page-head {
         position: sticky;
@@ -1733,9 +1827,13 @@ _PROGRESS_PAGE_STYLE = """
             padding: 10px 12px !important;
             border-radius: 10px !important;
         }
-        /* 账号折叠面板头与内容内边距收紧 */
-        .q-expansion-item .q-item { min-height: 44px !important; padding: 6px 10px !important; }
-        .q-expansion-item__content { padding: 4px 8px 8px !important; }
+        /* 子任务卡片窄屏单列；参数改回换行展示，避免省略后看不到内容 */
+        .tgs-combo-sub-grid { grid-template-columns: 1fr; }
+        .tgs-combo-sub-card .tgs-prog-param-value {
+            white-space: normal;
+            overflow: visible;
+            overflow-wrap: anywhere;
+        }
         /* 进度内容行允许换行，长参数名/任务名不挤压值区（no-wrap 需 !important 覆盖） */
         .tgs-prog-head-row,
         .tgs-prog-sub-row { flex-wrap: wrap !important; row-gap: 2px; }
@@ -1825,8 +1923,24 @@ def _build_progress_page(record_id: str) -> None:
         if run is not None:
             return (
                 "live",
-                len(run["details"]),
+                tuple(
+                    (
+                        str(d.get("chat") or ""),
+                        str(d.get("account") or ""),
+                        str(d.get("status") or ""),
+                        str(d.get("note") or ""),
+                    )
+                    for d in run["details"]
+                ),
                 tuple(view._sub_run_status(s, run) for s in view._run_subs(run)),
+                sum(
+                    int((p.get("stats") or {}).get("left_total") or 0)
+                    for p in run.get("procs") or []
+                ),
+                sum(
+                    int((p.get("stats") or {}).get("joined_total") or 0)
+                    for p in run.get("procs") or []
+                ),
                 len(
                     [
                         line

@@ -2700,6 +2700,26 @@ def test_bot_source_sweeps_only_target_bot(tmp_path):
     assert client.history_chats == ["BaibaoxiangCjBot"]
 
 
+def test_win_sweep_progress_kept_after_complete(tmp_path):
+    """回扫结束后保留进度文案（完成/中断两种），补漏轮开始不重置。"""
+    engine, _state = _bot_engine(tmp_path)
+
+    progress = engine._begin_win_sweep(2)
+    engine._advance_win_sweep(progress)
+    engine._end_win_sweep()
+    assert engine.win_sweep_text == "中奖回扫 (1/2)"
+
+    progress = engine._begin_win_sweep(2)
+    engine._advance_win_sweep(progress)
+    engine._advance_win_sweep(progress)
+    engine._end_win_sweep()
+    assert engine.win_sweep_text == "中奖回扫完成 (2/2)"
+
+    # 补漏轮（announce=False）开始时保留上一轮完成文案，直至本轮有进展
+    engine._begin_win_sweep(2, announce=False)
+    assert engine.win_sweep_text == "中奖回扫完成 (2/2)"
+
+
 def test_bot_source_click_confirm_without_auto_join(tmp_path):
     """机器人任务强制关闭自动加群：跟进确认时未走加群分支也不应报未赋值。"""
     import asyncio
@@ -3007,11 +3027,34 @@ def test_send_password_tasks_dedup_per_password(tmp_path, monkeypatch):
     assert ("daka_group", "出击雾织星宝宝") in client.sent
 
 
+def test_password_send_slots_spaced_per_group(tmp_path, monkeypatch):
+    """多账号命中同一群口令时按群组错峰排期：后到者在上一个名额之后发言。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    engine.password_send_gap = (10.0, 10.0)
+
+    async def _run():
+        await engine._wait_password_send_slot("acc1", "同一群", "same_group")
+        first = engine._password_gate_until["target:same_group"]
+        await engine._wait_password_send_slot("acc2", "同一群", "same_group")
+        second = engine._password_gate_until["target:same_group"]
+        return first, second
+
+    first, second = asyncio.run(_run())
+    assert second - first == pytest.approx(10.0, abs=0.5)
+
+
 def test_send_password_tasks_private_invite_link(tmp_path, monkeypatch):
     """口令群为私有邀请链接：先解析成真实 chat id 再发送，不再把
     t.me/+hash 整串当用户名走 contacts.ResolveUsername（USERNAME_INVALID）。"""
     import asyncio
-    from types import SimpleNamespace
 
     import tg_signer.giveaway_core as gc
 

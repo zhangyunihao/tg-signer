@@ -115,6 +115,11 @@ JOIN_FLOOD_BUFFER = 10
 RESOLVE_PACE_RANGE = (1.0, 2.0)
 
 
+# 多账号向同一个群发送口令的最小间隔（秒，区间内随机）：各账号相互独立、
+# 并行扫描时会同时命中同一条抽奖，几秒内扎堆发言容易被当成刷屏/机器人
+PASSWORD_SEND_GAP_RANGE = (20.0, 45.0)
+
+
 # 同一 bot 累计收到该次数「抽奖已结束」类回复后，本轮运行熔断该 bot
 # （如 @Lottery8Bot 对所有 start 一律回复 "The event has ended or does not exist"）
 MAX_ENDED_STRIKES = 3
@@ -362,6 +367,10 @@ class GiveawayEngine:
         self._join_cache: set = set()
         # 已发送过口令的群组：{account|bot|群名_lower}，重复参与不重复发言
         self._password_sent: set = set()
+        # 同群口令发言排期：{群名/目标: 下一个可发言时刻（monotonic 秒）}，
+        # 多账号并行命中同一条抽奖时按群组错峰，避免几个账号扎堆发口令
+        self._password_gate_until: Dict[str, float] = {}
+        self.password_send_gap: Tuple[float, float] = PASSWORD_SEND_GAP_RANGE
         # 已处理过点击的防脚本验证消息：{account|bot|msg_id}，进程内去重
         # （重发 start 后旧验证消息仍在候选里，避免误点过期验证按钮）
         self._emoji_verify_handled: set = set()
@@ -454,7 +463,7 @@ class GiveawayEngine:
         self.scanning = False
         self.scan_text = ""
         # 中奖回扫进度（与频道扫描分开显示）：分母=本轮待回扫的账号×bot 数，
-        # 分子=已回扫完成的 bot 数；不在回扫时为空
+        # 分子=已回扫完成的 bot 数；本轮结束后保留完成进度继续展示
         self.win_sweep_text = ""
         self.win_sweep_done = 0
         self.win_sweep_total = 0
@@ -545,6 +554,8 @@ class GiveawayEngine:
             max(1, int(win_sweep_limit)) if win_sweep_limit else WIN_SWEEP_LIMIT
         )
         self._win_handled.clear()
+        # 口令错峰排期按运行周期重置，避免上一轮残留的等待时刻拖慢本次启动
+        self._password_gate_until.clear()
         # 双向账户集合：发言数要求类抽奖自动跳过
         self.two_way_accounts = {str(a) for a in (two_way_accounts or ())}
         self.max_joins = max(0, int(max_joins)) if max_joins else None
@@ -1476,10 +1487,15 @@ class GiveawayEngine:
         return bots
 
     def _begin_win_sweep(self, total: int, *, announce: bool = True) -> Dict[str, int]:
-        """开始一轮中奖回扫：记录分母，返回本轮已完成计数。"""
+        """开始一轮中奖回扫：记录分母，返回本轮已完成计数。
+
+        announce=False（补漏轮）不重置展示文案，让上一轮的完成进度继续
+        显示，直到本轮有 bot 回扫完成再更新为本轮进度。
+        """
         self.win_sweep_total = total
         self.win_sweep_done = 0
-        self.win_sweep_text = f"中奖回扫 (0/{total})" if total and announce else ""
+        if total and announce:
+            self.win_sweep_text = f"中奖回扫 (0/{total})"
         return {"n": 0}
 
     def _advance_win_sweep(self, progress: Dict[str, int]) -> None:
@@ -1489,10 +1505,17 @@ class GiveawayEngine:
         self.win_sweep_text = f"中奖回扫 ({progress['n']}/{self.win_sweep_total})"
 
     def _end_win_sweep(self) -> None:
-        """本轮中奖回扫结束，清空独立进度展示。"""
-        self.win_sweep_text = ""
-        self.win_sweep_done = 0
-        self.win_sweep_total = 0
+        """本轮中奖回扫结束：保留进度文案，界面在回扫结束后继续展示。"""
+        if self.win_sweep_total > 0:
+            if self.win_sweep_done >= self.win_sweep_total:
+                self.win_sweep_text = (
+                    f"中奖回扫完成 ({self.win_sweep_done}/{self.win_sweep_total})"
+                )
+            else:
+                # 中途停止/异常退出：保留已扫进度，不标「完成」
+                self.win_sweep_text = (
+                    f"中奖回扫 ({self.win_sweep_done}/{self.win_sweep_total})"
+                )
 
     async def _sweep_all_accounts(self) -> None:
         """全部已连接账号并行回扫中奖消息，并单独维护该轮进度。"""
@@ -2817,6 +2840,47 @@ class GiveawayEngine:
                 return None
         return send_target
 
+    @staticmethod
+    def _password_gate_keys(group_name: str, send_target: Any) -> Tuple[str, str]:
+        """口令发言排期的两个键：群名 + 目标，覆盖同一群组的不同解析路径。"""
+        return (
+            f"name:{group_name.strip().lower()}",
+            f"target:{str(send_target).strip().lower()}",
+        )
+
+    async def _wait_password_send_slot(
+        self, account: str, group_name: str, send_target: Any
+    ) -> bool:
+        """同群口令发言错峰排期；返回 False 表示任务已停止、放弃本次发送。
+
+        多账号并行扫描时会几乎同时命中同一条抽奖，若都在几秒内往同一个群
+        发口令，看起来就是几个账号扎堆刷屏。这里把群组当作共享资源：每个
+        账号先同步预约自己的发言时段（检查与写入之间无 await，单事件循环内
+        天然原子），再按排期等待，后到者在上一个账号的随机间隔走完后再发。
+        等待只阻塞当前账号，其他群组的参与不受影响。
+        """
+        keys = sorted(self._password_gate_keys(group_name, send_target))
+        now = time.monotonic()
+        due = max(self._password_gate_until.get(key, 0.0) for key in keys)
+        slot_at = max(now, due)
+        lo, hi = self.password_send_gap
+        gap = random.uniform(lo, max(lo, hi))
+        for key in keys:
+            self._password_gate_until[key] = slot_at + gap
+        wait = slot_at - now + random.uniform(2.0, 6.0)
+        if wait >= 5:
+            self.log(f"[{account}] 口令群「{group_name}」错峰等待 {wait:.0f} 秒")
+        if self._stop is not None:
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=wait)
+            except asyncio.TimeoutError:
+                pass
+            else:
+                return False
+        else:
+            await asyncio.sleep(wait)
+        return True
+
     async def _send_password_to_target(
         self,
         account: str,
@@ -2828,8 +2892,11 @@ class GiveawayEngine:
         send_target: Any,
     ) -> None:
         try:
-            # 随机延迟错峰：多账号不在同一时刻向同群发言
-            await asyncio.sleep(random.uniform(2.0, 6.0))
+            # 同群错峰：多账号不在同一时刻向同群发言，也不扎堆连续发言
+            if not await self._wait_password_send_slot(
+                account, group_name, send_target
+            ):
+                return
             try:
                 await client.send_message(send_target, password)
             except Exception as resolve_exc:
