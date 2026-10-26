@@ -333,6 +333,32 @@ def print_to_user(*args, sep=" ", end="\n", flush=False, **kwargs):
     return print(*args, sep=sep, end=end, flush=flush, **kwargs)
 
 
+def atomic_write_text(
+    path: str | os.PathLike[str],
+    text: str,
+    *,
+    encoding: str = "utf-8",
+) -> None:
+    """原子写入文本文件：先写临时文件再 os.replace 替换。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as fp:
+            fp.write(text)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            logger.debug("清理原子写入临时文件失败", exc_info=True)
+        raise
+
+
 def atomic_write_json(
     path: str | os.PathLike[str],
     data,

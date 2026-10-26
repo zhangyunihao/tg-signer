@@ -13,6 +13,7 @@ from nicegui import app, run, ui
 
 from tg_signer import __version__
 from tg_signer.core import get_proxy
+from tg_signer.utils import atomic_write_text
 from tg_signer.webui.activity import install_activity_tracking, set_active_tab
 from tg_signer.webui.auto_leave import auto_leave_block
 from tg_signer.webui.channel_stats import channel_stats_block
@@ -1285,7 +1286,7 @@ def _load_or_create_storage_secret() -> str:
                 return secret
         _NICEGUI_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         secret = os.urandom(16).hex()
-        secret_file.write_text(secret, encoding="utf-8")
+        atomic_write_text(secret_file, secret)
         return secret
     except OSError:
         return os.urandom(16).hex()

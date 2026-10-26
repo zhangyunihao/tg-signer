@@ -18,7 +18,7 @@ from nicegui import ui
 
 from tg_signer.core import get_client, safe_disconnect
 from tg_signer.phrases import PHRASES, parse_custom_phrases, phrase_pool_label
-from tg_signer.utils import atomic_write_json
+from tg_signer.utils import atomic_write_json, atomic_write_text
 from tg_signer.webui.activity import should_poll
 from tg_signer.webui.common import (
     add_dialog_close_button,
@@ -138,7 +138,7 @@ async def update_account_chats(
         atomic_write_json(user_dir / "latest_chats.json", latest, indent=4)
         me_file = user_dir / "me.json"
         if not me_file.is_file():
-            me_file.write_text(str(me), encoding="utf-8")
+            atomic_write_text(me_file, str(me))
         log(f"[{account}] 已更新 {len(latest)} 个对话")
         return len(latest)
     except asyncio.TimeoutError:

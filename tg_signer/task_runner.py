@@ -90,6 +90,18 @@ def main(argv: list[str] | None = None) -> int:
 
     kwargs = _worker_kwargs(workdir, account)
 
+    from tg_signer.locks import acquire_task_locks, release_task_locks
+
+    lock_kind = "automation" if action == "automation-run" else "sign"
+    locks = acquire_task_locks(workdir, [account], lock_kind, task_names)
+    if locks is None:
+        print(
+            f"任务已在运行，拒绝重复启动: {account} / {', '.join(task_names)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 3
+
     try:
         if action == "run-once":
             from tg_signer.core import UserSigner
@@ -142,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
     except ChatFolderError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    finally:
+        release_task_locks(locks)
     return 0
 
 

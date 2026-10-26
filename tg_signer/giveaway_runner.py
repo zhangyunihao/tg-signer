@@ -246,7 +246,19 @@ def main() -> None:
     except json.JSONDecodeError as exc:
         print(f"自动抽奖任务参数解析失败: {exc}", flush=True)
         raise SystemExit(2)
-    raise SystemExit(asyncio.run(run_giveaway(spec)))
+
+    from tg_signer.locks import acquire_task_locks, release_task_locks
+
+    task = str(spec.get("task") or "")
+    accounts = [a for a in engine_kwargs_from_spec(spec)["accounts"] if a]
+    locks = acquire_task_locks(spec.get("workdir") or ".", accounts, "giveaway", task)
+    if locks is None:
+        print(f"任务 #{task} 已在运行，拒绝重复启动", flush=True)
+        raise SystemExit(3)
+    try:
+        raise SystemExit(asyncio.run(run_giveaway(spec)))
+    finally:
+        release_task_locks(locks)
 
 
 if __name__ == "__main__":

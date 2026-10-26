@@ -60,7 +60,13 @@ from tg_signer.config import (
 
 from ._kurigram import SafeGetForumTopics
 from .ai_tools import AITools, OpenAIConfigManager
-from .utils import UserInput, atomic_write_json, get_now, print_to_user
+from .utils import (
+    UserInput,
+    atomic_write_json,
+    atomic_write_text,
+    get_now,
+    print_to_user,
+)
 from .utils import get_timezone as _get_timezone
 
 logger = logging.getLogger("tg-signer")
@@ -354,8 +360,8 @@ class Client(SafeGetForumTopics, BaseClient):
         return self.workdir / (self.name + ".session_string")
 
     async def save_session_string(self):
-        with open(self.session_string_file, "w") as fp:
-            fp.write(await self.export_session_string())
+        # 原子写：会话串写到一半崩溃会得到不可用的残片
+        atomic_write_text(self.session_string_file, await self.export_session_string())
 
     def load_session_string(self):
         logger.info("Loading session_string from local file.")
@@ -681,10 +687,8 @@ class BaseUserWorker(Generic[ConfigT]):
 
     def set_me(self, user: User):
         self.user = user
-        with open(
-            self.get_user_dir(user).joinpath("me.json"), "w", encoding="utf-8"
-        ) as fp:
-            fp.write(str(user))
+        # 原子写：WebUI 轮询会并发读取 me.json，半截内容会解析失败
+        atomic_write_text(self.get_user_dir(user).joinpath("me.json"), str(user))
 
     async def login(
         self,

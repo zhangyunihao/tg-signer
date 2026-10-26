@@ -299,6 +299,20 @@ class TaskRunnerBlock:
         cls._line_seq += 1
 
     @classmethod
+    def drain_output(cls) -> None:
+        """把各运行任务队列里的输出转存到共享日志缓冲。
+
+        与 UI 渲染解耦：组合任务在「组合任务」tab 下启动、进度独立页面单独打开
+        或主控台已关闭时也要持续收集，否则进度页/进度快照读不到任何日志。
+        """
+        for run in list(cls.runs.values()):
+            q = run.get("queue")
+            if q is None:
+                continue
+            while not q.empty():
+                cls._append_output_line(q.get())
+
+    @classmethod
     def _lines_since(cls, seq: int) -> list[str]:
         """返回 seq 之后追加的行（deque 淘汰旧行后起点自动截断）。"""
         lines = list(cls.output_lines)
@@ -1918,6 +1932,9 @@ class TaskRunnerBlock:
                 return
             if not self._poll_enabled:
                 continue
+            # 先收集输出（与当前 tab / 页面可见性无关），保证组合任务在其他 tab
+            # 运行、页面切后台时进度页与进度快照仍有日志可读
+            TaskRunnerBlock.drain_output()
             # 页面不可见或已切到其他 tab 时跳过刷新，切回后自动恢复
             if not should_poll(self._poll_client, "run"):
                 continue

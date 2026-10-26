@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from pyrogram.types import Message
 
+from tg_signer.locks import file_lock
 from tg_signer.utils import atomic_write_json
 
 if TYPE_CHECKING:
@@ -74,13 +75,57 @@ class RuleStateStore:
         except (OSError, json.JSONDecodeError) as exc:
             self.logger.warning(f"无法读取状态文件: {self.path} ({exc})")
 
+    def _merge_with_disk(self) -> Dict[str, Any]:
+        """写前重读磁盘，按 rule/trigger 粒度合并本次改动。
+
+        state.json 按任务存放，同一自动化任务的不同账号进程会写同一个文件；
+        直接用内存副本覆盖会抹掉别的进程刚写入的 next_run_at 等字段。
+        """
+        try:
+            with open(self.path, "r", encoding="utf-8") as fp:
+                disk = json.load(fp)
+        except (OSError, json.JSONDecodeError):
+            return self._data
+        if not isinstance(disk, dict):
+            return self._data
+        rules = disk.get("rules")
+        if not isinstance(rules, dict):
+            rules = {}
+            disk["rules"] = rules
+        for rule_id, bucket in (self._data.get("rules") or {}).items():
+            if not isinstance(bucket, dict):
+                continue
+            target = rules.get(rule_id)
+            if not isinstance(target, dict):
+                target = {}
+                rules[rule_id] = target
+            target["vars"] = dict(bucket.get("vars") or {})
+            triggers = target.get("triggers")
+            if not isinstance(triggers, dict):
+                triggers = {}
+                target["triggers"] = triggers
+            for trigger_id, trigger_state in (bucket.get("triggers") or {}).items():
+                slot = triggers.get(trigger_id)
+                if isinstance(slot, dict) and isinstance(trigger_state, dict):
+                    slot.update(trigger_state)
+                else:
+                    triggers[trigger_id] = trigger_state
+        return disk
+
     def save(self, force: bool = False) -> None:
         # 无变更时跳过落盘，减少频繁 IO。
         if not self._dirty and not force:
             self.logger.debug("状态未变化，跳过写入: %s", self.path)
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(self.path, self._data)
+        try:
+            with file_lock(self.path):
+                merged = self._merge_with_disk()
+                atomic_write_json(self.path, merged)
+                self._data = merged
+        except TimeoutError:
+            self.logger.warning("等待状态文件锁超时，本次写入跳过: %s", self.path)
+            return
         self._dirty = False
         self.logger.debug("状态文件写入完成: %s", self.path)
 

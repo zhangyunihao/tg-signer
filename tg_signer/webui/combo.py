@@ -94,6 +94,8 @@ def load_combo_progress(workdir: Path | str | None = None) -> dict[str, dict]:
 
 
 def save_combo_progress(store: dict, workdir: Path | str | None = None) -> None:
+    # 单写者假设：只由 WebUI 主进程的轮询逻辑写入（子进程不落盘快照），
+    # 因此这里不加文件锁；若将来改由子进程写入，需要补 file_lock。
     atomic_write_json(_composite_progress_path(workdir), store)
 
 
@@ -116,6 +118,13 @@ class _SharedRunner:
         from tg_signer.webui.task_panel import TaskRunnerBlock
 
         return TaskRunnerBlock.output_lines
+
+    @staticmethod
+    def drain_output() -> None:
+        """收集服务进程内各运行任务的输出（与主控台是否打开无关）。"""
+        from tg_signer.webui.task_panel import TaskRunnerBlock
+
+        TaskRunnerBlock.drain_output()
 
     @staticmethod
     def _stop_run(record_id: str):
@@ -1304,6 +1313,9 @@ class ComboTaskBlock:
 
     def _sync_progress_snapshots(self) -> None:
         """每轮轮询：运行中的组合任务落盘快照，刚结束的运行补写终态快照。"""
+        # 组合任务通常在「组合任务」tab 启动，签到页的日志轮询不会运行；
+        # 这里主动收集子进程输出，进度页与快照才有日志可读
+        self.runner.drain_output()
         live: dict[str, dict] = {}
         for rid, run in list(self.runner.runs.items()):
             rec = run.get("record") or {}
@@ -1968,6 +1980,8 @@ def _build_progress_page(record_id: str) -> None:
         )
 
     def render_content() -> None:
+        # 进度页常单独打开（主控台已关闭/手机切页），先收集子进程输出再渲染
+        view.runner.drain_output()
         title.text = f"任务进度：{record.get('task_name') or record_id}"
         stop_btn.set_visibility(view.runner.runs.get(record_id) is not None)
         view._render_progress_into(content, record)

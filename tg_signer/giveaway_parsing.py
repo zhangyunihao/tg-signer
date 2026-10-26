@@ -14,7 +14,6 @@ from urllib.parse import parse_qs, urlparse
 logger = logging.getLogger(__name__)
 
 
-
 # 命中「确认参与」类按钮的默认关键词（callback 按钮直接点击；URL 按钮仅当
 # 链接指向同一 bot 的 start 深度链接时才点击，即重发 start 完成参与）
 DEFAULT_CONFIRM_KEYWORDS = (
@@ -71,8 +70,6 @@ def callback_answer_text(answer: Any) -> str:
     ).strip()
 
 
-
-
 class BotPolicy:
     """单个抽奖 bot 的专属行为开关；未登记的用户名一律使用默认通用策略。"""
 
@@ -93,8 +90,6 @@ class BotPolicy:
         self.restart_after_join = restart_after_join
 
 
-
-
 DEFAULT_BOT_POLICY = BotPolicy()
 
 
@@ -108,19 +103,14 @@ BOT_POLICIES: Dict[str, BotPolicy] = {
 }
 
 
-
-
 def bot_policy(username: Any) -> BotPolicy:
     """按 bot 用户名（忽略大小写与 @ 前缀）取专属策略，未登记返回默认策略。"""
     key = str(username or "").strip().lstrip("@").lower()
     return BOT_POLICIES.get(key, DEFAULT_BOT_POLICY)
 
 
-
-
 def bot_is_blocked(username: Any) -> bool:
     return bot_policy(username).blocked
-
 
 
 # —— 中奖识别 ——
@@ -142,9 +132,7 @@ WIN_PERSONAL_RE = re.compile(r"恭喜.{0,8}中奖|中奖提醒|中奖人[：:]")
 
 # 中奖奖品为站内虚拟积分「嫩妹币」时不认定为有效中奖（用户明确不关注此类
 # 奖励）：只按奖品行判断，避免说明段提及「嫩妹币」被误过滤
-WIN_IGNORE_PRIZE_RE = re.compile(
-    r"(?:中奖奖品|中得奖品|获得奖品)[：:][^\n]*嫩妹币"
-)
+WIN_IGNORE_PRIZE_RE = re.compile(r"(?:中奖奖品|中得奖品|获得奖品)[：:][^\n]*嫩妹币")
 
 
 # URL 主体合法字符（不含空白与非西文字符）：链接紧贴中文/全角标点时在此截断
@@ -199,8 +187,6 @@ _TIME_HM_RE = re.compile(
 )
 
 
-
-
 def parse_draw_date(text: str, now: Optional[datetime] = None) -> Optional[datetime]:
     """解析消息文本中的开奖日期；无提示词或解析不出返回 None。
 
@@ -251,8 +237,6 @@ def parse_draw_date(text: str, now: Optional[datetime] = None) -> Optional[datet
     return None
 
 
-
-
 def parse_bot_start_link(url: str) -> Optional[Tuple[str, str]]:
     """解析 bot 深度链接，返回 (用户名(不带@), start参数)；不是则返回 None。
 
@@ -292,14 +276,10 @@ def parse_bot_start_link(url: str) -> Optional[Tuple[str, str]]:
     return domain, mparam.group(0)
 
 
-
-
 def _message_text(message: Any) -> str:
     return str(
         getattr(message, "text", None) or getattr(message, "caption", None) or ""
     )
-
-
 
 
 def _giveaway_title(message: Any, limit: int = 30) -> str:
@@ -309,8 +289,6 @@ def _giveaway_title(message: Any, limit: int = 30) -> str:
         return ""
     snippet = re.sub(r"\s+", " ", text)
     return snippet if len(snippet) <= limit else snippet[:limit] + "…"
-
-
 
 
 def extract_giveaway_title(message: Any, limit: int = 40) -> str:
@@ -324,8 +302,6 @@ def extract_giveaway_title(message: Any, limit: int = 40) -> str:
         if title:
             return title if len(title) <= limit else title[:limit] + "…"
     return ""
-
-
 
 
 def _iter_candidate_urls(message: Any) -> Iterable[str]:
@@ -348,8 +324,6 @@ def _iter_candidate_urls(message: Any) -> Iterable[str]:
             url = getattr(btn, "url", None)
             if url:
                 yield str(url)
-
-
 
 
 def extract_bot_links(message: Any) -> List[Tuple[str, str]]:
@@ -385,8 +359,6 @@ def extract_bot_links(message: Any) -> List[Tuple[str, str]]:
     return found
 
 
-
-
 def message_matches_keywords(message: Any, keywords: Iterable[str]) -> bool:
     """消息文本是否包含任一关键词；关键词为空表示全部放行。
 
@@ -400,8 +372,6 @@ def message_matches_keywords(message: Any, keywords: Iterable[str]) -> bool:
     return any(kw in text for kw in kws)
 
 
-
-
 # 「抽奖说明」段落边界：段头行含「抽奖说明」，段落延续到下一个
 # 「行首 emoji + 文字 + 冒号」的段头（如 🔋人品加成 / 💁参与情况 / 📅开奖日期），
 # 无后续段头则到文本末尾。
@@ -409,8 +379,6 @@ _RULES_HEADER_RE = re.compile(r"抽奖说明")
 
 
 _SECTION_HEADER_RE = re.compile(r"^[^\w\s\u4e00-\u9fff]+\s*\S*[：:]", re.MULTILINE)
-
-
 
 
 def strip_rules_section(text: str) -> str:
@@ -430,8 +398,6 @@ def strip_rules_section(text: str) -> str:
     return text
 
 
-
-
 # —— 开奖结果公告过滤 ——
 # bot 群发给全体参与者的开奖结果公告（如「🎉🎉🎉 开奖通知 🎉🎉🎉」+ 防伪编号 +
 # 他人中奖名单）：抽奖已结束，参与无意义。置顶路径不受关键词过滤，且公告帖
@@ -440,14 +406,10 @@ def strip_rules_section(text: str) -> str:
 DRAW_ANNOUNCE_RE = re.compile(r"开奖通知|开奖结果|中奖名单")
 
 
-
-
 def message_is_draw_announce(message: Any) -> bool:
     """消息是否为开奖结果公告（非活跃抽奖帖）。"""
     text = strip_rules_section(_message_text(message))
     return bool(text and DRAW_ANNOUNCE_RE.search(text))
-
-
 
 
 # —— 归属地限制过滤 ——
@@ -469,8 +431,6 @@ ALLOWED_REGIONS = ("上海",)
 REGION_UNLIMITED_WORDS = ("全国", "不限", "所有", "全部")
 
 
-
-
 def parse_region_limits(text: str) -> Optional[List[List[str]]]:
     """提取文本中全部「归属地」行的地区列表；无该行返回 None（不限地区）。"""
     limits: List[List[str]] = []
@@ -479,8 +439,6 @@ def parse_region_limits(text: str) -> Optional[List[List[str]]]:
         if regions:
             limits.append(regions)
     return limits or None
-
-
 
 
 def message_region_allowed(message: Any) -> bool:
@@ -496,8 +454,6 @@ def message_region_allowed(message: Any) -> bool:
     return False
 
 
-
-
 # —— 发言数要求检测 ——
 # 抽奖帖含「发言数大于 N 条」「发言数超过 N 条」等参与条件时，双向账号
 # （隐私设置导致无法被 bot/群成员主动私聊核实）无法达标，需自动跳过。
@@ -510,13 +466,9 @@ SPEECH_TASK_RE = re.compile(
 )
 
 
-
-
 def message_requires_speech(message: Any) -> bool:
     """消息是否带「发言数」类参与条件。"""
     return bool(SPEECH_REQUIRE_RE.search(_message_text(message) or ""))
-
-
 
 
 # 口令参与条件：「发送口令﹝xx﹞」「发送口令激活」及「口令提示」段落头，
@@ -524,13 +476,9 @@ def message_requires_speech(message: Any) -> bool:
 PASSWORD_REQUIRE_RE = re.compile(r"发送口令|口令提示")
 
 
-
-
 def message_requires_password(message: Any) -> bool:
     """消息是否带「发送口令」类参与条件。"""
     return bool(PASSWORD_REQUIRE_RE.search(_message_text(message) or ""))
-
-
 
 
 # —— 口令任务解析 ——
@@ -562,13 +510,9 @@ _USERNAME_RESOLVE_ERRORS = (
 )
 
 
-
-
 def _is_username_resolve_error(exc: BaseException) -> bool:
     msg = str(exc).upper()
     return any(code in msg for code in _USERNAME_RESOLVE_ERRORS)
-
-
 
 
 def extract_password_tasks(message: Any) -> List[Tuple[str, str]]:
@@ -602,8 +546,6 @@ def extract_password_tasks(message: Any) -> List[Tuple[str, str]]:
     return tasks
 
 
-
-
 def extract_speech_tasks(message: Any) -> List[Tuple[str, int]]:
     """解析清单/原帖中的发言数任务，返回 [(群组名称, 要求条数)]。
 
@@ -635,8 +577,6 @@ def extract_speech_tasks(message: Any) -> List[Tuple[str, int]]:
     return tasks
 
 
-
-
 def _tme_join_target(url: str) -> Optional[str]:
     """t.me / tg://resolve 链接 → 可 join 的目标（用户名或私有邀请链接）。
 
@@ -661,8 +601,6 @@ def _tme_join_target(url: str) -> Optional[str]:
     return target
 
 
-
-
 def _line_bounds(text: str) -> List[Tuple[int, int, str]]:
     """按换行切出每行 (起始, 结束, 内容) 区间表，供实体 offset 定位所在行。"""
     bounds: List[Tuple[int, int, str]] = []
@@ -673,7 +611,6 @@ def _line_bounds(text: str) -> List[Tuple[int, int, str]]:
             start = i + 1
     bounds.append((start, len(text), text[start:]))
     return bounds
-
 
 
 def extract_join_name_links(message: Any) -> List[Tuple[str, str]]:
@@ -731,8 +668,6 @@ def _join_row_name_link(
     return None
 
 
-
-
 # bot 回复「抽奖活动已结束」类文案（活动可能提前结束）＝终态：
 # 跳过加入、重发、点按钮等一切后续跟进，避免对已结束的抽奖反复发 start
 # 中文与英文文案均覆盖（如 @Lottery8Bot 的 "The event has ended or does not exist"
@@ -745,13 +680,9 @@ ENDED_REPLY_RE = re.compile(
 )
 
 
-
-
 def reply_says_ended(message: Any) -> bool:
     """bot 回复是否表明该抽奖已结束（终态）。"""
     return bool(ENDED_REPLY_RE.search(_message_text(message) or ""))
-
-
 
 
 # 点击确认按钮后的弹窗提示（callback answer alert，非新消息）中的终态文案。
@@ -763,8 +694,6 @@ _POPUP_ENDED_RE = re.compile(
 )
 
 
-
-
 # bot 回复「您已成功报名抽奖（未达标β）您还需完成激活任务才能抽奖！」
 # 「您已获得抽奖资格（已达标）」等 ＝ 报名已成功：未达标仅剩发言数这类
 # 激活任务（❌ 标在「└ 🎟️ 发言数大于 N 条」子行上，非未加入频道），
@@ -772,13 +701,9 @@ _POPUP_ENDED_RE = re.compile(
 SIGNUP_SUCCESS_RE = re.compile(r"已成功报名|报名成功|已获得抽奖资格")
 
 
-
-
 def reply_says_signup_success(message: Any) -> bool:
     """bot 回复是否表明报名成功（未达标仅剩激活任务时同样算已参与）。"""
     return bool(SIGNUP_SUCCESS_RE.search(_message_text(message) or ""))
-
-
 
 
 # —— 防脚本验证（按顺序点击 emoji，如 @dbchoujiang123_bot）——
@@ -797,8 +722,6 @@ _EMOJI_BASE_RE = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF]"
 
 
 _EMOJI_MOD_RE = re.compile(r"[\uFE0F\u200D\U0001F3FB-\U0001F3FF\u20E3]")
-
-
 
 
 def _extract_emoji_order(text: str) -> List[str]:
@@ -826,8 +749,6 @@ def _extract_emoji_order(text: str) -> List[str]:
         if cur:
             order.append(cur)
     return order
-
-
 
 
 def is_emoji_verify_message(message: Any) -> bool:
@@ -895,9 +816,7 @@ def solve_math_expression(expr: str) -> Optional[str]:
             node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)
         ):
             continue
-        if isinstance(node, ast.UnaryOp) and isinstance(
-            node.op, (ast.UAdd, ast.USub)
-        ):
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
             continue
         if isinstance(node, ast.Constant) and type(node.value) in (int, float):
             continue
@@ -923,8 +842,6 @@ def math_verify_answer(message: Any) -> Optional[str]:
     return solve_math_expression(expr)
 
 
-
-
 # —— LotteryBestBot 式回复解析 ——
 # start 后不满足条件时 bot 回复「您需加入指定的群组/频道」，逐行列出
 # 「🎫 加入-名称 ❌/✅」，名称是带 TEXT_URL 隐藏链接的文本。只提取
@@ -946,8 +863,6 @@ def _utf16_to_index(text: str, u16_offset: int) -> int:
             return i
         units += 2 if ord(ch) > 0xFFFF else 1
     return len(text)
-
-
 
 
 def extract_join_status_targets(message: Any) -> List[str]:
@@ -991,8 +906,6 @@ def _unjoined_row_target(
     if "加入" not in line or "❌" not in line or "✅" in line:
         return None
     return _tme_join_target(str(url))
-
-
 
 
 def extract_channel_targets(message: Any) -> List[str]:

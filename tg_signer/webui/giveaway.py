@@ -27,6 +27,7 @@ from tg_signer.giveaway_core import (
 )
 from tg_signer.giveaway_parsing import DEFAULT_KEYWORDS
 from tg_signer.giveaway_state import GiveawayState
+from tg_signer.locks import file_lock
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.activity import should_poll
 from tg_signer.webui.auto_leave import create_auto_leave_task, run_auto_leave_task
@@ -162,6 +163,8 @@ class _AlertStore:
         return list(entries)
 
     def save(self, workdir, alerts: List[dict]) -> None:
+        # 单写者假设：提醒只由 WebUI 主进程（抽奖事件回调）追加，子进程不写，
+        # 因此未加文件锁；若子进程也需要写提醒，需改成读改写 + file_lock。
         path = Path(workdir) / self.filename
         kept = alerts[: self.limit]
         try:
@@ -503,6 +506,27 @@ def load_win_forward_targets(workdir) -> List[str]:
     return targets or ["me"]
 
 
+def _update_win_settings(workdir, **fields) -> None:
+    """更新全局设置文件里的若干键（一次读盘、一次写盘）。
+
+    多个设置项共用一个文件，若各自「整文件读 → 改一个键 → 整文件写」，
+    两次保存交错就会丢掉其中一项，因此统一走这里并在文件锁内完成。
+    """
+    path = Path(workdir) / WIN_SETTINGS_FILE
+    try:
+        with file_lock(path):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, ValueError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data.update(fields)
+            atomic_write_json(path, data)
+    except (OSError, ValueError, TimeoutError):
+        logger.debug("写入中奖提醒全局设置失败", exc_info=True)
+
+
 def save_win_forward_targets(workdir, targets) -> None:
     """保存中奖消息转发目标，保留文件中其他键（回扫条数等）。"""
     cleaned: List[str] = []
@@ -510,18 +534,7 @@ def save_win_forward_targets(workdir, targets) -> None:
         target = str(item).strip()
         if target and target not in cleaned:
             cleaned.append(target)
-    path = Path(workdir) / WIN_SETTINGS_FILE
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    try:
-        data["win_forward_target"] = cleaned or ["me"]
-        atomic_write_json(path, data)
-    except OSError:
-        logger.debug("写入中奖消息转发目标失败", exc_info=True)
+    _update_win_settings(workdir, win_forward_target=cleaned or ["me"])
 
 
 def load_win_sweep_limit(workdir) -> int:
@@ -541,18 +554,12 @@ def load_win_sweep_limit(workdir) -> int:
 
 def save_win_sweep_limit(workdir, limit) -> None:
     """保存中奖回扫条数，保留文件中其他键（转发目标等）。"""
-    path = Path(workdir) / WIN_SETTINGS_FILE
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    try:
-        data["win_sweep_limit"] = max(1, int(limit))
-        atomic_write_json(path, data)
-    except (OSError, ValueError):
-        logger.debug("写入中奖回扫条数失败", exc_info=True)
+        value = max(1, int(limit))
+    except (TypeError, ValueError):
+        logger.debug("中奖回扫条数非法，忽略写入: %r", limit)
+        return
+    _update_win_settings(workdir, win_sweep_limit=value)
 
 
 # 抽奖任务超时默认值（分钟）：单独运行与组合子任务共用，0=不限
@@ -575,18 +582,12 @@ def load_giveaway_timeout_min(workdir) -> int:
 
 def save_giveaway_timeout_min(workdir, val) -> None:
     """保存抽奖任务超时（分钟），保留文件中其他键。"""
-    path = Path(workdir) / WIN_SETTINGS_FILE
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    try:
-        data["giveaway_timeout_min"] = max(0, int(val))
-        atomic_write_json(path, data)
-    except (OSError, ValueError):
-        logger.debug("写入抽奖任务超时失败", exc_info=True)
+        value = max(0, int(val))
+    except (TypeError, ValueError):
+        logger.debug("抽奖任务超时非法，忽略写入: %r", val)
+        return
+    _update_win_settings(workdir, giveaway_timeout_min=value)
 
 
 def load_giveaway_scan_cap(workdir) -> int:
@@ -605,18 +606,12 @@ def load_giveaway_scan_cap(workdir) -> int:
 
 def save_giveaway_scan_cap(workdir, val) -> None:
     """保存单频道扫描上限（条），保留文件中其他键。"""
-    path = Path(workdir) / WIN_SETTINGS_FILE
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    try:
-        data["giveaway_scan_cap"] = max(1, int(val))
-        atomic_write_json(path, data)
-    except (OSError, ValueError):
-        logger.debug("写入单频道扫描上限失败", exc_info=True)
+        value = max(1, int(val))
+    except (TypeError, ValueError):
+        logger.debug("单频道扫描上限非法，忽略写入: %r", val)
+        return
+    _update_win_settings(workdir, giveaway_scan_cap=value)
 
 
 # 任务配置字段 -> 默认值，加载旧配置时补齐缺失字段
@@ -1535,9 +1530,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 'label="启动" @click="$parent.$emit(\'startTask\', props.row)" />'
                 f'<q-btn v-if="({running_expr})" flat dense color="negative" '
                 'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
-                '<q-btn flat dense color="primary" '
-                ":label=\"props.row.pinned ? '取消置顶' : '置顶'\" "
-                "@click=\"$parent.$emit('pinTask', props.row)\" />"
+                '<q-btn flat dense icon="push_pin" '
+                ":color=\"props.row.pinned ? 'primary' : 'grey-7'\" "
+                ":aria-label=\"props.row.pinned ? '取消置顶' : '置顶'\" "
+                "@click=\"$parent.$emit('pinTask', props.row)\">"
+                "<q-tooltip>{{ props.row.pinned ? '取消置顶' : '置顶' }}"
+                "</q-tooltip></q-btn>"
                 '<q-btn flat dense color="primary" '
                 'label="明细" @click="$parent.$emit(\'detailTask\', props.row)" />'
                 '<q-btn flat dense color="primary" '
@@ -1555,7 +1553,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     else:
                         engine = get_engine(n)
                         # 刚启动时子进程尚未回报进度，回退「运行中」避免状态为空
-                        text = (engine.progress_text() or "运行中") if engine else "运行中"
+                        text = (
+                            (engine.progress_text() or "运行中") if engine else "运行中"
+                        )
                     cfg_now = tasks.get(n) or {}
                     start_ts = cfg_now.get("_start_ts")
                     dur = (
@@ -1686,8 +1686,20 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             [
                                 ("类型", row["task_type"]),
                                 ("重复参与", row["ignore_hist"]),
-                                ("账号", row["accounts_summary"], True, True, row["accounts_full"]),
-                                ("监控对象", row["chats_summary"], True, True, row["chats_full"]),
+                                (
+                                    "账号",
+                                    row["accounts_summary"],
+                                    True,
+                                    True,
+                                    row["accounts_full"],
+                                ),
+                                (
+                                    "监控对象",
+                                    row["chats_summary"],
+                                    True,
+                                    True,
+                                    row["chats_full"],
+                                ),
                                 ("关键词", row["keywords"], True),
                                 ("参与上限", row["scan"]),
                                 ("新参加", f"{row['joined']}抽奖"),
@@ -1703,16 +1715,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             start_btn = ui.button(
                                 "启动",
                                 on_click=lambda nn=n,
-                                cb=set_status: asyncio.create_task(
-                                    _card_start(nn, cb)
-                                ),
+                                cb=set_status: asyncio.create_task(_card_start(nn, cb)),
                             ).props("flat dense color=primary")
                             stop_btn = ui.button(
                                 "停止",
                                 on_click=lambda nn=n,
-                                cb=set_status: asyncio.create_task(
-                                    _card_stop(nn, cb)
-                                ),
+                                cb=set_status: asyncio.create_task(_card_stop(nn, cb)),
                             ).props("flat dense color=negative")
                             if running:
                                 start_btn.set_visibility(False)
@@ -1720,10 +1728,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                 stop_btn.set_visibility(False)
                             card_start_btns[n] = start_btn
                             card_stop_btns[n] = stop_btn
+                            pin_color = "primary" if row["pinned"] else "grey-7"
                             ui.button(
-                                "取消置顶" if row["pinned"] else "置顶",
+                                icon="push_pin",
                                 on_click=lambda nn=n: toggle_pin(nn),
-                            ).props("flat dense color=primary")
+                            ).props(f"flat dense color={pin_color}").tooltip(
+                                "取消置顶" if row["pinned"] else "置顶"
+                            )
                             ui.button(
                                 "明细",
                                 on_click=lambda nn=n: open_detail(nn),

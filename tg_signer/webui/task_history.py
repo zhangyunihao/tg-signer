@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from tg_signer.locks import file_lock
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.common import state
 from tg_signer.webui.data import get_workdir
@@ -143,9 +144,15 @@ def load_task_accounts() -> dict[str, list[str]]:
 def save_task_binding(task_type: str, task_name: str, accounts: list[str]) -> None:
     if not task_type or not task_name or not accounts:
         return
-    data = load_task_accounts()
-    data[f"{task_type}|{task_name}"] = list(accounts)
-    atomic_write_json(_task_accounts_path(), data)
+    path = _task_accounts_path()
+    # 一个文件存所有任务的绑定关系，读改写需互斥，否则并发保存会丢别的任务的绑定
+    try:
+        with file_lock(path):
+            data = load_task_accounts()
+            data[f"{task_type}|{task_name}"] = list(accounts)
+            atomic_write_json(path, data)
+    except TimeoutError:
+        logger.warning("更新任务绑定账号超时，本次修改未保存: %s", path)
 
 
 def update_task_history(record: dict) -> None:

@@ -1555,7 +1555,9 @@ def test_participate_join_paused_not_recorded_as_participated(tmp_path, monkeypa
     client = _JoinRequiredReplyClient(bot_users={"BaibaoxiangCjBot"})
     engine._suspend_joins("acc", 259, "xbd5252a")
 
-    asyncio.run(engine._participate("acc", client, "BaibaoxiangCjBot", "hh1", "导航频道"))
+    asyncio.run(
+        engine._participate("acc", client, "BaibaoxiangCjBot", "hh1", "导航频道")
+    )
 
     # 未记成功：状态库无记录、名额已归还、计入失败
     assert not state.has("acc", "BaibaoxiangCjBot", "hh1")
@@ -1600,7 +1602,9 @@ def test_participate_bot_still_requires_join_not_recorded(tmp_path, monkeypatch)
     engine.max_joins = 5
     client = _StillNeedsJoinClient(bot_users={"BaibaoxiangCjBot"})
 
-    asyncio.run(engine._participate("acc", client, "BaibaoxiangCjBot", "hh2", "导航频道"))
+    asyncio.run(
+        engine._participate("acc", client, "BaibaoxiangCjBot", "hh2", "导航频道")
+    )
 
     assert client.joined_targets == ["NeedJoinCh"]
     assert not state.has("acc", "BaibaoxiangCjBot", "hh2")

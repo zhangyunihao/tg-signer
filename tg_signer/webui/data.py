@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from tg_signer.config import BaseJSONConfig, SignConfigV3
+from tg_signer.locks import file_lock
 from tg_signer.utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
@@ -234,8 +235,19 @@ def _read_accounts_state(path: Path) -> Dict:
         return {}
 
 
-def _write_accounts_state(path: Path, state: Dict) -> None:
-    atomic_write_json(path, state)
+def _update_accounts_state(path: Path, mutate) -> None:
+    """在文件锁内完成「读 → 改 → 写」。
+
+    同一个文件承载停用名单/排序/双向标记等多个字段，各 setter 若独立
+    整文件覆盖写，两次并发保存会互相覆盖其他字段。
+    """
+    try:
+        with file_lock(path):
+            state = _read_accounts_state(path)
+            mutate(state)
+            atomic_write_json(path, state)
+    except TimeoutError:
+        logger.warning("更新账户状态超时，本次修改未保存: %s", path)
 
 
 def load_disabled_accounts(workdir: Optional[Path | str] = None) -> set:
@@ -248,15 +260,16 @@ def set_account_enabled(
     name: str, enabled: bool, workdir: Optional[Path | str] = None
 ) -> None:
     """启用/停用账户，停用名单持久化到 webui_accounts.json（保留其他字段）。"""
-    path = _accounts_state_path(workdir)
-    state = _read_accounts_state(path)
-    disabled = set(state.get("disabled") or [])
-    if enabled:
-        disabled.discard(name)
-    else:
-        disabled.add(name)
-    state["disabled"] = sorted(disabled)
-    _write_accounts_state(path, state)
+
+    def _mutate(state: Dict) -> None:
+        disabled = set(state.get("disabled") or [])
+        if enabled:
+            disabled.discard(name)
+        else:
+            disabled.add(name)
+        state["disabled"] = sorted(disabled)
+
+    _update_accounts_state(_accounts_state_path(workdir), _mutate)
 
 
 def load_two_way_accounts(workdir: Optional[Path | str] = None) -> set:
@@ -269,29 +282,31 @@ def set_account_two_way(
     name: str, two_way: bool, workdir: Optional[Path | str] = None
 ) -> None:
     """标记/取消账户「双向」，持久化到 webui_accounts.json（保留其他字段）。"""
-    path = _accounts_state_path(workdir)
-    state = _read_accounts_state(path)
-    values = set(state.get("two_way") or [])
-    if two_way:
-        values.add(name)
-    else:
-        values.discard(name)
-    state["two_way"] = sorted(values)
-    _write_accounts_state(path, state)
+
+    def _mutate(state: Dict) -> None:
+        values = set(state.get("two_way") or [])
+        if two_way:
+            values.add(name)
+        else:
+            values.discard(name)
+        state["two_way"] = sorted(values)
+
+    _update_accounts_state(_accounts_state_path(workdir), _mutate)
 
 
 def rename_account_state(
     old: str, new: str, workdir: Optional[Path | str] = None
 ) -> None:
     """账户重命名后，同步更新 webui_accounts.json 中的 disabled/order/two_way 记录。"""
-    path = _accounts_state_path(workdir)
-    state = _read_accounts_state(path)
-    for field in ("disabled", "order", "two_way"):
-        values = state.get(field)
-        if isinstance(values, list) and old in values:
-            values[values.index(old)] = new
-            state[field] = values
-    _write_accounts_state(path, state)
+
+    def _mutate(state: Dict) -> None:
+        for field in ("disabled", "order", "two_way"):
+            values = state.get(field)
+            if isinstance(values, list) and old in values:
+                values[values.index(old)] = new
+                state[field] = values
+
+    _update_accounts_state(_accounts_state_path(workdir), _mutate)
 
 
 def load_account_order(workdir: Optional[Path | str] = None) -> List[str]:
@@ -302,10 +317,11 @@ def load_account_order(workdir: Optional[Path | str] = None) -> List[str]:
 
 def set_account_order(order: List[str], workdir: Optional[Path | str] = None) -> None:
     """保存账户展示顺序。"""
-    path = _accounts_state_path(workdir)
-    state = _read_accounts_state(path)
-    state["order"] = list(order)
-    _write_accounts_state(path, state)
+
+    def _mutate(state: Dict) -> None:
+        state["order"] = list(order)
+
+    _update_accounts_state(_accounts_state_path(workdir), _mutate)
 
 
 def apply_account_order(
@@ -432,14 +448,16 @@ def import_all_configs(
 
     account_state = data.get("account_state")
     if isinstance(account_state, dict):
-        state = _read_accounts_state(_accounts_state_path(base))
-        if isinstance(account_state.get("disabled"), list):
-            state["disabled"] = account_state["disabled"]
-        if isinstance(account_state.get("order"), list):
-            state["order"] = account_state["order"]
-        if isinstance(account_state.get("two_way"), list):
-            state["two_way"] = account_state["two_way"]
-        _write_accounts_state(_accounts_state_path(base), state)
+
+        def _mutate(state: Dict) -> None:
+            if isinstance(account_state.get("disabled"), list):
+                state["disabled"] = account_state["disabled"]
+            if isinstance(account_state.get("order"), list):
+                state["order"] = account_state["order"]
+            if isinstance(account_state.get("two_way"), list):
+                state["two_way"] = account_state["two_way"]
+
+        _update_accounts_state(_accounts_state_path(base), _mutate)
 
     return counts
 
