@@ -1696,6 +1696,98 @@ def test_click_confirm_still_clicks_callback_button(tmp_path, monkeypatch):
     assert any("确认按钮" in line for line in logs)
 
 
+def test_click_confirm_callback_timeout_returns_incomplete(tmp_path, monkeypatch):
+    """Bug 1 回归：request_callback_answer 超时（非 FLOOD_WAIT）时应返回
+    completed=False，让走 _handle_join_blocked 归还名额、不写参与记录。
+    之前错误地返回 completed=True，导致超时被记为「已参与」假成功。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+
+    class _TimeoutCallbackClient(_CallbackClient):
+        """request_callback_answer 始终抛网络超时（_TimeoutClient 层
+        就是把 asyncio.TimeoutError 包成 RuntimeError）。"""
+
+        async def request_callback_answer(self, chat_id, message_id, callback_data):
+            raise RuntimeError(
+                "网络请求 request_callback_answer 超时（30 秒，网络异常）"
+            )
+
+    engine, state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _TimeoutCallbackClient(bot_users={"ConfirmBot"})
+    msg = _msg(
+        text="请确认参与",
+        buttons=[[_btn("✅ 确认参与抽奖", callback_data="confirm_1")]],
+    )
+    # _click_confirm 直接调用：验证返回值语义
+    completed = asyncio.run(
+        engine._click_confirm("acc", client, "ConfirmBot", msg, "r1")
+    )
+    assert completed is False, (
+        "callback 超时应返回 False 让上层走 _handle_join_blocked，"
+        "不能返回 True 被误记为已参与"
+    )
+    # 日志应有失败记录
+    assert any("确认按钮失败" in line for line in logs)
+    # 不应写参与记录（completed=False 让入口走 _handle_join_blocked）
+    assert not state.has("acc", "ConfirmBot", "r1")
+
+
+def test_click_confirm_multi_round_join_restart_converges(tmp_path, monkeypatch):
+    """Bug 2 回归：@lycj_bot 风格 bot 每轮 start 只露出一个前置频道，
+    单次 _click_confirm 应在内部循环「加入→重发 start→再加→重发」直到
+    bot 不再有加入要求，而不是靠多轮任务扫描才能加完所有频道。
+
+    通过 patch _auto_join_and_restart 让它依次返回 3 轮收敛路径：
+    第 1 轮 did_join=True（加 A），第 2 轮 did_join=True（加 B），
+    第 3 轮 did_join=False（无新频道，退出循环）。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    calls: list = []
+
+    async def _patched(
+        self, account, client, username, param, source_message, candidates
+    ):
+        calls.append(1)
+        # 第 1 轮：有加入目标，did_join=True
+        # 第 2 轮：仍有加入目标，did_join=True
+        # 第 3 轮：无新加入目标，did_join=False → while 应 break
+        did_join = len(calls) <= 2
+        had_join_targets = len(calls) <= 2
+        return False, did_join, had_join_targets, candidates, False
+
+    monkeypatch.setattr(gc.GiveawayEngine, "_auto_join_and_restart", _patched)
+
+    # start_msg 随便传什么，patch 后不再关心候选里的内容
+    client = _CallbackClient(bot_users={"LyCJBot"})
+    msg = _msg(text="bot 初始回复")
+    completed = asyncio.run(engine._click_confirm("acc", client, "LyCJBot", msg, "r1"))
+    # 断言 while 循环至少跑了 3 轮（前 2 轮 did_join=True，第 3 轮 did_join=False break）
+    assert len(calls) >= 3, (
+        f"多轮 join→restart 应至少迭代 3 次才收敛，实际只调了 {len(calls)} 次"
+    )
+    # _auto_join_and_restart 都没返回 stop/join_blocked，流程应完成
+    assert completed is True
+
+
 def test_click_confirm_rejoin_button_after_join_restart(tmp_path, monkeypatch):
     """百宝箱式流程：bot 回复「必须先关注以下群组/频道…全部关注后请点击
     重新参与抽奖」，链接在警示文本之后。加入频道并重发 start 后 bot 未再

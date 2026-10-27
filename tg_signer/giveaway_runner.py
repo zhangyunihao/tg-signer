@@ -22,20 +22,13 @@ spec 为所选抽奖任务配置加上账号与工作目录::
 
 import asyncio
 import json
-import re
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from tg_signer.giveaway_core import GiveawayEngine
 from tg_signer.giveaway_state import GiveawayState
-
-# 已自带 HH:MM:SS 时间戳的消息不重复加前缀
-_TS_RE = re.compile(r"^\d{2}:\d{2}:\d{2}")
-
-# 日志文件达到该大小后滚动为 *.1，避免超限后静默停止落盘
-LOG_FILE_MAX_BYTES = 2_000_000
+from tg_signer.logger import make_task_logger
 
 
 def engine_kwargs_from_spec(spec: dict) -> Dict[str, Any]:
@@ -101,33 +94,6 @@ def engine_kwargs_from_spec(spec: dict) -> Dict[str, Any]:
         ),
         "win_detect": bool(spec.get("win_detect", True)),
     }
-
-
-def _make_log(workdir: str, task: str) -> Callable[[str], None]:
-    log_file = Path(workdir) / "logs" / "giveaway.log"
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-
-    def _log(msg: str) -> None:
-        ts = f"{datetime.now():%H:%M:%S}"
-        if not _TS_RE.match(msg):  # 已自带 HH:MM:SS 的消息不重复加前缀
-            msg = f"{ts} {msg}"
-        line = f"[#{task}] {msg}"
-        print(line, flush=True)
-        try:
-            if log_file.exists() and log_file.stat().st_size >= LOG_FILE_MAX_BYTES:
-                backup = log_file.with_name(log_file.name + ".1")
-                try:
-                    if backup.exists():
-                        backup.unlink()
-                    log_file.replace(backup)
-                except OSError:
-                    pass
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except OSError:
-            pass
-
-    return _log
 
 
 def _event_writer(path: Optional[str]) -> Callable[[dict], None]:
@@ -212,7 +178,12 @@ async def run_giveaway(spec: dict) -> int:
         finished.set()
 
     kwargs["state"] = GiveawayState(workdir)
-    kwargs["log"] = _make_log(workdir, str(spec.get("task") or accounts[0]))
+    kwargs["log"] = make_task_logger(
+        workdir,
+        task_name=str(spec.get("task") or accounts[0]),
+        account=account or accounts[0],
+        log_file="giveaway.log",
+    )
     kwargs["on_finish"] = _on_finish
     kwargs["on_event"] = lambda ev: emit({"kind": "event", "event": ev})
     started = await engine.start(

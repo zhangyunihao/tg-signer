@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from tg_signer.core import get_client, safe_disconnect
+from tg_signer.logger import make_task_logger
 from tg_signer.webui.auto_leave import (
     _scan_types_of,
     _to_days,
@@ -54,8 +55,11 @@ async def run_leave(spec: dict) -> int:
         print("缺少账号", flush=True)
         return 2
 
-    def log(msg: str) -> None:
-        print(msg, flush=True)
+    log = make_task_logger(
+        str(spec.get("session_dir") or "."),
+        task_name="leave",
+        log_file="leave.log",
+    )
 
     d = spec.get("days")
     days = _to_days(d, 7)

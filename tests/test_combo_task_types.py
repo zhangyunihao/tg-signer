@@ -506,12 +506,17 @@ def test_giveaway_process_finalizes_without_events_file(tmp_path):
     assert called == [True]
 
 
-def test_make_log_rotates_instead_of_dropping(tmp_path, monkeypatch):
-    """日志超过上限时滚动为 .1，而不是静默停止写入。"""
-    from tg_signer import giveaway_runner
+def test_make_log_rotates_instead_of_dropping(tmp_path):
+    """日志超过上限时滚动为 .1，而不是静默停止写入（标准库 RotatingFileHandler）。"""
+    from tg_signer.logger import make_task_logger
 
-    monkeypatch.setattr(giveaway_runner, "LOG_FILE_MAX_BYTES", 10)
-    log = giveaway_runner._make_log(str(tmp_path), "1")
+    log = make_task_logger(
+        str(tmp_path),
+        task_name="1",
+        log_file="giveaway.log",
+        max_bytes=10,
+        backup_count=1,
+    )
     log("第一条")
     log_file = tmp_path / "logs" / "giveaway.log"
     assert log_file.exists() and log_file.stat().st_size >= 10

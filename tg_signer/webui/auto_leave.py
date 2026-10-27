@@ -561,8 +561,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     def log(msg: str) -> None:
         line = f"{datetime.now():%H:%M:%S} {msg}"
         log_lines.append(line)
-        if len(log_lines) > 300:
-            del log_lines[:-300]
+        if len(log_lines) > 1000:
+            del log_lines[:-1000]
         try:
             log_area.push(line)
         except Exception:
@@ -1429,7 +1429,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             ui.button(icon="fullscreen", on_click=toggle_fullscreen).props(
                 "flat round dense"
             ).tooltip("全屏显示")
-    log_area = ui.log(max_lines=300).classes("w-full h-48")
+    log_area = ui.log(max_lines=1000).classes("w-full h-48")
     for line in log_lines:
         log_area.push(line)
     # 退出全屏悬浮按钮：仅全屏时 fixed 显示在视口右上角，平时不占布局

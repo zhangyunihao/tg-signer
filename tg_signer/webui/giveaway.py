@@ -903,8 +903,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     msg = f"{ts} {msg}"
                 line = f"[#{name}] {msg}"
             buf.append(line)
-            if len(buf) > 300:
-                del buf[:-300]
+            if len(buf) > 1000:
+                del buf[:-1000]
             if from_child:
                 return
             # 同时落盘，便于服务重启后仍可追溯
@@ -1961,7 +1961,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             ui.button(icon="fullscreen", on_click=toggle_fullscreen).props(
                 "flat round dense"
             ).tooltip("全屏显示")
-    send_log = ui.log(max_lines=300).classes("w-full h-40")
+    send_log = ui.log(max_lines=1000).classes("w-full h-40")
     log_buf = _GLOBAL_LOGS.setdefault(wd_key, [])
     _seen = {"n": len(log_buf)}
     for line in log_buf:

@@ -845,8 +845,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         def _log(msg: str) -> None:
             buf = _GLOBAL_LOGS.setdefault(wd_key, [])
             buf.append(f"[#{name}] {msg}")
-            if len(buf) > 300:
-                del buf[:-300]
+            if len(buf) > 1000:
+                del buf[:-1000]
 
         return _log
 
@@ -1404,7 +1404,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             ui.button(icon="fullscreen", on_click=toggle_fullscreen).props(
                 "flat round dense"
             ).tooltip("全屏显示")
-    send_log = ui.log(max_lines=300).classes("w-full h-40")
+    send_log = ui.log(max_lines=1000).classes("w-full h-40")
     log_buf = _GLOBAL_LOGS.setdefault(wd_key, [])
     _seen = {"n": len(log_buf)}
     # 退出全屏悬浮按钮：仅全屏时 fixed 显示在视口右上角，平时不占布局

@@ -32,6 +32,7 @@ from pyrogram import errors, types
 
 from tg_signer.config import SignConfigV3
 from tg_signer.core import get_client, safe_disconnect
+from tg_signer.logger import make_task_logger
 
 
 def _label_of(chat: Any) -> str:
@@ -138,13 +139,16 @@ async def run_join(spec: dict) -> int:
         print("缺少账号", flush=True)
         return 2
 
-    def log(msg: str) -> None:
-        print(msg, flush=True)
+    workdir = Path(str(spec.get("workdir") or spec.get("session_dir") or "."))
+    log = make_task_logger(
+        workdir,
+        task_name="join",
+        log_file="join.log",
+    )
 
     # session_dir 是会话文件所在目录（与 CLI 一致，相对子进程 CWD，即 "."）；
     # workdir 是配置根目录（WebUI 工作目录，配置在 <workdir>/signs/<task>）
     session_dir = Path(str(spec.get("session_dir") or "."))
-    workdir = Path(str(spec.get("workdir") or session_dir))
     chats = load_sign_chats(workdir, str(spec.get("task") or ""))
     items = [i for i in (spec.get("chats") or []) if isinstance(i, dict)]
     if not items:

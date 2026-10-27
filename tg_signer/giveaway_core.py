@@ -3375,18 +3375,41 @@ class GiveawayEngine:
         # 否则后面读取会触发 UnboundLocalError（机器人类型任务即此路径）
         had_join_targets = False
         if self.auto_join:
-            (
-                stop,
-                had_join_targets,
-                candidates,
-                join_blocked,
-            ) = await self._auto_join_and_restart(
-                account, client, username, param, source_message, candidates
-            )
-            if stop:
-                return True
-            if join_blocked:
-                return False
+            # 多轮循环：一次 start 后 bot 可能要求加入多个频道（如 @lycj_bot
+            # 每轮 start 只露出一个前置频道），必须在单次 _click_confirm 内
+            # 循环「扫目标→加入→重发 start」直到 bot 不再有新加入要求，否则
+            # 要靠多轮任务扫描才能跑完所有前置频道，效率极低且易错过开奖。
+            # _join_cache 保证同一 target 不会重复尝试加入；did_join 在本轮
+            # 没真加入任何新频道时为 False（哪怕 had_join_targets 因旧消息
+            # 残留仍为 True），配合硬上限防止 bot 无限循环或 FakeClient 类
+            # 测试场景死循环。
+            _MAX_AUTO_JOIN_ROUNDS = 5
+            for _round in range(_MAX_AUTO_JOIN_ROUNDS):
+                (
+                    stop,
+                    did_join,
+                    had_join_targets,
+                    candidates,
+                    join_blocked,
+                ) = await self._auto_join_and_restart(
+                    account, client, username, param, source_message, candidates
+                )
+                if stop:
+                    return True
+                if join_blocked:
+                    return False
+                # 本轮没有真的加入任何新频道：要么 bot 不再出新需求，
+                # 要么候选都是旧消息残留但已全被 join_cache 挡住，两种
+                # 情况都应该退出循环，交给后续点确认按钮流程兜底。
+                if not did_join:
+                    break
+            else:
+                # 达到硬上限仍在加新频道（罕见）：记录熔断日志但不崩，
+                # 继续尝试点按钮（可能已满足，也可能失败——由后续链路兜底）
+                self.log(
+                    f"[{account}] @{username} 连续 {_MAX_AUTO_JOIN_ROUNDS} 轮仍在"
+                    f"加入新频道，强制结束跟进"
+                )
         stop_set = self._stop is not None and self._stop.is_set()
         if had_join_targets and not stop_set:
             # 加入频道后稍等再点确认按钮，给 bot 侧成员状态同步留时间，
@@ -3479,11 +3502,15 @@ class GiveawayEngine:
         param: str,
         source_message: Any,
         candidates: List[Any],
-    ) -> Tuple[bool, bool, List[Any], bool]:
+    ) -> Tuple[bool, bool, bool, List[Any], bool]:
         """自动加入候选消息中的目标，必要时重发 start。
 
-        返回（是否应直接结束跟进，是否存在加入目标，更新后的候选，
+        返回（是否应直接结束跟进，本轮是否实际加入了新频道，
+        当前是否仍存在加入目标，更新后的候选，
         加入是否被限流/配额阻塞导致跟进未完成）。
+        did_join 与 had_join_targets 分离：前者仅在本轮真的执行了
+        新加入时为 True（join_cache 挡住的不计），后者反映 candidates
+        中是否还存在未处理的加入要求（可能只是旧消息残留）。
         """
         did_join, had_join_targets, blocked = await self._auto_join_candidates(
             account, client, username, candidates
@@ -3496,7 +3523,7 @@ class GiveawayEngine:
                 f"[{account}] @{username} 需要加入频道才能参与，"
                 "但本账号自动加入已暂停（限流/配额），本次跳过，稍后重试"
             )
-            return False, had_join_targets, candidates, True
+            return False, did_join, had_join_targets, candidates, True
         if did_join:
             # 加入后稍等，再拉一轮消息（bot 可能更新了按钮/提示）
             await asyncio.sleep(3)
@@ -3515,26 +3542,33 @@ class GiveawayEngine:
         # bot 消息里出现过加入要求时，加入校验完成后优先点
         # 「我已加入/重试参与」按钮完成重试（bot 设计的重试入口）；
         # 没有该按钮时兜底重发一次 start 完成参与（此前可能已全部
-        # 加入过，不必本次有新加入）
-        if had_join_targets:
+        # 加入过，不必本次有新加入）。注意：只有本轮真加入了新频道
+        # （did_join=True）才重发 start——bot 判定身份需要新的 start
+        # 触发；旧消息残留被 join_cache 挡住（did_join=False）不算。
+        if had_join_targets and did_join:
             retried, retry_completed = await self._click_join_retry_button(
                 account, client, username, candidates
             )
             if retried:
-                return True, had_join_targets, candidates, not retry_completed
+                return True, did_join, had_join_targets, candidates, not retry_completed
             self.log(f"[{account}] @{username} 要求加入频道后重新参与，再次发送 start")
             stop, had_join_targets, candidates = await self._restart_after_join(
                 account, client, username, param, candidates, had_join_targets
             )
-            return stop, had_join_targets, candidates, False
-        if bot_policy(username).restart_after_join:
-            # 强制名单：无加入要求也重发一次
+            return stop, did_join, had_join_targets, candidates, False
+        if bot_policy(username).restart_after_join and did_join:
+            # 强制名单：本轮真加入了频道时（did_join=True），
+            # 额外重发一次 start 让 bot 校验参与资格（即使 bot 消息里没有
+            # 显式加入要求）。LotteryBestBot 之类有清单的 bot 会因上面
+            # had_join_targets 分支已触发过 start，这里天然跳过；
+            # realsaberbot 这类完全不发加入要求的 bot，did_join=False 也
+            # 跳过（它通常也没什么好加的）。
             self.log(f"[{account}] @{username} 加入校验完成，重新发送 start")
             stop, had_join_targets, candidates = await self._restart_after_join(
                 account, client, username, param, candidates, had_join_targets
             )
-            return stop, had_join_targets, candidates, False
-        return False, had_join_targets, candidates, False
+            return stop, did_join, had_join_targets, candidates, False
+        return False, did_join, had_join_targets, candidates, False
 
     async def _auto_join_candidates(
         self, account: str, client: Any, username: str, candidates: List[Any]
@@ -3713,13 +3747,19 @@ class GiveawayEngine:
                 return True, completed
         except Exception as exc:
             # 限流同样登记（计数 + bot 级暂停 + 冷却落盘），避免异常被吞后
-            # 继续对同一个 bot 发请求把短限流拖成小时级
+            # 继续对同一个 bot 发请求把短限流拖成小时级。
+            # 限流返回 (True, True)：completed=True 让上层跳过 join_blocked
+            # 分支（bot 级熔断已登记，重试需等冷却，不该再无意义地记成功）。
             if self._record_flood(
                 account, username, param, "", exc, label="点击确认按钮"
             ):
                 return True, True
+            # 非限流异常（超时/网络抖动/RPC 偶发故障）：按钮点击实际没成功，
+            # 必须返回 completed=False，让上层走 _handle_join_blocked 归还
+            # 名额并保留重试可能。绝不能记「已参与」持久化记录，否则下一轮
+            # 扫描会把它当真成功跳过，参与请求彻底丢失。
             self.log(f"点击 @{username} 确认按钮失败: {exc}")
-            return True, True
+            return True, False
         return False, True
 
     @staticmethod
