@@ -889,11 +889,13 @@ class TaskRunnerBlock:
         accounts: list[str],
         auto: bool = False,
         sub_indexes: list[int] | None = None,
+        start_at: str | None = None,
     ) -> bool:
         """启动一个任务（每账号一个子进程）。auto=True 表示服务重启后的自动恢复。
 
         组合任务可通过 ``sub_indexes``（子任务下标，0 起）只执行勾选的子任务，
-        None 表示全部执行。
+        None 表示全部执行；``start_at``（``YYYY-MM-DD HH:MM:SS``）非空时，
+        子进程先等到该时间，再检测 TG 网络并按需重试。
         """
         is_combo = "组合" in task_type
         combo_subs: list[dict] = []
@@ -966,6 +968,8 @@ class TaskRunnerBlock:
             "duration": "",
             "result": "服务重启后自动恢复" if auto else "",
         }
+        if start_at:
+            record["result"] = f"等待开始时间 {start_at}"
         procs: list[dict] = []
         run_queue: queue.Queue = queue.Queue()
         chats_labels = [] if is_combo else self._chat_labels(task_name)
@@ -983,11 +987,14 @@ class TaskRunnerBlock:
                 if not spec_subs:
                     ui.notify(f"无法构建命令: {account}", type="warning")
                     continue
+                spec_payload = {"subs": spec_subs}
+                if start_at:
+                    spec_payload["start_at"] = start_at
                 cmd = [
                     sys.executable,
                     "-m",
                     "tg_signer.combo_runner",
-                    json.dumps({"subs": spec_subs}, ensure_ascii=False),
+                    json.dumps(spec_payload, ensure_ascii=False),
                 ]
             else:
                 args = self._build_args(account, task_type, task_name)

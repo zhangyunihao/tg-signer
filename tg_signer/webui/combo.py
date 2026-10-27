@@ -8,7 +8,7 @@ TaskRunnerBlock 的 _launch（task_type="组合任务"），历史统一记录�
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
 from typing import Callable
@@ -404,9 +404,9 @@ class ComboTaskBlock:
 
         ui.label("组合任务").classes("text-lg font-semibold")
         ui.label(
-            "点击「新增任务」选择组合任务模板和账号立即执行（账号可留空，"
-            "留空时各子任务使用其绑定的账号）；模板的创建与编辑在右上角"
-            "「任务组合配置」。"
+            "点击「新增任务」选择组合任务模板和账号执行（账号可留空，"
+            "留空时各子任务使用其绑定的账号；可设置开始时间延迟启动）；"
+            "模板的创建与编辑在右上角「任务组合配置」。"
         ).classes("text-sm text-gray-500")
 
         with ui.row().classes("w-full gap-2 items-center no-wrap"):
@@ -1733,6 +1733,14 @@ class ComboTaskBlock:
                 "留空：各子任务使用其绑定的账号执行（账号之间并行启动）。"
                 "选择账号后：所有子任务仅用所选账号执行。"
             ).classes("text-xs text-gray-500")
+            ui.label("开始时间（可选）").classes("text-sm text-gray-600")
+            self.new_task_start_time = (
+                ui.time(value=None).classes("w-full").props("clearable")
+            )
+            ui.label(
+                "留空立即执行；所选时间已过则从明天该时间开始。"
+                "开始时间到达后先检测 TG 网络，不通则每 30 分钟重试一次，最多 3 次。"
+            ).classes("text-xs text-gray-500")
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=self.new_task_dialog.close).props("outline")
                 ui.button("启动", color="primary", on_click=self._start_new_task)
@@ -1780,6 +1788,7 @@ class ComboTaskBlock:
         self.new_task_accounts.set_value(
             [a for a in (accounts or []) if a in valid_accounts]
         )
+        self.new_task_start_time.set_value(None)
         self.new_task_dialog.open()
         if template:
             ui.notify("已复制任务参数，可调整后点击「启动」", type="positive")
@@ -1795,9 +1804,28 @@ class ComboTaskBlock:
             if not sub_indexes:
                 ui.notify("请至少勾选一个子任务", type="warning")
                 return
+        # 开始时间（可选）：HH:MM；已过则顺延到明天，避免误以为会立即执行
+        raw_time = str(self.new_task_start_time.value or "").strip()
+        start_at = None
+        if raw_time:
+            try:
+                hour, minute = (int(part) for part in raw_time.split(":")[:2])
+                target = datetime.now().replace(
+                    hour=hour, minute=minute, second=0, microsecond=0
+                )
+            except ValueError:
+                ui.notify("开始时间格式无效，请重新选择", type="warning")
+                return
+            if target <= datetime.now():
+                target += timedelta(days=1)
+            start_at = f"{target:%Y-%m-%d %H:%M:%S}"
         accounts = [a for a in (self.new_task_accounts.value or []) if a]
         if self.runner._launch(
-            "组合任务", str(name), accounts, sub_indexes=sub_indexes
+            "组合任务",
+            str(name),
+            accounts,
+            sub_indexes=sub_indexes,
+            start_at=start_at,
         ):
             self.new_task_dialog.close()
             self._render_history()

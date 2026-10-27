@@ -12,7 +12,11 @@ from typing import Callable, Optional
 from nicegui import app, run, ui
 
 from tg_signer import __version__
-from tg_signer.core import get_proxy
+from tg_signer.netcheck import (
+    TELEGRAM_DC_HOST,
+    TELEGRAM_DC_PORT,
+    probe_telegram_connectivity,
+)
 from tg_signer.utils import atomic_write_text
 from tg_signer.webui.activity import install_activity_tracking, set_active_tab
 from tg_signer.webui.auto_leave import auto_leave_block
@@ -827,56 +831,18 @@ def _check_auth_code(input_code: str, auth_code: str) -> tuple[bool, str]:
 # —— 页面初始化科学上网检查 ——
 # 所有任务功能（签到/自动化/监控/抽奖等）都依赖能连上 Telegram，
 # 页面初始化时通过 TG_PROXY（未配置则直连）对 Telegram DC 做一次 TCP 握手验证。
-_TELEGRAM_DC_HOST = "149.154.167.51"
-_TELEGRAM_DC_PORT = 443
 _NETWORK_CHECK_TIMEOUT = 8.0
 
 
 async def _probe_telegram_connectivity() -> None:
     """通过当前代理配置连一次 Telegram DC，失败时在页面顶部弹出持久警告。"""
-    proxy = get_proxy()
-    dest = f"{_TELEGRAM_DC_HOST}:{_TELEGRAM_DC_PORT}"
-    logger.info(
-        "网络自检开始（目标 %s，代理 %s）",
-        dest,
-        f"{proxy.get('scheme')}://{proxy.get('hostname')}:{proxy.get('port')}"
-        if proxy
-        else "未配置（直连）",
-    )
-    try:
-        if proxy and proxy.get("scheme") in ("socks5", "socks4", "http"):
-            from urllib.parse import quote
-
-            from python_socks.async_.asyncio import Proxy as SocksProxy
-
-            auth = ""
-            if proxy.get("username"):
-                auth = f"{quote(str(proxy['username']))}:{quote(str(proxy['password'] or ''))}@"
-            proxy_url = f"{proxy['scheme']}://{auth}{proxy['hostname']}:{proxy['port']}"
-            sock = await asyncio.wait_for(
-                SocksProxy.from_url(proxy_url).connect(
-                    dest_host=_TELEGRAM_DC_HOST, dest_port=_TELEGRAM_DC_PORT
-                ),
-                timeout=_NETWORK_CHECK_TIMEOUT,
-            )
-            sock.close()
-        else:
-            writer = None
-            try:
-                _, writer = await asyncio.wait_for(
-                    asyncio.open_connection(_TELEGRAM_DC_HOST, _TELEGRAM_DC_PORT),
-                    timeout=_NETWORK_CHECK_TIMEOUT,
-                )
-            finally:
-                if writer is not None:
-                    writer.close()
-    except Exception as exc:
-        reason = f"通过代理 {proxy['hostname']}:{proxy['port']}" if proxy else "直连"
-        logger.warning(
-            "网络自检失败（%s 连 Telegram）：(%s) %s", reason, type(exc).__name__, exc
-        )
+    dest = f"{TELEGRAM_DC_HOST}:{TELEGRAM_DC_PORT}"
+    logger.info("网络自检开始（目标 %s，超时 %.0f 秒）", dest, _NETWORK_CHECK_TIMEOUT)
+    ok, detail = await probe_telegram_connectivity(_NETWORK_CHECK_TIMEOUT)
+    if not ok:
+        logger.warning("网络自检失败：%s", detail)
         ui.notify(
-            f"科学上网不可用：{reason}连接 Telegram 失败（{_NETWORK_CHECK_TIMEOUT:.0f} 秒内未握手成功）。"
+            f"科学上网不可用：{detail}（{_NETWORK_CHECK_TIMEOUT:.0f} 秒内未握手成功）。"
             "所有任务功能都无法正常使用，请检查代理/VPN 后刷新页面重试。",
             type="warning",
             position="top",
@@ -884,7 +850,7 @@ async def _probe_telegram_connectivity() -> None:
             close_button="知道了",
         )
         return
-    logger.info("网络自检通过：可连上 Telegram（%s）", dest)
+    logger.info("网络自检通过：可连上 Telegram（%s，%s）", dest, detail)
 
 
 def _auth_gate(container, auth_code: str, on_success: Callable[[], None]) -> None:
