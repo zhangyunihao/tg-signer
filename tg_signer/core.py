@@ -91,21 +91,6 @@ class ChatFolderError(RuntimeError):
     """Raised when an explicit Telegram chat folder cannot be used."""
 
 
-def readable_message(message: Message):
-    s = "\nMessage: "
-    s += f"\n  text: {message.text or ''}"
-    if message.photo:
-        s += f"\n  图片: [({message.photo.width}x{message.photo.height}) {message.caption}]"
-    if message.reply_markup:
-        if isinstance(message.reply_markup, InlineKeyboardMarkup):
-            s += "\n  InlineKeyboard: "
-            for row in message.reply_markup.inline_keyboard:
-                s += "\n   "
-                for button in row:
-                    s += f"{button.text} | "
-    return s
-
-
 def _get_message_text(message: Message) -> str:
     return getattr(message, "text", None) or getattr(message, "caption", None) or ""
 
@@ -1325,15 +1310,10 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         self.context.chat_messages[route_key][message.id] = message
 
     async def on_message(self, client: Client, message: Message):
-        self.log(
-            f"收到来自「{message.from_user.username or message.from_user.id}」的消息: {readable_message(message)}"
-        )
+        # 群里的消息仅用于驱动签到动作，不写入日志
         await self._on_message(client, message)
 
     async def on_edited_message(self, client, message: Message):
-        self.log(
-            f"收到来自「{message.from_user.username or message.from_user.id}」对消息的更新，消息: {readable_message(message)}"
-        )
         # 避免更新正在处理的消息，等待处理完成
         while (
             self.context.waiting_message
@@ -1510,7 +1490,6 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
                     # 将消息ID对应value置为None，保证收到消息的编辑时消息所处的顺序
                     self.context.chat_messages[route_key][message.id] = None
                     return None
-                self.log(f"忽略消息: {readable_message(message)}")
         self.log(f"等待超时: \nchat: \n{chat} \naction: {action}", level="WARNING")
         return None
 

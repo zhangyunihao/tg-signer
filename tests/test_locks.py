@@ -170,6 +170,30 @@ def test_account_state_fields_survive_concurrent_saves(tmp_path):
     assert load_two_way_accounts(tmp_path) == {"acct-two-way"}
 
 
+def test_giveaway_task_store_keeps_tasks_created_by_other_snapshots(tmp_path):
+    """旧页面快照落盘时不能冲掉其它页面刚创建、尚未执行的抽奖任务。"""
+    from tg_signer.webui.giveaway import (
+        add_task_to_store,
+        load_task_store,
+        save_task_store,
+    )
+
+    # 两个页面在任务创建前各自加载了同一份空配置
+    stale = load_task_store(tmp_path)
+    fresh = load_task_store(tmp_path)
+    name = add_task_to_store(tmp_path, {"accounts": ["acct"], "chats": ["1"]})
+
+    # 旧快照里没有新任务，落盘后磁盘仍必须保留它
+    save_task_store(tmp_path, stale)
+    disk = load_task_store(tmp_path)
+    assert name in disk["tasks"]
+    assert disk["seq"] >= int(name) + 1
+
+    # 删除仍要生效（不会被合并逻辑从磁盘捡回来）
+    save_task_store(tmp_path, {"seq": fresh["seq"], "tasks": {}}, {name})
+    assert name not in load_task_store(tmp_path)["tasks"]
+
+
 def test_atomic_write_text_replaces_content(tmp_path):
     path = tmp_path / "sub" / "secret.txt"
     atomic_write_text(path, "first")

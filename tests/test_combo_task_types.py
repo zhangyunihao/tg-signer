@@ -520,3 +520,34 @@ def test_make_log_rotates_instead_of_dropping(tmp_path, monkeypatch):
     backup = tmp_path / "logs" / "giveaway.log.1"
     assert backup.exists()
     assert "第二条" in log_file.read_text(encoding="utf-8")
+
+
+def test_drain_output_collects_logs_without_dashboard_polling():
+    """组合任务在非签到 tab 运行、主控台已关闭时，输出仍要转存到共享日志缓冲，
+    否则进度页只能显示「暂无日志输出」。"""
+    import queue
+
+    saved_runs = dict(TaskRunnerBlock.runs)
+    saved_lines = list(TaskRunnerBlock.output_lines)
+    saved_seq = TaskRunnerBlock._line_seq
+    try:
+        TaskRunnerBlock.runs.clear()
+        TaskRunnerBlock.output_lines.clear()
+        q: queue.Queue = queue.Queue()
+        q.put("[组合A:alice] 开始签到")
+        q.put("[组合A:alice] 签到完成")
+        TaskRunnerBlock.runs["rid"] = {"queue": q}
+
+        TaskRunnerBlock.drain_output()
+
+        assert list(TaskRunnerBlock.output_lines) == [
+            "[组合A:alice] 开始签到",
+            "[组合A:alice] 签到完成",
+        ]
+        assert q.empty()
+    finally:
+        TaskRunnerBlock.runs.clear()
+        TaskRunnerBlock.runs.update(saved_runs)
+        TaskRunnerBlock.output_lines.clear()
+        TaskRunnerBlock.output_lines.extend(saved_lines)
+        TaskRunnerBlock._line_seq = saved_seq

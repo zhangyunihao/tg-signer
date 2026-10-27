@@ -57,6 +57,9 @@ logger = logging.getLogger(__name__)
 _GLOBAL_ENGINES: Dict[str, GiveawayProcess] = {}
 _GLOBAL_LOGS: Dict[str, List[str]] = {}
 _GLOBAL_STATUS_CBS: Dict[str, Callable[[bool], None]] = {}
+# 已删除的任务编号（按 workdir）：落盘合并时不再从磁盘捡回，
+# 避免其它页面持有的旧快照把刚删除的任务复活
+_GLOBAL_REMOVED: Dict[str, set] = {}
 
 # 日志文件达到该大小后滚动为 *.1，避免超限后静默停止落盘
 LOG_FILE_MAX_BYTES = 2_000_000
@@ -728,8 +731,47 @@ def load_task_store(workdir) -> dict:
     return data
 
 
-def save_task_store(workdir, store: dict) -> None:
-    atomic_write_json(_store_path(workdir), store)
+def save_task_store(workdir, store: dict, removed=None) -> None:
+    """保存任务配置：文件锁内「读 → 合并 → 写」。
+
+    每个页面（桌面/手机）与每个 WebUI 实例各持一份内存快照，若直接整文件覆盖，
+    后保存的旧快照会把其它页面刚创建、尚未执行的任务冲掉（表现为刷新后任务消失）。
+    因此磁盘上多出来的任务一律保留（``removed`` 里的是本页刚删掉的，不再保留），
+    序号取两者较大值。
+    """
+    path = _store_path(workdir)
+    clean = dict(store.get("tasks") or {})
+    removed = {str(n) for n in (removed or ())}
+    try:
+        with file_lock(path):
+            disk = load_task_store(workdir)
+            for name, cfg in (disk.get("tasks") or {}).items():
+                if str(name) in removed:
+                    continue
+                clean.setdefault(name, cfg)
+            seq = max(int(store.get("seq") or 1), int(disk.get("seq") or 1))
+            atomic_write_json(path, {"seq": seq, "tasks": clean})
+    except (TimeoutError, OSError):
+        logger.warning("更新抽奖任务配置失败，本次修改未保存: %s", path)
+        return
+    store["seq"] = seq
+
+
+def add_task_to_store(workdir, cfg: dict) -> str:
+    """文件锁内按磁盘序号分配任务编号并写入配置，返回编号。
+
+    编号必须取磁盘最新值：两个页面/实例同时创建时若各自用内存里的序号，
+    会生成同名任务互相覆盖。
+    """
+    path = _store_path(workdir)
+    with file_lock(path):
+        disk = load_task_store(workdir)
+        seq = int(disk.get("seq") or 1)
+        name = str(seq)
+        disk["tasks"][name] = cfg
+        disk["seq"] = seq + 1
+        atomic_write_json(path, disk)
+    return name
 
 
 def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None]:
@@ -806,7 +848,11 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 # 上次中奖回扫进度（结束后继续展示）
                 "last_sweep": str(cfg.get("last_sweep") or ""),
             }
-        save_task_store(workdir, {"seq": store["seq"], "tasks": clean})
+        save_task_store(
+            workdir,
+            {"seq": store["seq"], "tasks": clean},
+            _GLOBAL_REMOVED.get(wd_key, set()),
+        )
 
     def engine_key(name: str) -> str:
         return f"{wd_key}|{name}"
@@ -952,6 +998,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             ui.notify(f"任务 #{name} 正在运行，请先停止再删除", type="warning")
             return
         tasks.pop(name, None)
+        _GLOBAL_REMOVED.setdefault(wd_key, set()).add(str(name))
         _GLOBAL_ENGINES.pop(engine_key(name), None)
         _GLOBAL_STATUS_CBS.pop(engine_key(name), None)
         _persist()
@@ -1270,9 +1317,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             auto_join = False
         else:
             auto_join = bool(auto_join_switch.value)
-        name = str(store["seq"])
-        store["seq"] += 1
-        tasks[name] = {
+        cfg = {
             "accounts": accounts,
             "chats": chats,
             "session_dir": str(Path(default_session_dir or ".")),
@@ -1299,8 +1344,15 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "resolve_pace_min": resolve_pace_min,
             "resolve_pace_max": resolve_pace_max,
         }
+        # 编号以磁盘顺序为准并在文件锁内落盘：其它页面/实例的旧快照不会冲掉新任务
+        try:
+            name = add_task_to_store(workdir, cfg)
+        except (TimeoutError, OSError):
+            ui.notify("保存任务配置失败，请稍后重试", type="warning")
+            return
+        store["seq"] = max(int(store.get("seq") or 1), int(name) + 1)
+        tasks[name] = cfg
         ensure_engine(name)
-        _persist()
         render_tasks()
         add_dlg.close()
         ui.notify(f"任务 #{name} 已添加，正在启动...", type="positive")
