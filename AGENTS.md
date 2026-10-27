@@ -83,6 +83,26 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
   - `python -m pytest -vv tests/`
 - Run `tox` for cross-Python validation when needed (`py310`, `py311`, `py312`).
 
+## Local PyPI Release
+- 发布脚本：`scripts/release_pypi.py`（完整自动化版本 bump / 构建 / 校验 / 上传 / 打 tag / 推送）。
+- 凭据：项目根目录 `.pypirc`（已在 `.gitignore`，不要提交），`username = __token__`。
+- **前置步骤（必须遵守）**：脚本只会 `git add tg_signer/__init__.py`（版本号文件），**不会自动提交业务改动**。工作区所有功能修复和新特性必须在运行脚本前先手动 commit。典型流程：
+  ```bash
+  git add .
+  git commit -m "fix: 描述本次改动"
+  .venv/Scripts/python.exe scripts/release_pypi.py --bump patch --push
+  ```
+- 脚本参数：
+  - `--bump patch`（默认不升版本）：1.0.76 → 1.0.77。可选 `minor`、`major`。
+  - `--dry-run`：只构建 + twine check，不上传、不打 tag、不推送，用于本地验证。
+  - `--push`：上传成功后自动 `git push origin HEAD` 与 `git push origin v{version}`。
+  - `--skip-tag`：只上传 PyPI，不打 git tag。
+- 版本号来源：`tg_signer/__init__.py` 中的 `__version__`（`pyproject.toml` 通过 `dynamic = ["version"]` 读取）。
+- tag 命名规则：`v{version}`（如 `v1.0.77`）。
+- 安全检查：脚本在上传前会自动查询 `https://pypi.org/pypi/tg-signer-plus/{version}/json`，若版本已存在则退出，避免覆盖。
+- Python 必须使用 `.venv` 里的解释器（脚本依赖 `build` 和 `twine`，装在 `.venv` 里）。
+- 产物位置：`dist/tg_signer_plus-{version}-py3-none-any.whl` 和 `dist/tg_signer_plus-{version}.tar.gz`。
+
 ## Change Strategy
 - Automation first: new rule-driven capabilities should go into `tg_signer/automation/`. Do not reintroduce the removed `monitor` module.
 - Preserve compatibility: when changing config models, keep the `BaseJSONConfig.load()` compatibility chain working, especially the migration logic for `SignConfigV1/V2/V3`.
