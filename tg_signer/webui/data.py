@@ -335,6 +335,30 @@ def apply_account_order(
     return known + rest
 
 
+def load_account_limits(
+    workdir: Optional[Path | str] = None,
+) -> Dict[str, List[Dict[str, object]]]:
+    """读取自动抽奖引擎落盘的账号级限流状态（仅未到期），供账户页展示。
+
+    返回 {账户名: [{kind, until, note}]}；数据库不存在或读取失败时返回空字典。
+    """
+    from tg_signer.giveaway_state import STATE_DB_FILE, GiveawayState
+
+    base = get_workdir(workdir)
+    if not (base / STATE_DB_FILE).is_file():
+        return {}
+    state_db = None
+    try:
+        state_db = GiveawayState(base)
+        return state_db.active_account_limits()
+    except Exception:  # noqa: BLE001 - 展示类信息失败不影响账户页
+        logger.debug("读取账号限流状态失败", exc_info=True)
+        return {}
+    finally:
+        if state_db is not None:
+            state_db.close()
+
+
 def account_identities(
     names: List[str],
     workdir: Optional[Path | str] = None,

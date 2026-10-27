@@ -9,6 +9,7 @@ Telegram 没有提供「已加入数量」的接口，只能遍历账号对话�
 import asyncio
 import json
 import logging
+import random
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,8 +29,12 @@ from tg_signer.webui.random_chat import build_account_options, list_session_name
 logger = logging.getLogger(__name__)
 
 STATS_FILE = "channel_stats.json"
+STATS_LOG_FILE = "channel_stats.log"
 # 单次网络调用超时（秒）：代理僵死时明确失败而不是永久挂起
 _NET_CALL_TIMEOUT = 90
+# 账号全并行，但按序号错峰启动（秒）：与抽奖一致，避免所有账号
+# 同一时刻一起连接并翻页、把代理和 Telegram 限流同时打满
+_SCAN_STAGGER_SECONDS = 3.0
 _FREE_LIMIT = 500
 _PREMIUM_LIMIT = 1000
 
@@ -60,6 +65,34 @@ def save_stats(workdir, data: Dict) -> None:
         logger.debug("保存频道统计缓存失败", exc_info=True)
 
 
+def _stats_log_path(workdir) -> Path:
+    return Path(workdir) / STATS_LOG_FILE
+
+
+def append_stats_log(workdir, message: str) -> None:
+    """把统计执行日志追加到 channel_stats.log。
+
+    手动更新与后台自动刷新（退频道/组合任务结束）都会写入，
+    统计弹窗重新打开时回放最近日志，避免日志区一直是空白。
+    """
+    try:
+        path = _stats_log_path(workdir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}\n")
+    except Exception:
+        logger.debug("写入频道统计执行日志失败", exc_info=True)
+
+
+def load_stats_log(workdir, limit: int = 300) -> List[str]:
+    """读取统计执行日志的最近若干行（文件不存在时返回空列表）。"""
+    try:
+        text = _stats_log_path(workdir).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+    return text.splitlines()[-limit:]
+
+
 async def scan_account(
     account: str,
     session_dir: Path,
@@ -73,10 +106,17 @@ async def scan_account(
     client = None
     try:
         client = get_client(account, workdir=str(session_dir))
-        ok = await asyncio.wait_for(client.connect(), 30)
+        try:
+            ok = await asyncio.wait_for(client.connect(), 30)
+        except asyncio.TimeoutError as exc:
+            # wait_for 超时抛出的异常没有描述，直接上报会让日志出现「统计失败：」空行
+            raise RuntimeError("连接超时（30 秒，网络或代理异常）") from exc
         if not ok:
             raise RuntimeError("会话未授权")
-        me = await asyncio.wait_for(client.get_me(), 30)
+        try:
+            me = await asyncio.wait_for(client.get_me(), 30)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("获取账号信息超时（30 秒，网络或代理异常）") from exc
         premium = bool(getattr(me, "is_premium", False))
         channel = supergroup = basic = private = scanned = 0
         # 逐项拉取套超时：代理僵死时明确失败，不永久挂起
@@ -136,22 +176,35 @@ async def refresh_stats_for_accounts(
     if not accounts:
         return load_stats(workdir)
     store = load_stats(workdir)
-    _log = log or logger.debug
+    _log = log or (lambda msg: append_stats_log(workdir, msg))
     _log(f"[频道统计] 自动刷新 {len(accounts)} 个账号：{'、'.join(accounts)}")
 
-    for account in accounts:
+    save_lock = asyncio.Lock()
+
+    async def _refresh_one(idx: int, account: str) -> None:
+        if idx:
+            # 账号全并行，但错峰启动：避免所有账号同时连接、同时翻页
+            await asyncio.sleep(
+                idx * _SCAN_STAGGER_SECONDS
+                + random.uniform(0, _SCAN_STAGGER_SECONDS / 2)
+            )
 
         def _local_log(msg: str, _a=account) -> None:
             _log(f"[{_a}] {msg}")
 
         try:
             rec = await scan_account(account, Path(session_dir), _local_log)
-            store["accounts"][account] = rec
         except Exception as exc:
             old = dict(store["accounts"].get(account) or {})
             old.update({"account": account, "error": str(exc)})
-            store["accounts"][account] = old
+            rec = old
             _log(f"[{account}] 自动刷新失败：{exc}")
+        async with save_lock:
+            store["accounts"][account] = rec
+            store["updated_at"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+            save_stats(workdir, store)
+
+    await asyncio.gather(*(_refresh_one(idx, acc) for idx, acc in enumerate(accounts)))
     store["updated_at"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
     save_stats(workdir, store)
     _log(f"[频道统计] 自动刷新完成：{store['updated_at']}")
@@ -249,6 +302,8 @@ def channel_stats_block(workdir) -> None:
             log_area.push(f"{datetime.now():%H:%M:%S} {message}")
         except Exception:
             logger.debug("推送频道统计日志失败", exc_info=True)
+        # 同步落盘：弹窗重开、页面刷新后仍能看到上次执行日志
+        append_stats_log(workdir, message)
 
     def _current_mtime() -> int:
         try:
@@ -273,6 +328,9 @@ def channel_stats_block(workdir) -> None:
         update_time.update()
         render_chart()
         render_summary()
+        # 后台（退频道/组合任务结束）自动刷新落盘时在日志区留痕，
+        # 否则用户只会看到数字变化、日志区一直空白
+        log(f"检测到后台自动刷新，统计已更新（{store.get('updated_at')}）")
 
     def render_chart() -> None:
         rows = [
@@ -312,34 +370,76 @@ def channel_stats_block(workdir) -> None:
         progress_status.text = f"准备统计 {total} 个账号..."
         progress_status.update()
         started = time.time()
-        log(f"开始更新统计：{'、'.join(accounts)}")
-        try:
-            for idx, account in enumerate(accounts):
+        log(f"开始更新统计：{'、'.join(accounts)}（全部账号并行，按账号错峰启动）")
+        save_lock = asyncio.Lock()
+        active: List[str] = []
+        notes: Dict[str, str] = {}
+        done = {"n": 0}
 
-                def on_scan(message: str, i=idx, name=account) -> None:
-                    progress_status.text = (
-                        f"正在统计 {i + 1}/{total}：{name}（{message}）"
-                    )
-                    progress_status.update()
+        def render_progress() -> None:
+            if active:
+                shown = active[:5]
+                parts = [
+                    f"{name}（{notes[name]}）" if notes.get(name) else name
+                    for name in shown
+                ]
+                more = f" 等 {len(active)} 个" if len(active) > len(shown) else ""
+                progress_status.text = (
+                    f"已完成 {done['n']}/{total}，正在统计：" + "、".join(parts) + more
+                )
+            else:
+                progress_status.text = f"已完成 {done['n']}/{total}"
+            progress_status.update()
 
-                try:
-                    rec = await scan_account(account, session_dir, log, on_scan)
-                    store["accounts"][account] = rec
-                    log(f"[{account}] 完成：{rec['joined']} / {rec['limit']}")
-                except Exception as exc:
-                    # 本次失败时保留上次的计数，只标记错误，避免图表数据被清零
-                    old = dict(store["accounts"].get(account) or {})
-                    old.update({"account": account, "error": str(exc)})
-                    store["accounts"][account] = old
-                    log(f"[{account}] 统计失败：{exc}")
-                    logger.debug("统计账号 %s 失败", account, exc_info=True)
+        async def run_account(idx: int, account: str) -> None:
+            if idx:
+                # 账号全并行，但错峰启动：避免所有账号同时连接、同时翻页
+                await asyncio.sleep(
+                    idx * _SCAN_STAGGER_SECONDS
+                    + random.uniform(0, _SCAN_STAGGER_SECONDS / 2)
+                )
+            active.append(account)
+            notes.pop(account, None)
+            render_progress()
+
+            def on_scan(message: str, name: str = account) -> None:
+                notes[name] = message
+                render_progress()
+
+            try:
+                rec = await scan_account(account, session_dir, log, on_scan)
+            except Exception as exc:
+                # 本次失败时保留上次的计数，只标记错误，避免图表数据被清零
+                record = dict(store["accounts"].get(account) or {})
+                record.update({"account": account, "error": str(exc)})
+                log(f"[{account}] 统计失败：{exc}")
+                logger.debug("统计账号 %s 失败", account, exc_info=True)
+            else:
+                record = rec
+                log(f"[{account}] 完成：{rec['joined']} / {rec['limit']}")
+
+            async with save_lock:
+                store["accounts"][account] = record
                 store["updated_at"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
                 save_stats(workdir, store)
                 update_time.text = f"上次更新：{store['updated_at']}"
                 update_time.update()
                 render_chart()
                 render_summary()
-                progress_bar.set_value((idx + 1) / total)
+                done["n"] += 1
+                progress_bar.set_value(done["n"] / total)
+
+            try:
+                active.remove(account)
+            except ValueError:
+                pass
+            notes.pop(account, None)
+            render_progress()
+
+        try:
+            await asyncio.gather(
+                *(run_account(idx, account) for idx, account in enumerate(accounts))
+            )
             progress_status.text = f"更新完成：{total} 个账号，耗时 {format_duration(time.time() - started)}"
             log(progress_status.text)
         finally:
@@ -388,3 +488,9 @@ def channel_stats_block(workdir) -> None:
     with ui.row().classes("w-full items-center justify-between mt-2"):
         ui.label("更新日志").classes("font-semibold text-sm")
     log_area = ui.log(max_lines=300).classes("w-full h-40")
+    # 回放上次执行日志（含后台自动刷新）：否则重新打开弹窗日志区总是空白
+    for line in load_stats_log(workdir):
+        try:
+            log_area.push(line)
+        except Exception:
+            logger.debug("回放频道统计执行日志失败", exc_info=True)

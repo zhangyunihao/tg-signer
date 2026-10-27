@@ -47,9 +47,9 @@ CONFIG_NAME = "auto_leave_config.json"
 LEAVE_TASKS_FILE = "webui_leave_tasks.json"
 
 # 保护关键字（频道名命中即不自动退出，仅在结果中展示供手动勾选）
-UNSELECT_KEYWORDS = ("抽奖", "嫩妹社", "野寻", "榜")
+UNSELECT_KEYWORDS = ("抽奖", "嫩妹社", "报告", "榜")
 
-DEFAULT_KEYWORDS = "抽奖,嫩妹社,野寻,榜"
+DEFAULT_KEYWORDS = "抽奖,嫩妹社,报告,榜"
 
 # 运行中任务的停止开关（跨浏览器标签页共享，供「停止所有任务」使用）
 # {workdir|task_id|token -> stop_fn}

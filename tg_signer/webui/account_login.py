@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import os
+import time
+from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict
+from typing import Callable, Dict, List
 
 from nicegui import ui
 
@@ -13,6 +15,7 @@ from tg_signer.webui.data import (
     account_identities,
     apply_account_order,
     get_workdir,
+    load_account_limits,
     load_disabled_accounts,
     load_two_way_accounts,
     load_user_infos,
@@ -145,8 +148,77 @@ class AccountLoginSession:
         self.password_needed = False
 
 
+_LIMIT_KIND_LABELS = {
+    "peer_flood": "PEER_FLOOD",
+    "flood_wait": "FLOOD_WAIT",
+    "join_flood": "加群限流",
+}
+
+
+def _format_remaining(seconds: float) -> str:
+    sec = max(0, int(seconds))
+    if sec >= 3600:
+        return f"{sec // 3600} 小时 {sec % 3600 // 60} 分"
+    if sec >= 60:
+        return f"{sec // 60} 分 {sec % 60} 秒"
+    return f"{sec} 秒"
+
+
+def _limit_text(limits: List[dict]) -> tuple[str, str]:
+    """把账号限流记录格式化为（展示文字, CSS 类），已到期的条目忽略。"""
+    now = time.time()
+    parts: List[str] = []
+    kinds = set()
+    for item in limits:
+        try:
+            left = float(item.get("until") or 0) - now
+        except (TypeError, ValueError):
+            continue
+        if left <= 0:
+            continue
+        kind = str(item.get("kind") or "")
+        kinds.add(kind)
+        label = _LIMIT_KIND_LABELS.get(kind, kind or "限流")
+        piece = (
+            f"{label} 剩余 {_format_remaining(left)}"
+            f"（至 {datetime.fromtimestamp(now + left):%H:%M}）"
+        )
+        note = str(item.get("note") or "").strip()
+        if note:
+            piece += f" · {note}"
+        parts.append(piece)
+    if not parts:
+        return "限流：正常", "text-xs text-green-600"
+    cls = "text-xs text-red-600" if "peer_flood" in kinds else "text-xs text-orange-600"
+    return "限流中：" + "；".join(parts), cls
+
+
 def user_info_block() -> Callable[[], None]:
     container = ui.column().classes("w-full gap-2")
+    # 账户卡片上的限流标签与快照：定时器每秒刷新剩余时长，每 5 秒重读落盘状态
+    limit_labels: Dict[str, object] = {}
+    limit_snapshot: Dict[str, List[dict]] = {}
+    limit_loaded_at = [0.0]
+
+    def _tick_limits() -> None:
+        if not limit_labels:
+            return
+        now = time.time()
+        if now - limit_loaded_at[0] >= 5:
+            limit_snapshot.clear()
+            limit_snapshot.update(load_account_limits(state.workdir))
+            limit_loaded_at[0] = now
+        for name, lbl in list(limit_labels.items()):
+            text, cls = _limit_text(limit_snapshot.get(name) or [])
+            try:
+                if lbl.text != text:
+                    lbl.text = text
+                lbl.classes(replace=cls)
+                lbl.update()
+            except Exception:  # noqa: BLE001 - 元素已被 refresh 清理
+                limit_labels.pop(name, None)
+
+    ui.timer(1.0, _tick_limits)
 
     # 增加账户弹窗（CLI 登录流程，只创建一次，refresh 清空 container 不影响它）
     login_session: dict = {"session": None}
@@ -363,9 +435,13 @@ def user_info_block() -> Callable[[], None]:
         asyncio.ensure_future(_run())
 
     def refresh() -> None:
+        limit_labels.clear()
         container.clear()
         disabled = load_disabled_accounts(state.workdir)
         two_ways = load_two_way_accounts(state.workdir)
+        limit_snapshot.clear()
+        limit_snapshot.update(load_account_limits(state.workdir))
+        limit_loaded_at[0] = time.time()
         with container:
             # —— 账户管理 ——
             with ui.card().classes("w-full shadow-sm tgs-account-card"):
@@ -593,6 +669,12 @@ def user_info_block() -> Callable[[], None]:
                                     ui.label(
                                         "→ 未获取到 Telegram 身份（未登录或缺少用户信息）"
                                     ).classes("text-xs text-gray-400")
+                                limit_text, limit_cls = _limit_text(
+                                    limit_snapshot.get(name) or []
+                                )
+                                limit_labels[name] = ui.label(limit_text).classes(
+                                    limit_cls
+                                )
                 ui.label(
                     "停用的账户不会出现在签到/随机发言/批量退频道的账号下拉列表中"
                 ).classes("text-xs text-gray-500")

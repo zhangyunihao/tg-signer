@@ -365,6 +365,16 @@ def _build_center_page() -> None:
         render_list()
         refresh_unread_badge()
 
+    def toggle_read(key: str) -> None:
+        """点击圆点切换已读/未读（已读消息可再次标为未读）。"""
+        if key in read_keys:
+            read_keys.discard(key)
+        else:
+            read_keys.add(key)
+        save_read_keys(state.workdir, read_keys)
+        render_list()
+        refresh_unread_badge()
+
     def mark_all_read() -> None:
         for m in visible_messages():
             read_keys.add(m["key"])
@@ -410,6 +420,9 @@ def _build_center_page() -> None:
                 def _on_pin_click(*_args, _key: str = m["key"]) -> None:
                     toggle_pin(_key)
 
+                def _on_dot_click(*_args, _key: str = m["key"]) -> None:
+                    toggle_read(_key)
+
                 with (
                     ui.row()
                     .classes(
@@ -418,11 +431,16 @@ def _build_center_page() -> None:
                     )
                     .on("click", _on_row_click)
                 ):
-                    ui.icon(
-                        "fiber_manual_record" if unread else "radio_button_unchecked"
-                    ).classes(
-                        ("text-blue-500" if unread else "text-gray-300")
-                        + " text-[10px] mt-1.5 shrink-0"
+                    # click.stop 阻止冒泡：点圆点只切换已读状态，不触发整行的「标为已读」
+                    ui.button(
+                        icon="fiber_manual_record"
+                        if unread
+                        else "radio_button_unchecked"
+                    ).props(
+                        "flat round dense size=sm "
+                        + ("color=primary" if unread else "color=grey-5")
+                    ).classes("shrink-0").on("click.stop", _on_dot_click).tooltip(
+                        "标为未读" if not unread else "标为已读"
                     )
                     ui.badge(m["tag"]).props(
                         f"outline dense color={m['color']}"

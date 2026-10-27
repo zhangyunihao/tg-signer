@@ -1,5 +1,6 @@
 """自动抽奖：bot 深度链接解析、消息链接提取、关键词匹配、去重存储与引擎决策。"""
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1044,6 +1045,18 @@ def test_flood_does_not_overwrite_joined_record(tmp_path):
     assert engine._record_flood("acc", "LotteryBot", "act1", "", exc)
     assert state.has("acc", "LotteryBot", "act1")
     assert not state.is_blocked("acc", "LotteryBot", "act1")
+
+
+def test_record_flood_persists_account_limit(tmp_path):
+    """限流要落盘账号级状态，账户页才能展示剩余时长。"""
+    engine, state = _engine(tmp_path)
+    exc = RuntimeError("Telegram says: [420 FLOOD_WAIT_X] - Please wait 90 seconds")
+    exc.value = 90
+    assert engine._record_flood("acc", "LotteryBot", "act1", "", exc)
+    limits = state.active_account_limits()
+    assert [item["kind"] for item in limits["acc"]] == ["flood_wait"]
+    assert limits["acc"][0]["note"] == "@LotteryBot（act1）"
+    assert 80 < limits["acc"][0]["until"] - time.time() <= 90
 
 
 def test_state_flood_wait_cooldown_expiry(tmp_path, monkeypatch):

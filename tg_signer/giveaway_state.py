@@ -75,6 +75,14 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS account_limits (
+    account    TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    until      REAL NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    updated_ts REAL NOT NULL,
+    PRIMARY KEY (account, kind)
+);
 """
 
 
@@ -450,3 +458,45 @@ class GiveawayState:
                 " ORDER BY ts DESC, rowid DESC LIMIT ?)",
                 (account, account, MAX_JOIN_EVENTS_PER_ACCOUNT),
             )
+
+    # ---- 账号级限流状态（供 WebUI 账户页展示） ----
+
+    def set_account_limit(
+        self, account: str, kind: str, until: float, note: str = ""
+    ) -> None:
+        """记录/延长账号某类限流到 until（epoch 秒），只延长不缩短。"""
+        with self._lock:
+            self._db().execute(
+                "INSERT INTO account_limits (account, kind, until, note, updated_ts)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(account, kind) DO UPDATE SET"
+                " until = MAX(until, excluded.until),"
+                " note = excluded.note,"
+                " updated_ts = excluded.updated_ts",
+                (str(account), str(kind), float(until), note, time.time()),
+            )
+
+    def active_account_limits(self) -> Dict[str, List[Dict[str, object]]]:
+        """读取未到期的账号限流，返回 {account: [{kind, until, note}]}。
+
+        顺带清理已到期的记录，避免账户页长期显示历史限流。
+        """
+        now = time.time()
+        conn = self._db()
+        with self._lock:
+            conn.execute("DELETE FROM account_limits WHERE until <= ?", (now,))
+            rows = conn.execute(
+                "SELECT account, kind, until, note FROM account_limits"
+                " WHERE until > ? ORDER BY until",
+                (now,),
+            ).fetchall()
+        result: Dict[str, List[Dict[str, object]]] = {}
+        for row in rows:
+            result.setdefault(str(row["account"]), []).append(
+                {
+                    "kind": str(row["kind"]),
+                    "until": float(row["until"]),
+                    "note": str(row["note"] or ""),
+                }
+            )
+        return result

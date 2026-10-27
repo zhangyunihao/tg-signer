@@ -100,7 +100,7 @@ The same menu also contains: **Work Directory** (switch/view the `.signer` data 
 
 - Set the "inactive days" threshold, select accounts, then "扫描预览" to list long-inactive channels/groups with their last message time
 - Scan results are **preview only**: nothing happens until you tick conversations and confirm twice
-- Conversations whose names contain keywords like 「抽奖」「嫩妹社」「野寻」「榜」 are unchecked by default to prevent accidental leaving
+- Conversations whose names contain keywords like 「抽奖」「嫩妹社」「报告」「榜」 are unchecked by default to prevent accidental leaving
 
 ## Config Management
 

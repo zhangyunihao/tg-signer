@@ -2026,6 +2026,14 @@ class GiveawayEngine:
         if account in self._peer_flood_accounts:
             return
         self._peer_flood_accounts.add(account)
+        if self._state is not None:
+            # PEER_FLOOD 没有官方解封时间，按建议的 24 小时记录，供账户页展示
+            self._state.set_account_limit(
+                account,
+                "peer_flood",
+                time.time() + 24 * 3600,
+                "强制限流，建议停用 24 小时以上",
+            )
         where = f"（{detail}）" if detail else ""
         self.log(
             f"[{account}] 触发 Telegram 强制限流 PEER_FLOOD{where}："
@@ -2087,6 +2095,15 @@ class GiveawayEngine:
         pause = max(1, int(wait)) + self.join_flood_buffer
         until = time.monotonic() + pause
         resume_at = datetime.now() + timedelta(seconds=pause)
+        if self._state is not None:
+            self._state.set_account_limit(
+                account,
+                "join_flood",
+                time.time() + pause,
+                f"邀请链接 {target}（@username 加入不受影响）"
+                if self._is_invite_target(target)
+                else f"加入 {target}",
+            )
         if self._is_invite_target(target):
             self._invite_suspended[account] = max(
                 self._invite_suspended.get(account, 0.0), until
@@ -2250,6 +2267,11 @@ class GiveawayEngine:
         # 按 bot 级别暂停到限流解除：暂停期间同账号不再对该 bot 发 start
         resume_at = time.monotonic() + wait
         self._flood_until[fkey] = max(self._flood_until.get(fkey, 0.0), resume_at)
+        if self._state is not None:
+            # 落盘账号级限流，供账户页展示剩余时长（落盘用 wall clock）
+            self._state.set_account_limit(
+                account, "flood_wait", time.time() + wait, f"@{username}（{param}）"
+            )
         # 已参与（joined）或已结束（ended）的记录不能被限流记录覆盖，
         # 否则会把成功状态翻成失败并在冷却后重复参与
         if self._state is not None and not self._state.has(account, username, param):
