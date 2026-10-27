@@ -578,26 +578,72 @@ class ComboTaskBlock:
             return str(run["record"].get("status") or rec.get("status") or "未知")
         return str(rec.get("status") or "未知")
 
+    def _hist_signature(self, records: list[dict] | None = None) -> tuple:
+        """历史列表签名：包含状态与运行中任务的进度，驱动是否需要重渲染。"""
+        if records is None:
+            records = self._combo_history_records()
+        sig = []
+        for rec in records:
+            rid = str(rec.get("id") or "")
+            status = self._record_status(rec)
+            entry: list = [rid, status]
+            run = self.runner.runs.get(rid)
+            if run is not None:
+                combo_subs = self._run_subs(run)
+                summary = self._progress_summary(run, combo_subs)
+                entry.extend(
+                    [
+                        summary["done"],
+                        summary["total"],
+                        tuple(summary["counts"].items()),
+                    ]
+                )
+            sig.append(tuple(entry))
+        return tuple(sig)
+
+    def _run_progress_text(self, rid: str) -> str | None:
+        """运行中任务的进度分数文本（如 "3/10 步 · 30%"）；非运行中返回 None。"""
+        run = self.runner.runs.get(rid)
+        if run is None:
+            return None
+        combo_subs = self._run_subs(run)
+        summary = self._progress_summary(run, combo_subs)
+        done = summary["done"]
+        total = summary["total"]
+        ratio = done / total * 100 if total else 0
+        return f"{done}/{total} 步 · {int(ratio)}%"
+
     def _render_history(self) -> None:
         self.history_container.clear()
         records = self._combo_history_records()
-        self._last_hist_sig = tuple(
-            (str(rec.get("id") or ""), self._record_status(rec)) for rec in records
-        )
+        self._last_hist_sig = self._hist_signature(records)
         # 桌面端表格同步行数据（表格自带分页，每页 10 条）；seq 为全量序号（跨页连续）
-        self.history_table.rows = [
-            {
-                "id": str(rec.get("id") or ""),
-                "seq": idx + 1,
-                "status": self._record_status(rec),
-                "task_name": str(rec.get("task_name") or "-"),
-                "accounts": str(rec.get("accounts") or "—"),
-                "start_time": str(rec.get("start_time") or "—"),
-                "duration": str(rec.get("duration") or "—"),
-                "result": str(rec.get("result") or ""),
-            }
-            for idx, rec in enumerate(records)
-        ]
+        table_rows = []
+        for idx, rec in enumerate(records):
+            rid = str(rec.get("id") or "")
+            status = self._record_status(rec)
+            result_text = str(rec.get("result") or "")
+            # 运行中任务：在 result 列最前面附上进度分数
+            progress_text = self._run_progress_text(rid)
+            if progress_text is not None:
+                result_text = (
+                    f"进度 {progress_text}\n{result_text}"
+                    if result_text
+                    else f"进度 {progress_text}"
+                )
+            table_rows.append(
+                {
+                    "id": rid,
+                    "seq": idx + 1,
+                    "status": status,
+                    "task_name": str(rec.get("task_name") or "-"),
+                    "accounts": str(rec.get("accounts") or "—"),
+                    "start_time": str(rec.get("start_time") or "—"),
+                    "duration": str(rec.get("duration") or "—"),
+                    "result": result_text,
+                }
+            )
+        self.history_table.rows = table_rows
         self.history_table.update()
         # 分页：每页 10 条；列表刷新时夹取页码到有效范围，避免越界空白
         page_size = 10
@@ -643,10 +689,41 @@ class ComboTaskBlock:
                             ("账号", rec.get("accounts"), True),
                         ]
                     )
-                    if rec.get("result"):
+                    # 运行中任务：卡片上直接显示进度条 + 分数
+                    run = self.runner.runs.get(rid)
+                    if run is not None:
+                        combo_subs = self._run_subs(run)
+                        summary = self._progress_summary(run, combo_subs)
+                        done = summary["done"]
+                        total = summary["total"]
+                        counts = summary["counts"]
+                        ratio = done / total if total else 0.0
+                        if counts["失败"]:
+                            bar_color = "negative"
+                        elif total and done >= total:
+                            bar_color = "positive"
+                        else:
+                            bar_color = "primary"
+                        with ui.row().classes("w-full items-center gap-2 mt-1"):
+                            ui.icon("play_circle").classes("text-sm text-info")
+                            ui.label(
+                                f"{done}/{total} 步 · {int(ratio * 100)}%"
+                            ).classes("text-xs font-medium text-info")
+                            ui.space()
+                            for key in ("成功", "失败", "中断"):
+                                cnt = counts.get(key, 0)
+                                if cnt:
+                                    color = self.UNIT_STATUS_COLOR.get(key, "grey-6")
+                                    ui.badge(f"{key} {cnt}").props(
+                                        f"color={color} outline"
+                                    ).classes("text-xs")
+                        ui.linear_progress(value=ratio, show_value=False).props(
+                            f"rounded color={bar_color}"
+                        ).classes("w-full mt-1").style("height: 6px")
+                    elif rec.get("result"):
                         mobile_card_result("结果", str(rec["result"]))
                     with ui.row().classes("w-full mobile-card-actions"):
-                        if self.runner.runs.get(rid) is not None:
+                        if run is not None:
                             ui.button(
                                 "停止", on_click=lambda r=rid: self._stop(r)
                             ).props("flat dense color=negative")
@@ -1131,17 +1208,14 @@ class ComboTaskBlock:
                         ui.badge(acc_status).props(f"color={acc_color} outline")
 
     def _tick(self) -> None:
-        """每 2 秒轮询：落盘进度快照；历史状态变化时刷新列表。"""
+        """每 2 秒轮询：落盘进度快照；历史状态或运行中任务进度变化时刷新列表。"""
         # 页面不可见或已切到其他 tab 时跳过，切回后自动恢复
         if not should_poll(self._poll_client, "combo"):
             return
         # 进度快照落盘：运行中每 2 秒更新，停止/结束后保留最终状态
         self._sync_progress_snapshots()
-        # 历史列表：仅状态/记录数变化时重渲染，避免每秒重建
-        hist_sig = tuple(
-            (str(rec.get("id") or ""), self._record_status(rec))
-            for rec in self._combo_history_records()
-        )
+        # 历史列表：状态变化或运行中任务进度（done/total/计数）变化时重渲染
+        hist_sig = self._hist_signature()
         if hist_sig != self._last_hist_sig:
             self._last_hist_sig = hist_sig
             self._render_history()
@@ -1362,6 +1436,45 @@ class ComboTaskBlock:
             },
             force=True,
         )
+        # 组合任务包含退频道子任务时，运行结束后自动刷新涉及账号的频道统计
+        combo_subs = snap.get("combo_subs") or []
+        has_leave = any("退频道" in str(s.get("type") or "") for s in combo_subs)
+        if has_leave:
+            procs = snap.get("procs") or []
+            if procs:
+                accounts = list(
+                    dict.fromkeys(
+                        str(p.get("account") or "") for p in procs if p.get("account")
+                    )
+                )
+            else:
+                accounts = list(
+                    dict.fromkeys(
+                        str(d.get("account") or "")
+                        for d in (rec.get("details") or [])
+                        if d.get("account")
+                    )
+                )
+            self._fire_combo_stats_refresh(accounts)
+
+    def _fire_combo_stats_refresh(self, accounts: list[str]) -> None:
+        """组合任务结束后异步刷新频道统计（fire-and-forget）。"""
+        if not accounts:
+            return
+        try:
+            import asyncio
+
+            from tg_signer.webui.channel_stats import refresh_stats_for_accounts
+
+            async def _runner() -> None:
+                try:
+                    await refresh_stats_for_accounts(accounts, self.workdir, ".")
+                except Exception:
+                    logger.debug("组合任务自动刷新频道统计失败", exc_info=True)
+
+            asyncio.get_running_loop().create_task(_runner())
+        except (ImportError, RuntimeError):
+            logger.debug("跳过组合任务频道统计自动刷新")
 
     def _snapshot_run_view(self, rec: dict) -> dict | None:
         """把历史记录 + 进度快照拼成与运行中一致的展示结构；无快照时返回 None。"""

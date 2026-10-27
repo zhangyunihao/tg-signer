@@ -122,6 +122,42 @@ async def scan_account(
             await safe_disconnect(client)
 
 
+async def refresh_stats_for_accounts(
+    accounts: List[str],
+    workdir,
+    session_dir: Path | str,
+    log: Callable[[str], None] | None = None,
+) -> Dict:
+    """只刷新指定账号的频道统计并落盘（不阻塞调用方，失败只标记不抛异常）。
+
+    退频道任务完成后调用，避免全量扫描所有账号；传入的账号列表为空时直接返回。
+    """
+    accounts = [str(a) for a in (accounts or []) if str(a)]
+    if not accounts:
+        return load_stats(workdir)
+    store = load_stats(workdir)
+    _log = log or logger.debug
+    _log(f"[频道统计] 自动刷新 {len(accounts)} 个账号：{'、'.join(accounts)}")
+
+    for account in accounts:
+
+        def _local_log(msg: str, _a=account) -> None:
+            _log(f"[{_a}] {msg}")
+
+        try:
+            rec = await scan_account(account, Path(session_dir), _local_log)
+            store["accounts"][account] = rec
+        except Exception as exc:
+            old = dict(store["accounts"].get(account) or {})
+            old.update({"account": account, "error": str(exc)})
+            store["accounts"][account] = old
+            _log(f"[{account}] 自动刷新失败：{exc}")
+    store["updated_at"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+    save_stats(workdir, store)
+    _log(f"[频道统计] 自动刷新完成：{store['updated_at']}")
+    return store
+
+
 def _ordered_records(store: Dict, names: List[str]) -> List[tuple]:
     """按账号管理中的顺序返回统计记录（未知账号排在最后）。"""
     order = {name: idx for idx, name in enumerate(names)}
@@ -205,12 +241,38 @@ def channel_stats_block(workdir) -> None:
     store = load_stats(workdir)
     names = list_session_names(session_dir, workdir)
     running = {"flag": False}
+    _stats_path = Path(workdir) / STATS_FILE
+    _last_mtime: int = 0
 
     def log(message: str) -> None:
         try:
             log_area.push(f"{datetime.now():%H:%M:%S} {message}")
         except Exception:
             logger.debug("推送频道统计日志失败", exc_info=True)
+
+    def _current_mtime() -> int:
+        try:
+            return _stats_path.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    def _poll_file() -> None:
+        """每 3 秒检查 channel_stats.json 是否被其他进程更新（如自动退频道任务触发的刷新），
+        如果变了就重新加载并重渲染图表与摘要。"""
+        nonlocal store, _last_mtime
+        mtime = _current_mtime()
+        if mtime and mtime == _last_mtime:
+            return
+        new_store = load_stats(workdir)
+        if new_store == store:
+            _last_mtime = mtime
+            return
+        store = new_store
+        _last_mtime = mtime
+        update_time.text = f"上次更新：{store.get('updated_at') or '尚未统计'}"
+        update_time.update()
+        render_chart()
+        render_summary()
 
     def render_chart() -> None:
         rows = [
@@ -317,6 +379,11 @@ def channel_stats_block(workdir) -> None:
     summary_box = ui.column().classes("w-full gap-0")
     render_chart()
     render_summary()
+
+    # 初始化文件 mtime 并启动 3 秒轮询：后台自动刷新（如退频道任务触发）落盘后，
+    # 弹窗打开时自动反映最新数据，无需手动点「更新统计」
+    _last_mtime = _current_mtime()
+    ui.timer(3.0, _poll_file)
 
     with ui.row().classes("w-full items-center justify-between mt-2"):
         ui.label("更新日志").classes("font-semibold text-sm")

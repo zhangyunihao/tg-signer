@@ -23,6 +23,7 @@ from pyrogram.errors import FloodWait, RPCError
 from tg_signer.core import get_client, safe_disconnect, timeout_aiter
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.activity import should_poll
+from tg_signer.webui.channel_stats import refresh_stats_for_accounts
 from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
@@ -53,6 +54,27 @@ DEFAULT_KEYWORDS = "抽奖,嫩妹社,野寻,榜"
 # 运行中任务的停止开关（跨浏览器标签页共享，供「停止所有任务」使用）
 # {workdir|task_id|token -> stop_fn}
 _ACTIVE_STOPS: Dict[str, Callable[[], None]] = {}
+
+
+def _fire_refresh_stats(workdir, session_dir: Path | str, accounts: List[str]) -> None:
+    """退频道任务完成后异步触发频道统计刷新（fire-and-forget）。
+
+    用 asyncio.create_task 不阻塞主流程，失败不影响退频道任务的状态。
+    """
+    if not accounts:
+        return
+
+    async def _runner() -> None:
+        try:
+            await refresh_stats_for_accounts(accounts, workdir, session_dir)
+        except Exception:
+            logger.debug("自动刷新频道统计失败", exc_info=True)
+
+    try:
+        asyncio.get_running_loop().create_task(_runner())
+    except RuntimeError:
+        logger.debug("无运行事件循环，跳过自动频道统计刷新")
+
 
 # 模块级页面日志缓冲：按 workdir 存储页面级退频道日志，
 # 页面刷新后从这里回放历史日志，运行中任务也能继续往这里追加。
@@ -359,6 +381,9 @@ async def run_auto_leave_task(
             duration=format_duration(time.time() - started),
         )
         log_fn(f"[{task_name}] {status}")
+        # 自动刷新频道统计（仅在实际退出了至少 1 个频道时才刷新）
+        if auto_left:
+            _fire_refresh_stats(workdir, path, list(task.get("accounts") or []))
 
 
 def _chat_type(chat) -> str:
@@ -715,6 +740,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 duration=task["duration"],
             )
             render_list()
+            # 自动刷新频道统计（仅在自动退出非零时才刷新）
+            if st.get("auto_left"):
+                _fire_refresh_stats(workdir, session_dir, accounts)
 
     def stop_task(task_id: str) -> None:
         st = task_states.get(task_id)
@@ -741,7 +769,13 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         _patch_leave_task(workdir, task_id, status=st["status"])
         ui.notify("退出流程已启动，可在任务列表查看进度", type="positive")
         render_list()
+        # 预先收集账号列表，finally 里用于自动刷新频道统计
+        leaving_accounts: list[str] = []
+        done_keys: set = set()
         try:
+            leaving_accounts = list(
+                {row["account"] for row in selected if row.get("account")}
+            )
             by_account: Dict[str, List[Dict]] = {}
             for row in selected:
                 by_account.setdefault(row["account"], []).append(row)
@@ -776,6 +810,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             )
             _refresh_detail(task_id)
             render_list()
+            # 自动刷新频道统计（手动勾选退出后刷新这些账号）
+            if done_keys:
+                _fire_refresh_stats(workdir, session_dir, leaving_accounts)
 
     def delete_task(task_id: str) -> None:
         task = find_task(task_id)
