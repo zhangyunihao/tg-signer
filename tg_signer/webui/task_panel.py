@@ -83,6 +83,10 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
     if "退频道" in sub_type:
         # 按名称选择退频道任务（任务列表模式）；「默认配置」或找不到时
         # 回退旧版全局配置，兼容历史保存的组合
+        # 注意：session_dir 必须是 "."（WebUI CWD），不是 workdir（即 ".signer"）。
+        # .session 文件与账号发现逻辑（_get_account_names）都用 CWD；
+        # 抽奖任务自带 session_dir 字段所以不受影响，退频道任务配置未存此字段，
+        # 因此这里固定用 "." 与独立页面 auto_leave_block 保持一致。
         leave_task = next(
             (t for t in _load_leave_tasks(workdir) if str(t.get("name")) == task_name),
             None,
@@ -93,7 +97,7 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
                 "module": "tg_signer.leave_runner",
                 "spec": {
                     "account": account,
-                    "session_dir": str(workdir),
+                    "session_dir": ".",
                     "days": (
                         float(leave_task["days"])
                         if leave_task.get("days") is not None
@@ -115,7 +119,7 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
             "module": "tg_signer.leave_runner",
             "spec": {
                 "account": account,
-                "session_dir": str(workdir),
+                "session_dir": ".",
                 "days": float(cfg["days"]) if cfg.get("days") is not None else 7,
                 "scan_types": _leave_scan_types(cfg),
                 "include_groups": bool(cfg.get("include_groups")),

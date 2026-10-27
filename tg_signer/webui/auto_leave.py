@@ -54,6 +54,13 @@ DEFAULT_KEYWORDS = "抽奖,嫩妹社,野寻,榜"
 # {workdir|task_id|token -> stop_fn}
 _ACTIVE_STOPS: Dict[str, Callable[[], None]] = {}
 
+# 模块级页面日志缓冲：按 workdir 存储页面级退频道日志，
+# 页面刷新后从这里回放历史日志，运行中任务也能继续往这里追加。
+_LEAVE_GLOBAL_LOGS: Dict[str, List[str]] = {}
+# 模块级活跃 log_area 引用：按 workdir 存储当前页面的 ui.log 对象，
+# 让后台运行的任务能把日志推送到最新页面。
+_LEAVE_ACTIVE_LOG_AREA: Dict[str, "ui.log"] = {}
+
 
 def stop_all_leave_tasks(workdir) -> int:
     """请求停止当前工作目录下所有运行中的退频道任务，返回请求停止的数量。"""
@@ -552,7 +559,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         }
 
     task_states: Dict[str, Dict] = {t["id"]: _default_state(t) for t in tasks}
-    log_lines: List[str] = []
+    # 从模块级全局缓冲获取日志列表：页面刷新后可回放历史，
+    # 运行中后台协程也能继续往这里追加。
+    log_lines = _LEAVE_GLOBAL_LOGS.setdefault(wd_key, [])
     # 页面级持久弹窗的引用与状态（弹窗不在事件槽位里动态创建）
     detail_refs: Dict = {"task_id": None, "body": None, "count": None}
     delete_state: Dict = {"task_id": None}
@@ -563,10 +572,15 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         log_lines.append(line)
         if len(log_lines) > 1000:
             del log_lines[:-1000]
-        try:
-            log_area.push(line)
-        except Exception:
-            logger.debug("推送日志到界面日志区失败", exc_info=True)
+        # 推送到当前活跃页面的 log_area（如果存在）；
+        # 后台运行的任务在页面刷新后，会通过 _LEAVE_ACTIVE_LOG_AREA
+        # 找到新页面的 ui.log 对象继续推送。
+        active_area = _LEAVE_ACTIVE_LOG_AREA.get(wd_key)
+        if active_area is not None:
+            try:
+                active_area.push(line)
+            except Exception:
+                logger.debug("推送日志到界面日志区失败", exc_info=True)
 
     def _skip_btn_text() -> str:
         n = len(load_skip_keywords(workdir))
@@ -1430,8 +1444,13 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 "flat round dense"
             ).tooltip("全屏显示")
     log_area = ui.log(max_lines=1000).classes("w-full h-48")
+    # 注册当前活跃 log_area：后台运行的任务通过它推送到最新页面
+    _LEAVE_ACTIVE_LOG_AREA[wd_key] = log_area
     for line in log_lines:
-        log_area.push(line)
+        try:
+            log_area.push(line)
+        except Exception:
+            logger.debug("回放历史日志到界面日志区失败", exc_info=True)
     # 退出全屏悬浮按钮：仅全屏时 fixed 显示在视口右上角，平时不占布局
     exit_full_btn = (
         ui.button(icon="close", on_click=toggle_fullscreen)

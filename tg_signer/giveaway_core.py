@@ -1979,6 +1979,25 @@ class GiveawayEngine:
         """账号已加入的频道/群组数达到 Telegram 上限（CHANNELS_TOO_MUCH）。"""
         return "CHANNELS_TOO_MUCH" in str(exc).upper()
 
+    @staticmethod
+    def _is_network_timeout(exc: Exception) -> bool:
+        """判断异常是否为网络临时异常（超时/连接断开/代理僵死等）。
+
+        网络异常是瞬时的，账号/频道本身没有问题，应该允许下次重试，
+        不应记入持久化的「加入失败」提醒或消耗 _join_cache 尝试机会。
+        目前 GiveawayEngine 的 _TimeoutClient 会把 asyncio.TimeoutError
+        包装成 RuntimeError，消息含「网络请求 … 超时」「网络异常」关键字；
+        同时识别原生 TimeoutError / ConnectionError 作为兜底。
+        """
+        msg = str(exc)
+        if "网络请求" in msg and "超时" in msg:
+            return True
+        if "网络异常" in msg:
+            return True
+        if isinstance(exc, (asyncio.TimeoutError, ConnectionError, OSError)):
+            return True
+        return False
+
     def _note_channels_full(
         self, account: str, exc: Exception, where: str = ""
     ) -> bool:
@@ -2674,6 +2693,15 @@ class GiveawayEngine:
                 wait = self._flood_seconds(exc) or 60
                 self._suspend_joins(account, wait, target)
                 return False, True
+            elif self._is_network_timeout(exc):
+                # 网络临时异常：类似限流，不消耗 _join_cache 尝试机会
+                logger.debug(
+                    "消息链接加入触发网络异常，跳过本轮：account=%s target=%s err=%s",
+                    account,
+                    target,
+                    str(exc)[:120],
+                )
+                return False, True
             else:
                 self.log(f"[{account}] 加入 {target} 失败: {msg[:120]}")
             return False, False
@@ -3063,6 +3091,16 @@ class GiveawayEngine:
                 if self._monitor_join_error_handled(account, chat, key, exc):
                     return
                 # 其他失败（如数字 id 无法解析）：还有候选目标则继续尝试
+        # 全部候选失败：区分网络异常 vs 真实失败
+        if last_exc is not None and self._is_network_timeout(last_exc):
+            # 网络临时异常：不记入持久化的「加入失败」提醒，允许下次重试
+            logger.debug(
+                "监控对象加入全部候选遇网络异常，跳过本轮：account=%s chat=%s err=%s",
+                account,
+                chat,
+                str(last_exc)[:120],
+            )
+            return
         self._join_cache.add(key)
         self.log(
             f"[{account}] 自动加入监控对象 {chat} 失败: {str(last_exc)[:120]}"
@@ -3112,6 +3150,17 @@ class GiveawayEngine:
                 }
             )
             self._join_cache.discard(key)  # 限流不消耗尝试机会，恢复后重试
+            return True
+        if self._is_network_timeout(exc):
+            # 网络临时异常：账号/频道本身没问题，允许下次重试，
+            # 不消耗 _join_cache 尝试机会，不写入持久化的「加入失败」提醒。
+            logger.debug(
+                "监控对象加入触发网络异常，跳过本轮：account=%s chat=%s err=%s",
+                account,
+                chat,
+                str(exc)[:120],
+            )
+            self._join_cache.discard(key)
             return True
         return False
 

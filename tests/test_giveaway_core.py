@@ -2048,6 +2048,75 @@ def test_ensure_monitor_membership_emits_join_events(tmp_path):
     assert events and events[0]["type"] == "join_resolved"
 
 
+def test_ensure_monitor_membership_network_timeout_not_join_failed(tmp_path):
+    """监控对象加入遇网络超时：不发 join_failed、不占 _join_cache、允许下次重试。
+
+    回归场景：网络请求 join_chat 超时（30 秒，网络异常）不应算作"加入失败"，
+    因为账号/频道本身没有问题，只是瞬时网络故障。
+    """
+    import asyncio
+
+    events: list = []
+    engine, _state = _engine(tmp_path)
+    engine.on_event = events.append
+    logs: list = []
+    engine.log = logs.append
+
+    # join_chat 模拟网络超时
+    client = JoinClient()
+
+    async def _timeout(target):
+        raise RuntimeError("网络请求 join_chat 超时（30 秒，网络异常）")
+
+    client.join_chat = _timeout
+
+    # 第一次尝试：不应发 join_failed，key 不应进 _join_cache
+    asyncio.run(engine._ensure_monitor_membership("acc", client, "ChatX"))
+    assert events == [], f"网络超时不应发任何事件，实际: {events}"
+    key = "acc|monitor|chatx"
+    assert key not in engine._join_cache, "网络超时不应消耗 _join_cache 尝试机会"
+
+    # 第二次尝试（模拟下次引擎运行）：因为 key 不在 _join_cache，应该再次调用
+    client2 = JoinClient()
+    client2.join_chat = _timeout
+    calls_before = len(client2.joined)
+    asyncio.run(engine._ensure_monitor_membership("acc", client2, "ChatX"))
+    assert client2.joined[calls_before:] == []  # 仍超时
+    assert events == []
+
+
+def test_join_single_target_network_timeout_does_not_block_retry(tmp_path):
+    """消息链接加入遇网络超时：调用方 discard key，下次扫描可重试。"""
+    import asyncio
+
+    class TimeoutClient:
+        def __init__(self):
+            self.calls = []
+
+        async def get_chat(self, target):
+            return SimpleNamespace(type=SimpleNamespace(name="CHANNEL"))
+
+        async def get_chat_member(self, target, user_id):
+            raise RuntimeError("USER_NOT_PARTICIPANT")
+
+        async def join_chat(self, target):
+            self.calls.append(target)
+            raise RuntimeError("网络请求 join_chat 超时（30 秒，网络异常）")
+
+    engine, _state = _engine(tmp_path)
+    client = TimeoutClient()
+    msg = _msg(text="加入 @ChanA 和 @ChanB 领奖")
+
+    joined_any, blocked = asyncio.run(
+        engine._join_from_message("acc", client, "LotteryBot", msg)
+    )
+    assert joined_any is False
+    assert blocked is True  # 网络超时被当作 blocked 处理
+    # key 应从 _join_cache 中被 discard
+    assert "acc|chana" not in engine._join_cache
+    assert "acc|chanb" not in engine._join_cache
+
+
 def test_engine_join_flood_wait_suspends(tmp_path):
     """JoinChannel 触发 FLOOD_WAIT 后暂停自动加入，恢复前跳过后续加入。"""
     import asyncio

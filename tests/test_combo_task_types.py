@@ -29,7 +29,7 @@ def test_build_combo_sub_spec_leave(tmp_path):
     assert spec["label"] == "批量退频道 (auto leave) · 默认配置"
     inner = spec["spec"]
     assert inner["account"] == "alice"
-    assert inner["session_dir"] == str(tmp_path)
+    assert inner["session_dir"] == "."
     assert inner["days"] == 14
     assert inner["include_groups"] is True
     assert inner["skip_pinned"] is False
