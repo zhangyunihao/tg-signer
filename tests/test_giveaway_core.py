@@ -4212,25 +4212,127 @@ def test_scan_cap_setting_roundtrip(tmp_path):
     assert load_giveaway_scan_cap(tmp_path) == 500
 
 
-def test_win_skip_keywords_setting_roundtrip(tmp_path):
-    """中奖消息跳过关键字（全局设置）：逗号分隔读写、去重、损坏文件回退空。"""
+def test_global_pacing_setting_roundtrip(tmp_path):
+    """全局调用上限/同时扫描账号数（全局设置）：默认值、往返读写、0=不限、损坏回退。"""
+    from tg_signer.giveaway_core import (
+        DEFAULT_GLOBAL_QPS,
+        DEFAULT_MAX_CONCURRENT_ACCOUNTS,
+    )
     from tg_signer.webui.giveaway import (
-        load_win_skip_keywords,
-        save_win_skip_keywords,
+        load_giveaway_global_qps,
+        load_giveaway_max_concurrent,
+        save_giveaway_global_qps,
+        save_giveaway_max_concurrent,
     )
 
-    assert load_win_skip_keywords(tmp_path) == []
-    save_win_skip_keywords(tmp_path, "感谢参与，未中奖, 未中奖")
-    assert load_win_skip_keywords(tmp_path) == ["感谢参与", "未中奖"]
-    # 列表形式（兼容旧配置）同样可读
-    save_win_skip_keywords(tmp_path, ["活动结束", " ", "未中奖"])
-    assert load_win_skip_keywords(tmp_path) == ["活动结束", "未中奖"]
+    assert load_giveaway_global_qps(tmp_path) == DEFAULT_GLOBAL_QPS
+    assert load_giveaway_max_concurrent(tmp_path) == DEFAULT_MAX_CONCURRENT_ACCOUNTS
+    save_giveaway_global_qps(tmp_path, 6)
+    save_giveaway_max_concurrent(tmp_path, 3)
+    assert load_giveaway_global_qps(tmp_path) == 6
+    assert load_giveaway_max_concurrent(tmp_path) == 3
+    # 0=不限，允许保存（排障时可临时关掉限速）
+    save_giveaway_global_qps(tmp_path, 0)
+    save_giveaway_max_concurrent(tmp_path, 0)
+    assert load_giveaway_global_qps(tmp_path) == 0
+    assert load_giveaway_max_concurrent(tmp_path) == 0
     (tmp_path / "webui_win_settings.json").write_text("{bad", encoding="utf-8")
-    assert load_win_skip_keywords(tmp_path) == []
+    assert load_giveaway_global_qps(tmp_path) == DEFAULT_GLOBAL_QPS
+    assert load_giveaway_max_concurrent(tmp_path) == DEFAULT_MAX_CONCURRENT_ACCOUNTS
 
 
-def test_win_skip_keywords_ignore_win_message(tmp_path):
-    """中奖消息命中跳过关键字：不推送事件、不转发。"""
+@pytest.mark.asyncio
+async def test_global_limiter_shared_across_instances(tmp_path):
+    """跨进程共享限速：两个独立实例（模拟两个任务进程）共用同一游标文件。"""
+    from tg_signer.giveaway_core import SHARED_RATE_FILE, _GlobalRateLimiter
+
+    shared = tmp_path / SHARED_RATE_FILE
+    first = _GlobalRateLimiter(100.0, shared)
+    second = _GlobalRateLimiter(100.0, shared)
+    started = time.monotonic()
+    await first.wait()
+    assert shared.exists()
+    await second.wait()
+    # 第二个实例必须等第一个预约的槽位，说明游标确实跨实例生效
+    assert time.monotonic() - started >= 0.009
+    local = _GlobalRateLimiter(100.0)
+    await local.wait()
+    assert not local.shared_path
+
+
+@pytest.mark.asyncio
+async def test_global_limiter_resets_stale_cursor(tmp_path):
+    """残留的远未来游标会被重置，不会把任务卡住几小时。"""
+    import json
+
+    from tg_signer.giveaway_core import SHARED_RATE_FILE, _GlobalRateLimiter
+
+    shared = tmp_path / SHARED_RATE_FILE
+    shared.write_text(json.dumps({"next_at": time.time() + 36000}), encoding="utf-8")
+    limiter = _GlobalRateLimiter(100.0, shared)
+    started = time.monotonic()
+    await limiter.wait()
+    assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.asyncio
+async def test_global_limiter_falls_back_without_shared_file(tmp_path, monkeypatch):
+    """共享状态文件不可用时退化为进程内限速，不抛错、不建文件。"""
+    from tg_signer.giveaway_core import SHARED_RATE_FILE, _GlobalRateLimiter
+
+    def _boom(*args, **kwargs):
+        raise TimeoutError("锁超时")
+
+    monkeypatch.setattr("tg_signer.giveaway_core.file_lock", _boom)
+    limiter = _GlobalRateLimiter(50.0, tmp_path / SHARED_RATE_FILE)
+    await limiter.wait()
+    assert not (tmp_path / SHARED_RATE_FILE).exists()
+
+
+def test_post_skip_keywords_setting_roundtrip(tmp_path):
+    """抽奖贴跳过关键字（全局设置）：逗号分隔读写、去重、兼容旧键、损坏文件回退空。"""
+    from tg_signer.webui.giveaway import (
+        load_post_skip_keywords,
+        save_post_skip_keywords,
+    )
+
+    assert load_post_skip_keywords(tmp_path) == []
+    save_post_skip_keywords(tmp_path, "嫩妹币，仅限新用户, 仅限新用户")
+    assert load_post_skip_keywords(tmp_path) == ["嫩妹币", "仅限新用户"]
+    # 1.0.82 的旧键 win_skip_keywords 仍可读（配置未丢失）
+    (tmp_path / "webui_win_settings.json").write_text(
+        '{"win_skip_keywords": "旧配置"}', encoding="utf-8"
+    )
+    assert load_post_skip_keywords(tmp_path) == ["旧配置"]
+    save_post_skip_keywords(tmp_path, ["活动结束", " ", "嫩妹币"])
+    assert load_post_skip_keywords(tmp_path) == ["活动结束", "嫩妹币"]
+    (tmp_path / "webui_win_settings.json").write_text("{bad", encoding="utf-8")
+    assert load_post_skip_keywords(tmp_path) == []
+
+
+def test_post_skip_keywords_skip_post(tmp_path):
+    """抽奖贴命中跳过关键字：扫描时直接跳过，不参与该抽奖。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.post_skip_keywords = ("嫩妹币",)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"LotteryBot"})
+
+    skipped = _msg(text="抽奖啦 奖品：嫩妹币 https://t.me/LotteryBot?start=skip1")
+    assert asyncio.run(engine._process_message("acc", client, skipped)) is None
+    assert client.started == []
+    assert any("命中跳过关键字" in line for line in logs)
+
+    # 未命中的帖子正常参与
+    ok = _msg(text="抽奖啦 奖品：红包 https://t.me/LotteryBot?start=ok1")
+    assert asyncio.run(engine._process_message("acc", client, ok)) == "joined"
+    assert client.started == [("LotteryBot", "ok1")]
+
+
+def test_post_skip_keywords_from_start(tmp_path):
+    """启动参数 post_skip_keywords 落到引擎配置。"""
     import asyncio
 
     engine, state = _engine(tmp_path)
@@ -4240,26 +4342,11 @@ def test_win_skip_keywords_ignore_win_message(tmp_path):
             chats=[],
             session_dir=tmp_path,
             log=lambda msg: None,
-            win_detect=True,
-            win_skip_keywords=["感谢参与"],
+            post_skip_keywords=["嫩妹币"],
             state=state,
         )
     )
-    assert engine.win_skip_keywords == ("感谢参与",)
-    state.add("acc", "LotteryBestBot", "p1")
-    state.save()
-    client = FakeClient(bot_users={"LotteryBestBot"})
-    client.history = [
-        _msg(text="💐💐💐 中奖提醒 💐💐💐 恭喜您中奖了！感谢参与", id=11),
-        _msg(text="💐💐💐 中奖提醒 💐💐💐 恭喜您中奖了！", id=10),
-    ]
-    events: list = []
-    engine.on_event = events.append
-    asyncio.run(engine._sweep_bot_wins("acc", client))
-    # 只有不含跳过关键字的那条按中奖处理
-    assert len(events) == 1
-    assert len(client.forwarded) == 1
-    assert client.forwarded[0][2] == (10,)
+    assert engine.post_skip_keywords == ("嫩妹币",)
 
 
 # ---------------- 防脚本验证（按顺序点击 emoji） ----------------

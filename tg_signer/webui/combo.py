@@ -38,6 +38,8 @@ from tg_signer.webui.components import (
 from tg_signer.webui.data import get_workdir, load_config
 from tg_signer.webui.giveaway import (
     channel_title_map,
+    load_giveaway_global_qps,
+    load_giveaway_max_concurrent,
     load_giveaway_timeout_min,
     load_task_store,
 )
@@ -260,10 +262,10 @@ def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | 
             f"{cfg.get('resolve_pace_min') or 0}–{cfg.get('resolve_pace_max') or 0}",
         ),
         (
-            "全局调用上限 / 同时扫描账号数",
+            "全局调用上限 / 同时扫描账号数（全局设置）",
             (
-                f"{cfg.get('global_qps') or 0} 次/秒 / "
-                f"{cfg.get('max_concurrent_accounts') or 0}（0=不限）"
+                f"{load_giveaway_global_qps(workdir):g} 次/秒 / "
+                f"{load_giveaway_max_concurrent(workdir)}（0=不限）"
             ),
         ),
         (

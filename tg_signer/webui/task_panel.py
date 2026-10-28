@@ -169,9 +169,6 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
                 "join_flood_buffer": gcfg.get("join_flood_buffer"),
                 "resolve_pace_min": gcfg.get("resolve_pace_min"),
                 "resolve_pace_max": gcfg.get("resolve_pace_max"),
-                # 全局限速：单账号子任务同样受任务级配置约束
-                "global_qps": gcfg.get("global_qps"),
-                "max_concurrent_accounts": gcfg.get("max_concurrent_accounts"),
                 # 超时（分钟→秒，全局设置）：0=不限
                 "timeout": load_giveaway_timeout_min(workdir) * 60,
             },

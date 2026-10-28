@@ -586,23 +586,26 @@ def _split_keywords(raw) -> List[str]:
     return cleaned
 
 
-def load_win_skip_keywords(workdir) -> List[str]:
-    """中奖消息跳过关键字（全局设置）：命中任一即不提醒、不转发，默认空。"""
+def load_post_skip_keywords(workdir) -> List[str]:
+    """抽奖贴跳过关键字（全局设置）：扫描时命中任一即不参与，默认空。"""
     path = Path(workdir) / WIN_SETTINGS_FILE
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
     except (OSError, ValueError):
-        logger.debug("读取中奖消息跳过关键字失败", exc_info=True)
+        logger.debug("读取抽奖贴跳过关键字失败", exc_info=True)
         return []
-    raw = data.get("win_skip_keywords") if isinstance(data, dict) else None
+    # 兼容 1.0.82 误命名为 win_skip_keywords 的旧配置
+    raw = None
+    if isinstance(data, dict):
+        raw = data.get("skip_keywords") or data.get("win_skip_keywords")
     return _split_keywords(raw)
 
 
-def save_win_skip_keywords(workdir, keywords) -> None:
-    """保存中奖消息跳过关键字（支持逗号分隔字符串或列表），保留其他键。"""
-    _update_win_settings(workdir, win_skip_keywords=_split_keywords(keywords))
+def save_post_skip_keywords(workdir, keywords) -> None:
+    """保存抽奖贴跳过关键字（支持逗号分隔字符串或列表），保留其他键。"""
+    _update_win_settings(workdir, skip_keywords=_split_keywords(keywords))
 
 
 # 抽奖任务超时默认值（分钟）：单独运行与组合子任务共用，0=不限
@@ -657,6 +660,57 @@ def save_giveaway_scan_cap(workdir, val) -> None:
     _update_win_settings(workdir, giveaway_scan_cap=value)
 
 
+def load_giveaway_global_qps(workdir) -> float:
+    """所有账号合计的 API 调用上限（次/秒，全局设置），默认 DEFAULT_GLOBAL_QPS。
+
+    0 表示不限制；非法值回落默认，避免限流保护被配置错误关掉。
+    """
+    path = Path(workdir) / WIN_SETTINGS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return DEFAULT_GLOBAL_QPS
+    try:
+        val = float(data.get("giveaway_global_qps"))  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return DEFAULT_GLOBAL_QPS
+    return max(0.0, val)
+
+
+def save_giveaway_global_qps(workdir, val) -> None:
+    """保存所有账号合计的 API 调用上限，保留文件中其他键。"""
+    try:
+        value = max(0.0, float(val))
+    except (TypeError, ValueError):
+        logger.debug("全局调用上限非法，忽略写入: %r", val)
+        return
+    _update_win_settings(workdir, giveaway_global_qps=value)
+
+
+def load_giveaway_max_concurrent(workdir) -> int:
+    """同时进行扫描的账号数上限（全局设置），默认 DEFAULT_MAX_CONCURRENT_ACCOUNTS。"""
+    path = Path(workdir) / WIN_SETTINGS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return DEFAULT_MAX_CONCURRENT_ACCOUNTS
+    try:
+        val = int(data.get("giveaway_max_concurrent"))  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_CONCURRENT_ACCOUNTS
+    return max(0, val)
+
+
+def save_giveaway_max_concurrent(workdir, val) -> None:
+    """保存同时进行扫描的账号数上限，保留文件中其他键。"""
+    try:
+        value = max(0, int(val))
+    except (TypeError, ValueError):
+        logger.debug("同时扫描账号数非法，忽略写入: %r", val)
+        return
+    _update_win_settings(workdir, giveaway_max_concurrent=value)
+
+
 # 任务配置字段 -> 默认值，加载旧配置时补齐缺失字段
 _CFG_FIELDS = {
     "accounts": list,
@@ -686,9 +740,6 @@ _CFG_FIELDS = {
     "join_flood_buffer": lambda: JOIN_FLOOD_BUFFER,  # FLOOD_WAIT 额外缓冲（秒）
     "resolve_pace_min": lambda: int(RESOLVE_PACE_RANGE[0]),  # 解析类调用最小间隔
     "resolve_pace_max": lambda: int(RESOLVE_PACE_RANGE[1]),
-    # 全局调用节奏（同进程跨账号共享）：0=不限制
-    "global_qps": lambda: int(DEFAULT_GLOBAL_QPS),  # 所有账号合计 API 次/秒
-    "max_concurrent_accounts": lambda: DEFAULT_MAX_CONCURRENT_ACCOUNTS,
     "last_joined": lambda: 0,  # 上次运行新参与抽奖总数
     "last_joined_by_account": dict,  # 上次运行各账号新参与数 {account: count}
     "last_joined_by_account_chat": dict,  # 上次运行各账号按来源频道/群组分布 {account: {chat: count}}
@@ -875,11 +926,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "join_flood_buffer": max(0, int(cfg.get("join_flood_buffer") or 0)),
                 "resolve_pace_min": max(0, int(cfg.get("resolve_pace_min") or 0)),
                 "resolve_pace_max": max(0, int(cfg.get("resolve_pace_max") or 0)),
-                # 全局调用节奏（跨账号共享，0=不限制）
-                "global_qps": max(0, int(cfg.get("global_qps") or 0)),
-                "max_concurrent_accounts": max(
-                    0, int(cfg.get("max_concurrent_accounts") or 0)
-                ),
                 # 上次执行的开始时间与时长（运行结束或停止时写入时长）
                 "last_start_time": str(cfg.get("last_start_time") or ""),
                 "last_duration": str(cfg.get("last_duration") or ""),
@@ -1095,8 +1141,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         join_flood_buffer_input.value = cfg.get("join_flood_buffer")
         resolve_pace_min_input.value = cfg.get("resolve_pace_min")
         resolve_pace_max_input.value = cfg.get("resolve_pace_max")
-        global_qps_input.value = cfg.get("global_qps")
-        max_concurrent_accounts_input.value = cfg.get("max_concurrent_accounts")
         _apply_rescue_visibility()
         _apply_source_visibility()
         for el in (
@@ -1123,8 +1167,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             join_flood_buffer_input,
             resolve_pace_min_input,
             resolve_pace_max_input,
-            global_qps_input,
-            max_concurrent_accounts_input,
         ):
             el.update()
         ui.notify("已复制任务参数，可修改后点击「确定添加」", type="positive")
@@ -1348,10 +1390,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             join_flood_buffer = max(0, int(join_flood_buffer_input.value or 0))
             resolve_pace_min = max(0, int(resolve_pace_min_input.value or 0))
             resolve_pace_max = max(0, int(resolve_pace_max_input.value or 0))
-            global_qps = max(0, int(global_qps_input.value or 0))
-            max_concurrent_accounts = max(
-                0, int(max_concurrent_accounts_input.value or 0)
-            )
             scan_limit = (
                 max(1, int(bot_scan_limit_input.value or BAIBAOXIANG_SCAN_LIMIT))
                 if source_type == SOURCE_BOT
@@ -1399,8 +1437,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "join_flood_buffer": join_flood_buffer,
             "resolve_pace_min": resolve_pace_min,
             "resolve_pace_max": resolve_pace_max,
-            "global_qps": global_qps,
-            "max_concurrent_accounts": max_concurrent_accounts,
         }
         # 编号以磁盘顺序为准并在文件锁内落盘：其它页面/实例的旧快照不会冲掉新任务
         try:
@@ -2314,35 +2350,16 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     max=600,
                     format="%d",
                 ).classes("w-48")
-            with ui.row().classes("items-end w-full gap-3 flex-wrap"):
-                global_qps_input = ui.number(
-                    label="全局调用上限（次/秒，0=不限）",
-                    value=int(DEFAULT_GLOBAL_QPS),
-                    min=0,
-                    max=100,
-                    format="%d",
-                ).classes("w-64")
-                max_concurrent_accounts_input = ui.number(
-                    label="同时扫描账号数上限（0=不限）",
-                    value=DEFAULT_MAX_CONCURRENT_ACCOUNTS,
-                    min=0,
-                    max=100,
-                    format="%d",
-                ).classes("w-64")
             ui.label(
                 "加入/解析节奏与滚动配额用于规避 Telegram 限流"
                 "（FLOOD_WAIT 短暂停、PEER_FLOOD 会数小时到数天无法加群）；"
                 "间隔在上下限之间随机取值，配额按账号统计且跨任务重启累计，"
                 "0 表示不限制。"
             ).classes("text-xs text-gray-500")
-            ui.label(
-                "全局调用上限与同时扫描账号数按「整个任务进程内所有账号合计」生效："
-                "429 的 Transport flood 按出口 IP 计数，账号越多越需要压低合计速率。"
-            ).classes("text-xs text-gray-500")
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             win_switch = ui.switch(
-                "中奖识别（检测到中奖消息自动提醒；转发目标与跳过关键字在右上角菜单「设置」）",
+                "中奖识别（检测到中奖消息自动提醒；转发目标、抽奖贴跳过关键字在右上角菜单「设置」）",
                 value=True,
             )
 

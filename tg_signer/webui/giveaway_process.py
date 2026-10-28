@@ -165,9 +165,6 @@ class GiveawayProcess:
             "join_hourly_cap": cfg.get("join_hourly_cap"),
             "join_daily_cap": cfg.get("join_daily_cap"),
             "join_flood_buffer": cfg.get("join_flood_buffer"),
-            # 全局调用节奏：跨账号共享的 QPS 与并扫账号数
-            "global_qps": cfg.get("global_qps"),
-            "max_concurrent_accounts": cfg.get("max_concurrent_accounts"),
         }
 
     def _read_stdout(self) -> None:

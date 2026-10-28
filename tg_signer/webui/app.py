@@ -47,15 +47,19 @@ from tg_signer.webui.data import (
 from tg_signer.webui.giveaway import (
     giveaway_block,
     list_known_channels,
+    load_giveaway_global_qps,
+    load_giveaway_max_concurrent,
     load_giveaway_scan_cap,
     load_giveaway_timeout_min,
+    load_post_skip_keywords,
     load_win_forward_targets,
-    load_win_skip_keywords,
     load_win_sweep_limit,
+    save_giveaway_global_qps,
+    save_giveaway_max_concurrent,
     save_giveaway_scan_cap,
     save_giveaway_timeout_min,
+    save_post_skip_keywords,
     save_win_forward_targets,
-    save_win_skip_keywords,
     save_win_sweep_limit,
 )
 from tg_signer.webui.messages import message_center_button
@@ -385,7 +389,11 @@ def _build_dashboard(container) -> None:
             sweep_limit = await run.io_bound(load_win_sweep_limit, state.workdir)
             timeout_min = await run.io_bound(load_giveaway_timeout_min, state.workdir)
             scan_cap = await run.io_bound(load_giveaway_scan_cap, state.workdir)
-            skip_keywords = await run.io_bound(load_win_skip_keywords, state.workdir)
+            skip_keywords = await run.io_bound(load_post_skip_keywords, state.workdir)
+            global_qps = await run.io_bound(load_giveaway_global_qps, state.workdir)
+            max_concurrent = await run.io_bound(
+                load_giveaway_max_concurrent, state.workdir
+            )
             with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
                 add_dialog_close_button(dialog)
                 ui.label("设置").classes("text-lg font-semibold")
@@ -457,16 +465,39 @@ def _build_dashboard(container) -> None:
                     max=10000,
                     precision=0,
                 ).classes("w-full")
-                # 中奖消息跳过关键字（全局）：命中的"中奖"消息不提醒、不转发
-                ui.label("中奖消息跳过关键字").classes("text-lg font-semibold mt-2")
+                # 全局调用节奏（全局）：跨账号共享的 API 速率与并发账号数
+                ui.label("全局调用上限与同时扫描账号数").classes(
+                    "text-lg font-semibold mt-2"
+                )
                 ui.label(
-                    "中奖消息包含其中任一字符串时视为非中奖，不转发、不推送提醒"
+                    "按「所有同时运行的抽奖任务 + 全部账号合计」生效（同目录任务共用"
+                    "一个限速队列），用于规避 429 Transport flood（按出口 IP 计数，"
+                    "账号越多越需要压低合计速率）；0=不限，默认 8 次/秒、4 个账号。"
+                ).classes("text-xs text-gray-500")
+                global_qps_input = ui.number(
+                    label="全局调用上限（次/秒，0=不限）",
+                    value=global_qps,
+                    min=0,
+                    max=100,
+                    precision=0,
+                ).classes("w-full")
+                max_concurrent_input = ui.number(
+                    label="同时扫描账号数（0=不限）",
+                    value=max_concurrent,
+                    min=0,
+                    max=100,
+                    precision=0,
+                ).classes("w-full")
+                # 抽奖贴跳过关键字（全局）：扫描时命中的抽奖帖不参与
+                ui.label("抽奖贴跳过关键字").classes("text-lg font-semibold mt-2")
+                ui.label(
+                    "抽奖任务扫描到的帖子包含其中任一字符串时直接跳过、不参与该抽奖"
                     "（逗号分隔，留空则不过滤）。"
                 ).classes("text-xs text-gray-500")
                 skip_kw_input = ui.input(
                     label="跳过关键字（逗号分隔）",
                     value="，".join(skip_keywords),
-                    placeholder="如：感谢参与，未中奖",
+                    placeholder="如：嫩妹币，仅限新用户",
                 ).classes("w-full")
 
                 async def apply_settings() -> None:
@@ -490,7 +521,17 @@ def _build_dashboard(container) -> None:
                             save_giveaway_scan_cap, state.workdir, scan_cap_input.value
                         )
                         await run.io_bound(
-                            save_win_skip_keywords,
+                            save_giveaway_global_qps,
+                            state.workdir,
+                            global_qps_input.value,
+                        )
+                        await run.io_bound(
+                            save_giveaway_max_concurrent,
+                            state.workdir,
+                            max_concurrent_input.value,
+                        )
+                        await run.io_bound(
+                            save_post_skip_keywords,
                             state.workdir,
                             skip_kw_input.value,
                         )

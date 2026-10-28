@@ -49,12 +49,6 @@ def engine_kwargs_from_spec(spec: dict) -> Dict[str, Any]:
             return None
         return int(val)
 
-    def _optional_float(key: str) -> Optional[float]:
-        val = spec.get(key)
-        if val is None or val == "":
-            return None
-        return float(val)
-
     # 兼容单账号（组合任务）与多账号（WebUI 抽奖任务）两种 spec
     if spec.get("accounts") is not None:
         accounts = [
@@ -89,9 +83,6 @@ def engine_kwargs_from_spec(spec: dict) -> Dict[str, Any]:
         "join_hourly_cap": _optional_int("join_hourly_cap"),
         "join_daily_cap": _optional_int("join_daily_cap"),
         "join_flood_buffer": _optional_int("join_flood_buffer"),
-        # 全局调用节奏：跨账号共享的 QPS 与并扫账号数（None 沿用引擎默认值）
-        "global_qps": _optional_float("global_qps"),
-        "max_concurrent_accounts": _optional_int("max_concurrent_accounts"),
         "confirm_wait": (
             int(spec["confirm_wait"]) if spec.get("confirm_wait") is not None else 8
         ),
@@ -154,9 +145,11 @@ async def run_giveaway(spec: dict) -> int:
         return 2
     from tg_signer.webui.data import chat_username_map, load_two_way_accounts
     from tg_signer.webui.giveaway import (
+        load_giveaway_global_qps,
+        load_giveaway_max_concurrent,
         load_giveaway_scan_cap,
+        load_post_skip_keywords,
         load_win_forward_targets,
-        load_win_skip_keywords,
         load_win_sweep_limit,
     )
     from tg_signer.webui.random_chat import parse_chat_id
@@ -177,10 +170,13 @@ async def run_giveaway(spec: dict) -> int:
     ]
     # 中奖回扫条数：全局设置，回扫各 bot 私聊最近 N 条消息找中奖通知
     kwargs["win_sweep_limit"] = load_win_sweep_limit(workdir)
-    # 中奖消息跳过关键字：全局设置，命中任一关键字的"中奖"消息不提醒/不转发
-    kwargs["win_skip_keywords"] = load_win_skip_keywords(workdir)
+    # 抽奖贴跳过关键字：全局设置，扫描时命中任一关键字的帖子不参与
+    kwargs["post_skip_keywords"] = load_post_skip_keywords(workdir)
     # 频道/群组单轮扫描上限：全局设置，关键词未命中时也按此条数截断
     kwargs["scan_cap"] = load_giveaway_scan_cap(workdir)
+    # 全局调用节奏：右上角「设置」配置，覆盖任务级旧配置（跨账号共享）
+    kwargs["global_qps"] = load_giveaway_global_qps(workdir)
+    kwargs["max_concurrent_accounts"] = load_giveaway_max_concurrent(workdir)
     engine = GiveawayEngine()
     finished = asyncio.Event()
 

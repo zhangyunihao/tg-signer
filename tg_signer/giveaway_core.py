@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import random
 import re
@@ -72,6 +73,8 @@ from tg_signer.giveaway_state import (
     JOIN_LOG_WINDOW,
     GiveawayState,
 )
+from tg_signer.locks import file_lock
+from tg_signer.utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +197,15 @@ DEFAULT_GLOBAL_QPS = 8.0
 DEFAULT_MAX_CONCURRENT_ACCOUNTS = 4
 
 
+# 全局限速游标文件（位于 workdir）：并行运行的多个抽奖任务进程共用同一
+# 令牌桶，让「全局调用上限」按所有任务合计生效（锁文件为 <name>.lock）。
+SHARED_RATE_FILE = "giveaway_global_rate.json"
+
+# 共享游标距当前超过该秒数视为异常（时钟跳变/历史残留），直接重置，
+# 避免任务长时间等待。12 账号 × 8 次/秒的排队量远小于该值。
+SHARED_RATE_MAX_WAIT = 10.0
+
+
 # —— 网络调用统一超时 ——
 # 半开连接（手机切换网络/代理僵死）下 Pyrogram 请求可能永久挂起，导致引擎
 # 任务协程卡死、WebUI 状态永不收敛。所有经引擎客户端发出的请求统一加超时：
@@ -292,30 +304,68 @@ def _install_transport_flood_probe() -> None:
 
 
 class _GlobalRateLimiter:
-    """进程内跨账号的令牌桶：限制所有账号合计的 API 发起速率。
+    """跨账号（可选跨进程）的令牌桶：限制所有账号合计的 API 发起速率。
 
     在锁内预约「下次可用时刻」并把游标推进一个间隔，睡眠放在锁外，
     因此多个账号是排队等待而非串行执行；rate<=0 表示不限制。
+
+    传入 ``shared_path`` 时把游标落盘到 workdir 下的状态文件（带文件锁），
+    同目录下并行运行的多个抽奖任务进程共用同一个令牌桶，避免多任务叠加
+    击穿出口 IP 的 429 阈值。文件不可用时自动退化为进程内限速。
     """
 
-    def __init__(self, qps: float) -> None:
+    def __init__(self, qps: float, shared_path: Optional[Path] = None) -> None:
         self.qps = max(0.0, float(qps))
         self.interval = 1.0 / self.qps if self.qps > 0 else 0.0
+        self.shared_path = Path(shared_path) if shared_path else None
         self._next_at = 0.0
         self._lock: Optional[asyncio.Lock] = None
 
     async def wait(self) -> None:
         if self.interval <= 0:
             return
+        delay: Optional[float] = None
+        if self.shared_path is not None:
+            # 文件锁是阻塞式 IO，放线程池里避免卡住事件循环
+            delay = await asyncio.to_thread(self._reserve_shared)
+        if delay is None:
+            delay = await self._reserve_local()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    async def _reserve_local(self) -> float:
+        """进程内预约一个槽位（跨进程不可用时的退化路径）。"""
         if self._lock is None:
             self._lock = asyncio.Lock()
         loop = asyncio.get_running_loop()
         async with self._lock:
             start = max(loop.time(), self._next_at)
             self._next_at = start + self.interval
-        delay = start - loop.time()
-        if delay > 0:
-            await asyncio.sleep(delay)
+        return start - loop.time()
+
+    def _reserve_shared(self) -> Optional[float]:
+        """跨进程预约一个调用槽位，返回需要等待的秒数。
+
+        读写失败返回 None，由调用方退化为进程内限速，避免限速状态文件异常
+        直接把任务卡死。
+        """
+        now = time.time()
+        try:
+            with file_lock(self.shared_path):
+                try:
+                    data = json.loads(self.shared_path.read_text(encoding="utf-8"))
+                    next_at = float(data.get("next_at") or 0.0)
+                except (OSError, ValueError, TypeError):
+                    next_at = 0.0
+                # 残留的远未来游标（时钟跳变/文件损坏）直接重置，避免长时间卡住
+                if next_at - now > SHARED_RATE_MAX_WAIT:
+                    next_at = now
+                slot = max(now, next_at)
+                atomic_write_json(self.shared_path, {"next_at": slot + self.interval})
+            return slot - now
+        except (OSError, ValueError, TimeoutError):
+            logger.debug("跨进程限速状态读写失败，退化为进程内限速", exc_info=True)
+            return None
 
 
 class _TimeoutClient:
@@ -607,7 +657,7 @@ class GiveawayEngine:
         self.join_hourly_cap: int = JOIN_HOURLY_CAP
         self.join_daily_cap: int = JOIN_DAILY_CAP
         self.join_flood_buffer: int = JOIN_FLOOD_BUFFER
-        # 全局调用节奏（任务级可配置）：跨账号共享的 API QPS 上限与并扫账号数
+        # 全局调用节奏（右上角「设置」全局配置）：跨账号共享的 QPS 上限与并扫账号数
         self.global_qps: float = DEFAULT_GLOBAL_QPS
         self.max_concurrent_accounts: int = DEFAULT_MAX_CONCURRENT_ACCOUNTS
         self._api_limiter = _GlobalRateLimiter(self.global_qps)
@@ -645,8 +695,8 @@ class GiveawayEngine:
         self.win_forward_targets: List[Any] = ["me"]
         # 中奖回扫条数：每次回扫各 bot 私聊最近多少条消息找中奖通知
         self.win_sweep_limit = WIN_SWEEP_LIMIT
-        # 中奖消息跳过关键字：文本命中任一关键字即不提醒、不转发（全局设置）
-        self.win_skip_keywords: Tuple[str, ...] = ()
+        # 抽奖贴跳过关键字：扫描时帖子文本命中任一关键字即不参与（全局设置）
+        self.post_skip_keywords: Tuple[str, ...] = ()
         # 已处理的中奖消息：{account|bot|msg_id}，进程内去重（跨重启靠状态文件）
         self._win_handled: set = set()
         # 标记为「双向」的账户集合：发言数要求类抽奖自动跳过
@@ -737,7 +787,7 @@ class GiveawayEngine:
         win_detect: bool = True,
         win_forward_target=None,
         win_sweep_limit: Optional[int] = None,
-        win_skip_keywords: Optional[Iterable[str]] = None,
+        post_skip_keywords: Optional[Iterable[str]] = None,
         two_way_accounts: Optional[Iterable[str]] = None,
         chat_usernames: Optional[Dict[str, str]] = None,
         state: Optional[GiveawayState] = None,
@@ -774,9 +824,9 @@ class GiveawayEngine:
         self.win_sweep_limit = (
             max(1, int(win_sweep_limit)) if win_sweep_limit else WIN_SWEEP_LIMIT
         )
-        # 中奖消息跳过关键字：命中即视为非中奖（空配置＝不过滤）
-        self.win_skip_keywords = tuple(
-            str(k).strip() for k in (win_skip_keywords or ()) if str(k).strip()
+        # 抽奖贴跳过关键字：扫描到的帖子命中任一关键字即跳过、不参与（含置顶）
+        self.post_skip_keywords = tuple(
+            str(k).strip() for k in (post_skip_keywords or ()) if str(k).strip()
         )
         self._win_handled.clear()
         # 口令错峰排期按运行周期重置，避免上一轮残留的等待时刻拖慢本次启动
@@ -809,7 +859,13 @@ class GiveawayEngine:
             if global_qps is not None
             else DEFAULT_GLOBAL_QPS
         )
-        self._api_limiter = _GlobalRateLimiter(self.global_qps)
+        # 跨进程共享游标：同 workdir 下并行运行的抽奖任务共用同一令牌桶
+        shared_path = (
+            self._state.path.parent / SHARED_RATE_FILE
+            if self._state is not None
+            else None
+        )
+        self._api_limiter = _GlobalRateLimiter(self.global_qps, shared_path)
         self.max_concurrent_accounts = (
             max(0, int(max_concurrent_accounts))
             if max_concurrent_accounts is not None
@@ -1682,10 +1738,6 @@ class GiveawayEngine:
         # 奖品为站内虚拟积分「嫩妹币」：不转发、不推送
         if WIN_IGNORE_PRIZE_RE.search(text):
             return
-        # 用户配置的中奖消息跳过关键字：命中即不提醒、不转发
-        if any(kw in text for kw in self.win_skip_keywords):
-            logger.debug("中奖消息命中跳过关键字，忽略：%s", text[:80])
-            return
         mid = getattr(message, "id", None)
         if not self._mark_win_handled(account, bot_username, mid, text):
             return
@@ -2018,6 +2070,11 @@ class GiveawayEngine:
         if message_is_draw_announce(message):
             if log_skips:
                 self.log(f"[{account}] {tag} 开奖结果公告，跳过")
+            return None
+        # 抽奖贴跳过关键字：帖文命中任一关键字即不参与（置顶路径同样生效）
+        text = _message_text(message) or ""
+        if any(kw in text for kw in self.post_skip_keywords):
+            self.log(f"[{account}] {tag} 命中跳过关键字，跳过")
             return None
         links = self._candidate_bot_links(message)
         if not links:
