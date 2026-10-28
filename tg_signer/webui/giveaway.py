@@ -17,6 +17,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 from nicegui import ui
 
 from tg_signer.giveaway_core import (
+    DEFAULT_GLOBAL_QPS,
+    DEFAULT_MAX_CONCURRENT_ACCOUNTS,
     DEFAULT_SCAN_CAP,
     JOIN_DAILY_CAP,
     JOIN_FLOOD_BUFFER,
@@ -41,6 +43,11 @@ from tg_signer.webui.common import (
     pretty_json,
     read_file_tail,
     with_select_all,
+)
+from tg_signer.webui.components import (
+    LOG_AREA_CLASS,
+    LogFullscreen,
+    exit_fullscreen_button,
 )
 from tg_signer.webui.data import load_user_infos
 from tg_signer.webui.giveaway_process import GiveawayProcess
@@ -565,6 +572,39 @@ def save_win_sweep_limit(workdir, limit) -> None:
     _update_win_settings(workdir, win_sweep_limit=value)
 
 
+def _split_keywords(raw) -> List[str]:
+    """逗号（中英文）、顿号、空白分隔的关键字串 → 去重列表。"""
+    if isinstance(raw, str):
+        parts = re.split(r"[,，、\s]+", raw)
+    else:
+        parts = list(raw or [])
+    cleaned: List[str] = []
+    for item in parts:
+        kw = str(item).strip()
+        if kw and kw not in cleaned:
+            cleaned.append(kw)
+    return cleaned
+
+
+def load_win_skip_keywords(workdir) -> List[str]:
+    """中奖消息跳过关键字（全局设置）：命中任一即不提醒、不转发，默认空。"""
+    path = Path(workdir) / WIN_SETTINGS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        logger.debug("读取中奖消息跳过关键字失败", exc_info=True)
+        return []
+    raw = data.get("win_skip_keywords") if isinstance(data, dict) else None
+    return _split_keywords(raw)
+
+
+def save_win_skip_keywords(workdir, keywords) -> None:
+    """保存中奖消息跳过关键字（支持逗号分隔字符串或列表），保留其他键。"""
+    _update_win_settings(workdir, win_skip_keywords=_split_keywords(keywords))
+
+
 # 抽奖任务超时默认值（分钟）：单独运行与组合子任务共用，0=不限
 GIVEAWAY_TIMEOUT_MIN = 10
 
@@ -646,6 +686,9 @@ _CFG_FIELDS = {
     "join_flood_buffer": lambda: JOIN_FLOOD_BUFFER,  # FLOOD_WAIT 额外缓冲（秒）
     "resolve_pace_min": lambda: int(RESOLVE_PACE_RANGE[0]),  # 解析类调用最小间隔
     "resolve_pace_max": lambda: int(RESOLVE_PACE_RANGE[1]),
+    # 全局调用节奏（同进程跨账号共享）：0=不限制
+    "global_qps": lambda: int(DEFAULT_GLOBAL_QPS),  # 所有账号合计 API 次/秒
+    "max_concurrent_accounts": lambda: DEFAULT_MAX_CONCURRENT_ACCOUNTS,
     "last_joined": lambda: 0,  # 上次运行新参与抽奖总数
     "last_joined_by_account": dict,  # 上次运行各账号新参与数 {account: count}
     "last_joined_by_account_chat": dict,  # 上次运行各账号按来源频道/群组分布 {account: {chat: count}}
@@ -832,6 +875,11 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "join_flood_buffer": max(0, int(cfg.get("join_flood_buffer") or 0)),
                 "resolve_pace_min": max(0, int(cfg.get("resolve_pace_min") or 0)),
                 "resolve_pace_max": max(0, int(cfg.get("resolve_pace_max") or 0)),
+                # 全局调用节奏（跨账号共享，0=不限制）
+                "global_qps": max(0, int(cfg.get("global_qps") or 0)),
+                "max_concurrent_accounts": max(
+                    0, int(cfg.get("max_concurrent_accounts") or 0)
+                ),
                 # 上次执行的开始时间与时长（运行结束或停止时写入时长）
                 "last_start_time": str(cfg.get("last_start_time") or ""),
                 "last_duration": str(cfg.get("last_duration") or ""),
@@ -1047,6 +1095,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         join_flood_buffer_input.value = cfg.get("join_flood_buffer")
         resolve_pace_min_input.value = cfg.get("resolve_pace_min")
         resolve_pace_max_input.value = cfg.get("resolve_pace_max")
+        global_qps_input.value = cfg.get("global_qps")
+        max_concurrent_accounts_input.value = cfg.get("max_concurrent_accounts")
         _apply_rescue_visibility()
         _apply_source_visibility()
         for el in (
@@ -1073,6 +1123,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             join_flood_buffer_input,
             resolve_pace_min_input,
             resolve_pace_max_input,
+            global_qps_input,
+            max_concurrent_accounts_input,
         ):
             el.update()
         ui.notify("已复制任务参数，可修改后点击「确定添加」", type="positive")
@@ -1296,6 +1348,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             join_flood_buffer = max(0, int(join_flood_buffer_input.value or 0))
             resolve_pace_min = max(0, int(resolve_pace_min_input.value or 0))
             resolve_pace_max = max(0, int(resolve_pace_max_input.value or 0))
+            global_qps = max(0, int(global_qps_input.value or 0))
+            max_concurrent_accounts = max(
+                0, int(max_concurrent_accounts_input.value or 0)
+            )
             scan_limit = (
                 max(1, int(bot_scan_limit_input.value or BAIBAOXIANG_SCAN_LIMIT))
                 if source_type == SOURCE_BOT
@@ -1343,6 +1399,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "join_flood_buffer": join_flood_buffer,
             "resolve_pace_min": resolve_pace_min,
             "resolve_pace_max": resolve_pace_max,
+            "global_qps": global_qps,
+            "max_concurrent_accounts": max_concurrent_accounts,
         }
         # 编号以磁盘顺序为准并在文件锁内落盘：其它页面/实例的旧快照不会冲掉新任务
         try:
@@ -1931,20 +1989,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             type="positive",
         )
 
-    fullscreen_on = False
-
     def toggle_fullscreen() -> None:
         """切换共用日志全屏态：日志区 fixed 铺满视口，右上角显示退出按钮。"""
-        nonlocal fullscreen_on
-        fullscreen_on = not fullscreen_on
-        if fullscreen_on:
-            send_log.classes(add="tgs-page-log-fullscreen")
-            exit_full_btn.classes(add="tgs-log-exit-visible")
-        else:
-            send_log.classes(remove="tgs-page-log-fullscreen")
-            exit_full_btn.classes(remove="tgs-log-exit-visible")
-        send_log.update()
-        exit_full_btn.update()
+        fullscreen.toggle()
 
     with ui.row().classes("w-full items-center justify-between"):
         ui.label("共用日志（所有任务）").classes("font-semibold")
@@ -1961,7 +2008,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             ui.button(icon="fullscreen", on_click=toggle_fullscreen).props(
                 "flat round dense"
             ).tooltip("全屏显示")
-    send_log = ui.log(max_lines=1000).classes("w-full h-40")
+    send_log = ui.log(max_lines=1000).classes(LOG_AREA_CLASS).style("height: 320px")
     log_buf = _GLOBAL_LOGS.setdefault(wd_key, [])
     _seen = {"n": len(log_buf)}
     for line in log_buf:
@@ -1971,11 +2018,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             logger.debug("回放历史日志到界面日志区失败", exc_info=True)
 
     # 退出全屏的悬浮按钮：仅全屏时 fixed 显示在视口右上角，平时不占布局
-    exit_full_btn = (
-        ui.button(icon="close", on_click=toggle_fullscreen)
-        .props("flat round dense unelevated")
-        .classes("tgs-log-exit-full")
-    )
+    exit_full_btn = exit_fullscreen_button(toggle_fullscreen)
+    fullscreen = LogFullscreen(send_log, exit_full_btn)
 
     client = ui.context.client
 
@@ -2270,16 +2314,35 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     max=600,
                     format="%d",
                 ).classes("w-48")
+            with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+                global_qps_input = ui.number(
+                    label="全局调用上限（次/秒，0=不限）",
+                    value=int(DEFAULT_GLOBAL_QPS),
+                    min=0,
+                    max=100,
+                    format="%d",
+                ).classes("w-64")
+                max_concurrent_accounts_input = ui.number(
+                    label="同时扫描账号数上限（0=不限）",
+                    value=DEFAULT_MAX_CONCURRENT_ACCOUNTS,
+                    min=0,
+                    max=100,
+                    format="%d",
+                ).classes("w-64")
             ui.label(
                 "加入/解析节奏与滚动配额用于规避 Telegram 限流"
                 "（FLOOD_WAIT 短暂停、PEER_FLOOD 会数小时到数天无法加群）；"
                 "间隔在上下限之间随机取值，配额按账号统计且跨任务重启累计，"
                 "0 表示不限制。"
             ).classes("text-xs text-gray-500")
+            ui.label(
+                "全局调用上限与同时扫描账号数按「整个任务进程内所有账号合计」生效："
+                "429 的 Transport flood 按出口 IP 计数，账号越多越需要压低合计速率。"
+            ).classes("text-xs text-gray-500")
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             win_switch = ui.switch(
-                "中奖识别（检测到中奖消息自动提醒；转发目标在右上角菜单「设置」）",
+                "中奖识别（检测到中奖消息自动提醒；转发目标与跳过关键字在右上角菜单「设置」）",
                 value=True,
             )
 

@@ -385,6 +385,9 @@ def test_giveaway_runner_engine_kwargs():
     assert kwargs["join_hourly_cap"] is None
     assert kwargs["join_daily_cap"] is None
     assert kwargs["join_flood_buffer"] is None
+    # 旧任务未配置全局限速：保持 None，由引擎使用默认常量
+    assert kwargs["global_qps"] is None
+    assert kwargs["max_concurrent_accounts"] is None
 
 
 def test_giveaway_runner_limits_from_spec():

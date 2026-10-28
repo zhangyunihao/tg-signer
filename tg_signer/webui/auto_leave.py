@@ -33,6 +33,11 @@ from tg_signer.webui.common import (
     mobile_card_result,
     with_select_all,
 )
+from tg_signer.webui.components import (
+    LOG_AREA_CLASS,
+    LogFullscreen,
+    exit_fullscreen_button,
+)
 from tg_signer.webui.random_chat import (
     build_account_options,
     list_session_names,
@@ -46,10 +51,8 @@ _NET_CALL_TIMEOUT = 90
 CONFIG_NAME = "auto_leave_config.json"
 LEAVE_TASKS_FILE = "webui_leave_tasks.json"
 
-# 保护关键字（频道名命中即不自动退出，仅在结果中展示供手动勾选）
+# 内置保护关键字：仅作为未配置页面级「默认保护关键字」时的兜底
 UNSELECT_KEYWORDS = ("抽奖", "嫩妹社", "报告", "榜")
-
-DEFAULT_KEYWORDS = "抽奖,嫩妹社,报告,榜"
 
 # 运行中任务的停止开关（跨浏览器标签页共享，供「停止所有任务」使用）
 # {workdir|task_id|token -> stop_fn}
@@ -140,6 +143,8 @@ def load_config(workdir) -> Dict:
         "skip_pinned": True,
         # 页面级「扫描跳过」配置：标题命中任一关键字的频道/群组直接跳过
         "skip_keywords": [],
+        # 页面级「默认保护关键字」：新建任务与自动任务的保护字初始值，空表示用内置默认
+        "default_keywords": [],
     }
     try:
         data = json.loads(_config_path(workdir).read_text(encoding="utf-8"))
@@ -164,6 +169,16 @@ def load_skip_keywords(workdir) -> List[str]:
         for kw in (load_config(workdir).get("skip_keywords") or [])
         if str(kw).strip()
     ]
+
+
+def load_default_keywords(workdir) -> List[str]:
+    """读取页面级「默认保护关键字」，未配置时回落到内置默认值。"""
+    kws = [
+        str(kw).strip()
+        for kw in (load_config(workdir).get("default_keywords") or [])
+        if str(kw).strip()
+    ]
+    return kws or list(UNSELECT_KEYWORDS)
 
 
 def _tasks_path(workdir) -> Path:
@@ -200,7 +215,7 @@ def load_leave_tasks(workdir) -> List[Dict]:
                 "days": float(cfg.get("days") or 7),
                 "scan_types": _scan_types_of(cfg),
                 "skip_pinned": bool(cfg.get("skip_pinned", True)),
-                "keywords": list(UNSELECT_KEYWORDS),
+                "keywords": load_default_keywords(workdir),
                 "include_keywords": [],
                 "auto_leave": False,
             }
@@ -270,7 +285,7 @@ def create_auto_leave_task(
         "days": float(days),
         "scan_types": "channel",
         "skip_pinned": True,
-        "keywords": list(UNSELECT_KEYWORDS),
+        "keywords": load_default_keywords(workdir),
         "include_keywords": [],
         "auto_leave": True,
         "status": str(status or "待执行"),
@@ -607,9 +622,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             except Exception:
                 logger.debug("推送日志到界面日志区失败", exc_info=True)
 
-    def _skip_btn_text() -> str:
+    def _settings_btn_text() -> str:
         n = len(load_skip_keywords(workdir))
-        return f"跳过设置（{n}）" if n else "跳过设置"
+        return f"设置（跳过 {n}）" if n else "设置"
 
     def find_task(task_id: str) -> Dict | None:
         return next((t for t in tasks if t["id"] == task_id), None)
@@ -856,7 +871,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         days_input.value = float(d) if d is not None else 7
         scope_sel.value = _scan_types_of(prefill)
         sp.value = bool(prefill.get("skip_pinned", True))
-        kw_input.value = ",".join(prefill.get("keywords") or []) or DEFAULT_KEYWORDS
+        kw_input.value = ",".join(prefill.get("keywords") or []) or ",".join(
+            load_default_keywords(workdir)
+        )
         ik_input.value = ",".join(prefill.get("include_keywords") or [])
         auto_cb.value = bool(prefill.get("auto_leave"))
         _sync_auto_cb()
@@ -1225,10 +1242,10 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         ui.label(
             "每次执行都会在列表新增一条记录，可复制配置再次执行；点击「明细」查看命中的频道"
         ).classes("text-xs text-gray-500 ml-auto")
-        skip_btn = (
-            ui.button(_skip_btn_text(), on_click=lambda: open_skip_dialog())
+        settings_btn = (
+            ui.button(_settings_btn_text(), on_click=lambda: open_settings_dialog())
             .props("flat dense color=primary")
-            .tooltip("扫描时直接跳过指定频道/群组（标题命中即跳过，不展示也不退出）")
+            .tooltip("页面级设置：默认保护关键字与扫描跳过")
         )
 
     leave_table = (
@@ -1359,9 +1376,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             "不更新天数阈值支持小数（如 0.5 天）；填 0 表示扫描全部频道/群组，"
             "此时不允许勾选自动退出"
         ).classes("text-xs text-gray-500")
-        kw_input = ui.input("保护关键字（逗号分隔）", value=DEFAULT_KEYWORDS).classes(
-            "w-full"
-        )
+        kw_input = ui.input(
+            "保护关键字（逗号分隔）", value=",".join(load_default_keywords(workdir))
+        ).classes("w-full")
         ik_input = ui.input(
             "包含关键字（逗号分隔，任一命中即算，留空不限制）", value=""
         ).classes("w-full")
@@ -1413,41 +1430,61 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             ui.button("取消", on_click=delete_dialog.close).props("flat")
             ui.button("删除", on_click=_do_delete).props("color=negative")
 
-    # ---- 扫描跳过设置：页面级配置，标题命中的频道/群组扫描时直接跳过 ----
+    # ---- 页面级设置：默认保护关键字 + 扫描跳过，对所有退频道任务生效 ----
 
-    def open_skip_dialog() -> None:
+    def open_settings_dialog() -> None:
+        default_kw_input.value = ", ".join(load_default_keywords(workdir))
         skip_input.value = ", ".join(load_skip_keywords(workdir))
+        default_kw_input.update()
         skip_input.update()
-        skip_dialog.open()
+        settings_dialog.open()
 
-    def _save_skip() -> None:
-        kws = _split_keywords(str(skip_input.value or "").replace("\n", ","))
+    def _save_settings() -> None:
+        default_kws = _split_keywords(
+            str(default_kw_input.value or "").replace("\n", ",")
+        )
+        skip_kws = _split_keywords(str(skip_input.value or "").replace("\n", ","))
         cfg = load_config(workdir)
-        cfg["skip_keywords"] = kws
+        cfg["default_keywords"] = default_kws
+        cfg["skip_keywords"] = skip_kws
         save_config(workdir, cfg)
-        skip_btn.text = _skip_btn_text()
-        skip_btn.update()
-        skip_dialog.close()
-        log("扫描跳过设置已更新：" + (", ".join(kws) if kws else "（空）"))
+        settings_btn.text = _settings_btn_text()
+        settings_btn.update()
+        settings_dialog.close()
+        log(
+            "退频道设置已更新：默认保护关键字 "
+            + (", ".join(default_kws) if default_kws else "（空，将回落内置默认）")
+            + "；扫描跳过 "
+            + (", ".join(skip_kws) if skip_kws else "（空）")
+        )
 
     with (
-        ui.dialog() as skip_dialog,
+        ui.dialog() as settings_dialog,
         ui.card().classes("w-[520px] max-w-[96vw]"),
     ):
-        add_dialog_close_button(skip_dialog)
-        ui.label("扫描跳过设置").classes("text-lg font-semibold")
+        add_dialog_close_button(settings_dialog)
+        ui.label("退频道设置").classes("text-lg font-semibold")
         ui.label(
-            "标题命中任一名称/关键字的频道、群组在扫描时直接跳过（不展示、不自动退出）；"
-            "多个用逗号或换行分隔，对所有退频道任务（含自动/组合）生效。"
+            "默认保护关键字：新建任务与自动任务（含频道已满、组合任务）的保护字初始值，"
+            "标题命中即不自动退出；留空则使用内置默认。"
         ).classes("text-xs text-gray-500")
+        default_kw_input = (
+            ui.textarea("默认保护关键字（逗号分隔）", value="")
+            .classes("w-full")
+            .props("outlined autogrow")
+        )
+        ui.label(
+            "扫描跳过：标题命中任一名称/关键字的频道、群组在扫描时直接跳过"
+            "（不展示、不自动退出）；对所有退频道任务（含自动/组合）生效。"
+        ).classes("text-xs text-gray-500 mt-2")
         skip_input = (
             ui.textarea("跳过的频道/群组名称", value="")
             .classes("w-full")
             .props("outlined autogrow")
         )
         with ui.row().classes("w-full justify-end"):
-            ui.button("取消", on_click=skip_dialog.close).props("flat")
-            ui.button("保存", on_click=_save_skip).props("color=primary")
+            ui.button("取消", on_click=settings_dialog.close).props("flat")
+            ui.button("保存", on_click=_save_settings).props("color=primary")
 
     def copy_log() -> None:
         if not log_lines:
@@ -1456,20 +1493,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         copy_text_to_clipboard("\n".join(log_lines))
         ui.notify(f"已复制 {len(log_lines)} 行日志", type="positive")
 
-    fullscreen_on = False
-
     def toggle_fullscreen() -> None:
         """切换运行日志全屏态：日志区 fixed 铺满视口，右上角显示退出按钮。"""
-        nonlocal fullscreen_on
-        fullscreen_on = not fullscreen_on
-        if fullscreen_on:
-            log_area.classes(add="tgs-page-log-fullscreen")
-            exit_full_btn.classes(add="tgs-log-exit-visible")
-        else:
-            log_area.classes(remove="tgs-page-log-fullscreen")
-            exit_full_btn.classes(remove="tgs-log-exit-visible")
-        log_area.update()
-        exit_full_btn.update()
+        fullscreen.toggle()
 
     with ui.row().classes("w-full items-center justify-between mt-2"):
         ui.label("运行日志").classes("font-semibold")
@@ -1480,7 +1506,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             ui.button(icon="fullscreen", on_click=toggle_fullscreen).props(
                 "flat round dense"
             ).tooltip("全屏显示")
-    log_area = ui.log(max_lines=1000).classes("w-full h-48")
+    log_area = (
+        ui.log(max_lines=1000).classes(LOG_AREA_CLASS).style("height: 320px")
+    )
     # 注册当前活跃 log_area：后台运行的任务通过它推送到最新页面
     _LEAVE_ACTIVE_LOG_AREA[wd_key] = log_area
     for line in log_lines:
@@ -1489,11 +1517,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         except Exception:
             logger.debug("回放历史日志到界面日志区失败", exc_info=True)
     # 退出全屏悬浮按钮：仅全屏时 fixed 显示在视口右上角，平时不占布局
-    exit_full_btn = (
-        ui.button(icon="close", on_click=toggle_fullscreen)
-        .props("flat round dense unelevated")
-        .classes("tgs-log-exit-full")
-    )
+    exit_full_btn = exit_fullscreen_button(toggle_fullscreen)
+    fullscreen = LogFullscreen(log_area, exit_full_btn)
 
     def refresh() -> None:
         render_list()

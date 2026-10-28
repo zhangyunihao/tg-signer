@@ -17,8 +17,9 @@ spec 格式::
 「>>> 子任务开始/结束」标记行生成明细进度。
 
 spec 可带可选的 ``start_at``（``YYYY-MM-DD HH:MM:SS``）：进程先等待到该
-时间，再探测 TG 网络；不通则每 30 分钟重试一次、最多 3 次，仍不通则
-退出码 3（视为本次组合任务失败）。
+时间，再探测 TG 网络；不通则按 ``network_retry_seconds``（默认 1800 秒）
+间隔重试，最多 ``network_max_retries`` 次（默认 3 次），仍不通则退出码 3
+（视为本次组合任务失败）。
 """
 
 import json
@@ -28,7 +29,8 @@ import sys
 import time
 from datetime import datetime
 
-# 开始时间到达后若 TG 网络不通：每 30 分钟重试一次，最多重试 3 次
+# 开始时间到达后若 TG 网络不通：默认每 30 分钟重试一次，最多重试 3 次；
+# 可通过 spec 的 network_retry_seconds / network_max_retries 覆盖
 NETWORK_RETRY_INTERVAL = 30 * 60
 NETWORK_MAX_RETRIES = 3
 NETWORK_PROBE_TIMEOUT = 8.0
@@ -49,6 +51,19 @@ def _parse_start_at(value) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+def _parse_retry_settings(spec: dict) -> tuple[int, int]:
+    """读取网络重试间隔（秒）与次数；缺失或非法时用默认值，负值归零。"""
+    try:
+        interval = int(spec.get("network_retry_seconds"))
+    except (TypeError, ValueError):
+        interval = NETWORK_RETRY_INTERVAL
+    try:
+        retries = int(spec.get("network_max_retries"))
+    except (TypeError, ValueError):
+        retries = NETWORK_MAX_RETRIES
+    return max(1, interval), max(0, retries)
 
 
 def _fmt_remaining(seconds: float) -> str:
@@ -83,22 +98,29 @@ def _check_telegram_network() -> tuple[bool, str]:
     return check_telegram_connectivity(NETWORK_PROBE_TIMEOUT)
 
 
-def _wait_for_network() -> bool:
-    """开始时间到达后确认 TG 网络可用；不通则每 30 分钟重试，最多 3 次。"""
+def _fmt_interval(seconds: int) -> str:
+    """把重试间隔格式化为「N 分钟」或「N 秒」。"""
+    if seconds % 60 == 0:
+        return f"{seconds // 60} 分钟"
+    return f"{seconds} 秒"
+
+
+def _wait_for_network(interval: int, max_retries: int) -> bool:
+    """开始时间到达后确认 TG 网络可用；不通则按 interval 秒重试，最多 max_retries 次。"""
     ok, detail = _check_telegram_network()
     retry = 0
-    while not ok and retry < NETWORK_MAX_RETRIES:
+    while not ok and retry < max_retries:
         retry += 1
         print(
-            f">>> TG 网络不通（{detail}），{NETWORK_RETRY_INTERVAL // 60} 分钟后"
-            f"第 {retry}/{NETWORK_MAX_RETRIES} 次重试",
+            f">>> TG 网络不通（{detail}），{_fmt_interval(interval)}后"
+            f"第 {retry}/{max_retries} 次重试",
             flush=True,
         )
-        time.sleep(NETWORK_RETRY_INTERVAL)
+        time.sleep(interval)
         ok, detail = _check_telegram_network()
     if not ok:
         print(
-            f">>> TG 网络连续 {NETWORK_MAX_RETRIES + 1} 次不通（{detail}），放弃执行",
+            f">>> TG 网络连续 {max_retries + 1} 次不通（{detail}），放弃执行",
             flush=True,
         )
         return False
@@ -148,7 +170,8 @@ def main() -> None:
         raise SystemExit(2)
     if start_at is not None:
         _wait_until_start(start_at)
-        if not _wait_for_network():
+        interval, retries = _parse_retry_settings(spec)
+        if not _wait_for_network(interval, retries):
             raise SystemExit(3)
     subs = spec.get("subs") or []
     total = len(subs)

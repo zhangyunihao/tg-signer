@@ -218,6 +218,26 @@ def test_skip_keywords_config_roundtrip(tmp_path):
     assert auto_leave.load_skip_keywords(tmp_path) == ["鲸鱼", "yy"]
 
 
+def test_default_keywords_config_roundtrip(tmp_path):
+    # 未配置时回落到内置默认值
+    assert auto_leave.load_default_keywords(tmp_path) == list(
+        auto_leave.UNSELECT_KEYWORDS
+    )
+    cfg = auto_leave.load_config(tmp_path)
+    cfg["default_keywords"] = ["自定义保护字"]
+    auto_leave.save_config(tmp_path, cfg)
+    assert auto_leave.load_default_keywords(tmp_path) == ["自定义保护字"]
+    # 频道已满自动任务与迁移出的默认任务都使用页面级配置
+    task = auto_leave.create_auto_leave_task(tmp_path, "alice")
+    assert task["keywords"] == ["自定义保护字"]
+    # 配置为空时回落内置默认
+    cfg["default_keywords"] = []
+    auto_leave.save_config(tmp_path, cfg)
+    assert auto_leave.load_default_keywords(tmp_path) == list(
+        auto_leave.UNSELECT_KEYWORDS
+    )
+
+
 def test_scan_stale_chats_skips_configured_titles(tmp_path, monkeypatch):
     dialogs = [
         _FakeDialog(_FakeChat(1, "鲸鱼福利频道")),

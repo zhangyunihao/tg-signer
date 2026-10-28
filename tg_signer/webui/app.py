@@ -30,6 +30,11 @@ from tg_signer.webui.common import (
     pretty_json,
     state,
 )
+from tg_signer.webui.components import (
+    LOG_AREA_CLASS,
+    LOG_AREA_STYLE,
+    classify_log_line,
+)
 from tg_signer.webui.data import (
     DEFAULT_LOG_FILE,
     DEFAULT_WORKDIR,
@@ -45,10 +50,12 @@ from tg_signer.webui.giveaway import (
     load_giveaway_scan_cap,
     load_giveaway_timeout_min,
     load_win_forward_targets,
+    load_win_skip_keywords,
     load_win_sweep_limit,
     save_giveaway_scan_cap,
     save_giveaway_timeout_min,
     save_win_forward_targets,
+    save_win_skip_keywords,
     save_win_sweep_limit,
 )
 from tg_signer.webui.messages import message_center_button
@@ -104,10 +111,8 @@ def log_block(card: Optional[ui.card] = None) -> Callable[[], None]:
             log_path_input = ui.input(
                 label="日志路径（可自定义）", value=str(state.log_path)
             ).classes("w-full")
-        log_area = ui.scroll_area().classes(
-            "w-full bg-gray-50 rounded-lg border border-gray-200 tgs-log-area"
-        )
-        log_area.style("max-height: 420px")
+        log_area = ui.scroll_area().classes(LOG_AREA_CLASS)
+        log_area.style(LOG_AREA_STYLE)
         with log_area:
             log_list = (
                 ui.column()
@@ -116,14 +121,7 @@ def log_block(card: Optional[ui.card] = None) -> Callable[[], None]:
             )
 
         def classify_line(line: str) -> str:
-            upper = line.upper()
-            if "ERROR" in upper:
-                return "text-red-700"
-            if "WARN" in upper:
-                return "text-amber-700"
-            if "INFO" in upper:
-                return "text-blue-700"
-            return "text-gray-800"
+            return classify_log_line(line)
 
         current_lines: list[str] = []
 
@@ -387,6 +385,7 @@ def _build_dashboard(container) -> None:
             sweep_limit = await run.io_bound(load_win_sweep_limit, state.workdir)
             timeout_min = await run.io_bound(load_giveaway_timeout_min, state.workdir)
             scan_cap = await run.io_bound(load_giveaway_scan_cap, state.workdir)
+            skip_keywords = await run.io_bound(load_win_skip_keywords, state.workdir)
             with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
                 add_dialog_close_button(dialog)
                 ui.label("设置").classes("text-lg font-semibold")
@@ -458,6 +457,17 @@ def _build_dashboard(container) -> None:
                     max=10000,
                     precision=0,
                 ).classes("w-full")
+                # 中奖消息跳过关键字（全局）：命中的"中奖"消息不提醒、不转发
+                ui.label("中奖消息跳过关键字").classes("text-lg font-semibold mt-2")
+                ui.label(
+                    "中奖消息包含其中任一字符串时视为非中奖，不转发、不推送提醒"
+                    "（逗号分隔，留空则不过滤）。"
+                ).classes("text-xs text-gray-500")
+                skip_kw_input = ui.input(
+                    label="跳过关键字（逗号分隔）",
+                    value="，".join(skip_keywords),
+                    placeholder="如：感谢参与，未中奖",
+                ).classes("w-full")
 
                 async def apply_settings() -> None:
                     # 先切换工作目录并刷新界面，再在后台线程落盘各项设置
@@ -478,6 +488,11 @@ def _build_dashboard(container) -> None:
                         )
                         await run.io_bound(
                             save_giveaway_scan_cap, state.workdir, scan_cap_input.value
+                        )
+                        await run.io_bound(
+                            save_win_skip_keywords,
+                            state.workdir,
+                            skip_kw_input.value,
                         )
                     except Exception as exc:  # noqa: BLE001
                         notify_error(exc)

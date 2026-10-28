@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -16,9 +17,9 @@ from typing import Dict, Optional
 from nicegui import ui
 
 from tg_signer.webui.activity import should_poll
-from tg_signer.webui.auto_leave import UNSELECT_KEYWORDS as _LEAVE_EXCLUDE_KEYWORDS
 from tg_signer.webui.auto_leave import _scan_types_of as _leave_scan_types
 from tg_signer.webui.auto_leave import load_config as _load_leave_config
+from tg_signer.webui.auto_leave import load_default_keywords as _load_leave_keywords
 from tg_signer.webui.auto_leave import load_leave_tasks as _load_leave_tasks
 from tg_signer.webui.combo import load_composite_tasks
 from tg_signer.webui.common import (
@@ -36,6 +37,14 @@ from tg_signer.webui.common import (
     read_file_tail,
     state,
     with_select_all,
+)
+from tg_signer.webui.components import (
+    LOG_AREA_CLASS,
+    LOG_AREA_STYLE,
+    STOPPING_STATUS,
+    LogFullscreen,
+    classify_log_line,
+    stop_with_feedback,
 )
 from tg_signer.webui.data import (
     CONFIG_META,
@@ -107,7 +116,7 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
                     "include_groups": bool(leave_task.get("include_groups")),
                     "skip_pinned": bool(leave_task.get("skip_pinned", True)),
                     "exclude_keywords": list(
-                        leave_task.get("keywords") or _LEAVE_EXCLUDE_KEYWORDS
+                        leave_task.get("keywords") or _load_leave_keywords(workdir)
                     ),
                     "include_keywords": list(leave_task.get("include_keywords") or []),
                     "auto_leave": bool(leave_task.get("auto_leave", False)),
@@ -124,7 +133,7 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
                 "scan_types": _leave_scan_types(cfg),
                 "include_groups": bool(cfg.get("include_groups")),
                 "skip_pinned": bool(cfg.get("skip_pinned", True)),
-                "exclude_keywords": list(_LEAVE_EXCLUDE_KEYWORDS),
+                "exclude_keywords": _load_leave_keywords(workdir),
             },
         }
     if "抽奖" in sub_type:
@@ -160,6 +169,9 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
                 "join_flood_buffer": gcfg.get("join_flood_buffer"),
                 "resolve_pace_min": gcfg.get("resolve_pace_min"),
                 "resolve_pace_max": gcfg.get("resolve_pace_max"),
+                # 全局限速：单账号子任务同样受任务级配置约束
+                "global_qps": gcfg.get("global_qps"),
+                "max_concurrent_accounts": gcfg.get("max_concurrent_accounts"),
                 # 超时（分钟→秒，全局设置）：0=不限
                 "timeout": load_giveaway_timeout_min(workdir) * 60,
             },
@@ -423,10 +435,12 @@ class TaskRunnerBlock:
         self._cards_limit = 5
         self.history_cards = ui.column().classes("w-full gap-2 tgs-mobile-cards mt-1")
         # 状态列渲染为彩色徽章：已完成=绿、失败=红、运行中=蓝、其他=灰
+        # 附带 data-runstatus=<任务id>，停止任务时用 JS 就地改为「停止中」，避免整表重渲染
         self.history_table.add_slot(
             "body-cell-status",
             '<q-td :props="props">'
-            "<q-badge :color=\"props.row.status === '已完成' ? 'positive' : "
+            '<q-badge :data-runstatus="props.row.id" '
+            ":color=\"props.row.status === '已完成' ? 'positive' : "
             "props.row.status === '失败' ? 'negative' : "
             "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
             "{{ props.row.status }}</q-badge></q-td>",
@@ -471,10 +485,8 @@ class TaskRunnerBlock:
                 "flat round dense"
             ).tooltip("全屏显示")
 
-        self.log_area = ui.scroll_area().classes(
-            "w-full bg-gray-50 rounded-lg border border-gray-200 sign-log-area"
-        )
-        self.log_area.style("max-height: 420px")
+        self.log_area = ui.scroll_area().classes(f"{LOG_AREA_CLASS} sign-log-area")
+        self.log_area.style(LOG_AREA_STYLE)
         with self.log_area:
             self.log_list = (
                 ui.column()
@@ -487,6 +499,7 @@ class TaskRunnerBlock:
             .props("flat round dense unelevated")
             .classes("tgs-log-exit-full")
         )
+        self._log_fullscreen = LogFullscreen(self.log_area, self._log_exit_btn)
         # 增量渲染状态：记录 DOM 中已渲染的 label 与行序号/清空代次
         self._rendered_labels: deque[ui.label] = deque()
         self._last_render_seq: Optional[int] = None
@@ -760,9 +773,10 @@ class TaskRunnerBlock:
                             "text-base font-semibold truncate min-w-0"
                         )
                         status = row.get("status") or "未知"
+                        rid = str(row.get("id") or "")
                         ui.badge(status).props(
                             f"color={self._status_color(status)}"
-                        ).classes("shrink-0")
+                        ).classes("shrink-0").props(f'data-runstatus="{rid}"')
                     mobile_card_fields(
                         [
                             ("类型", row.get("type")),
@@ -788,8 +802,9 @@ class TaskRunnerBlock:
                         if row.get("status") == "运行中":
                             ui.button(
                                 "停止",
-                                on_click=lambda r=row: self._stop_run(
-                                    str(r.get("id") or "")
+                                on_click=functools.partial(
+                                    self._stop_with_feedback,
+                                    str(row.get("id") or ""),
                                 ),
                             ).props("flat dense color=negative")
             if len(self.history_rows) > self._cards_limit:
@@ -890,12 +905,15 @@ class TaskRunnerBlock:
         auto: bool = False,
         sub_indexes: list[int] | None = None,
         start_at: str | None = None,
+        retry_interval_seconds: int | None = None,
+        max_retries: int | None = None,
     ) -> bool:
         """启动一个任务（每账号一个子进程）。auto=True 表示服务重启后的自动恢复。
 
         组合任务可通过 ``sub_indexes``（子任务下标，0 起）只执行勾选的子任务，
         None 表示全部执行；``start_at``（``YYYY-MM-DD HH:MM:SS``）非空时，
-        子进程先等到该时间，再检测 TG 网络并按需重试。
+        子进程先等到该时间，再检测 TG 网络并按 ``retry_interval_seconds``
+        间隔重试最多 ``max_retries`` 次。
         """
         is_combo = "组合" in task_type
         combo_subs: list[dict] = []
@@ -990,6 +1008,10 @@ class TaskRunnerBlock:
                 spec_payload = {"subs": spec_subs}
                 if start_at:
                     spec_payload["start_at"] = start_at
+                    if retry_interval_seconds is not None:
+                        spec_payload["network_retry_seconds"] = retry_interval_seconds
+                    if max_retries is not None:
+                        spec_payload["network_max_retries"] = max_retries
                 cmd = [
                     sys.executable,
                     "-m",
@@ -1493,10 +1515,29 @@ class TaskRunnerBlock:
             row = row[0]
         return row if isinstance(row, dict) else None
 
-    def _on_stop_event(self, e) -> None:
+    async def _on_stop_event(self, e) -> None:
         row = self._event_row(e)
         if row and row.get("id"):
-            self._stop_run(str(row["id"]))
+            await self._stop_with_feedback(str(row["id"]))
+
+    def _set_row_status(self, record_id: str, status: str) -> None:
+        """就地更新某条记录的状态文本（内存行 + 桌面表格/移动端卡片徽章）。"""
+        for row in self.history_table.rows:
+            if row.get("id") == record_id:
+                row["status"] = status
+                break
+        safe_id = str(record_id).replace("\\", "\\\\").replace('"', '\\"')
+        safe_status = status.replace("\\", "\\\\").replace("'", "\\'")
+        ui.run_javascript(
+            f"document.querySelectorAll('[data-runstatus=\"{safe_id}\"]').forEach("
+            f"el => {{ el.textContent = '{safe_status}'; }});"
+        )
+
+    async def _stop_with_feedback(self, record_id: str) -> None:
+        """统一的停止交互：先把状态改为「停止中」，再在线程里执行阻塞的停止。"""
+        self._set_row_status(record_id, STOPPING_STATUS)
+        result = await stop_with_feedback(lambda: stop_run_core(record_id))
+        self._apply_stop_result(record_id, *result)
 
     def _on_detail_event(self, e) -> None:
         """桌面表格「明细」按钮事件入口。"""
@@ -1783,7 +1824,11 @@ class TaskRunnerBlock:
         ui.notify("已复制任务参数，可调整后点击「执行」", type="positive")
 
     def _stop_run(self, record_id: str) -> None:
-        outcome, record = stop_run_core(record_id)
+        """同步停止（组合任务等既有调用方使用），阻塞当前线程直至进程退出。"""
+        return self._apply_stop_result(record_id, *stop_run_core(record_id))
+
+    def _apply_stop_result(self, record_id: str, outcome: str, record) -> tuple:
+        """停止结果落地：刷新表格/状态并提示（须在事件循环线程调用）。"""
         if outcome == "orphan":
             self._refresh_history_table()
             self._update_status()
@@ -1965,15 +2010,7 @@ class TaskRunnerBlock:
 
     def _toggle_log_fullscreen(self) -> None:
         """切换实时输出全屏态：日志区 fixed 铺满视口，右上角显示退出按钮。"""
-        self._log_full = not getattr(self, "_log_full", False)
-        if self._log_full:
-            self.log_area.classes(add="tgs-page-log-fullscreen")
-            self._log_exit_btn.classes(add="tgs-log-exit-visible")
-        else:
-            self.log_area.classes(remove="tgs-page-log-fullscreen")
-            self._log_exit_btn.classes(remove="tgs-log-exit-visible")
-        self.log_area.update()
-        self._log_exit_btn.update()
+        self._log_fullscreen.toggle()
 
     def _load_task_history_tail(self, limit: int) -> str:
         """读取任务历史文件尾部记录（读取失败返回空串，不打扰用户）。"""
@@ -2025,14 +2062,7 @@ class TaskRunnerBlock:
 
     @staticmethod
     def _classify_line(line: str) -> str:
-        upper = line.upper()
-        if "ERROR" in upper:
-            return "text-red-700"
-        if "WARN" in upper:
-            return "text-amber-700"
-        if "INFO" in upper:
-            return "text-blue-700"
-        return "text-gray-800"
+        return classify_log_line(line)
 
     def _auto_restore(self) -> None:
         """服务重启后自动恢复上次未结束的「签到 (run 定时)」常驻任务。

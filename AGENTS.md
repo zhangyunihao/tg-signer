@@ -86,12 +86,6 @@ This file guides agents/developers collaborating in the `tg-signer` repository. 
 ## Local PyPI Release
 - 发布脚本：`scripts/release_pypi.py`（完整自动化版本 bump / 构建 / 校验 / 上传 / 打 tag / 推送）。
 - 凭据：项目根目录 `.pypirc`（已在 `.gitignore`，不要提交），`username = __token__`。
-- **前置步骤（必须遵守）**：脚本只会 `git add tg_signer/__init__.py`（版本号文件），**不会自动提交业务改动**。工作区所有功能修复和新特性必须在运行脚本前先手动 commit。典型流程：
-  ```bash
-  git add .
-  git commit -m "fix: 描述本次改动"
-  .venv/Scripts/python.exe scripts/release_pypi.py --bump patch --push
-  ```
 - 脚本参数：
   - `--bump patch`（默认不升版本）：1.0.76 → 1.0.77。可选 `minor`、`major`。
   - `--dry-run`：只构建 + twine check，不上传、不打 tag、不推送，用于本地验证。

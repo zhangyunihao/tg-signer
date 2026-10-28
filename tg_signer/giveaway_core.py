@@ -22,7 +22,7 @@ import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 from tg_signer.core import get_client, safe_disconnect
 from tg_signer.giveaway_parsing import (
@@ -167,6 +167,32 @@ WIN_SWEEP_PAGE = 100  # 增量回扫单页拉取的消息条数
 
 WIN_SWEEP_PAGE_MAX = 20  # 增量回扫最多翻页数（防水位线异常时无限翻页）
 
+# 回扫相邻 bot 之间的随机间隔（秒）：避免单账号短时间内连发多次
+# GetHistory，把连接打到 Transport flood 429
+WIN_SWEEP_BOT_GAP_RANGE = (1.0, 2.0)
+
+# 429 明细日志：同账号 60 秒内只记一条；60 秒窗口内 ≥3 个账号被 429 视为
+# 「共享出口/IP 层风控」，否则视为单账号请求过密
+TRANSPORT_FLOOD_LOG_INTERVAL = 60
+TRANSPORT_FLOOD_CLUSTER_WINDOW = 60
+TRANSPORT_FLOOD_CLUSTER_SIZE = 3
+# 429 主动提醒节流（秒）：单账号 15 分钟一次，多账号同批 10 分钟一次，
+# 避免限流期间又用有限配额刷自己的通知
+TRANSPORT_FLOOD_ALERT_INTERVAL_SINGLE = 900
+TRANSPORT_FLOOD_ALERT_INTERVAL_CLUSTER = 600
+
+
+# —— 全局调用节奏（同进程内跨账号共享）——
+# 所有账号合计每秒最多发起的 API 调用数；0=不限制。
+# Transport flood 429 按出口 IP 计，账号一多单账号节流就管不住聚合速率，
+# 默认 8 QPS 约为「4 个账号同时满速」的水平（单账号自然约 2 QPS）。
+DEFAULT_GLOBAL_QPS = 8.0
+
+
+# 同时进行扫描/补漏/回扫的账号数上限；0=不限制。
+# 与 DEFAULT_GLOBAL_QPS 匹配：4 个账号并行即可打满令牌桶，再开更多只会排队。
+DEFAULT_MAX_CONCURRENT_ACCOUNTS = 4
+
 
 # —— 网络调用统一超时 ——
 # 半开连接（手机切换网络/代理僵死）下 Pyrogram 请求可能永久挂起，导致引擎
@@ -185,6 +211,9 @@ _CLIENT_API_LOCKS: Dict[str, asyncio.Lock] = {}
 _CLIENT_API_LAST_CALL: Dict[str, float] = {}
 _CLIENT_API_MIN_INTERVAL = 0.35  # 相邻 API 调用最小间隔（秒）
 _CLIENT_TRANSPORT_FLOOD_BACKOFF = [5, 10, 20, 30]  # Transport 429 指数退避（秒）
+# 网络超时后的重试退避（秒）：连续超时逐级加大，成功一次即清零。
+# 网络差时 Pyrogram 会反复重试同一请求，不加退避会形成重试风暴。
+_CLIENT_TIMEOUT_BACKOFF = [2, 5, 10, 20]
 
 
 async def _timeout_aiter(agen: Any, timeout: float, name: str = "") -> Any:
@@ -212,6 +241,83 @@ def _is_transport_flood(exc: BaseException) -> bool:
     return any(k in msg for k in ("transport flood", "429", "please slow down"))
 
 
+# Transport flood 429 出现后多久内发生的会话重连/请求失败，视为该账号被限流
+_TRANSPORT_FLOOD_ATTRIBUTION_WINDOW = 15.0
+
+# 只有「请求超时」类失败才允许在窗口内直接归属，避免把别的账号的 429 算错
+_TRANSPORT_FLOOD_TIMEOUT_WINDOW = 5.0
+
+# 账户页展示的 Transport flood 限流时长（秒）：每次 429 重新计时
+_TRANSPORT_FLOOD_LIMIT_SECONDS = 60
+
+# 不可访问目标（CHANNEL_PRIVATE/CHANNEL_INVALID）的跳过有效期（秒）：
+# 到期后允许再试一次加入，失败则重新计时，避免永久放弃或每轮撞墙
+UNREACHABLE_TARGET_TTL = 24 * 3600
+
+# 最近一次 Transport flood 429 的时刻（monotonic 秒），由日志探针写入
+_LAST_TRANSPORT_FLOOD_AT = 0.0
+
+_PROBE_INSTALLED = False
+
+
+class _TransportFloodProbe(logging.Handler):
+    """监听 Pyrogram 会话日志中的 429 Transport flood。
+
+    协议层的 429 不会作为异常抛给调用方：Pyrogram 只打一条
+    `Server sent transport error: 429 (Transport flood...)` 并重启会话，
+    调用方最终拿到的是「Request timed out」。因此只能从日志里捕获时间点，
+    再由 _TimeoutClient 结合「会话连接对象是否被替换」判断是哪个账号被限流。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        global _LAST_TRANSPORT_FLOOD_AT
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - 日志格式化失败不影响业务
+            return
+        if "429" in message and "flood" in message.lower():
+            _LAST_TRANSPORT_FLOOD_AT = time.monotonic()
+
+
+def _install_transport_flood_probe() -> None:
+    """安装一次日志探针（幂等），用于把协议层 429 同步到账号限流状态。"""
+    global _PROBE_INSTALLED
+    if _PROBE_INSTALLED:
+        return
+    _PROBE_INSTALLED = True
+    logging.getLogger("pyrogram.session").addHandler(_TransportFloodProbe())
+
+
+class _GlobalRateLimiter:
+    """进程内跨账号的令牌桶：限制所有账号合计的 API 发起速率。
+
+    在锁内预约「下次可用时刻」并把游标推进一个间隔，睡眠放在锁外，
+    因此多个账号是排队等待而非串行执行；rate<=0 表示不限制。
+    """
+
+    def __init__(self, qps: float) -> None:
+        self.qps = max(0.0, float(qps))
+        self.interval = 1.0 / self.qps if self.qps > 0 else 0.0
+        self._next_at = 0.0
+        self._lock: Optional[asyncio.Lock] = None
+
+    async def wait(self) -> None:
+        if self.interval <= 0:
+            return
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            start = max(loop.time(), self._next_at)
+            self._next_at = start + self.interval
+        delay = start - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
 class _TimeoutClient:
     """Pyrogram 客户端代理：超时 + 账号级统一节流 + Transport flood 退避。
 
@@ -221,16 +327,27 @@ class _TimeoutClient:
     """
 
     def __init__(
-        self, client: Any, timeout: float = NET_CALL_TIMEOUT, account: str = ""
+        self,
+        client: Any,
+        timeout: float = NET_CALL_TIMEOUT,
+        account: str = "",
+        on_transport_flood: Optional[Callable[[str, float], None]] = None,
+        global_limiter: Optional[_GlobalRateLimiter] = None,
     ) -> None:
         self._raw = client
         self._timeout = timeout
         self._account = account or "default"
+        # 跨账号共享的全局令牌桶：限制同进程所有账号的合计调用速率
+        self._global_limiter = global_limiter
         # 每个 _TimeoutClient 实例共享 per-account 锁（GiveawayEngine
         # 里通常一账号一 client，所以 key 就是 account）
         self._lock = _CLIENT_API_LOCKS.setdefault(self._account, asyncio.Lock())
         self._backoff_idx = 0  # 当前账号 Transport flood 退避等级
         self._last_transport_flood_at = 0.0
+        self._timeout_backoff_idx = 0  # 当前账号网络超时退避等级
+        self._last_timeout_at = 0.0
+        # 协议层 429 被识别后回调，用于把限流状态同步到账户页
+        self._on_transport_flood = on_transport_flood
 
     def __getattr__(self, item: str) -> Any:
         attr = getattr(self._raw, item)
@@ -254,19 +371,30 @@ class _TimeoutClient:
             await self._wait_min_interval()
             # 2) Transport flood 冷却期：如果刚被限流过，先 sleep
             await self._wait_transport_cooldown()
-            # 3) 执行带超时的调用
+            # 2.5) 网络超时冷却期：连续超时时按等级退避，压住重试风暴
+            await self._wait_timeout_cooldown()
+            # 2.6) 全局令牌桶：跨账号共享，压住同 IP 的聚合速率
+            await self._wait_global()
+            # 3) 执行带超时的调用；记录调用前的会话连接对象，
+            #    调用期间被 429 重启会话时据此判定是本账号被限流
             await self._throttled_enter()
+            conn_before = self._connection_ref()
             try:
                 result = await asyncio.wait_for(coro, self._timeout)
             except asyncio.TimeoutError:
+                self._on_timeout()
+                self._note_transport_flood(conn_before, timeout_failure=True)
                 raise RuntimeError(
                     f"网络请求 {name} 超时（{self._timeout:.0f} 秒，网络异常）"
                 ) from None
             except BaseException as exc:
                 self._on_call_exception(exc)
+                self._note_transport_flood(conn_before, timeout_failure=True)
                 raise
             else:
+                self._note_transport_flood(conn_before, timeout_failure=False)
                 self._backoff_idx = 0
+                self._timeout_backoff_idx = 0
                 _CLIENT_API_LAST_CALL[self._account] = self._loop_time()
                 return result
 
@@ -282,24 +410,38 @@ class _TimeoutClient:
             async with self._lock:
                 await self._wait_min_interval()
                 await self._wait_transport_cooldown()
+                await self._wait_timeout_cooldown()
+                await self._wait_global()
                 await self._throttled_enter()
+                conn_before = self._connection_ref()
                 try:
                     item = await asyncio.wait_for(agen.__anext__(), self._timeout)
                 except StopAsyncIteration:
                     self._backoff_idx = 0
+                    self._timeout_backoff_idx = 0
                     return
                 except asyncio.TimeoutError:
+                    self._on_timeout()
+                    self._note_transport_flood(conn_before, timeout_failure=True)
                     raise RuntimeError(
                         f"网络请求 {name or '数据拉取'} 超时"
                         f"（{self._timeout:.0f} 秒，网络异常）"
                     ) from None
                 except BaseException as exc:
                     self._on_call_exception(exc)
+                    self._note_transport_flood(conn_before, timeout_failure=True)
                     raise
+                self._note_transport_flood(conn_before, timeout_failure=False)
+                self._timeout_backoff_idx = 0
                 _CLIENT_API_LAST_CALL[self._account] = self._loop_time()
             yield item
 
     # —— 节流内部辅助 ——
+
+    async def _wait_global(self) -> None:
+        """全局令牌桶等待：所有账号共享同一速率上限。"""
+        if self._global_limiter is not None:
+            await self._global_limiter.wait()
 
     async def _wait_min_interval(self) -> None:
         loop = asyncio.get_running_loop()
@@ -322,6 +464,23 @@ class _TimeoutClient:
             if since < need:
                 await asyncio.sleep(need - since)
 
+    async def _wait_timeout_cooldown(self) -> None:
+        """网络超时后按等级退避：避免网络差时连续重试形成请求风暴。"""
+        idx = self._timeout_backoff_idx
+        if idx <= 0:
+            return
+        need = _CLIENT_TIMEOUT_BACKOFF[min(idx - 1, len(_CLIENT_TIMEOUT_BACKOFF) - 1)]
+        since = time.monotonic() - self._last_timeout_at
+        if since < need:
+            await asyncio.sleep(need - since)
+
+    def _on_timeout(self) -> None:
+        """请求超时：升级网络超时退避等级（成功一次即由调用方清零）。"""
+        self._timeout_backoff_idx = min(
+            self._timeout_backoff_idx + 1, len(_CLIENT_TIMEOUT_BACKOFF)
+        )
+        self._last_timeout_at = time.monotonic()
+
     def _on_call_exception(self, exc: BaseException) -> None:
         """调用异常后更新状态：Transport flood 升级退避等级。"""
         if _is_transport_flood(exc):
@@ -338,6 +497,45 @@ class _TimeoutClient:
                 wait,
                 str(exc)[:80],
             )
+            # 异常本身带 429 信息时直接同步（多数情况是日志里的 transport 429，
+            # 见 _note_transport_flood）
+            self._emit_transport_flood()
+
+    def _connection_ref(self) -> Any:
+        """当前会话的底层连接对象；429 后 Pyrogram 会重启会话并替换它。"""
+        session = getattr(self._raw, "session", None)
+        return getattr(session, "connection", None)
+
+    def _note_transport_flood(self, conn_before: Any, timeout_failure: bool) -> None:
+        """把「协议层 429 导致本账号会话重连/请求超时」同步为账号限流。
+
+        Pyrogram 收到 `429 Transport flood` 时不会抛给调用方，只会重启会话，
+        于是账号页看不到任何限流。这里用两个信号定位到具体账号：
+        1) 调用期间会话连接对象被替换（说明 429 触发了本账号重连）；
+        2) 紧接着出现请求超时（429 重连途中在途请求必然超时）。
+        """
+        now = time.monotonic()
+        since = now - _LAST_TRANSPORT_FLOOD_AT
+        if not _LAST_TRANSPORT_FLOOD_AT or since > _TRANSPORT_FLOOD_ATTRIBUTION_WINDOW:
+            return
+        conn_after = self._connection_ref()
+        restarted = (
+            conn_before is not None
+            and conn_after is not None
+            and conn_after is not conn_before
+        )
+        if restarted or (timeout_failure and since <= _TRANSPORT_FLOOD_TIMEOUT_WINDOW):
+            self._last_transport_flood_at = now
+            self._emit_transport_flood()
+
+    def _emit_transport_flood(self) -> None:
+        """通知引擎把本账号标记为限流（账户页展示剩余时长）。"""
+        if self._on_transport_flood is None:
+            return
+        try:
+            self._on_transport_flood(self._account, _TRANSPORT_FLOOD_LIMIT_SECONDS)
+        except Exception:  # noqa: BLE001 - 状态同步失败不能影响参与流程
+            logger.debug("同步 Transport flood 限流状态失败", exc_info=True)
 
     async def _throttled_enter(self) -> None:
         """调用前的统一钩子（给子类/测试扩展用）。"""
@@ -360,6 +558,8 @@ class GiveawayEngine:
         self._stop: Optional[asyncio.Event] = None
         self._stopping = False
         self._clients: Dict[str, Any] = {}
+        # 429 提醒发送任务（fire-and-forget，持有引用防被 GC）
+        self._flood_alert_tasks: set = set()
         self._locks: Dict[str, asyncio.Lock] = {}
         # bot 身份内存缓存：{account|username_lower: True/False}，避免反复 resolve
         self._bot_cache: Dict[str, bool] = {}
@@ -390,12 +590,28 @@ class GiveawayEngine:
         self._channels_full_notified: set = set()
         # 加入频道时间日志（state 不可用时的内存兜底）{account: [epoch 秒...]}
         self._join_events: Dict[str, List[float]] = {}
+        # 协议层 Transport flood 429 提示节流：{account: 上次提示的 monotonic 秒}
+        self._transport_flood_logged: Dict[str, float] = {}
+        # 429 明细日志节流：{account: 上次记录的 monotonic 秒}
+        self._transport_flood_429_logged: Dict[str, float] = {}
+        # 最近 429 的账号与时刻（epoch 秒），用于判断是单账号过密还是多账号同时被风控
+        self._transport_flood_hits: Dict[str, float] = {}
+        # 429 主动提醒节流：{"cluster" 或 "single:账号": 上次提醒的 monotonic 秒}
+        self._transport_flood_alerted: Dict[str, float] = {}
+        # 不可访问目标（CHANNEL_PRIVATE/CHANNEL_INVALID）：{账号|目标_lower: 到期时间戳}，
+        # 未加入/被踢/链接失效，冷却期内直接跳过，到期（24 小时）后再试一次
+        self._unreachable_targets: Dict[str, float] = {}
         # 加入节奏与配额（任务级可配置，默认取模块常量）
         self.join_pace_range: Tuple[float, float] = JOIN_PACE_RANGE
         self.resolve_pace_range: Tuple[float, float] = RESOLVE_PACE_RANGE
         self.join_hourly_cap: int = JOIN_HOURLY_CAP
         self.join_daily_cap: int = JOIN_DAILY_CAP
         self.join_flood_buffer: int = JOIN_FLOOD_BUFFER
+        # 全局调用节奏（任务级可配置）：跨账号共享的 API QPS 上限与并扫账号数
+        self.global_qps: float = DEFAULT_GLOBAL_QPS
+        self.max_concurrent_accounts: int = DEFAULT_MAX_CONCURRENT_ACCOUNTS
+        self._api_limiter = _GlobalRateLimiter(self.global_qps)
+        self._account_slots: Optional[asyncio.Semaphore] = None
         # 解析类调用上次发起时刻（monotonic 秒），用于账号级最小间隔
         self._last_resolve_at: Dict[str, float] = {}
         # FLOOD_WAIT 熔断：{account|bot_lower: 连续次数}；达到上限加入 _flood_bots
@@ -429,6 +645,8 @@ class GiveawayEngine:
         self.win_forward_targets: List[Any] = ["me"]
         # 中奖回扫条数：每次回扫各 bot 私聊最近多少条消息找中奖通知
         self.win_sweep_limit = WIN_SWEEP_LIMIT
+        # 中奖消息跳过关键字：文本命中任一关键字即不提醒、不转发（全局设置）
+        self.win_skip_keywords: Tuple[str, ...] = ()
         # 已处理的中奖消息：{account|bot|msg_id}，进程内去重（跨重启靠状态文件）
         self._win_handled: set = set()
         # 标记为「双向」的账户集合：发言数要求类抽奖自动跳过
@@ -511,12 +729,15 @@ class GiveawayEngine:
         join_hourly_cap: Optional[int] = None,
         join_daily_cap: Optional[int] = None,
         join_flood_buffer: Optional[int] = None,
+        global_qps: Optional[float] = None,
+        max_concurrent_accounts: Optional[int] = None,
         confirm_wait: int = 8,
         confirm_keywords: Optional[Iterable[str]] = None,
         ignore_history: bool = True,
         win_detect: bool = True,
         win_forward_target=None,
         win_sweep_limit: Optional[int] = None,
+        win_skip_keywords: Optional[Iterable[str]] = None,
         two_way_accounts: Optional[Iterable[str]] = None,
         chat_usernames: Optional[Dict[str, str]] = None,
         state: Optional[GiveawayState] = None,
@@ -553,6 +774,10 @@ class GiveawayEngine:
         self.win_sweep_limit = (
             max(1, int(win_sweep_limit)) if win_sweep_limit else WIN_SWEEP_LIMIT
         )
+        # 中奖消息跳过关键字：命中即视为非中奖（空配置＝不过滤）
+        self.win_skip_keywords = tuple(
+            str(k).strip() for k in (win_skip_keywords or ()) if str(k).strip()
+        )
         self._win_handled.clear()
         # 口令错峰排期按运行周期重置，避免上一轮残留的等待时刻拖慢本次启动
         self._password_gate_until.clear()
@@ -578,6 +803,23 @@ class GiveawayEngine:
             self.join_daily_cap = max(0, int(join_daily_cap))
         if join_flood_buffer is not None:
             self.join_flood_buffer = max(0, int(join_flood_buffer))
+        # 全局限速：None 沿用默认值；0 表示不限制
+        self.global_qps = (
+            max(0.0, float(global_qps))
+            if global_qps is not None
+            else DEFAULT_GLOBAL_QPS
+        )
+        self._api_limiter = _GlobalRateLimiter(self.global_qps)
+        self.max_concurrent_accounts = (
+            max(0, int(max_concurrent_accounts))
+            if max_concurrent_accounts is not None
+            else DEFAULT_MAX_CONCURRENT_ACCOUNTS
+        )
+        self._account_slots = (
+            asyncio.Semaphore(self.max_concurrent_accounts)
+            if self.max_concurrent_accounts > 0
+            else None
+        )
         self.session_dir = Path(session_dir)
         self.log = log
         self.on_event = on_event
@@ -672,6 +914,8 @@ class GiveawayEngine:
 
     async def _connect_accounts(self, accounts: List[str]) -> None:
         """多账号并行连接（各账号客户端相互独立，连接超时互不拖累）。"""
+        # 协议层 429 只写日志不抛异常，先装上探针才能同步到账号限流状态
+        _install_transport_flood_probe()
 
         async def _connect_one(account: str) -> None:
             client = None
@@ -687,7 +931,14 @@ class GiveawayEngine:
                 # 连接成功即纳入账号表；昵称仅用于展示，获取失败不断开。
                 # 统一包一层网络超时代理，防半开连接永久挂起任务协程；
                 # 传入 account 让 _TimeoutClient 复用账号级节流锁与最小调用间隔。
-                self._clients[account] = _TimeoutClient(client, account=account)
+                # on_transport_flood：协议层 429 不抛异常，需由日志探针+会话
+                # 重连判定后回写账号限流，否则账户页会显示「正常」。
+                self._clients[account] = _TimeoutClient(
+                    client,
+                    account=account,
+                    on_transport_flood=self._note_transport_flood,
+                    global_limiter=self._api_limiter,
+                )
                 self._locks[account] = asyncio.Lock()
                 try:
                     me = await asyncio.wait_for(
@@ -753,6 +1004,17 @@ class GiveawayEngine:
             self._clients.clear()
             self.log("自动抽奖已停止")
 
+    async def _with_account_slot(
+        self, fn: Callable[..., Awaitable[None]], *args: Any, **kwargs: Any
+    ) -> None:
+        """在全局账号窗口内执行单账号任务；窗口满时排队，避免账号数即并发数。"""
+        slots = self._account_slots
+        if slots is None:
+            await fn(*args, **kwargs)
+            return
+        async with slots:
+            await fn(*args, **kwargs)
+
     async def scan_now(self) -> None:
         """对所有账号 × 频道回溯扫描历史消息并自动参与（多账号并行扫描）。
 
@@ -771,11 +1033,16 @@ class GiveawayEngine:
             joined_before = self.joined
             account_items = list(self._clients.items())
             # 多账号错峰启动：各账号协程自己先 sleep idx*5 秒，
-            # 避免 asyncio.gather 把所有账号的 API 调用同时打出去触发限流
+            # 避免 asyncio.gather 把所有账号的 API 调用同时打出去触发限流；
+            # 真正并发数再由全局账号窗口（max_concurrent_accounts）限制
             tasks = []
             for idx, (account, client) in enumerate(account_items):
                 if idx == 0:
-                    tasks.append(self._scan_one(account, client, done, total))
+                    tasks.append(
+                        self._with_account_slot(
+                            self._scan_one, account, client, done, total
+                        )
+                    )
                 else:
                     tasks.append(
                         self._scan_one_delayed(idx, account, client, done, total)
@@ -828,9 +1095,9 @@ class GiveawayEngine:
     async def _scan_one_delayed(
         self, idx: int, account: str, client: Any, done: Dict[str, int], total: int
     ) -> None:
-        """错峰启动：idx > 0 的账号先 sleep idx*5 秒再开始扫描。"""
+        """错峰启动：idx > 0 的账号先 sleep idx*5 秒再进入全局账号窗口扫描。"""
         await asyncio.sleep(idx * 5)
-        await self._scan_one(account, client, done, total)
+        await self._with_account_slot(self._scan_one, account, client, done, total)
 
     async def _scan_chat_history(self, account: str, client: Any, chat: Any) -> None:
         """单频道回溯扫描历史消息：水位线去重 + 处理，命中停止条件即止。"""
@@ -1264,8 +1531,14 @@ class GiveawayEngine:
             for idx, (account, client) in enumerate(account_items):
                 if idx == 0:
                     tasks.append(
-                        self._rescue_one_account(
-                            account, client, failures, done, total, sweep
+                        self._with_account_slot(
+                            self._rescue_one_account,
+                            account,
+                            client,
+                            failures,
+                            done,
+                            total,
+                            sweep,
                         )
                     )
                 else:
@@ -1335,9 +1608,11 @@ class GiveawayEngine:
         total: int,
         sweep: Dict[str, int],
     ) -> None:
-        """错峰启动：idx > 0 的账号先 sleep idx*5 秒再开始补漏。"""
+        """错峰启动：idx > 0 的账号先 sleep idx*5 秒再进入全局账号窗口补漏。"""
         await asyncio.sleep(idx * 5)
-        await self._rescue_one_account(account, client, failures, done, total, sweep)
+        await self._with_account_slot(
+            self._rescue_one_account, account, client, failures, done, total, sweep
+        )
 
     async def _rescue_chat_safe(
         self, account: str, client: Any, chat: Any, failures: Dict[str, int]
@@ -1406,6 +1681,10 @@ class GiveawayEngine:
             return
         # 奖品为站内虚拟积分「嫩妹币」：不转发、不推送
         if WIN_IGNORE_PRIZE_RE.search(text):
+            return
+        # 用户配置的中奖消息跳过关键字：命中即不提醒、不转发
+        if any(kw in text for kw in self.win_skip_keywords):
+            logger.debug("中奖消息命中跳过关键字，忽略：%s", text[:80])
             return
         mid = getattr(message, "id", None)
         if not self._mark_win_handled(account, bot_username, mid, text):
@@ -1535,7 +1814,13 @@ class GiveawayEngine:
         try:
             await asyncio.gather(
                 *[
-                    self._sweep_bot_wins(account, client, bots=bots, progress=progress)
+                    self._with_account_slot(
+                        self._sweep_bot_wins,
+                        account,
+                        client,
+                        bots=bots,
+                        progress=progress,
+                    )
                     for account, client, bots in pairs
                 ]
             )
@@ -1568,9 +1853,13 @@ class GiveawayEngine:
             # 无任何交互记录（含保留的 win: 去重）时没有回扫目标，等账号参与后重建
             self.log(f"[{account}] 回扫：暂无 bot 记录（等待账号参与后重建）")
             return
-        for bot in bots:
+        for idx, bot in enumerate(bots):
             if self._stop is not None and self._stop.is_set():
                 return
+            # bot 之间随机间隔：一个账号 10+ 个 bot 连发 GetHistory 会在很短的
+            # 时间内把连接打到 Transport flood 429（尤其多个账号同时回扫时）
+            if idx > 0:
+                await asyncio.sleep(random.uniform(*WIN_SWEEP_BOT_GAP_RANGE))
             await self._sweep_bot_messages(account, client, bot)
             if progress is not None:
                 self._advance_win_sweep(progress)
@@ -1980,6 +2269,17 @@ class GiveawayEngine:
         return "CHANNELS_TOO_MUCH" in str(exc).upper()
 
     @staticmethod
+    def _is_unreachable_target_error(exc: Exception) -> bool:
+        """目标群组不可访问且本任务内重试无意义。
+
+        CHANNEL_PRIVATE 表示账号未加入/已被踢出/链接已失效，
+        CHANNEL_INVALID 表示目标已不存在；两者重试都不会成功，
+        继续每轮尝试只会白白消耗请求额度并触发限流，直接跳过。
+        """
+        msg = str(exc).upper()
+        return "CHANNEL_PRIVATE" in msg or "CHANNEL_INVALID" in msg
+
+    @staticmethod
     def _is_network_timeout(exc: Exception) -> bool:
         """判断异常是否为网络临时异常（超时/连接断开/代理僵死等）。
 
@@ -2234,6 +2534,108 @@ class GiveawayEngine:
             self._flood_until.pop(fkey, None)
             return False
         return True
+
+    def _log_transport_flood_429(self, account: str) -> None:
+        """记录每次 429 的账号与时刻，并区分「单账号过密」和「多账号同时被风控」。
+
+        Pyrogram 的 429 只打一行无账号前缀的会话日志，事后无法判断是哪个账号、
+        也无法判断是否集中在同一时段，因此这里补一条带账号和时刻的明细。
+        """
+        now = time.monotonic()
+        wall = time.time()
+        self._transport_flood_hits[account] = wall
+        window = TRANSPORT_FLOOD_CLUSTER_WINDOW
+        recent = {
+            acc: at
+            for acc, at in self._transport_flood_hits.items()
+            if wall - at <= window
+        }
+        self._transport_flood_hits = recent
+        if (
+            now - self._transport_flood_429_logged.get(account, 0.0)
+            < TRANSPORT_FLOOD_LOG_INTERVAL
+        ):
+            return
+        self._transport_flood_429_logged[account] = now
+        if len(recent) >= TRANSPORT_FLOOD_CLUSTER_SIZE:
+            accounts = "、".join(sorted(recent))
+            text = (
+                f"[429] {window:.0f} 秒内 {len(recent)} 个账号触发 Transport flood"
+                f"（{accounts}）：疑似共享出口/IP 层风控，建议减少同时在线账号数或换出口"
+            )
+            alert_key = "cluster"
+            alert_interval = TRANSPORT_FLOOD_ALERT_INTERVAL_CLUSTER
+        else:
+            text = (
+                f"[429] [{account}] 触发 Transport flood"
+                f"（{datetime.fromtimestamp(wall):%H:%M:%S}），单账号请求过密，"
+                "已按退避放缓"
+            )
+            alert_key = f"single:{account}"
+            alert_interval = TRANSPORT_FLOOD_ALERT_INTERVAL_SINGLE
+        self.log(text)
+        if now - self._transport_flood_alerted.get(alert_key, 0.0) < alert_interval:
+            return
+        self._transport_flood_alerted[alert_key] = now
+        self._spawn_flood_alert(text)
+
+    def _spawn_flood_alert(self, text: str) -> None:
+        """把 429 判定发到自己的通知目标（默认收藏夹）。
+
+        限流期间发送本身也消耗配额，因此只在判定为「单账号/多账号」的那一刻
+        发一条，并交给独立任务执行，不阻塞请求链路。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._send_flood_alert(text))
+        self._flood_alert_tasks.add(task)
+        task.add_done_callback(self._flood_alert_tasks.discard)
+
+    async def _send_flood_alert(self, text: str) -> None:
+        """用未处于限流状态的账号把 429 提醒发到通知目标（默认收藏夹）。"""
+        candidates = [
+            (acc, client)
+            for acc, client in list(self._clients.items())
+            if acc not in self._transport_flood_hits
+        ]
+        for target in self.win_forward_targets:
+            name = "收藏夹" if target == "me" else target
+            for account, client in candidates:
+                try:
+                    await client.send_message(target, text)
+                    self.log(f"[{account}] 429 提醒已发送到 {name}")
+                    break
+                except Exception:  # noqa: BLE001 - 提醒失败不影响业务
+                    logger.debug("429 提醒发送失败", exc_info=True)
+                    continue
+            else:
+                self.log(f"429 提醒发送到 {name} 失败：没有可用账号（均在限流或断连）")
+
+    def _note_transport_flood(self, account: str, seconds: float) -> None:
+        """协议层 Transport flood 429：落盘账号限流，账户页才能显示「限流中」。
+
+        Pyrogram 收到 429 只重启会话、不抛异常，调用方拿到的是「请求超时」，
+        因此这条链路必须单独回写，否则账户页始终显示「限流：正常」。
+        """
+        resume_at = datetime.now() + timedelta(seconds=seconds)
+        if self._state is not None:
+            self._state.set_account_limit(
+                account,
+                "flood_wait",
+                time.time() + seconds,
+                "Transport flood 429（协议层限流）",
+            )
+        now = time.monotonic()
+        self._log_transport_flood_429(account)
+        if now - self._transport_flood_logged.get(account, 0.0) < 300:
+            return
+        self._transport_flood_logged[account] = now
+        self.log(
+            f"[{account}] Telegram 协议层限流（Transport flood 429），"
+            f"已同步到账户页（约至 {resume_at:%H:%M}）"
+        )
 
     def _record_flood(
         self,
@@ -2555,6 +2957,9 @@ class GiveawayEngine:
             key = f"{account}|{target.lower()}"
             if key in self._join_cache:
                 continue
+            # 已判定不可访问（私密/失效）：冷却期内不再重复尝试，也不消耗加入配额
+            if self._target_unreachable(account, target):
+                continue
             self._join_cache.add(key)
             if not await self._should_join_target(account, client, target, label):
                 continue
@@ -2569,6 +2974,47 @@ class GiveawayEngine:
                 blocked = True
                 break
         return joined_any, blocked
+
+    @staticmethod
+    def _target_key(account: str, target: Any) -> str:
+        return f"{account}|{str(target).strip().lower()}"
+
+    def _mark_unreachable(self, account: str, *targets: Any) -> bool:
+        """标记目标不可访问（TTL 内跳过），返回是否首次标记。"""
+        first = False
+        until = time.time() + UNREACHABLE_TARGET_TTL
+        for target in targets:
+            key = self._target_key(account, target)
+            # 释放加入缓存：否则 TTL 到期后仍被 _join_cache 永久拦下
+            self._join_cache.discard(f"{account}|{str(target).lower()}")
+            if key in self._unreachable_targets:
+                continue
+            self._unreachable_targets[key] = until
+            first = True
+        return first
+
+    def _target_unreachable(self, account: str, *targets: Any) -> bool:
+        """目标是否仍在不可访问冷却期内；过期条目顺手清理，到期后可再试。"""
+        now = time.time()
+        for target in targets:
+            key = self._target_key(account, target)
+            until = self._unreachable_targets.get(key)
+            if until is None:
+                continue
+            if until > now:
+                return True
+            self._unreachable_targets.pop(key, None)
+        return False
+
+    def _join_flood_paused(self, account: str) -> bool:
+        """是否因限流（PEER_FLOOD / JoinChannel FLOOD_WAIT）暂停加入，不写日志。
+
+        仅用于区分日志原因：网络异常也会阻塞加入，但不应报成「限流」。
+        """
+        if account in self._peer_flood_accounts:
+            return True
+        until = self._join_suspended.get(account)
+        return until is not None and until > time.monotonic()
 
     def _join_paused(self, account: str) -> bool:
         if account in self._peer_flood_accounts:
@@ -2724,6 +3170,11 @@ class GiveawayEngine:
                     str(exc)[:120],
                 )
                 return False, True
+            elif self._is_unreachable_target_error(exc):
+                # 私密/已失效群组：加入永远失败，本任务内直接跳过
+                self._mark_unreachable(account, target)
+                self.log(f"[{account}] {target} 不可访问（私密/已失效，本任务内跳过）")
+                return False, False
             else:
                 self.log(f"[{account}] 加入 {target} 失败: {msg[:120]}")
             return False, False
@@ -2758,6 +3209,9 @@ class GiveawayEngine:
         for group_name, password in tasks:
             sent_key = f"{account}|{username}|{group_name.lower()}|{password}"
             if not ignore_sent and sent_key in self._password_sent:
+                continue
+            # 该群已判定不可访问（被踢/链接失效）：冷却期内不再尝试
+            if self._target_unreachable(account, group_name):
                 continue
             target = self._match_password_target(group_name, name_links)
             if target is None:
@@ -2859,6 +3313,8 @@ class GiveawayEngine:
         # 私有邀请链接目标：先解析成真实 chat id（未加入则顺带加入），
         # 直接拿链接字符串 send_message 会误走用户名解析必失败
         send_target: Any = target
+        if self._target_unreachable(account, group_name, target):
+            return None
         invite_match = _INVITE_LINK_RE.match(str(target).strip())
         if invite_match:
             send_target = await self._resolve_invite_target(
@@ -2876,13 +3332,22 @@ class GiveawayEngine:
             already = True
         else:
             already = await self._is_member(client, send_target)
-        if already is False:
+        # 成员检查返回 None（无法判断）时也要尝试加入：直接发消息会拿到
+        # CHANNEL_PRIVATE 并每轮重复失败，先 join 一次更可靠
+        if already is not True:
             try:
                 await client.join_chat(send_target)
                 self.log(f"[{account}] 已加入口令群「{group_name}」")
                 # 成员状态同步后再发言，避免 bot 侧校验不到
                 await asyncio.sleep(3)
             except Exception as exc:
+                if self._is_unreachable_target_error(exc):
+                    self._mark_unreachable(account, group_name, target, send_target)
+                    self.log(
+                        f"[{account}] 口令群「{group_name}」不可访问"
+                        "（私密/已失效，本任务内跳过）"
+                    )
+                    return None
                 self._note_channels_full(account, exc, f"加入口令群「{group_name}」")
                 self._log_password_group_join_failure(
                     account, group_name, password, str(exc)[:120]
@@ -2976,6 +3441,15 @@ class GiveawayEngine:
                 }
             )
         except Exception as exc:
+            if self._is_unreachable_target_error(exc):
+                # 群组已不可访问（被踢/链接失效）：标记后本任务内不再尝试
+                fresh = self._mark_unreachable(account, group_name, send_target)
+                if fresh:
+                    self.log(
+                        f"[{account}] 口令群「{group_name}」不可访问"
+                        "（私密/已失效，本任务内跳过）"
+                    )
+                return
             self.log(f"[{account}] 发送口令失败（{group_name}）: {str(exc)[:120]}")
             self._emit(
                 {
@@ -3020,6 +3494,9 @@ class GiveawayEngine:
                 return -chat.id
             return None
         except Exception as exc:
+            if self._is_unreachable_target_error(exc):
+                # 私密/失效邀请链接：重试不会成功，本任务内不再尝试
+                self._mark_unreachable(account, invite_link)
             self._note_channels_full(account, exc, "加入私有邀请链接")
             logger.debug("私有邀请链接解析口令群失败", exc_info=True)
             return None
@@ -3590,9 +4067,14 @@ class GiveawayEngine:
             # 加入被暂停时重发 start/点按钮都不会生效（bot 仍判定未加入），
             # 还会白白消耗一次 start 并触发重复按钮跳过；直接按未完成返回，
             # 由上层归还名额且不记「已参与」，等恢复后重试
+            paused = self._join_flood_paused(account)
             self.log(
-                f"[{account}] @{username} 需要加入频道才能参与，"
-                "但本账号自动加入已暂停（限流/配额），本次跳过，稍后重试"
+                f"[{account}] @{username} 需要加入频道才能参与，但"
+                + (
+                    "本账号自动加入已暂停（限流），本次跳过，稍后重试"
+                    if paused
+                    else "自动加入未完成（网络异常或已达加入配额），本次跳过，稍后重试"
+                )
             )
             return False, did_join, had_join_targets, candidates, True
         if did_join:

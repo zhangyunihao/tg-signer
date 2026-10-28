@@ -5,6 +5,7 @@
 TaskRunnerBlock 的 _launch（task_type="组合任务"），历史统一记录在任务历史里。
 """
 
+import functools
 import json
 import logging
 import time
@@ -27,6 +28,12 @@ from tg_signer.webui.common import (
     mobile_card_result,
     state,
     with_select_all,
+)
+from tg_signer.webui.components import (
+    LOG_AREA_CLASS,
+    LOG_AREA_STYLE,
+    progress_summary,
+    stop_with_feedback,
 )
 from tg_signer.webui.data import get_workdir, load_config
 from tg_signer.webui.giveaway import (
@@ -251,6 +258,13 @@ def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | 
         (
             "解析间隔（秒）",
             f"{cfg.get('resolve_pace_min') or 0}–{cfg.get('resolve_pace_max') or 0}",
+        ),
+        (
+            "全局调用上限 / 同时扫描账号数",
+            (
+                f"{cfg.get('global_qps') or 0} 次/秒 / "
+                f"{cfg.get('max_concurrent_accounts') or 0}（0=不限）"
+            ),
         ),
         (
             "超时（分钟，全局）",
@@ -689,27 +703,21 @@ class ComboTaskBlock:
                             ("账号", rec.get("accounts"), True),
                         ]
                     )
-                    # 运行中任务：卡片上直接显示进度条 + 分数
+                    # 运行中任务：卡片上直接显示进度条 + 状态徽章
                     run = self.runner.runs.get(rid)
                     if run is not None:
                         combo_subs = self._run_subs(run)
                         summary = self._progress_summary(run, combo_subs)
-                        done = summary["done"]
-                        total = summary["total"]
                         counts = summary["counts"]
-                        ratio = done / total if total else 0.0
-                        if counts["失败"]:
-                            bar_color = "negative"
-                        elif total and done >= total:
-                            bar_color = "positive"
-                        else:
-                            bar_color = "primary"
-                        with ui.row().classes("w-full items-center gap-2 mt-1"):
-                            ui.icon("play_circle").classes("text-sm text-info")
-                            ui.label(
-                                f"{done}/{total} 步 · {int(ratio * 100)}%"
-                            ).classes("text-xs font-medium text-info")
-                            ui.space()
+                        progress_summary(
+                            summary["done"],
+                            summary["total"],
+                            counts["失败"],
+                            unit="步",
+                        )
+                        with ui.row().classes(
+                            "w-full items-center gap-1 flex-wrap mt-1"
+                        ):
                             for key in ("成功", "失败", "中断"):
                                 cnt = counts.get(key, 0)
                                 if cnt:
@@ -717,15 +725,13 @@ class ComboTaskBlock:
                                     ui.badge(f"{key} {cnt}").props(
                                         f"color={color} outline"
                                     ).classes("text-xs")
-                        ui.linear_progress(value=ratio, show_value=False).props(
-                            f"rounded color={bar_color}"
-                        ).classes("w-full mt-1").style("height: 6px")
                     elif rec.get("result"):
                         mobile_card_result("结果", str(rec["result"]))
                     with ui.row().classes("w-full mobile-card-actions"):
                         if run is not None:
                             ui.button(
-                                "停止", on_click=lambda r=rid: self._stop(r)
+                                "停止",
+                                on_click=functools.partial(self._stop, rid),
                             ).props("flat dense color=negative")
                         ui.button(
                             "复制",
@@ -766,11 +772,11 @@ class ComboTaskBlock:
         if row:
             self.open_progress_page(row)
 
-    def _on_table_stop(self, e) -> None:
+    async def _on_table_stop(self, e) -> None:
         """桌面表格「停止」按钮。"""
         row = self._event_row(e)
         if row and row.get("id"):
-            self._stop(str(row["id"]))
+            await self._stop(str(row["id"]))
 
     def _on_table_duplicate(self, e) -> None:
         """桌面表格「复制」按钮：用该行参数打开新增任务弹窗。"""
@@ -981,25 +987,13 @@ class ComboTaskBlock:
                 ui.label(f"结果：{rec['result']}").classes("text-xs text-gray-600")
             # 整体进度：一步 = 一个账号执行一个子任务，配进度条与状态徽章
             summary = self._progress_summary(run, combo_subs)
-            total_units = summary["total"]
-            done_units = summary["done"]
             counts = summary["counts"]
-            ratio = done_units / total_units if total_units else 0.0
-            if counts["失败"]:
-                bar_color = "negative"
-            elif total_units and done_units >= total_units:
-                bar_color = "positive"
-            else:
-                bar_color = "primary"
-            with ui.row().classes("w-full items-center gap-2 mt-1"):
-                ui.label("整体进度").classes("text-sm font-semibold text-gray-800")
-                ui.space()
-                ui.label(
-                    f"{done_units}/{total_units} 步 · {int(ratio * 100)}%"
-                ).classes("text-xs text-gray-600")
-            ui.linear_progress(value=ratio, show_value=False).props(
-                f"rounded color={bar_color}"
-            ).classes("w-full").style("height: 8px")
+            progress_summary(
+                summary["done"],
+                summary["total"],
+                counts["失败"],
+                unit="步",
+            )
             # 退频道/抽奖的累计成果（多账号求和，来自子进程日志解析计数）
             sub_types = " ".join(str(s.get("type") or "") for s in combo_subs)
             left_n = sum(
@@ -1070,17 +1064,17 @@ class ComboTaskBlock:
                     ui.button(icon="fullscreen", on_click=_toggle_log_fullscreen).props(
                         "flat round dense"
                     ).tooltip("全屏显示")
-            log_classes = (
-                "w-full bg-gray-50 rounded-lg border border-gray-200 gap-0 p-2 "
-                "font-mono text-xs"
-            )
+            log_classes = f"{LOG_AREA_CLASS} gap-0 p-2 font-mono text-sm"
             if getattr(self, "_combo_log_full", False):
                 log_classes += " tgs-page-log-fullscreen"
             # pre-wrap：保留日志缩进但允许长行折行，避免移动端横向溢出
             with (
                 ui.column()
                 .classes(log_classes)
-                .style("white-space: pre-wrap; overflow-wrap: anywhere;")
+                .style(
+                    f"white-space: pre-wrap; overflow-wrap: anywhere; "
+                    f"{LOG_AREA_STYLE}; overflow-y: auto;"
+                )
             ):
                 if not lines:
                     ui.label("暂无日志输出").classes("text-xs text-gray-400")
@@ -1279,17 +1273,19 @@ class ComboTaskBlock:
                     if created:
                         ui.label(f"创建于 {created}").classes("text-xs text-gray-400")
 
-    def _stop(self, run_id: str) -> None:
-        self._stop_shared(run_id)
+    async def _stop(self, run_id: str) -> None:
+        await self._stop_shared(run_id)
         self._render_history()
 
-    def _stop_shared(self, run_id: str) -> tuple[str, dict | None]:
+    async def _stop_shared(self, run_id: str) -> tuple[str, dict | None]:
         """停止任务并落盘终态快照；返回 (结果, 记录)，供历史列表与进度页面共用。"""
         run = self.runner.runs.get(run_id)
         if run is not None:
             # 停止前先落盘一次，确保中断前的明细与日志被保留
             self._persist_snapshot(self._build_snapshot(run), force=True)
-        outcome, record = self.runner._stop_run(run_id)
+        outcome, record = await stop_with_feedback(
+            lambda: self.runner._stop_run(run_id)
+        )
         if outcome == "stopped":
             self._finalize_snapshot(run_id)
         self._live_ids.discard(run_id)
@@ -1739,8 +1735,26 @@ class ComboTaskBlock:
             )
             ui.label(
                 "留空立即执行；所选时间已过则从明天该时间开始。"
-                "开始时间到达后先检测 TG 网络，不通则每 30 分钟重试一次，最多 3 次。"
+                "开始时间到达后先检测 TG 网络，不通则按下方间隔重试，"
+                "次数用尽仍不通则放弃本次任务。"
             ).classes("text-xs text-gray-500")
+            with ui.row().classes("w-full gap-2 no-wrap"):
+                self.new_task_retry_interval = ui.number(
+                    label="网络不通重试间隔（分钟）",
+                    value=30,
+                    min=1,
+                    max=1440,
+                    step=1,
+                    precision=0,
+                ).classes("flex-1")
+                self.new_task_retry_times = ui.number(
+                    label="最多重试次数",
+                    value=3,
+                    min=0,
+                    max=20,
+                    step=1,
+                    precision=0,
+                ).classes("flex-1")
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=self.new_task_dialog.close).props("outline")
                 ui.button("启动", color="primary", on_click=self._start_new_task)
@@ -1789,6 +1803,8 @@ class ComboTaskBlock:
             [a for a in (accounts or []) if a in valid_accounts]
         )
         self.new_task_start_time.set_value(None)
+        self.new_task_retry_interval.set_value(30)
+        self.new_task_retry_times.set_value(3)
         self.new_task_dialog.open()
         if template:
             ui.notify("已复制任务参数，可调整后点击「启动」", type="positive")
@@ -1819,6 +1835,15 @@ class ComboTaskBlock:
             if target <= datetime.now():
                 target += timedelta(days=1)
             start_at = f"{target:%Y-%m-%d %H:%M:%S}"
+        try:
+            retry_minutes = int(self.new_task_retry_interval.value)
+            retry_times = int(self.new_task_retry_times.value)
+        except (TypeError, ValueError):
+            ui.notify("重试间隔和次数需为整数", type="warning")
+            return
+        if retry_minutes < 1 or retry_times < 0:
+            ui.notify("重试间隔需不小于 1 分钟，重试次数不能为负", type="warning")
+            return
         accounts = [a for a in (self.new_task_accounts.value or []) if a]
         if self.runner._launch(
             "组合任务",
@@ -1826,6 +1851,8 @@ class ComboTaskBlock:
             accounts,
             sub_indexes=sub_indexes,
             start_at=start_at,
+            retry_interval_seconds=retry_minutes * 60,
+            max_retries=retry_times,
         ):
             self.new_task_dialog.close()
             self._render_history()
@@ -2054,8 +2081,8 @@ def _build_progress_page(record_id: str) -> None:
             )
         return
 
-    def stop_task() -> None:
-        outcome, stopped = view._stop_shared(record_id)
+    async def stop_task() -> None:
+        outcome, stopped = await view._stop_shared(record_id)
         if outcome == "stopped" and stopped is not None:
             ui.notify(f"已停止: {stopped['task_name']}", type="positive")
         elif outcome == "orphan":

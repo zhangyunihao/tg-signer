@@ -1059,6 +1059,169 @@ def test_record_flood_persists_account_limit(tmp_path):
     assert 80 < limits["acc"][0]["until"] - time.time() <= 90
 
 
+def test_transport_flood_probe_captures_pyrogram_429(monkeypatch):
+    """Pyrogram 的协议层 429 只写日志，探针要能捕获其时间点。"""
+    import logging
+
+    import tg_signer.giveaway_core as gc
+
+    monkeypatch.setattr(gc, "_LAST_TRANSPORT_FLOOD_AT", 0.0)
+    gc._install_transport_flood_probe()
+    logging.getLogger("pyrogram.session").warning(
+        "Server sent transport error: 429 (Transport flood. Please slow down your requests.)"
+    )
+    assert gc._LAST_TRANSPORT_FLOOD_AT > 0
+    # 普通日志不应被误判
+    monkeypatch.setattr(gc, "_LAST_TRANSPORT_FLOOD_AT", 0.0)
+    logging.getLogger("pyrogram.session").warning("Server sent transport error")
+    assert gc._LAST_TRANSPORT_FLOOD_AT == 0
+
+
+class _RestartSession:
+    """模拟 Pyrogram 会话：429 后重启会替换 connection 对象。"""
+
+    def __init__(self):
+        self.connection = object()
+
+
+class _TransportFloodClient:
+    """调用期间发生 429 会话重连、调用方最终只看到超时的假客户端。"""
+
+    def __init__(self):
+        self.session = _RestartSession()
+
+    async def start_bot(self, username, param):
+        self.session.connection = object()  # 429 触发会话重启
+        import asyncio
+
+        raise asyncio.TimeoutError("Request timed out")
+
+
+def test_transport_flood_syncs_account_limit_on_reconnect(tmp_path, monkeypatch):
+    """协议层 429 导致会话重连+超时时，必须落盘账号限流，账户页才不会显示正常。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    engine, state = _engine(tmp_path)
+    monkeypatch.setattr(gc, "_LAST_TRANSPORT_FLOOD_AT", time.monotonic())
+    client = gc._TimeoutClient(
+        _TransportFloodClient(),
+        account="deux",
+        on_transport_flood=engine._note_transport_flood,
+    )
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(client.start_bot("LotteryBot", "p1"))
+
+    limits = state.active_account_limits()
+    assert [item["kind"] for item in limits["deux"]] == ["flood_wait"]
+    assert "Transport flood" in limits["deux"][0]["note"]
+    assert limits["deux"][0]["until"] - time.time() > 0
+    assert "deux" in engine._transport_flood_logged
+
+
+def test_transport_flood_without_429_does_not_mark_limit(tmp_path, monkeypatch):
+    """没有 429 日志时，普通网络超时不能误报成限流。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    engine, state = _engine(tmp_path)
+    monkeypatch.setattr(gc, "_LAST_TRANSPORT_FLOOD_AT", 0.0)
+    client = gc._TimeoutClient(
+        _TransportFloodClient(),
+        account="acc",
+        on_transport_flood=engine._note_transport_flood,
+    )
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(client.start_bot("LotteryBot", "p1"))
+
+    assert state.active_account_limits() == {}
+
+
+def test_transport_flood_logs_account_and_time(tmp_path):
+    """429 明细日志要带账号，并且触发一次主动提醒。"""
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    alerts: list = []
+    engine.log = logs.append
+    engine._spawn_flood_alert = alerts.append
+    engine._note_transport_flood("deux", 60)
+    assert any("[429]" in line and "deux" in line for line in logs)
+    assert any("单账号请求过密" in line for line in logs)
+    assert alerts and "deux" in alerts[0] and "单账号" in alerts[0]
+
+
+def test_transport_flood_alert_sent_via_healthy_account(tmp_path):
+    """429 提醒要用未限流的账号发到通知目标（默认收藏夹）。"""
+    import asyncio
+
+    class _FakeClient:
+        def __init__(self):
+            self.sent: list = []
+
+        async def send_message(self, target, text):
+            self.sent.append((target, text))
+
+    engine, _state = _engine(tmp_path)
+    healthy, flooded = _FakeClient(), _FakeClient()
+    engine._clients = {"deux": flooded, "3": healthy}
+    engine.win_forward_targets = ["me"]
+    engine._transport_flood_hits = {"deux": time.time()}
+
+    asyncio.run(engine._send_flood_alert("[429] 测试"))
+
+    assert healthy.sent == [("me", "[429] 测试")]
+    assert flooded.sent == []
+
+
+def test_transport_flood_alert_when_no_healthy_account(tmp_path):
+    """所有账号都在限流时，提醒发送失败要记日志而不是静默。"""
+    import asyncio
+
+    class _FakeClient:
+        async def send_message(self, target, text):
+            raise RuntimeError("flood")
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    engine._clients = {"deux": _FakeClient()}
+    engine.win_forward_targets = ["me"]
+    engine._transport_flood_hits = {}
+
+    asyncio.run(engine._send_flood_alert("[429] 测试"))
+
+    assert any("429 提醒发送到 收藏夹 失败" in line for line in logs)
+
+
+def test_transport_flood_logs_cluster_when_multi_accounts(tmp_path):
+    """60 秒内 3 个账号都被 429：日志判定为共享出口/IP 层风控。"""
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    alerts: list = []
+    engine.log = logs.append
+    engine._spawn_flood_alert = alerts.append
+    for acc in ("deux", "3", "扣扣un"):
+        engine._note_transport_flood(acc, 60)
+    cluster = [line for line in logs if "疑似共享出口" in line]
+    assert len(cluster) == 1
+    assert "deux" in cluster[0] and "扣扣un" in cluster[0]
+    assert any("疑似共享出口" in text for text in alerts)
+
+
+def test_join_flood_paused_reflects_suspend_state(tmp_path):
+    """加入被暂停的日志原因要能区分限流与网络异常。"""
+    engine, _state = _engine(tmp_path)
+    assert not engine._join_flood_paused("acc")
+    engine._join_suspended["acc"] = time.monotonic() + 600
+    assert engine._join_flood_paused("acc")
+    engine._peer_flood_accounts.add("acc")
+    assert engine._join_flood_paused("acc")
+
+
 def test_state_flood_wait_cooldown_expiry(tmp_path, monkeypatch):
     from datetime import datetime, timedelta
 
@@ -3172,6 +3335,133 @@ def test_send_password_tasks_dedup(tmp_path, monkeypatch):
     assert len([line for line in logs if "发送口令" in line]) == 1
 
 
+class _PrivateGroupClient(FakeClient):
+    """口令目标不可访问：成员检查与加入都返回 CHANNEL_PRIVATE。"""
+
+    def __init__(self):
+        super().__init__()
+        self.join_attempts = 0
+
+    async def get_chat_member(self, target, user_id):
+        raise RuntimeError(
+            "Telegram says: [400 CHANNEL_PRIVATE] - "
+            "You haven't joined this channel/supergroup."
+        )
+
+    async def join_chat(self, target):
+        self.join_attempts += 1
+        raise RuntimeError(
+            "Telegram says: [400 CHANNEL_PRIVATE] - "
+            "You haven't joined this channel/supergroup."
+        )
+
+
+def test_private_password_group_skipped_within_ttl(tmp_path, monkeypatch):
+    """CHANNEL_PRIVATE 口令群：加入失败后打标记，TTL 内不再重复尝试。
+
+    旧逻辑：成员检查返回未知就跳过 join 直接发消息，每轮都拿
+    CHANNEL_PRIVATE 失败并重复消耗请求额度（日志里的
+    「发送口令失败（【上海】沪上嫩妹甄选府）」）。
+    """
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _PrivateGroupClient()
+    private_post = (
+        "🎰 测试抽奖\n"
+        "📮 参与条件：\n"
+        "🎫 加入-沪上嫩妹甄选府\n"
+        "└  🔑 发送口令﹝出击婷婷宝宝﹞"
+    )
+    checklist = _status_message(
+        "您需加入指定的群组/频道\n\n🎫 加入-沪上嫩妹甄选府 ❌",
+        {"沪上嫩妹甄选府": "https://t.me/hsnmyxs_private"},
+    )
+    for _ in range(2):
+        asyncio.run(
+            engine._send_password_tasks(
+                "acc",
+                client,
+                "LotteryBestBot",
+                _msg(text=private_post),
+                [checklist],
+            )
+        )
+    # 成员未知时先尝试加入（而不是直接发消息撞 CHANNEL_PRIVATE）
+    assert client.join_attempts == 1
+    assert client.sent == []
+    assert engine._target_unreachable("acc", "沪上嫩妹甄选府")
+    assert sum("不可访问" in line for line in logs) == 1
+
+
+def test_unreachable_join_target_not_retried(tmp_path, monkeypatch):
+    """CHANNEL_PRIVATE 的加入目标（如 chasesh_jlq）在后续消息里直接跳过。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _PrivateGroupClient()
+    message = _status_message(
+        "您需加入指定的群组/频道\n\n🎫 加入-私密群组 ❌",
+        {"私密群组": "https://t.me/chasesh_private"},
+    )
+    # 直接走加入路径：第一次失败标记，第二次不再发起 join_chat
+    for _ in range(2):
+        asyncio.run(engine._join_from_message("acc", client, "LotteryBestBot", message))
+    assert client.join_attempts == 1
+    assert engine._target_unreachable("acc", "chasesh_private")
+
+
+def test_unreachable_target_retried_after_ttl(tmp_path, monkeypatch):
+    """不可访问标记 24 小时后过期：到期后允许再试一次加入。
+
+    避免私密群恢复可加入（或被重新拉回）后，任务一直跳过直到重启。
+    """
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    engine.log = lambda *a, **k: None
+    monkeypatch.setattr(gc, "UNREACHABLE_TARGET_TTL", 60)
+    client = _PrivateGroupClient()
+    message = _status_message(
+        "您需加入指定的群组/频道\n\n🎫 加入-私密群组 ❌",
+        {"私密群组": "https://t.me/chasesh_private"},
+    )
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBestBot", message))
+    assert client.join_attempts == 1
+    assert engine._target_unreachable("acc", "chasesh_private")
+
+    # 手工把到期时间拨到过去，模拟 TTL 过期
+    key = engine._target_key("acc", "chasesh_private")
+    engine._unreachable_targets[key] = 0.0
+    assert not engine._target_unreachable("acc", "chasesh_private")
+    assert key not in engine._unreachable_targets
+
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBestBot", message))
+    assert client.join_attempts == 2
+
+
 def test_send_password_tasks_dedup_per_password(tmp_path, monkeypatch):
     """去重键含口令文本：同一群组被多个抽奖复用且各带不同口令时，
     第二个抽奖的口令不被首个口令的去重误拦（旧键 account|bot|群组
@@ -3922,6 +4212,56 @@ def test_scan_cap_setting_roundtrip(tmp_path):
     assert load_giveaway_scan_cap(tmp_path) == 500
 
 
+def test_win_skip_keywords_setting_roundtrip(tmp_path):
+    """中奖消息跳过关键字（全局设置）：逗号分隔读写、去重、损坏文件回退空。"""
+    from tg_signer.webui.giveaway import (
+        load_win_skip_keywords,
+        save_win_skip_keywords,
+    )
+
+    assert load_win_skip_keywords(tmp_path) == []
+    save_win_skip_keywords(tmp_path, "感谢参与，未中奖, 未中奖")
+    assert load_win_skip_keywords(tmp_path) == ["感谢参与", "未中奖"]
+    # 列表形式（兼容旧配置）同样可读
+    save_win_skip_keywords(tmp_path, ["活动结束", " ", "未中奖"])
+    assert load_win_skip_keywords(tmp_path) == ["活动结束", "未中奖"]
+    (tmp_path / "webui_win_settings.json").write_text("{bad", encoding="utf-8")
+    assert load_win_skip_keywords(tmp_path) == []
+
+
+def test_win_skip_keywords_ignore_win_message(tmp_path):
+    """中奖消息命中跳过关键字：不推送事件、不转发。"""
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    asyncio.run(
+        engine.start(
+            accounts=[],
+            chats=[],
+            session_dir=tmp_path,
+            log=lambda msg: None,
+            win_detect=True,
+            win_skip_keywords=["感谢参与"],
+            state=state,
+        )
+    )
+    assert engine.win_skip_keywords == ("感谢参与",)
+    state.add("acc", "LotteryBestBot", "p1")
+    state.save()
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    client.history = [
+        _msg(text="💐💐💐 中奖提醒 💐💐💐 恭喜您中奖了！感谢参与", id=11),
+        _msg(text="💐💐💐 中奖提醒 💐💐💐 恭喜您中奖了！", id=10),
+    ]
+    events: list = []
+    engine.on_event = events.append
+    asyncio.run(engine._sweep_bot_wins("acc", client))
+    # 只有不含跳过关键字的那条按中奖处理
+    assert len(events) == 1
+    assert len(client.forwarded) == 1
+    assert client.forwarded[0][2] == (10,)
+
+
 # ---------------- 防脚本验证（按顺序点击 emoji） ----------------
 
 DBCHOUJIANG_VERIFY_TEXT = (
@@ -4347,3 +4687,189 @@ def test_extract_giveaway_title_accepts_party_emoji():
     assert extract_giveaway_title(msg).startswith("秋季校园招生福利抽奖大放送")
     assert extract_giveaway_title(_msg(text="🎰 周末福利")) == "周末福利"
     assert extract_giveaway_title(_msg(text="普通消息")) == ""
+
+
+def test_win_sweep_paces_between_bots(tmp_path, monkeypatch):
+    """回扫相邻 bot 之间要留间隔，避免单账号连发 GetHistory 触发 429。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    sleeps: list = []
+
+    async def _fake_sleep(sec, *a, **k):
+        sleeps.append(sec)
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(gc.random, "uniform", lambda lo, hi: hi)
+    engine, _state = _engine(tmp_path)
+    calls: list = []
+
+    async def _fake_sweep(account, client, bot):
+        calls.append(bot)
+
+    engine._sweep_bot_messages = _fake_sweep
+    asyncio.run(engine._sweep_bot_wins("acc", object(), bots=["b1", "b2", "b3"]))
+    assert calls == ["b1", "b2", "b3"]
+    # 第一个 bot 前不等待，之后每个 bot 前各等一次
+    assert sleeps == [gc.WIN_SWEEP_BOT_GAP_RANGE[1]] * 2
+
+
+def test_timeout_client_backs_off_and_resets(monkeypatch):
+    """连续超时按等级退避，成功一次后回退到 0。
+
+    网络差时 Pyrogram 会把超时请求反复重试，退避是为了压住重试风暴。
+    """
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    monkeypatch.setattr(gc, "_LAST_TRANSPORT_FLOOD_AT", 0.0)
+    client = gc._TimeoutClient(_TransportFloodClient(), account="acc-timeout-backoff")
+    for expected in (1, 2):
+        with pytest.raises(RuntimeError):
+            asyncio.run(client.start_bot("Bot", "p"))
+        assert client._timeout_backoff_idx == expected
+
+    sleeps: list = []
+
+    async def _fake_sleep(sec, *a, **k):
+        sleeps.append(sec)
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _fake_sleep)
+    asyncio.run(client._wait_timeout_cooldown())
+    assert sleeps and 0 < sleeps[0] <= gc._CLIENT_TIMEOUT_BACKOFF[1]
+
+    class _OkClient:
+        async def start_bot(self, username, param):
+            return "ok"
+
+    ok = gc._TimeoutClient(_OkClient(), account="acc-timeout-backoff")
+    ok._timeout_backoff_idx = 2
+    assert asyncio.run(ok.start_bot("Bot", "p")) == "ok"
+    assert ok._timeout_backoff_idx == 0
+
+
+def test_global_rate_limiter_interval():
+    """0 或负值表示不限制；正值换算为相邻两次调用的最小间隔。"""
+    import tg_signer.giveaway_core as gc
+
+    assert gc._GlobalRateLimiter(0).interval == 0
+    assert gc._GlobalRateLimiter(-5).interval == 0
+    assert gc._GlobalRateLimiter(8).interval == pytest.approx(0.125)
+
+
+def test_global_rate_limiter_queues_calls():
+    """连续预约时按间隔排队：第 2、3 次调用需要等待，不会同时放行。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _run():
+        limiter = gc._GlobalRateLimiter(20)  # 间隔 50ms
+        await limiter.wait()
+        await limiter.wait()
+        await limiter.wait()
+
+    started = time.monotonic()
+    asyncio.run(_run())
+    # 首调用不等待，后两次各等一个间隔
+    assert time.monotonic() - started >= 0.09
+
+
+def test_timeout_client_waits_global_limiter():
+    """账号代理的每次 API 调用都要先过全局令牌桶。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    calls = []
+
+    class _Limiter:
+        async def wait(self):
+            calls.append(1)
+
+    class _Api:
+        async def ping(self):
+            return "pong"
+
+    client = gc._TimeoutClient(_Api(), account="acc-global", global_limiter=_Limiter())
+    assert asyncio.run(client.ping()) == "pong"
+    assert len(calls) == 1
+
+
+def test_engine_global_limiter_defaults(tmp_path):
+    import tg_signer.giveaway_core as gc
+
+    engine, _state = _engine(tmp_path)
+    assert engine.global_qps == gc.DEFAULT_GLOBAL_QPS
+    assert engine.max_concurrent_accounts == gc.DEFAULT_MAX_CONCURRENT_ACCOUNTS
+    assert engine._api_limiter.interval == pytest.approx(1 / gc.DEFAULT_GLOBAL_QPS)
+
+
+def test_engine_start_applies_global_limiter(tmp_path, monkeypatch):
+    """任务参数里的全局 QPS / 并发账号数要落到引擎与客户端代理上。"""
+    import asyncio
+
+    async def _run():
+        engine, _state = _engine(tmp_path)
+
+        async def _fake_run(accounts, auto_scan):
+            return None
+
+        monkeypatch.setattr(engine, "_run", _fake_run)
+        ok = await engine.start(
+            ["acc"],
+            [],
+            tmp_path,
+            lambda _m: None,
+            global_qps=3,
+            max_concurrent_accounts=2,
+        )
+        assert ok
+        assert engine.global_qps == 3
+        assert engine._api_limiter.interval == pytest.approx(1 / 3)
+        assert engine._account_slots is not None
+        await engine.stop()
+
+    asyncio.run(_run())
+
+
+def test_account_slots_limit_parallel_accounts(tmp_path):
+    """全局账号窗口生效时，同时运行的账号数不超过上限。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.max_concurrent_accounts = 2
+    engine._account_slots = asyncio.Semaphore(2)
+    active = {"now": 0, "peak": 0}
+
+    async def _job():
+        active["now"] += 1
+        active["peak"] = max(active["peak"], active["now"])
+        await asyncio.sleep(0.01)
+        active["now"] -= 1
+
+    async def _run():
+        await asyncio.gather(*[engine._with_account_slot(_job) for _ in range(6)])
+
+    asyncio.run(_run())
+    assert active["peak"] == 2
+
+
+def test_account_slots_unlimited_when_zero(tmp_path):
+    """0=不限制：没有信号量时直接执行，不做并发约束。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    assert engine._account_slots is None
+    ran = []
+
+    async def _job(tag):
+        ran.append(tag)
+
+    async def _run():
+        await asyncio.gather(*[engine._with_account_slot(_job, i) for i in range(3)])
+
+    asyncio.run(_run())
+    assert ran == [0, 1, 2]
