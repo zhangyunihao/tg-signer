@@ -72,7 +72,11 @@ def make_task_logger(
     log_path = log_dir / log_file
 
     # 按 workdir / task / account 构造唯一 logger 名，避免多账号互相污染 handler
-    logger_name = f"tg-signer.task.{task_name}.{account}" if account else f"tg-signer.task.{task_name}"
+    logger_name = (
+        f"tg-signer.task.{task_name}.{account}"
+        if account
+        else f"tg-signer.task.{task_name}"
+    )
     level = log_level.strip().upper()
     level_no: int = logging.getLevelName(level)
 

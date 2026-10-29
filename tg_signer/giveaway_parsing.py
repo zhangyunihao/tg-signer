@@ -697,7 +697,7 @@ _POPUP_ENDED_RE = re.compile(
 # callback 弹窗直接确认参与成功（部分 bot 只弹窗、不再发新消息）：
 # 弹窗是此时唯一成功凭据，不识别会让后续核对读不到新回复而误判未完成
 _POPUP_SUCCESS_RE = re.compile(
-    r"已参加|已参与|参与成功|已成功报名|报名成功|已获得抽奖资格"
+    r"已参加|已参与|参与成功|参加抽奖成功|已成功报名|报名成功|已获得抽奖资格"
 )
 
 
@@ -705,7 +705,7 @@ _POPUP_SUCCESS_RE = re.compile(
 # 「您已获得抽奖资格（已达标）」等 ＝ 报名已成功：未达标仅剩发言数这类
 # 激活任务（❌ 标在「└ 🎟️ 发言数大于 N 条」子行上，非未加入频道），
 # 系统按参与成功标记，不再以中性行「点击后回复」呈现
-SIGNUP_SUCCESS_RE = re.compile(r"已成功报名|报名成功|已获得抽奖资格")
+SIGNUP_SUCCESS_RE = re.compile(r"已成功报名|报名成功|已获得抽奖资格|参加抽奖成功")
 
 
 def reply_says_signup_success(message: Any) -> bool:

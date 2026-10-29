@@ -931,6 +931,97 @@ def test_engine_skips_non_bot_and_keyword_miss(tmp_path):
     assert client.started == []
 
 
+class _FlakyBotClient:
+    """get_users 首次抛网络超时，之后正常返回 bot（模拟临时解析失败）。"""
+
+    def __init__(self, fail_times=1):
+        self.fail_times = fail_times
+        self.calls = 0
+        self.started = []
+
+    async def get_users(self, username):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise RuntimeError("网络请求 get_users 超时（30 秒，网络异常）")
+        return SimpleNamespace(is_bot=True)
+
+    async def start_bot(self, username, param):
+        self.started.append((username, param))
+
+
+def test_is_bot_transient_error_not_cached(tmp_path):
+    """回归：get_users 因超时/限流抛错时不得缓存「不是机器人」。
+
+    @Lottery_2_bot 场景：解析被限流或超时打断一次，旧实现会写入
+    _bot_cache[key]=False，整个任务期间反复「跳过非机器人链接」，再也不会
+    重试。修复后仅本次返回 False，下一轮解析成功即恢复为机器人。
+    """
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    client = _FlakyBotClient()
+
+    async def _scenario():
+        first = await engine._is_bot("acc", client, "LotteryBot")
+        second = await engine._is_bot("acc", client, "LotteryBot")
+        return first, second
+
+    first, second = asyncio.run(_scenario())
+    assert first is False
+    assert second is True
+    assert client.calls == 2
+    assert engine._bot_cache["acc|lotterybot"] is True
+
+
+def test_is_bot_invalid_username_cached(tmp_path):
+    """用户名无效/不存在是明确错误，仍缓存 False，避免每轮重复 resolve。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+
+    class _InvalidUserClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_users(self, username):
+            self.calls += 1
+            raise RuntimeError(
+                "Telegram says: [400 USERNAME_NOT_OCCUPIED] - The username is "
+                "not occupied"
+            )
+
+    client = _InvalidUserClient()
+
+    async def _scenario():
+        first = await engine._is_bot("acc", client, "GhostBot")
+        second = await engine._is_bot("acc", client, "GhostBot")
+        return first, second
+
+    first, second = asyncio.run(_scenario())
+    assert first is False
+    assert second is False
+    assert client.calls == 1
+    assert engine._bot_cache["acc|ghostbot"] is False
+
+
+def test_engine_retries_bot_after_transient_resolve_error(tmp_path):
+    """端到端：首轮解析失败只跳过本次，下一轮扫描仍会正常参与该 bot。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _FlakyBotClient()
+    message = _msg(text="抽奖 https://t.me/LotteryBot?start=act1")
+
+    asyncio.run(_run_process(engine, client, "acc", message))
+    assert client.started == []
+    assert any("跳过非机器人链接" in line for line in logs)
+
+    asyncio.run(_run_process(engine, client, "acc", message))
+    assert client.started == [("LotteryBot", "act1")]
+
+
 # ---------------- extract_channel_targets（自动加入目标） ----------------
 
 
@@ -1923,6 +2014,89 @@ def test_click_confirm_callback_timeout_returns_incomplete(tmp_path, monkeypatch
     assert any("确认按钮失败" in line for line in logs)
     # 不应写参与记录（completed=False 让入口走 _handle_join_blocked）
     assert not state.has("acc", "ConfirmBot", "r1")
+
+
+def test_click_timeout_confirmed_by_late_success_message(tmp_path, monkeypatch):
+    """回调超时但 bot 已受理并稍后补发成功消息（@Lottery_2_bot 首次报名
+    要逐个校验多个频道身份，回调答复常超 15 秒）时应记参与成功，
+    不能按失败进冷却——否则日志显示未参与，实际已报名。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+
+    class _TimeoutThenSuccessClient(_CallbackClient):
+        async def request_callback_answer(self, chat_id, message_id, callback_data):
+            raise RuntimeError(
+                "网络请求 request_callback_answer 超时（15 秒，网络异常）"
+            )
+
+    engine, state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _TimeoutThenSuccessClient(bot_users={"Lottery_2_bot"})
+    card = _msg(
+        text="🎫 参与条件: 全部满足\n📅 开奖时间：2026-10-31 11:00",
+        buttons=[[_btn("立即参加抽奖", callback_data="join-L179317180816-1")]],
+        id=7165,
+    )
+    # 点击后 bot 补发的成功消息（id 大于被点击卡片）
+    client.history = [
+        _msg(
+            text="参加抽奖成功，请耐心等待，中奖通知机器人会私发给您！\n"
+            "抽奖编号：L179317180816",
+            id=7166,
+        ),
+        card,
+    ]
+    completed, fail_reason = asyncio.run(
+        engine._click_confirm("acc", client, "Lottery_2_bot", card, "")
+    )
+    assert completed is True
+    assert fail_reason == ""
+    assert any("参与成功" in line for line in logs)
+    # 已确认参与，不应进入点击失败冷却
+    assert not engine._click_failed_paused("acc", "Lottery_2_bot")
+
+
+def test_click_timeout_ignores_older_success_message(tmp_path, monkeypatch):
+    """历史遗留的成功消息（id 小于被点击卡片）不能当成本次点击的结果。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+
+    class _TimeoutOnlyClient(_CallbackClient):
+        async def request_callback_answer(self, chat_id, message_id, callback_data):
+            raise RuntimeError(
+                "网络请求 request_callback_answer 超时（15 秒，网络异常）"
+            )
+
+    engine, _state = _engine(tmp_path)
+    client = _TimeoutOnlyClient(bot_users={"Lottery_2_bot"})
+    card = _msg(
+        text="🎫 参与条件: 全部满足",
+        buttons=[[_btn("立即参加抽奖", callback_data="join-L179317180816-1")]],
+        id=7165,
+    )
+    client.history = [
+        _msg(text="参加抽奖成功，请耐心等待", id=7000),
+        card,
+    ]
+    completed, fail_reason = asyncio.run(
+        engine._click_confirm("acc", client, "Lottery_2_bot", card, "")
+    )
+    assert completed is False
+    assert "点击确认按钮失败" in fail_reason
+    assert engine._click_failed_paused("acc", "Lottery_2_bot")
 
 
 def test_click_timeout_sets_bot_retry_cooldown(tmp_path, monkeypatch):
@@ -3153,6 +3327,92 @@ def test_bot_source_sweeps_only_target_bot(tmp_path):
     assert client.history_chats == ["BaibaoxiangCjBot"]
 
 
+# ---------------- 中奖扫描任务类型 ----------------
+
+
+def _win_engine(tmp_path):
+    engine, state = _engine(tmp_path, keywords=(), delay_max=0.0)
+    engine.source_type = "win"
+    engine.bot_username = "BaibaoxiangCjBot"
+    engine.auto_join = False
+    return engine, state
+
+
+def test_win_extra_bots_appended_to_sweep_list(tmp_path):
+    """全局设置的额外机器人无条件追加到中奖回扫列表，且大小写去重。"""
+    engine, state = _win_engine(tmp_path)
+    # 目标 bot 已在列表中：额外配置同名（大小写不同）不重复追加
+    engine.win_extra_bots = ("baibaoxiangcjbot", "yujie_lottery_bot")
+    assert engine._win_sweep_bots("deux") == [
+        "BaibaoxiangCjBot",
+        "yujie_lottery_bot",
+    ]
+
+    # 频道类型任务：状态库记录的 bot + 额外机器人
+    channel_engine, channel_state = _engine(tmp_path, keywords=(), delay_max=0.0)
+    channel_state.add("deux", "lotterybestbot", "p1")
+    channel_engine.win_extra_bots = ("yujie_lottery_bot",)
+    assert channel_engine._win_sweep_bots("deux") == [
+        "lotterybestbot",
+        "yujie_lottery_bot",
+    ]
+
+
+def test_win_source_never_participates(tmp_path):
+    """中奖扫描：不扫描频道/群组、不参与抽奖，只回扫机器人私聊通知。"""
+    import asyncio
+
+    engine, _state = _win_engine(tmp_path)
+    engine.chats = ["@giveaway_channel"]
+    client = FakeClient(bot_users={"BaibaoxiangCjBot"})
+    client.history = [
+        _msg(
+            text="抽奖｜https://t.me/BaibaoxiangCjBot?start=participate_1",
+            id=1,
+        )
+    ]
+    engine._clients = {"deux": client}
+
+    asyncio.run(engine.scan_now())
+
+    assert client.started == []
+    assert engine.joined == 0
+
+
+def test_win_source_sweeps_target_bot_without_history(tmp_path):
+    """中奖扫描任务即使从未参与过该 bot，也直接回扫目标机器人私聊。"""
+    engine, state = _win_engine(tmp_path)
+    assert state.bots_for("deux") == []
+    assert engine._win_sweep_bots("deux") == ["BaibaoxiangCjBot"]
+
+
+def test_win_source_rescue_sweeps_bot_only(tmp_path):
+    """中奖扫描的补漏轮只回扫中奖通知，不读取频道/群组历史。"""
+    import asyncio
+
+    engine, _state = _win_engine(tmp_path)
+    engine.chats = ["@giveaway_channel"]
+
+    class RecordingClient(FakeClient):
+        def __init__(self):
+            super().__init__(bot_users={"BaibaoxiangCjBot"})
+            self.history_chats = []
+
+        def get_chat_history(self, chat, limit=None, max_id=0):
+            self.history_chats.append(str(chat))
+            return super().get_chat_history(chat, limit, max_id)
+
+    client = RecordingClient()
+    failures = {"n": 0}
+    done = {"n": 0}
+    sweep = engine._begin_win_sweep(1)
+
+    asyncio.run(engine._rescue_one_account("deux", client, failures, done, 1, sweep))
+
+    assert client.history_chats == ["BaibaoxiangCjBot"]
+    assert done["n"] == 0
+
+
 def test_win_sweep_progress_kept_after_complete(tmp_path):
     """回扫结束后保留进度文案（完成/中断两种），补漏轮开始不重置。"""
     engine, _state = _bot_engine(tmp_path)
@@ -3855,6 +4115,50 @@ def test_verify_after_click_emits_speech_required(tmp_path, monkeypatch):
     ]
 
 
+def test_verify_after_click_emits_speech_when_not_latest_message(tmp_path, monkeypatch):
+    """真实日志回归（deux 账户）：「您已成功报名抽奖（未达标）…发言数大于
+    N 条 ❌」发出后，其后 bot 又回了 /start 等消息把目标顶到非最新一条——
+    仍要扫近期消息发 speech_required 提醒；最新一条是自己发出的 /start
+    时本次参与判未生效（返回 False），不误记成功。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    events: list = []
+    engine.on_event = events.append
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    activation = _status_message(
+        ACTIVATION_REPLY,
+        {
+            "已加入-野寻·上海学生交流群": "https://t.me/xuesheng_group",
+            "已加入-野寻·上海打卡通告群": "https://t.me/daka_group2",
+        },
+    )
+    own = _msg(text="/start p1")
+    own.outgoing = True
+    # FakeClient 按原序返回且 history[0] 为最新：目标回复被自己的 /start 顶到第 2 条
+    client.history = [own, activation]
+    completed = asyncio.run(
+        engine._verify_after_click("acc", client, "LotteryBestBot", [activation])
+    )
+    assert completed is False
+    assert [e for e in events if e.get("type") == "speech_required"] == [
+        {
+            "type": "speech_required",
+            "account": "acc",
+            "bot": "LotteryBestBot",
+            "title": "上海雾织星半价券",
+            "group": "野寻·上海学生交流群",
+            "required": 6,
+        }
+    ]
+
+
 SOURCE_SPEECH_POST = """🎰 宝山【慧慧 @xiaoguoer7】P五折卷
 
 📮 参与条件
@@ -4358,6 +4662,29 @@ def test_win_settings_roundtrip(tmp_path):
     assert load_win_forward_targets(tmp_path) == ["me"]
     (tmp_path / "webui_win_settings.json").write_text("{bad", encoding="utf-8")
     assert load_win_forward_targets(tmp_path) == ["me"]
+
+
+def test_win_extra_bots_setting_roundtrip(tmp_path):
+    """中奖扫描额外机器人（全局设置）：逗号分隔解析、去 @、去重、保留其他键。"""
+    from tg_signer.webui.giveaway import (
+        load_win_extra_bots,
+        load_win_sweep_limit,
+        save_win_extra_bots,
+        save_win_sweep_limit,
+    )
+
+    assert load_win_extra_bots(tmp_path) == []
+    save_win_sweep_limit(tmp_path, 80)
+    save_win_extra_bots(tmp_path, "@yujie_lottery_bot，@LotteryBestBot, me")
+    assert load_win_extra_bots(tmp_path) == [
+        "yujie_lottery_bot",
+        "LotteryBestBot",
+        "me",
+    ]
+    # 大小写去重（保留首次出现的写法），且不覆盖同文件里的其他设置
+    save_win_extra_bots(tmp_path, "Yujie_Lottery_Bot, @yujie_lottery_bot")
+    assert load_win_extra_bots(tmp_path) == ["Yujie_Lottery_Bot"]
+    assert load_win_sweep_limit(tmp_path) == 80
 
 
 def test_scan_cap_setting_roundtrip(tmp_path):

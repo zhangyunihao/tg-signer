@@ -58,6 +58,9 @@ from tg_signer.webui.giveaway import (
     channel_title_map as _chat_title_map,
 )
 from tg_signer.webui.giveaway import (
+    giveaway_type_label as _giveaway_type_label,
+)
+from tg_signer.webui.giveaway import (
     load_giveaway_timeout_min,
 )
 from tg_signer.webui.giveaway import (
@@ -149,6 +152,10 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
                 "workdir": str(workdir),
                 "task": task_name,
                 "session_dir": str(gcfg.get("session_dir") or "."),
+                # 任务类型：channel=频道/群组，bot=百宝箱扫描，win=中奖扫描
+                "source_type": str(gcfg.get("source_type") or "channel"),
+                "bot_username": str(gcfg.get("bot_username") or ""),
+                "scan_limit": gcfg.get("scan_limit"),
                 "chats": [str(c) for c in (gcfg.get("chats") or [])],
                 "keywords": list(gcfg.get("keywords") or []),
                 "auto_scan": bool(gcfg.get("auto_scan", True)),
@@ -636,6 +643,7 @@ class TaskRunnerBlock:
                 reverse=True,  # 创建时间倒序：编号大的（新建的）在前
             ):
                 cfg = store["tasks"][tid] or {}
+                type_label = _giveaway_type_label(cfg)
                 accounts = "、".join(str(a) for a in (cfg.get("accounts") or []))
                 chats = [str(c) for c in (cfg.get("chats") or [])]
                 # 监控对象优先显示频道/群组名称，未缓存的保留原 id
@@ -644,7 +652,8 @@ class TaskRunnerBlock:
                 if len(labels) > 5:
                     chats_text += f" 等{len(labels)}个"
                 opts[str(tid)] = (
-                    f"{tid}｜账号：{accounts or '未设置'}｜监控：{chats_text or '未设置'}"
+                    f"{tid}｜{type_label}｜账号：{accounts or '未设置'}"
+                    f"｜监控：{chats_text or '未设置'}"
                 )
             return opts
         if "退频道" in task_type:

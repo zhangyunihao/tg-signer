@@ -52,6 +52,7 @@ from tg_signer.webui.giveaway import (
     load_giveaway_scan_cap,
     load_giveaway_timeout_min,
     load_post_skip_keywords,
+    load_win_extra_bots,
     load_win_forward_targets,
     load_win_sweep_limit,
     save_giveaway_global_qps,
@@ -59,6 +60,7 @@ from tg_signer.webui.giveaway import (
     save_giveaway_scan_cap,
     save_giveaway_timeout_min,
     save_post_skip_keywords,
+    save_win_extra_bots,
     save_win_forward_targets,
     save_win_sweep_limit,
 )
@@ -387,6 +389,7 @@ def _build_dashboard(container) -> None:
                 load_win_forward_targets, state.workdir
             )
             sweep_limit = await run.io_bound(load_win_sweep_limit, state.workdir)
+            extra_bots = await run.io_bound(load_win_extra_bots, state.workdir)
             timeout_min = await run.io_bound(load_giveaway_timeout_min, state.workdir)
             scan_cap = await run.io_bound(load_giveaway_scan_cap, state.workdir)
             skip_keywords = await run.io_bound(load_post_skip_keywords, state.workdir)
@@ -436,6 +439,17 @@ def _build_dashboard(container) -> None:
                     min=1,
                     max=1000,
                     precision=0,
+                ).classes("w-full")
+                # 中奖扫描额外机器人（全局）：除抽奖任务扫到的 bot 外也回扫这些 bot
+                ui.label("中奖扫描额外机器人").classes("text-lg font-semibold mt-2")
+                ui.label(
+                    "中奖扫描除了回扫抽奖任务扫到的机器人，还额外回扫这里填写的"
+                    "机器人私聊中奖通知（逗号分隔，可带 @，如 @yujie_lottery_bot）。"
+                ).classes("text-xs text-gray-500")
+                extra_bots_input = ui.input(
+                    label="额外机器人（逗号分隔）",
+                    value="，".join(extra_bots),
+                    placeholder="如：@yujie_lottery_bot, @LotteryBestBot",
                 ).classes("w-full")
                 # 抽奖任务超时（全局）：单独运行与组合子任务共用
                 ui.label("抽奖任务超时（分钟）").classes("text-lg font-semibold mt-2")
@@ -511,6 +525,11 @@ def _build_dashboard(container) -> None:
                         )
                         await run.io_bound(
                             save_win_sweep_limit, state.workdir, sweep_input.value
+                        )
+                        await run.io_bound(
+                            save_win_extra_bots,
+                            state.workdir,
+                            extra_bots_input.value,
                         )
                         await run.io_bound(
                             save_giveaway_timeout_min,

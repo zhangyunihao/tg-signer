@@ -712,6 +712,8 @@ class GiveawayEngine:
         self.win_forward_targets: List[Any] = ["me"]
         # 中奖回扫条数：每次回扫各 bot 私聊最近多少条消息找中奖通知
         self.win_sweep_limit = WIN_SWEEP_LIMIT
+        # 中奖扫描额外机器人：除任务扫到的 bot 外也回扫这些 bot（全局设置）
+        self.win_extra_bots: Tuple[str, ...] = ()
         # 抽奖贴跳过关键字：扫描时帖子文本命中任一关键字即不参与（全局设置）
         self.post_skip_keywords: Tuple[str, ...] = ()
         # 已处理的中奖消息：{account|bot|msg_id}，进程内去重（跨重启靠状态文件）
@@ -719,7 +721,7 @@ class GiveawayEngine:
         # 标记为「双向」的账户集合：发言数要求类抽奖自动跳过
         self.two_way_accounts: set = set()
         self.chats: List = []
-        # 监控来源类型：channel=频道/群组（默认），bot=抽奖机器人私聊
+        # 监控来源类型：channel=频道/群组（默认），bot=百宝箱扫描，win=中奖扫描
         self.source_type = "channel"
         # 机器人私聊来源时的目标用户名（不含 @），只参与该 bot 的抽奖链接
         self.bot_username = ""
@@ -765,6 +767,14 @@ class GiveawayEngine:
             return None
         if self._stopping:
             return "停止中"
+        if self.source_type == "win":
+            # 中奖扫描进度：只回扫中奖通知，不展示参与数
+            if self.scanning:
+                return f"中奖回扫中 {self.scan_text}".strip()
+            if self.rescue_interval > 0:
+                mins = max(1, round(self.rescue_interval / 60))
+                return f"中奖回扫待命中（每{mins}分钟）"
+            return "中奖回扫完成"
         if self.scanning:
             return f"扫描中 {self.scan_text}".strip()
         if self.rescue_interval > 0:
@@ -804,6 +814,7 @@ class GiveawayEngine:
         win_detect: bool = True,
         win_forward_target=None,
         win_sweep_limit: Optional[int] = None,
+        win_extra_bots: Optional[Iterable[str]] = None,
         post_skip_keywords: Optional[Iterable[str]] = None,
         two_way_accounts: Optional[Iterable[str]] = None,
         chat_usernames: Optional[Dict[str, str]] = None,
@@ -827,13 +838,13 @@ class GiveawayEngine:
         self.confirm_keywords = tuple(confirm_keywords or DEFAULT_CONFIRM_KEYWORDS)
         self.confirm_wait = max(0, int(confirm_wait))
         # 机器人私聊来源不做自动加入：消息里的 ✅ 清单与推广链接都不是
-        # 本次任务的加入目标，避免误加频道/群组
-        self.auto_join = bool(auto_join) and self.source_type != "bot"
+        # 本次任务的加入目标，避免误加频道/群组；中奖扫描根本不参与抽奖
+        self.auto_join = bool(auto_join) and self.source_type not in ("bot", "win")
         # 忽略历史成功记录：开启后已参与过的抽奖链接允许重新参与
         self.ignore_history = bool(ignore_history)
         # 中奖识别配置：转发目标列表，"me" = 收藏夹（Saved Messages），
-        # 兼容旧的单目标字符串配置
-        self.win_detect = bool(win_detect)
+        # 兼容旧的单目标字符串配置；中奖扫描类型必须开启，否则无任何动作
+        self.win_detect = bool(win_detect) or self.source_type == "win"
         self.win_forward_targets = self._normalize_win_forward_targets(
             win_forward_target
         )
@@ -841,6 +852,15 @@ class GiveawayEngine:
         self.win_sweep_limit = (
             max(1, int(win_sweep_limit)) if win_sweep_limit else WIN_SWEEP_LIMIT
         )
+        # 中奖扫描额外机器人：去 @、按大小写去重后保存
+        extra_bots: List[str] = []
+        seen_bots = set()
+        for item in win_extra_bots or ():
+            name = str(item).strip().lstrip("@").strip()
+            if name and name.lower() not in seen_bots:
+                seen_bots.add(name.lower())
+                extra_bots.append(name)
+        self.win_extra_bots = tuple(extra_bots)
         # 抽奖贴跳过关键字：扫描到的帖子命中任一关键字即跳过、不参与（含置顶）
         self.post_skip_keywords = tuple(
             str(k).strip() for k in (post_skip_keywords or ()) if str(k).strip()
@@ -1050,6 +1070,25 @@ class GiveawayEngine:
             if not self._clients:
                 self.log("没有可用账号，任务结束")
                 return
+            if self.source_type == "win":
+                # 中奖扫描：只回扫机器人私聊的中奖通知，不扫描频道、不参与抽奖
+                target = (
+                    f"@{self.bot_username}" if self.bot_username else "全部已知 bot"
+                )
+                self.log(
+                    f"任务已启动：中奖扫描（{len(self._clients)} 个账号，回扫 {target}）"
+                )
+                if not self._stop.is_set():
+                    self.scanning = True
+                    try:
+                        await self._sweep_all_accounts()
+                    finally:
+                        self.scanning = False
+                if self.rescue_interval > 0:
+                    await self._rescue_loop()
+                elif not self._stop.is_set():
+                    self.log("中奖回扫完成，任务结束")
+                return
             mode_kw = "，".join(self.keywords) if self.keywords else "全部 bot 链接"
             source_desc = (
                 f"机器人 @{self.bot_username}"
@@ -1099,6 +1138,9 @@ class GiveawayEngine:
             关键词未命中时同样生效，防止翻完整个频道历史）
         """
         if self.scanning or not self._clients:
+            return
+        if self.source_type == "win":
+            # 中奖扫描不扫描频道/群组，也不参与抽奖
             return
         self.scanning = True
         try:
@@ -1663,6 +1705,12 @@ class GiveawayEngine:
             self.log(f"[{account}] 补漏：连接不可用，跳过该账号")
             failures["n"] += 1
             return
+        if self.source_type == "win":
+            # 中奖扫描：补漏轮只重扫中奖通知，不读取 bot 私聊里的抽奖链接
+            await self._sweep_bot_wins(
+                account, client, bots=self._win_sweep_bots(account), progress=sweep
+            )
+            return
         for chat in self.chats:
             if self._stop is not None and self._stop.is_set():
                 return
@@ -1826,15 +1874,28 @@ class GiveawayEngine:
                 logger.debug("中奖消息转发失败", exc_info=True)
 
     def _win_sweep_bots(self, account: str) -> List[str]:
-        """该账号本轮待回扫的 bot 列表（机器人任务只回扫目标 bot）。"""
-        if self._state is None:
-            return []
-        bots = self._state.bots_for(account)
-        if self.source_type == "bot" and self.bot_username:
+        """该账号本轮待回扫的 bot 列表（机器人任务只回扫目标 bot）。
+
+        全局设置里的「中奖扫描额外机器人」无条件追加到列表末尾：这些 bot
+        可能从未在该账号下参与过抽奖（状态库无记录），用户显式配置后仍要
+        回扫其私聊，补齐抽奖任务扫不到的中奖通知。
+        """
+        bots: List[str] = (
+            list(self._state.bots_for(account)) if self._state is not None else []
+        )
+        if self.source_type in ("bot", "win") and self.bot_username:
             # 机器人类型任务只关心目标 bot 的中奖通知：不回扫账号历史上
-            # 参与过的其他 bot，避免启动阶段被十几个 bot 拖住几分钟
+            # 参与过的其他 bot，避免启动阶段被十几个 bot 拖住几分钟；
+            # 中奖扫描任务可能从未参与过该 bot，没有记录时也直接回扫目标
             target = self.bot_username.lower()
-            bots = [b for b in bots if str(b).lower() == target]
+            bots = [b for b in bots if str(b).lower() == target] or (
+                [self.bot_username] if self.source_type == "win" else []
+            )
+        seen = {str(b).lower() for b in bots}
+        for bot in self.win_extra_bots:
+            if bot.lower() not in seen:
+                seen.add(bot.lower())
+                bots.append(bot)
         return bots
 
     def _begin_win_sweep(self, total: int, *, announce: bool = True) -> Dict[str, int]:
@@ -2322,6 +2383,14 @@ class GiveawayEngine:
         return participated
 
     async def _is_bot(self, account: str, client: Any, username: str) -> bool:
+        """判断链接目标是否为机器人；解析失败不缓存，允许下一轮重试。
+
+        get_users 在限流/网络超时时会抛错。此前把任何异常都当成「不是机器人」
+        并写入 _bot_cache，导致该账号本轮任务内永久跳过这条链接（日志反复出现
+        「跳过非机器人链接 @Lottery_2_bot」）。这里区分异常类型：
+        解析成功 → 缓存结果；用户名无效/不存在 → 缓存 False（重试无意义）；
+        其余临时异常（限流/超时/网络抖动）→ 仅本次返回 False、不写缓存。
+        """
         cache_key = f"{account}|{username.lower()}"
         cached = self._bot_cache.get(cache_key)
         if cached is not None:
@@ -2330,9 +2399,18 @@ class GiveawayEngine:
             # 通过 get_users 拿到 is_bot 标记（不同层的 InputPeer 标记不统一）
             await self._pace_resolve(account)
             users = await client.get_users(username)
-            is_bot = bool(getattr(users, "is_bot", False))
-        except Exception:
-            is_bot = False
+        except Exception as exc:
+            if _is_username_resolve_error(exc):
+                self._bot_cache[cache_key] = False
+            else:
+                logger.debug(
+                    "[%s] 解析 @%s 是否为机器人失败（不缓存，稍后重试）：%s",
+                    account,
+                    username,
+                    exc,
+                )
+            return False
+        is_bot = bool(getattr(users, "is_bot", False))
         self._bot_cache[cache_key] = is_bot
         return is_bot
 
@@ -4506,6 +4584,14 @@ class GiveawayEngine:
                 account, username, param, "", exc, label="点击确认按钮"
             ):
                 return True, False, "点击确认按钮触发限流（该 bot 已进入冷却）"
+            # 网络超时（如 @Lottery_2_bot 首次报名要逐个校验多个频道身份，
+            # 回调答复常超过 15 秒而抛超时）：点击可能已在 bot 侧生效，
+            # bot 稍后会补发「参加抽奖成功…」新消息。直接按失败处理会漏记
+            # 参与并进入冷却，日志显示未参与但实际已报名，故先短轮询核对。
+            if self._is_network_timeout(exc) and await self._confirm_after_timeout(
+                account, client, username, message
+            ):
+                return True, True, ""
             # 非限流异常（超时/网络抖动/RPC 偶发故障）：按钮点击实际没成功，
             # 必须返回 completed=False，让上层走 _handle_join_blocked 归还
             # 名额并保留重试可能。绝不能记「已参与」持久化记录，否则下一轮
@@ -4572,6 +4658,33 @@ class GiveawayEngine:
                 }
             )
 
+    async def _confirm_after_timeout(
+        self, account: str, client: Any, username: str, message: Any
+    ) -> bool:
+        """点击回调超时后兜底核对：bot 可能已受理并补发成功消息。
+
+        @Lottery_2_bot 这类 bot 首次报名要逐个校验多个频道成员身份，
+        GetBotCallbackAnswer 常要 10 秒以上，超过客户端超时直接抛错；
+        但点击在 bot 侧已生效，稍后会发「参加抽奖成功…抽奖编号…」。
+        只认被点击消息之后的新消息，避免把历史成功误当本次结果。
+        """
+        clicked_id = int(getattr(message, "id", 0) or 0)
+        for _ in range(4):
+            await asyncio.sleep(3)
+            try:
+                async for item in client.get_chat_history(username, limit=4):
+                    if getattr(item, "outgoing", False):
+                        continue
+                    if int(getattr(item, "id", 0) or 0) <= clicked_id:
+                        continue
+                    if reply_says_signup_success(item):
+                        flat = " ".join(str(_message_text(item) or "").split())[:40]
+                        self.log(f"@{username} 参与成功（{flat}）")
+                        return True
+            except Exception:
+                logger.debug("点击超时后核对 bot 回复失败", exc_info=True)
+        return False
+
     async def _verify_after_click(
         self,
         account: str,
@@ -4589,52 +4702,61 @@ class GiveawayEngine:
             await asyncio.sleep(3)
             if self._stop is not None and self._stop.is_set():
                 return True
-            async for msg in client.get_chat_history(username, limit=1):
-                await self._check_win_message(account, client, username, msg)
-                if getattr(msg, "outgoing", False):
-                    # 最新消息是自己刚发出的（如 URL 参与按钮重发的 /start）：
-                    # bot 对本次操作尚未回复，不能拿自己的消息当「点击后回复」
-                    # 判成功——真实日志里出现过回复内容就是 /start 的假成功
-                    self.log(
-                        f"@{username} 点击后 bot 未回复本次操作，参与未确认，稍后重试"
-                    )
-                    return False
-                text = (_message_text(msg) or "").strip()
-                if not text:
-                    return True
-                flat = " ".join(str(text).split())[:40]
-                if "已参加" in text or reply_says_signup_success(msg):
-                    # 「已参加…」或「已成功报名抽奖（未达标β）/已获得抽奖资格」
-                    # 均为参与成功（未达标仅剩发言数等激活任务，标记为完成）
-                    self.log(f"@{username} 参与成功（{flat}）")
-                    # 报名成功后的激活任务清单若仍列出 ❌ 口令任务
-                    # （发送口令﹝xx﹞），说明 bot 未计入此前发送的口令
-                    # （部分 bot 只核验报名之后在群里的发言），立即按清单
-                    # 补发一次；✅ 已完成行由解析自动跳过，发言数等其余
-                    # 激活任务不处理
-                    try:
-                        await self._send_password_tasks(
-                            account,
-                            client,
-                            username,
-                            None,
-                            [msg],
-                            ignore_sent=True,
-                            link_messages=[msg, *(candidates or [])],
-                        )
-                    except Exception:
-                        logger.debug("报名成功后补发口令任务失败", exc_info=True)
-                    # 清单中未达标（❌）的发言数任务：推送「还需发言 N 条」提醒
-                    self._emit_speech_tasks(account, username, msg)
-                    return True
-                if JOIN_REQUIRED_POPUP_RE.search(text):
-                    # bot 仍在要求加入频道：这次 start/点击没有真正报名成功，
-                    # 不能记「已参与」，留给下一轮扫描重试
-                    self.log(f"@{username} 仍要求加入频道，本次参与未生效：{flat}")
-                    return False
-                if not reply_says_ended(msg):
-                    self.log(f"@{username} 点击后回复：{flat}")
+            recent: List[Any] = []
+            async for item in client.get_chat_history(username, limit=4):
+                recent.append(item)
+            if not recent:
                 return True
+            # 「您已成功报名抽奖（未达标）…发言数大于 N 条 ❌」不一定恰好是
+            # 最新一条（其后可能还有自己重发的 /start、bot 的其他回复），
+            # 只看最新一条会漏掉：逐条扫描近期 bot 回复，凡解析出发言任务
+            # 即推提醒（消息中心按账号|bot|群组|条数|标题去重，不重复弹窗）
+            for item in recent:
+                if getattr(item, "outgoing", False):
+                    continue
+                self._emit_speech_tasks(account, username, item)
+            msg = recent[0]
+            await self._check_win_message(account, client, username, msg)
+            if getattr(msg, "outgoing", False):
+                # 最新消息是自己刚发出的（如 URL 参与按钮重发的 /start）：
+                # bot 对本次操作尚未回复，不能拿自己的消息当「点击后回复」
+                # 判成功——真实日志里出现过回复内容就是 /start 的假成功
+                self.log(f"@{username} 点击后 bot 未回复本次操作，参与未确认，稍后重试")
+                return False
+            text = (_message_text(msg) or "").strip()
+            if not text:
+                return True
+            flat = " ".join(str(text).split())[:40]
+            if "已参加" in text or reply_says_signup_success(msg):
+                # 「已参加…」或「已成功报名抽奖（未达标）/已获得抽奖资格」
+                # 均为参与成功（未达标仅剩发言数等激活任务，标记为完成）
+                self.log(f"@{username} 参与成功（{flat}）")
+                # 报名成功后的激活任务清单若仍列出 ❌ 口令任务
+                # （发送口令﹝xx﹞），说明 bot 未计入此前发送的口令
+                # （部分 bot 只核验报名之后在群里的发言），立即按清单
+                # 补发一次；✅ 已完成行由解析自动跳过，发言数等其余
+                # 激活任务不处理
+                try:
+                    await self._send_password_tasks(
+                        account,
+                        client,
+                        username,
+                        None,
+                        [msg],
+                        ignore_sent=True,
+                        link_messages=[msg, *(candidates or [])],
+                    )
+                except Exception:
+                    logger.debug("报名成功后补发口令任务失败", exc_info=True)
+                return True
+            if JOIN_REQUIRED_POPUP_RE.search(text):
+                # bot 仍在要求加入频道：这次 start/点击没有真正报名成功，
+                # 不能记「已参与」，留给下一轮扫描重试
+                self.log(f"@{username} 仍要求加入频道，本次参与未生效：{flat}")
+                return False
+            if not reply_says_ended(msg):
+                self.log(f"@{username} 点击后回复：{flat}")
+            return True
         except Exception:
             logger.debug("核对确认按钮回复失败", exc_info=True)
         return True

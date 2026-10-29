@@ -38,6 +38,7 @@ from tg_signer.webui.components import (
 from tg_signer.webui.data import get_workdir, load_config
 from tg_signer.webui.giveaway import (
     channel_title_map,
+    giveaway_type_label,
     load_giveaway_global_qps,
     load_giveaway_max_concurrent,
     load_giveaway_timeout_min,
@@ -219,7 +220,8 @@ def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | 
     if not isinstance(cfg, dict):
         return None
     titles = channel_title_map(workdir)
-    is_bot = str(cfg.get("source_type") or "channel") == "bot"
+    source_type = str(cfg.get("source_type") or "channel")
+    is_bot_like = source_type in ("bot", "win")
     chats = [str(c) for c in (cfg.get("chats") or [])]
     chats_text = "\n".join(
         f"{titles.get(cid)} ({cid})" if titles.get(cid) else cid for cid in chats
@@ -228,9 +230,12 @@ def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | 
     rescue_min = int(cfg.get("rescue_interval_min") or 0)
     return [
         ("账号", _fmt_param_value(cfg.get("accounts"))),
-        ("任务类型", "百宝箱机器人" if is_bot else "频道/群组"),
-        ("监控机器人", f"@{cfg.get('bot_username')}" if is_bot else "—"),
-        ("监控频道/群组", ("—" if is_bot else chats_text) or "—"),
+        ("任务类型", giveaway_type_label(cfg)),
+        ("监控机器人", f"@{cfg.get('bot_username')}" if is_bot_like else "—"),
+        (
+            "监控频道/群组",
+            ("—" if is_bot_like else chats_text) or "—",
+        ),
         ("会话目录", str(cfg.get("session_dir") or ".")),
         ("消息关键词", _fmt_param_value(cfg.get("keywords"))),
         ("启动时自动扫描", _fmt_param_value(cfg.get("auto_scan"))),
@@ -1237,6 +1242,12 @@ class ComboTaskBlock:
                 ui.label("还没有组合任务模板，点击「新增组合任务模板」创建").classes(
                     "text-sm text-gray-400"
                 )
+            # 抽奖子任务行展示「是否重复参与」：读一次任务库避免逐卡片重复读盘
+            try:
+                give_cfgs = load_task_store(self.workdir).get("tasks") or {}
+            except Exception:
+                logger.debug("读取抽奖任务配置失败", exc_info=True)
+                give_cfgs = {}
             for c in items:
                 name = str(c.get("name") or "")
                 subs = c.get("subs") or []
@@ -1263,6 +1274,14 @@ class ComboTaskBlock:
                                 )
                                 if chats_text:
                                     text += f"｜监控对象：{chats_text}"
+                                cfg = give_cfgs.get(str(s.get("task") or ""))
+                                if isinstance(cfg, dict):
+                                    allow = (
+                                        "是"
+                                        if cfg.get("ignore_history", True)
+                                        else "否"
+                                    )
+                                    text += f"｜允许重复参与：{allow}"
                             ui.label(text).classes("text-sm text-gray-700")
                     last = last_runs.get(name)
                     if last is not None:

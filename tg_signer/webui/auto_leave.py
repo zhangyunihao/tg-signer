@@ -1506,9 +1506,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             ui.button(icon="fullscreen", on_click=toggle_fullscreen).props(
                 "flat round dense"
             ).tooltip("全屏显示")
-    log_area = (
-        ui.log(max_lines=1000).classes(LOG_AREA_CLASS).style("height: 320px")
-    )
+    log_area = ui.log(max_lines=1000).classes(LOG_AREA_CLASS).style("height: 320px")
     # 注册当前活跃 log_area：后台运行的任务通过它推送到最新页面
     _LEAVE_ACTIVE_LOG_AREA[wd_key] = log_area
     for line in log_lines:

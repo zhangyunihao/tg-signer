@@ -274,8 +274,8 @@ def test_combo_giveaway_options_show_accounts_chats(monkeypatch):
     blk = TaskRunnerBlock.__new__(TaskRunnerBlock)
 
     opts = blk._get_combo_task_names("自动抽奖 (giveaway run)")
-    assert opts["3"] == "3｜账号：alice、bob｜监控：@c1、鲸鱼群组"
-    assert opts["7"] == "7｜账号：未设置｜监控：未设置"
+    assert opts["3"] == "3｜频道/群组｜账号：alice、bob｜监控：@c1、鲸鱼群组"
+    assert opts["7"] == "7｜频道/群组｜账号：未设置｜监控：未设置"
     # 超过 5 个监控对象截断显示
     monkeypatch.setattr(
         sign_mod,
@@ -286,6 +286,48 @@ def test_combo_giveaway_options_show_accounts_chats(monkeypatch):
     )
     opts = blk._get_combo_task_names("自动抽奖 (giveaway run)")
     assert opts["2"].endswith("等7个")
+
+
+def test_combo_giveaway_options_show_source_type(monkeypatch):
+    """组合任务选择抽奖子任务时标注三种类型，构建 spec 时带上类型字段。"""
+    monkeypatch.setattr(
+        sign_mod,
+        "_load_giveaway_store",
+        lambda _wd: {
+            "tasks": {
+                "1": {"accounts": ["a"], "chats": ["-1001"]},
+                "2": {
+                    "accounts": ["a"],
+                    "chats": ["BaibaoxiangCjBot"],
+                    "source_type": "bot",
+                    "bot_username": "BaibaoxiangCjBot",
+                    "scan_limit": 200,
+                },
+                "3": {
+                    "accounts": ["a"],
+                    "chats": ["BaibaoxiangCjBot"],
+                    "source_type": "win",
+                    "bot_username": "BaibaoxiangCjBot",
+                    "scan_limit": 200,
+                },
+            }
+        },
+    )
+    monkeypatch.setattr(sign_mod, "_chat_title_map", lambda _wd: {})
+    blk = TaskRunnerBlock.__new__(TaskRunnerBlock)
+    opts = blk._get_combo_task_names("自动抽奖 (giveaway run)")
+    assert "频道/群组" in opts["1"]
+    assert "百宝箱扫描" in opts["2"]
+    assert "中奖扫描" in opts["3"]
+
+    spec = build_combo_sub_spec(
+        "a", {"type": "自动抽奖 (giveaway run)", "task": "3"}, "."
+    )
+    assert spec is not None
+    inner = spec["spec"]
+    assert inner["source_type"] == "win"
+    assert inner["bot_username"] == "BaibaoxiangCjBot"
+    assert inner["scan_limit"] == 200
 
 
 def test_combo_sub_accounts_resolution(monkeypatch):
