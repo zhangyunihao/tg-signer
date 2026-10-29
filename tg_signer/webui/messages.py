@@ -18,7 +18,7 @@
 import asyncio
 import json
 import logging
-from datetime import datetime
+import re
 from pathlib import Path
 from typing import Callable, List, Set
 
@@ -122,17 +122,17 @@ def save_pin_keys(workdir, keys: Set[str]) -> None:
 
 
 def _time_sort_value(m: dict) -> int:
-    """把消息时间（%m-%d %H:%M:%S）转为可比较整数，便于跨分类按新旧排序。"""
-    time_str = str(m.get("time") or "")
-    try:
-        dt = datetime.strptime(time_str, "%m-%d %H:%M:%S")
-    except ValueError:
+    """把消息时间（%m-%d %H:%M:%S）转为可比较整数，便于跨分类按新旧排序。
+
+    手工取数字解析而不是 datetime.strptime：该格式不含年份，Python 3.14 起
+    strptime 会抛 DeprecationWarning（无年份日期解析语义将在 3.15 改变）。
+    这里只用于排序，缺字段或格式不符时按 0 处理。
+    """
+    parts = re.findall(r"\d+", str(m.get("time") or ""))
+    if len(parts) != 5:
         return 0
-    return (
-        ((dt.month * 100 + dt.day) * 100 + dt.hour) * 10000
-        + dt.minute * 100
-        + dt.second
-    )
+    month, day, hour, minute, second = (int(part) for part in parts)
+    return ((month * 100 + day) * 100 + hour) * 10000 + minute * 100 + second
 
 
 def message_sort_key(

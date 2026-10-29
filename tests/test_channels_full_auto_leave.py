@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from tg_signer.giveaway_core import GiveawayEngine
 from tg_signer.webui import auto_leave, giveaway
-from tg_signer.webui.messages import collect_messages
+from tg_signer.webui.messages import collect_messages, message_sort_key
 
 
 class _FullClient:
@@ -267,3 +267,22 @@ def test_scan_stale_chats_skips_configured_titles(tmp_path, monkeypatch):
     )
     assert [r["title"] for r in rows] == ["普通频道"]
     assert any("跳过指定频道/群组" in line for line in logs)
+
+
+def test_message_sort_key_orders_by_time_without_strptime():
+    """消息时间（%m-%d %H:%M:%S）排序：手工解析，不触发 Python 3.14 的弃用警告。"""
+    keys = [
+        {"key": "a", "tag": "消息", "time": "10-29 08:00:00"},
+        {"key": "b", "tag": "消息", "time": "10-29 21:30:00"},
+        {"key": "c", "tag": "消息", "time": "10-28 23:59:59"},
+        {"key": "d", "tag": "消息", "time": "坏数据"},
+    ]
+    ordered = [
+        m["key"]
+        for m in sorted(
+            keys,
+            key=lambda m: message_sort_key(m, read_keys=set(), pin_keys=frozenset()),
+        )
+    ]
+    # 同组内按时间倒序（新消息在前），无法解析的排在最后
+    assert ordered == ["b", "a", "c", "d"]
