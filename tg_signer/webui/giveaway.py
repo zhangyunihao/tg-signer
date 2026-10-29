@@ -933,6 +933,9 @@ def add_task_to_store(workdir, cfg: dict) -> str:
 
 def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None]:
     """构建“自动抽奖”标签页内容，返回刷新函数以纳入全局刷新。"""
+    # 构建该区块的客户端：后台任务（引擎事件、超时停止等）里 ui.context 的
+    # 槽栈为空，直接 ui.notify 会抛「slot stack is empty」，需显式进入 client
+    client = ui.context.client
     wd_key = str(Path(workdir).resolve())
     store = load_task_store(workdir)
     tasks: Dict[str, dict] = {
@@ -1253,9 +1256,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     eng.stop()
                 except Exception:
                     logger.debug("任务运行超时自动停止失败", exc_info=True)
-                ui.notify(
+                # 定时器在后台任务里触发，ui.context 无槽栈，需显式进入 client
+                _notify_alert(
+                    client,
                     f"任务 #{_n} 已达最长运行时长 {_mins} 分钟，自动停止",
-                    type="warning",
+                    "warning",
+                    "推送任务超时自动停止提醒失败",
                 )
 
         cfg = tasks[name]
@@ -1409,7 +1415,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         except Exception:
             logger.debug("更新任务运行状态回调执行失败", exc_info=True)
 
-    def on_add_task() -> None:
+    async def on_add_task() -> None:
         accounts = list(account_select.value or [])
         # 清理历史标签后缀
         accounts = [str(a).replace(" ⚠️未授权", "") for a in accounts]
@@ -1525,7 +1531,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         render_tasks()
         add_dlg.close()
         ui.notify(f"任务 #{name} 已添加，正在启动...", type="positive")
-        asyncio.create_task(start_task(name, tasks[name]["_set_status"]))
+        # 直接 await：on_click 事件处理本身带槽栈上下文，启动里的 ui.notify 才能弹；
+        # asyncio.create_task 会开新任务、槽栈为空，后台更新 UI 直接抛 RuntimeError
+        await start_task(name, tasks[name]["_set_status"])
 
     def _card_time_html(text: str) -> str:
         return (
@@ -1931,15 +1939,22 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         card_time_texts[n] = time_text
                         with ui.row().classes("w-full mobile-card-actions"):
                             # 启动/停止两个按钮都创建，按运行状态切换显隐（创建后自动启动也能跟着变）
+                            # 直接交给 NiceGUI 调度（它会带着元素槽栈上下文 await）：
+                            # 自己 asyncio.create_task 会开新任务、槽栈为空，
+                            # 启动流程里的 ui.notify 就抛「slot stack is empty」
+                            async def _on_card_start(nn=n, cb=set_status) -> None:
+                                await _card_start(nn, cb)
+
+                            async def _on_card_stop(nn=n, cb=set_status) -> None:
+                                await _card_stop(nn, cb)
+
                             start_btn = ui.button(
                                 "启动",
-                                on_click=lambda nn=n,
-                                cb=set_status: asyncio.create_task(_card_start(nn, cb)),
+                                on_click=_on_card_start,
                             ).props("flat dense color=primary")
                             stop_btn = ui.button(
                                 "停止",
-                                on_click=lambda nn=n,
-                                cb=set_status: asyncio.create_task(_card_stop(nn, cb)),
+                                on_click=_on_card_stop,
                             ).props("flat dense color=negative")
                             if running:
                                 start_btn.set_visibility(False)
