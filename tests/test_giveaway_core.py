@@ -1689,7 +1689,7 @@ def test_click_confirm_join_paused_reports_incomplete(tmp_path, monkeypatch):
             [_btn("🎟️ 点击参与抽奖", url="https://t.me/BaibaoxiangCjBot?start=p1")]
         ],
     )
-    completed = asyncio.run(
+    completed, _reason = asyncio.run(
         engine._click_confirm("acc", client, "BaibaoxiangCjBot", msg, "p1")
     )
     assert completed is False
@@ -1902,18 +1902,120 @@ def test_click_confirm_callback_timeout_returns_incomplete(tmp_path, monkeypatch
         text="请确认参与",
         buttons=[[_btn("✅ 确认参与抽奖", callback_data="confirm_1")]],
     )
-    # _click_confirm 直接调用：验证返回值语义
-    completed = asyncio.run(
+    # _click_confirm 直接调用：验证返回值语义（completed, fail_reason）
+    completed, fail_reason = asyncio.run(
         engine._click_confirm("acc", client, "ConfirmBot", msg, "r1")
     )
     assert completed is False, (
         "callback 超时应返回 False 让上层走 _handle_join_blocked，"
         "不能返回 True 被误记为已参与"
     )
+    assert "点击确认按钮失败" in fail_reason
     # 日志应有失败记录
     assert any("确认按钮失败" in line for line in logs)
     # 不应写参与记录（completed=False 让入口走 _handle_join_blocked）
     assert not state.has("acc", "ConfirmBot", "r1")
+
+
+def test_click_timeout_sets_bot_retry_cooldown(tmp_path, monkeypatch):
+    """点击超时后该 bot 进入冷却：冷却期内参与入口直接跳过、不再发 start，
+    回归「加入成功→重发 start→点击超时 30 秒→下一轮扫描立刻重试」的重试风暴。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    class _TimeoutClickClient(_CallbackClient):
+        async def request_callback_answer(self, chat_id, message_id, callback_data):
+            raise RuntimeError(
+                "网络请求 request_callback_answer 超时（15 秒，网络异常）"
+            )
+
+    client = _TimeoutClickClient(bot_users={"ConfirmBot"})
+    msg = _msg(
+        text="请确认参与",
+        buttons=[[_btn("✅ 确认参与抽奖", callback_data="confirm_1")]],
+    )
+    completed, reason = asyncio.run(
+        engine._click_confirm("acc", client, "ConfirmBot", msg, "r1")
+    )
+    assert completed is False
+    assert "点击确认按钮失败" in reason
+    assert engine._click_failed_paused("acc", "ConfirmBot")
+    # 冷却期内参与入口直接跳过（否则下一轮扫描立刻重试、重复烧一次超时）
+    assert engine._can_participate_link("acc", "ConfirmBot", "r1") is False
+    assert not state.has("acc", "ConfirmBot", "r1")
+
+
+def test_click_flood_not_recorded_as_success(tmp_path, monkeypatch):
+    """确认按钮点击触发 FLOOD_WAIT：不能走成功路径记「已参与」——
+    那会覆盖 _record_flood 刚写入的 flood_wait 冷却记录，造成永久假成功。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    engine.max_joins = 5
+
+    class _FloodClickClient(_CallbackClient):
+        async def start_bot(self, username, param):
+            self.started.append((username, param))
+            return _msg(
+                text="请确认参与",
+                buttons=[[_btn("✅ 确认参与抽奖", callback_data="c1")]],
+            )
+
+        async def request_callback_answer(self, chat_id, message_id, callback_data):
+            exc = RuntimeError(
+                "Telegram says: [420 FLOOD_WAIT_X] - Please wait 500 seconds"
+            )
+            exc.value = 500
+            raise exc
+
+    client = _FloodClickClient(bot_users={"FloodClickBot"})
+    asyncio.run(engine._participate("acc", client, "FloodClickBot", "p1", "导航频道"))
+    assert engine._flood_paused("acc", "FloodClickBot")
+    assert not state.has("acc", "FloodClickBot", "p1")
+    assert any("[未参与]" in line for line in logs)
+    assert not any("[已参与]" in line for line in logs)
+    assert engine.joined == 0
+    assert engine.failed == 1
+
+
+def test_verify_after_click_own_message_not_counted_as_reply(tmp_path, monkeypatch):
+    """参与按钮重发 start 后 bot 没回复：历史最新一条是自己发出的 /start，
+    不能把它当「点击后回复」判成功（真实日志中的 /start 假成功回归）。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"SomeBot"})
+    own = _msg(text="/start p1")
+    own.outgoing = True
+    client.history = [own]
+    completed = asyncio.run(engine._verify_after_click("acc", client, "SomeBot", []))
+    assert completed is False
+    assert any("bot 未回复" in line for line in logs)
 
 
 def test_click_confirm_multi_round_join_restart_converges(tmp_path, monkeypatch):
@@ -1955,7 +2057,9 @@ def test_click_confirm_multi_round_join_restart_converges(tmp_path, monkeypatch)
     # start_msg 随便传什么，patch 后不再关心候选里的内容
     client = _CallbackClient(bot_users={"LyCJBot"})
     msg = _msg(text="bot 初始回复")
-    completed = asyncio.run(engine._click_confirm("acc", client, "LyCJBot", msg, "r1"))
+    completed, _reason = asyncio.run(
+        engine._click_confirm("acc", client, "LyCJBot", msg, "r1")
+    )
     # 断言 while 循环至少跑了 3 轮（前 2 轮 did_join=True，第 3 轮 did_join=False break）
     assert len(calls) >= 3, (
         f"多轮 join→restart 应至少迭代 3 次才收敛，实际只调了 {len(calls)} 次"

@@ -29,6 +29,7 @@ from tg_signer.core import get_client, safe_disconnect
 from tg_signer.giveaway_parsing import (
     _INVITE_LINK_RE,
     _POPUP_ENDED_RE,
+    _POPUP_SUCCESS_RE,
     _TME_RE,
     DEFAULT_CONFIRM_KEYWORDS,
     DEFAULT_KEYWORDS,
@@ -90,6 +91,13 @@ FLOOD_HARD_BLOCK_SECONDS = 300
 # 同一 bot 相邻两次 StartBot 的最小间隔（秒）：一次参与流程会连发
 # 1~3 次 start（初次 / 加入后重发 / 点参与按钮），间隔过密会触发账号级限流
 START_MIN_INTERVAL = 8.0
+
+
+# 确认按钮点击失败（网络超时/抖动/RPC 异常）后的 bot 级冷却（秒）：
+# 冷却期内该账号对该 bot 不再发 start/点按钮。没有冷却时「加入成功→
+# 重发 start→点击超时 30 秒→下一轮扫描立刻重试」会形成重试风暴，
+# 每轮白烧一次完整超时且无法收敛（FLOOD 有冷却，网络超时没有）。
+CLICK_FAILURE_COOLDOWN = 60
 
 
 # —— 加入频道限流保护 ——
@@ -226,6 +234,9 @@ _CLIENT_TRANSPORT_FLOOD_BACKOFF = [5, 10, 20, 30]  # Transport 429 指数退避�
 # 网络超时后的重试退避（秒）：连续超时逐级加大，成功一次即清零。
 # 网络差时 Pyrogram 会反复重试同一请求，不加退避会形成重试风暴。
 _CLIENT_TIMEOUT_BACKOFF = [2, 5, 10, 20]
+# 部分调用的独立超时（秒）：callback 答复是毫秒级小包，健康网络秒回；
+# 与普通请求共用 30 秒会在网络故障/限流时把每次按钮点击都拖满 30 秒
+_CALL_TIMEOUT_OVERRIDES: Dict[str, float] = {"request_callback_answer": 15}
 
 
 async def _timeout_aiter(agen: Any, timeout: float, name: str = "") -> Any:
@@ -429,13 +440,14 @@ class _TimeoutClient:
             #    调用期间被 429 重启会话时据此判定是本账号被限流
             await self._throttled_enter()
             conn_before = self._connection_ref()
+            timeout = _CALL_TIMEOUT_OVERRIDES.get(name, self._timeout)
             try:
-                result = await asyncio.wait_for(coro, self._timeout)
+                result = await asyncio.wait_for(coro, timeout)
             except asyncio.TimeoutError:
                 self._on_timeout()
                 self._note_transport_flood(conn_before, timeout_failure=True)
                 raise RuntimeError(
-                    f"网络请求 {name} 超时（{self._timeout:.0f} 秒，网络异常）"
+                    f"网络请求 {name} 超时（{timeout:.0f} 秒，网络异常）"
                 ) from None
             except BaseException as exc:
                 self._on_call_exception(exc)
@@ -664,6 +676,9 @@ class GiveawayEngine:
         self._account_slots: Optional[asyncio.Semaphore] = None
         # 解析类调用上次发起时刻（monotonic 秒），用于账号级最小间隔
         self._last_resolve_at: Dict[str, float] = {}
+        # 同一加入目标上次 join_chat 时刻（monotonic 秒）：跨账号错峰，
+        # 多账号并行扫描常在同一秒撞同一条邀请链接触发整批 FLOOD_WAIT
+        self._last_target_join_at: Dict[str, float] = {}
         # FLOOD_WAIT 熔断：{account|bot_lower: 连续次数}；达到上限加入 _flood_bots
         self._flood_counts: Dict[str, int] = {}
         self._flood_bots: set = set()
@@ -672,6 +687,8 @@ class GiveawayEngine:
         self._flood_until: Dict[str, float] = {}
         # 同一 bot 上次 StartBot 时刻（monotonic 秒），用于强制最小间隔
         self._last_start_at: Dict[str, float] = {}
+        # 确认按钮点击失败后的 bot 级冷却：{account|bot_lower: 恢复时刻}
+        self._click_failed_until: Dict[str, float] = {}
         # 「已结束」回复熔断：{account|bot_lower: 次数}；达到上限加入 _ended_bots
         self._ended_counts: Dict[str, int] = {}
         self._ended_bots: set = set()
@@ -888,6 +905,7 @@ class GiveawayEngine:
         self._flood_bots.clear()
         self._flood_until.clear()
         self._last_start_at.clear()
+        self._click_failed_until.clear()
         self._ended_counts.clear()
         self._ended_bots.clear()
         self._seen_msgs.clear()
@@ -900,6 +918,7 @@ class GiveawayEngine:
         self._peer_flood_accounts.clear()
         self._join_events.clear()
         self._last_resolve_at.clear()
+        self._last_target_join_at.clear()
         # 监控对象 chat_id -> @username：数字 id 无法直接加入时兜底
         self.chat_usernames = self._normalize_chat_usernames(chat_usernames)
         self._rescue_fail_streak = 0
@@ -1045,10 +1064,9 @@ class GiveawayEngine:
             if not self._stop.is_set():
                 await self._sweep_all_accounts()
             if auto_scan and not self._stop.is_set():
+                # 首扫后不再追加第二轮回扫；首扫新增的 bot 无水位线，
+                # 下一轮回扫（补漏轮或下次任务启动）会自动按回扫条数建基线
                 await self.scan_now()
-                # 首扫后新增参与的 bot 需建回扫基线（此前无水位线会漏扫）
-                if not self._stop.is_set():
-                    await self._sweep_all_accounts()
             if self.rescue_interval > 0:
                 await self._rescue_loop()
             elif not self._stop.is_set():
@@ -2592,6 +2610,17 @@ class GiveawayEngine:
             return False
         return True
 
+    def _click_failed_paused(self, account: str, username: str) -> bool:
+        """确认按钮点击失败后的冷却是否仍生效（到期自动解除）。"""
+        fkey = self._flood_key(account, username)
+        until = self._click_failed_until.get(fkey)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            self._click_failed_until.pop(fkey, None)
+            return False
+        return True
+
     def _log_transport_flood_429(self, account: str) -> None:
         """记录每次 429 的账号与时刻，并区分「单账号过密」和「多账号同时被风控」。
 
@@ -2833,6 +2862,10 @@ class GiveawayEngine:
             return False
         if self._flood_paused(account, username):
             return False
+        if self._click_failed_paused(account, username):
+            # 确认按钮刚点击失败（超时/网络异常）：冷却期内不重发 start，
+            # 避免「start→点击超时 30 秒→下一轮扫描立刻重试」的重试风暴
+            return False
         return True
 
     async def _handle_start_reply(
@@ -2854,13 +2887,28 @@ class GiveawayEngine:
         if reply_says_ended(start_msg):
             self._handle_start_ended(account, username, param, channel, title, reserved)
             return
-        completed = await self._click_confirm(
+        completed, fail_reason = await self._click_confirm(
             account, client, username, start_msg, param, source_message=source_message
         )
         if not completed:
-            # bot 要求加入频道，但加入没生效（限流暂停，或点击后 bot 仍要求
-            # 先加入）：不能记「已参与」，否则后续扫描会当成功跳过、用户看到假成功
-            self._handle_join_blocked(account, username, channel, title, reserved)
+            # 跟进未完成（加入未生效/点击超时/仍要求加入等）：不能记「已参与」，
+            # 否则后续扫描会当成功跳过、用户看到假成功；具体原因透传到日志
+            self._handle_join_blocked(
+                account, username, channel, title, reserved, fail_reason
+            )
+            return
+        if self._flood_paused(account, username):
+            # 跟进期间触发限流（重发 start/点按钮被 FLOOD_WAIT 打断）：
+            # _record_flood 已写入 flood_wait 冷却记录，这里若记成功会把它
+            # 覆盖成「已参与」造成假成功，必须按未完成处理
+            self._handle_join_blocked(
+                account,
+                username,
+                channel,
+                title,
+                reserved,
+                "跟进期间触发限流（该 bot 已进入冷却）",
+            )
             return
         self._record_participate_success(
             account, username, param, channel, title, reserved
@@ -2967,12 +3015,14 @@ class GiveawayEngine:
         channel: str,
         title: str,
         reserved: bool,
+        reason: str = "",
     ) -> None:
-        """参与跟进未完成（需加入频道但未生效）：归还名额、不记成功，保留重试。
+        """参与跟进未完成：归还名额、不记成功，保留重试。
 
-        两种情形走这里：本账号加入被限流/配额暂停；或已发 start/点按钮后
-        bot 仍回复要求先加入频道。两者都不能写参与记录，否则后续扫描会
-        把它当成功跳过，用户看到假成功。
+        reason 是跟进失败的真实原因（加入暂停/点击超时/仍要求加入/限流等），
+        用于把 [未参与] 日志与实际原因对齐——此前一律报「bot 要求加入频道
+        但本次未生效」，点击超时也被误标成加入问题，排障时严重误导。
+        任何原因都不能写参与记录，否则后续扫描会把它当成功跳过。
         """
         if reserved:
             self.joined -= 1
@@ -2980,9 +3030,10 @@ class GiveawayEngine:
         from_part = f"来自 {channel or '未知频道'}"
         if title:
             from_part += f"：{title}"
+        detail = reason or "bot 要求加入频道但本次未生效"
         self.log(
             f"{datetime.now():%H:%M:%S} [未参与] {account} -> @{username} "
-            f"（{from_part}）: bot 要求加入频道但本次未生效，稍后重试"
+            f"（{from_part}）: {detail}，稍后重试"
         )
         self._emit(
             {
@@ -2991,7 +3042,7 @@ class GiveawayEngine:
                 "channel": channel,
                 "title": title,
                 "ok": False,
-                "error": "需加入频道但参与未生效，稍后重试",
+                "error": f"{detail}，稍后重试",
             }
         )
 
@@ -3179,6 +3230,25 @@ class GiveawayEngine:
             )
         return True
 
+    async def _wait_same_target_gap(self, target: str) -> None:
+        """同一加入目标跨账号错峰：多账号并行扫描常在同一秒加入同一条邀请
+        链接，整批撞同链接会触发成片 FLOOD_WAIT（6 个账号同时等 100+ 秒）。
+
+        预约时刻在无 await 的区间内更新，后到账号排队等待而非同时放行；
+        join_pace 配置为 0（含单测）时完全不生效。
+        """
+        lo, hi = self.join_pace_range
+        if hi <= 0:
+            return
+        key = str(target).strip().lower()
+        now = time.monotonic()
+        gap = random.uniform(lo, hi)
+        start = max(now, self._last_target_join_at.get(key, 0.0) + gap)
+        self._last_target_join_at[key] = start
+        delay = start - now
+        if delay > 0:
+            await asyncio.sleep(min(delay, 30.0))
+
     async def _join_single_target(
         self, account: str, client: Any, target: str, label: str
     ) -> Tuple[bool, bool]:
@@ -3194,6 +3264,8 @@ class GiveawayEngine:
             return False, True
         # 闸门放行后先记账：Telegram 按请求次数限流，失败请求同样消耗额度
         self._note_join_attempt(account)
+        # 同一目标跨账号错峰，避免多账号同秒撞同一条链接
+        await self._wait_same_target_gap(target)
         try:
             chat = await client.join_chat(target)
             title = str(getattr(chat, "title", "") or target)
@@ -3219,12 +3291,13 @@ class GiveawayEngine:
                 self._suspend_joins(account, wait, target)
                 return False, True
             elif self._is_network_timeout(exc):
-                # 网络临时异常：类似限流，不消耗 _join_cache 尝试机会
-                logger.debug(
-                    "消息链接加入触发网络异常，跳过本轮：account=%s target=%s err=%s",
-                    account,
-                    target,
-                    str(exc)[:120],
+                # 网络临时异常：类似限流，不消耗 _join_cache 尝试机会。
+                # 必须可见地打出来：上游汇总会报「自动加入未完成（网络异常
+                # 或已达加入配额）」，若这里只有 debug 日志，用户会看到
+                # 「已在 X 中跳过」紧接着「自动加入未完成」的矛盾输出
+                self.log(
+                    f"[{account}] 加入 {target} 网络异常（超时），"
+                    "本轮跳过该目标，稍后重试"
                 )
                 return False, True
             elif self._is_unreachable_target_error(exc):
@@ -3955,22 +4028,24 @@ class GiveawayEngine:
         start_msg: Any,
         param: str = "",
         source_message: Any = None,
-    ) -> bool:
+    ) -> Tuple[bool, str]:
         """start 后跟进：自动加入 bot 消息中的频道（若开启），并点确认按钮。
 
-        返回 False 表示 bot 要求加入频道但本次未生效（加入被暂停，或点击后
-        bot 仍要求先加入），跟进未完成；其余情况返回 True（含已结束终态）。
+        返回（是否完成，未完成原因）：completed=False 表示 bot 要求加入频道
+        但本次未生效（加入被暂停、点击超时、点击后仍要求先加入等），原因
+        字符串用于把上层 [未参与] 日志与真实故障对齐；completed=True 时
+        原因为空（含已结束终态）。
         """
         ended, candidates = self._initial_confirm_candidates(
             account, username, start_msg, source_message
         )
         if ended:
-            return True
+            return True, ""
         if self.confirm_wait > 0:
             if await self._poll_confirm_candidates(
                 account, client, username, candidates
             ):
-                return True
+                return True, ""
         # 「防脚本验证」（如 @dbchoujiang123_bot）：按正文顺序点击 emoji 按钮
         # 完成人机校验，再刷新候选，让后续加入/确认流程看到验证后的消息
         await self._refresh_candidates_after_verification(
@@ -3995,14 +4070,21 @@ class GiveawayEngine:
                     did_join,
                     had_join_targets,
                     candidates,
-                    join_blocked,
+                    block_reason,
                 ) = await self._auto_join_and_restart(
                     account, client, username, param, source_message, candidates
                 )
+                # 未完成原因优先于 stop 判定：重试按钮路径会同时给出
+                # stop=True 与原因，先看 stop 会把「点了重试按钮但 bot 仍
+                # 要求加入」当成完成、记成假成功
+                if block_reason:
+                    return False, (
+                        block_reason
+                        if isinstance(block_reason, str)
+                        else "自动加入被限流/配额阻塞，参与未完成"
+                    )
                 if stop:
-                    return True
-                if join_blocked:
-                    return False
+                    return True, ""
                 # 本轮没有真的加入任何新频道：要么 bot 不再出新需求，
                 # 要么候选都是旧消息残留但已全被 join_cache 挡住，两种
                 # 情况都应该退出循环，交给后续点确认按钮流程兜底。
@@ -4107,12 +4189,12 @@ class GiveawayEngine:
         param: str,
         source_message: Any,
         candidates: List[Any],
-    ) -> Tuple[bool, bool, bool, List[Any], bool]:
+    ) -> Tuple[bool, bool, bool, List[Any], str]:
         """自动加入候选消息中的目标，必要时重发 start。
 
         返回（是否应直接结束跟进，本轮是否实际加入了新频道，
         当前是否仍存在加入目标，更新后的候选，
-        加入是否被限流/配额阻塞导致跟进未完成）。
+        跟进未完成的原因（空串＝未被阻塞））。
         did_join 与 had_join_targets 分离：前者仅在本轮真的执行了
         新加入时为 True（join_cache 挡住的不计），后者反映 candidates
         中是否还存在未处理的加入要求（可能只是旧消息残留）。
@@ -4133,7 +4215,17 @@ class GiveawayEngine:
                     else "自动加入未完成（网络异常或已达加入配额），本次跳过，稍后重试"
                 )
             )
-            return False, did_join, had_join_targets, candidates, True
+            return (
+                False,
+                did_join,
+                had_join_targets,
+                candidates,
+                (
+                    "本账号自动加入已暂停（限流）"
+                    if paused
+                    else "自动加入未完成（网络异常或已达加入配额）"
+                ),
+            )
         if did_join:
             # 加入后稍等，再拉一轮消息（bot 可能更新了按钮/提示）
             await asyncio.sleep(3)
@@ -4160,12 +4252,22 @@ class GiveawayEngine:
                 account, client, username, candidates
             )
             if retried:
-                return True, did_join, had_join_targets, candidates, not retry_completed
+                return (
+                    True,
+                    did_join,
+                    had_join_targets,
+                    candidates,
+                    (
+                        ""
+                        if retry_completed
+                        else "点击「我已加入/重试参与」按钮后 bot 仍未确认参与"
+                    ),
+                )
             self.log(f"[{account}] @{username} 要求加入频道后重新参与，再次发送 start")
             stop, had_join_targets, candidates = await self._restart_after_join(
                 account, client, username, param, candidates, had_join_targets
             )
-            return stop, did_join, had_join_targets, candidates, False
+            return stop, did_join, had_join_targets, candidates, ""
         if bot_policy(username).restart_after_join and did_join:
             # 强制名单：本轮真加入了频道时（did_join=True），
             # 额外重发一次 start 让 bot 校验参与资格（即使 bot 消息里没有
@@ -4177,8 +4279,8 @@ class GiveawayEngine:
             stop, had_join_targets, candidates = await self._restart_after_join(
                 account, client, username, param, candidates, had_join_targets
             )
-            return stop, did_join, had_join_targets, candidates, False
-        return False, did_join, had_join_targets, candidates, False
+            return stop, did_join, had_join_targets, candidates, ""
+        return False, did_join, had_join_targets, candidates, ""
 
     async def _auto_join_candidates(
         self, account: str, client: Any, username: str, candidates: List[Any]
@@ -4279,20 +4381,23 @@ class GiveawayEngine:
         username: str,
         candidates: List[Any],
         param: str = "",
-    ) -> bool:
-        """找到并处理第一个确认按钮；返回参与是否真正完成。"""
+    ) -> Tuple[bool, str]:
+        """找到并处理第一个确认按钮；返回（参与是否真正完成，未完成原因）。"""
         if self._flood_paused(account, username):
-            return True  # 该 bot 已被限流，暂停期内不再发起任何 start/点击
+            return True, ""  # 该 bot 已被限流，暂停期内不再发起任何 start/点击
+        if self._click_failed_paused(account, username):
+            # 按钮刚点击失败（超时/网络异常），冷却期内不重复点击
+            return False, "确认按钮点击失败后的冷却期内，跳过本次点击"
         for message in candidates:
             btn = self._find_confirm_button(message)
             if btn is None:
                 continue
-            stop, completed = await self._try_confirm_button(
+            stop, completed, reason = await self._try_confirm_button(
                 account, client, username, message, btn, candidates, param
             )
             if stop:
-                return completed
-        return True
+                return completed, reason
+        return True, ""
 
     async def _try_confirm_button(
         self,
@@ -4303,8 +4408,8 @@ class GiveawayEngine:
         btn: Any,
         candidates: List[Any],
         param: str = "",
-    ) -> Tuple[bool, bool]:
-        """处理单个确认按钮；返回（是否结束整个跟进流程，参与是否完成）。"""
+    ) -> Tuple[bool, bool, str]:
+        """处理单个确认按钮；返回（是否结束整个跟进流程，参与是否完成，未完成原因）。"""
         try:
             if getattr(btn, "callback_data", None):
                 answer = await client.request_callback_answer(
@@ -4321,12 +4426,25 @@ class GiveawayEngine:
                         f"[{account}] @{username} 弹窗提示「{popup[:40]}」，"
                         "抽奖已结束，跳过后续跟进"
                     )
-                    return True, True
+                    return True, True, ""
+                if popup and _POPUP_SUCCESS_RE.search(popup):
+                    # 部分 bot 只弹窗确认、不再发新消息：弹窗即成功凭据，
+                    # 否则后续核对读不到新回复会把成功误判成未完成
+                    self.log(f"@{username} 参与成功（弹窗：{popup[:40]}）")
+                    return True, True, ""
                 self.log(self._format_confirm_button_log(username, btn.text))
                 completed = await self._verify_after_click(
                     account, client, username, candidates
                 )
-                return True, completed
+                return (
+                    True,
+                    completed,
+                    (
+                        ""
+                        if completed
+                        else "点击后 bot 未确认参与（仍要求加入或未回复）"
+                    ),
+                )
             # URL 按钮：仅当链接指向同一 bot（含/不含 start 参数）时才「点击」
             # （等同按链接参数重发 start 完成参与），其他链接一律不碰
             url_btn = str(getattr(btn, "url", "") or "").strip()
@@ -4347,30 +4465,53 @@ class GiveawayEngine:
                 completed = await self._verify_after_click(
                     account, client, username, candidates
                 )
-                return True, completed
+                return (
+                    True,
+                    completed,
+                    (
+                        ""
+                        if completed
+                        else "点击后 bot 未确认参与（仍要求加入或未回复）"
+                    ),
+                )
             if plain_same_bot:
                 await self._start_bot(client, account, username, "")
                 self.log(f"已点击 @{username} 的参与按钮「{btn.text}」（重发 start）")
                 completed = await self._verify_after_click(
                     account, client, username, candidates
                 )
-                return True, completed
+                return (
+                    True,
+                    completed,
+                    (
+                        ""
+                        if completed
+                        else "点击后 bot 未确认参与（仍要求加入或未回复）"
+                    ),
+                )
         except Exception as exc:
             # 限流同样登记（计数 + bot 级暂停 + 冷却落盘），避免异常被吞后
             # 继续对同一个 bot 发请求把短限流拖成小时级。
-            # 限流返回 (True, True)：completed=True 让上层跳过 join_blocked
-            # 分支（bot 级熔断已登记，重试需等冷却，不该再无意义地记成功）。
+            # 限流按未完成返回：completed=True 会被上层记「已参与」，覆盖
+            # _record_flood 刚写入的 flood_wait 冷却记录造成假成功；bot 级
+            # 熔断已登记，重试等冷却结束。
             if self._record_flood(
                 account, username, param, "", exc, label="点击确认按钮"
             ):
-                return True, True
+                return True, False, "点击确认按钮触发限流（该 bot 已进入冷却）"
             # 非限流异常（超时/网络抖动/RPC 偶发故障）：按钮点击实际没成功，
             # 必须返回 completed=False，让上层走 _handle_join_blocked 归还
             # 名额并保留重试可能。绝不能记「已参与」持久化记录，否则下一轮
             # 扫描会把它当真成功跳过，参与请求彻底丢失。
-            self.log(f"点击 @{username} 确认按钮失败: {exc}")
-            return True, False
-        return False, True
+            self._click_failed_until[self._flood_key(account, username)] = (
+                time.monotonic() + CLICK_FAILURE_COOLDOWN
+            )
+            self.log(
+                f"点击 @{username} 确认按钮失败: {exc}"
+                f"（{CLICK_FAILURE_COOLDOWN} 秒内不再重试该 bot）"
+            )
+            return True, False, f"点击确认按钮失败：{str(exc)[:80]}"
+        return False, True, ""
 
     @staticmethod
     def _format_confirm_button_log(username: str, text: str) -> str:
@@ -4406,7 +4547,8 @@ class GiveawayEngine:
     ) -> bool:
         """点击确认/参与按钮后核对 bot 回复，把结果写进日志（不再盲点）。
 
-        返回 False 表示 bot 仍要求先加入频道（本次点击未生效）；其余情况返回
+        返回 False 表示本次点击未生效（bot 仍要求先加入频道，或对本次操作
+        没有回复、最新消息只是自己发出的 /start）；其余情况返回
         True（成功、终态或无法判定，沿用原来的完成口径）。
         """
         try:
@@ -4415,6 +4557,14 @@ class GiveawayEngine:
                 return True
             async for msg in client.get_chat_history(username, limit=1):
                 await self._check_win_message(account, client, username, msg)
+                if getattr(msg, "outgoing", False):
+                    # 最新消息是自己刚发出的（如 URL 参与按钮重发的 /start）：
+                    # bot 对本次操作尚未回复，不能拿自己的消息当「点击后回复」
+                    # 判成功——真实日志里出现过回复内容就是 /start 的假成功
+                    self.log(
+                        f"@{username} 点击后 bot 未回复本次操作，参与未确认，稍后重试"
+                    )
+                    return False
                 text = (_message_text(msg) or "").strip()
                 if not text:
                     return True
