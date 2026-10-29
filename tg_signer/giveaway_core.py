@@ -1196,11 +1196,13 @@ class GiveawayEngine:
                     )
                     if self.source_type != "bot":
                         # 达到全局扫描上限：通知消息中心，避免任务静默截断
+                        chat_title = self._chat_title(message)
                         self._emit(
                             {
                                 "type": "scan_cap",
                                 "account": account,
                                 "chat": str(chat),
+                                "title": "" if chat_title == str(chat) else chat_title,
                                 "cap": hard_cap,
                             }
                         )
@@ -2131,6 +2133,9 @@ class GiveawayEngine:
         expired = self._expired_draw_status(account, message, tag)
         if expired is not None:
             return expired
+        # 原帖带「发言数大于 N 条」即建任务提醒（不等参与成功）：参与成功
+        # 才提醒会漏掉弹窗成功/无确认按钮/已参与过等不读回复清单的路径
+        self._emit_source_speech_tasks(account, message, links)
         if self._join_cap_reached(account):
             return None
         # 先过滤出可参与的链接（未参与过/未冷却/未熔断），全部不可参与时
@@ -2188,6 +2193,7 @@ class GiveawayEngine:
             # 群组置顶的「按钮型」抽奖：帖内无可 start 的 bot 链接
             # （或仅剩黑名单推广链接），但帖上带「参与抽奖」按钮，
             # 直接点击源帖按钮完成参与
+            self._emit_source_speech_tasks(account, message, [])
             await self._participate_via_source_button(account, client, message)
             return
         if self.source_type == "bot":
@@ -2197,6 +2203,7 @@ class GiveawayEngine:
                 return
             if self._expired_draw_status(account, message, tag) is not None:
                 return
+            self._emit_source_speech_tasks(account, message, [])
             await self._participate_via_source_button(account, client, message)
 
     def _message_filtered_out(
@@ -4532,6 +4539,33 @@ class GiveawayEngine:
                     "type": "speech_required",
                     "account": account,
                     "bot": bot_username,
+                    "title": title,
+                    "group": group,
+                    "required": required,
+                }
+            )
+
+    def _emit_source_speech_tasks(
+        self, account: str, message: Any, links: list
+    ) -> None:
+        """扫描到原帖即推送发言数任务提醒（不等参与成功）。
+
+        双向账号无法在群里发言，不建任务；title/bot 口径与报名成功清单
+        的 _emit_speech_tasks 一致，消息中心按同键去重不重复弹窗。
+        """
+        if account in self.two_way_accounts:
+            return
+        tasks = extract_speech_tasks(message)
+        if not tasks:
+            return
+        title = extract_giveaway_title(message)
+        bot = str(links[0][0]) if links else ""
+        for group, required in tasks:
+            self._emit(
+                {
+                    "type": "speech_required",
+                    "account": account,
+                    "bot": bot,
                     "title": title,
                     "group": group,
                     "required": required,

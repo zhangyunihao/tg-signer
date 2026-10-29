@@ -290,8 +290,11 @@ def save_scan_cap_alerts(workdir, alerts: List[dict]) -> None:
 
 
 def format_scan_cap_alert(a: dict) -> str:
+    chat = str(a.get("chat") or "")
+    title = str(a.get("title") or "").strip()
+    target = f"频道「{title}」（{chat}）" if title and title != chat else f"「{chat}」"
     return (
-        f"账号 {a.get('account')} 扫描「{a.get('chat')}」达到单轮上限 "
+        f"账号 {a.get('account')} 扫描{target}达到单轮上限 "
         f"{a.get('cap')} 条，已停止该频道本轮扫描（{a.get('time')}）"
     )
 
@@ -339,7 +342,13 @@ def _handle_scan_cap_event(client, workdir, ev: dict) -> None:
     )
     alerts.insert(
         0,
-        {"account": acct, "chat": chat, "cap": cap, "time": _alert_time()},
+        {
+            "account": acct,
+            "chat": chat,
+            "title": str(ev.get("title") or ""),
+            "cap": cap,
+            "time": _alert_time(),
+        },
     )
     save_scan_cap_alerts(workdir, alerts)
     _notify_alert(

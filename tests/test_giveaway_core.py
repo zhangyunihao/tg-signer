@@ -659,7 +659,15 @@ def test_scan_now_stops_at_scan_cap_when_keywords_miss(tmp_path):
     assert client.started == []
     assert any("已扫描 3 条" in line for line in logs)
     caps = [e for e in events if e.get("type") == "scan_cap"]
-    assert caps == [{"type": "scan_cap", "account": "acc", "chat": "123", "cap": 3}]
+    assert caps == [
+        {
+            "type": "scan_cap",
+            "account": "acc",
+            "chat": "123",
+            "title": "测试频道",
+            "cap": 3,
+        }
+    ]
 
 
 def test_scan_now_enumerates_all_pinned_messages(tmp_path):
@@ -3845,6 +3853,61 @@ def test_verify_after_click_emits_speech_required(tmp_path, monkeypatch):
             "required": 6,
         }
     ]
+
+
+SOURCE_SPEECH_POST = """🎰 宝山【慧慧 @xiaoguoer7】P五折卷
+
+📮 参与条件
+🪪 必须设置用户名
+🎫 加入-上海修车协会
+└  🎟️ 发言数大于 10 条
+🎫 加入-慧慧06
+
+🎁 奖品名单
+💰️ P五折优惠劵 × 1
+
+参与抽奖 https://t.me/LotteryBot?start=huihui1
+"""
+
+
+def test_scan_source_post_emits_speech_required(tmp_path):
+    """方案 b：扫描到原帖「发言数大于 N 条」即推 speech_required，不等参与成功。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    events: list = []
+    engine.on_event = events.append
+    client = FakeClient(bot_users={"LotteryBot"})
+    engine._clients = {"acc": client}
+    msg = _msg(text=SOURCE_SPEECH_POST, id=777)
+
+    asyncio.run(engine._process_message("acc", client, msg))
+
+    assert [e for e in events if e.get("type") == "speech_required"] == [
+        {
+            "type": "speech_required",
+            "account": "acc",
+            "bot": "LotteryBot",
+            "title": "宝山【慧慧 @xiaoguoer7】P五折卷",
+            "group": "上海修车协会",
+            "required": 10,
+        }
+    ]
+
+
+def test_scan_source_post_speech_skipped_for_two_way_account(tmp_path):
+    """双向账号无法在群里发言：扫描到发言数要求也不建任务提醒。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.two_way_accounts = {"acc"}
+    events: list = []
+    engine.on_event = events.append
+    msg = _msg(text=SOURCE_SPEECH_POST, id=778)
+
+    asyncio.run(engine._process_message("acc", None, msg))
+
+    assert not [e for e in events if e.get("type") == "speech_required"]
 
 
 def test_verify_after_click_resends_pending_password(tmp_path, monkeypatch):
