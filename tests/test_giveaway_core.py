@@ -5454,3 +5454,68 @@ def test_account_slots_unlimited_when_zero(tmp_path):
 
     asyncio.run(_run())
     assert ran == [0, 1, 2]
+
+
+def test_find_confirm_button_prefers_callback_over_entry_url(tmp_path):
+    """同一张卡片上既有入口链接按钮又有 callback 报名按钮时，优先点 callback。
+
+    @Lottery_2_bot 的「👉参与抽奖👈」是带 start 参数的入口链接，点了只会
+    再回一张同样的卡片；只有 callback 按钮才是真正报名。
+    """
+    engine, _state = _engine(tmp_path)
+    card = _msg(
+        text="TG抽奖福利中心 抽奖标题：普陀思",
+        buttons=[
+            [_btn("👉参与抽奖👈", url="https://t.me/Lottery_2_bot?start=abc")],
+            [_btn("立即参加抽奖", callback_data="join:1")],
+        ],
+    )
+    assert engine._find_confirm_button(card).callback_data == "join:1"
+    # 没有 callback 时仍退回入口链接按钮（旧行为不丢）
+    only_url = _msg(
+        text="卡片",
+        buttons=[[_btn("👉参与抽奖👈", url="https://t.me/Lottery_2_bot?start=abc")]],
+    )
+    assert engine._find_confirm_button(only_url).url.endswith("start=abc")
+
+
+def test_initial_candidates_put_bot_reply_first(tmp_path):
+    """bot 回复排在原始抽奖帖之前：原始帖只有入口链接，先点它会一直空转。"""
+    engine, _state = _engine(tmp_path)
+    start_msg = _msg(id=99, text="bot 卡片", buttons=[[_btn("立即参加抽奖")]])
+    source = _msg(id=1, text="频道抽奖帖", buttons=[[_btn("👉参与抽奖👈")]])
+    stop, candidates = engine._initial_confirm_candidates(
+        "acc", "Lottery_2_bot", start_msg, source
+    )
+    assert stop is False
+    assert [m.id for m in candidates] == [99, 1]
+
+
+def test_verify_after_click_entry_card_is_not_success(tmp_path, monkeypatch):
+    """点击后 bot 又回一张带参与按钮的入口卡片 → 未真正报名，不能记已参与。
+
+    真实日志里 @Lottery_2_bot 对入口链接重发 start 一律回同样的卡片，
+    旧逻辑把「无法识别的回复」当成功，导致显示已参与但账号并未报名。
+    """
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"Lottery_2_bot"})
+    card = _msg(
+        text="TG抽奖福利中心：https://t.me/hmflzx 抽奖标题：普陀思",
+        buttons=[[_btn("立即参加抽奖", callback_data="join:2")]],
+    )
+    client.history = [card]
+    completed = asyncio.run(
+        engine._verify_after_click("acc", client, "Lottery_2_bot", [])
+    )
+    assert completed is False
+    assert any("参与入口卡片" in line for line in logs)

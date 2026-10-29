@@ -4199,10 +4199,10 @@ class GiveawayEngine:
         source_message: Any,
     ) -> Tuple[bool, List[Any]]:
         candidates: List[Any] = []
-        # 原始抽奖帖参与条件中的频道（如「加入：xx 频道」）与 bot 回复一并进行提取，
-        # 否则只覆盖 bot 回复会漏加原始帖列出的频道
-        if source_message is not None:
-            candidates.append(source_message)
+        # bot 回复优先于原始抽奖帖：原始帖里的「👉参与抽奖👈」多是带 start
+        # 参数的入口链接，点它只是再发一次 start、bot 又回一张同样的卡片，
+        # 永远点不到真正的报名按钮；只有 bot 回复里的 callback 按钮才是
+        # 报名动作（曾因此把「点击后回复仍是入口卡片」误记成已参与）
         if start_msg is not None:
             candidates.append(start_msg)
             # bot 直接回复「已结束」（活动提前结束）＝终态，立即返回，
@@ -4211,6 +4211,10 @@ class GiveawayEngine:
                 self._note_ended(account, username)
                 self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
                 return True, candidates
+        # 原始抽奖帖参与条件中的频道（如「加入：xx 频道」）与 bot 回复一并进行提取，
+        # 否则只覆盖 bot 回复会漏加原始帖列出的频道
+        if source_message is not None:
+            candidates.append(source_message)
         return False, candidates
 
     async def _poll_confirm_candidates(
@@ -4754,6 +4758,12 @@ class GiveawayEngine:
                 # 不能记「已参与」，留给下一轮扫描重试
                 self.log(f"@{username} 仍要求加入频道，本次参与未生效：{flat}")
                 return False
+            if self._find_confirm_button(msg) is not None:
+                # 回复仍是带「参与」按钮的入口卡片 = 本次点击没生效（
+                # @Lottery_2_bot 会一直重发同一张卡片）。按「无法判定」记成功
+                # 会造成日志显示已参与、实际根本没报名，必须判未完成
+                self.log(f"@{username} 点击后仍是参与入口卡片，本次未真正报名：{flat}")
+                return False
             if not reply_says_ended(msg):
                 self.log(f"@{username} 点击后回复：{flat}")
             return True
@@ -4767,6 +4777,7 @@ class GiveawayEngine:
         if SCORE_SPEND_RE.search(_message_text(message) or ""):
             return None
         reply_markup = getattr(message, "reply_markup", None)
+        matched: List[Any] = []
         for row in getattr(reply_markup, "inline_keyboard", None) or []:
             for btn in row or []:
                 text = str(getattr(btn, "text", "") or "")
@@ -4778,5 +4789,11 @@ class GiveawayEngine:
                 if SCORE_BUTTON_RE.search(text):
                     continue
                 if any(kw in text for kw in self.confirm_keywords):
-                    return btn
-        return None
+                    matched.append(btn)
+        # callback 按钮才是真正的报名动作；URL 按钮只是「按链接重发 start」
+        # 的入口（如 @Lottery_2_bot 的「👉参与抽奖👈」），点了只会再回一张
+        # 同样的卡片。优先点 callback，没有时才退回 URL 按钮
+        for btn in matched:
+            if getattr(btn, "callback_data", None):
+                return btn
+        return matched[0] if matched else None
