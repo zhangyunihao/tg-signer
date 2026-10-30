@@ -5270,6 +5270,23 @@ def test_extract_giveaway_title_accepts_party_emoji():
     assert extract_giveaway_title(_msg(text="普通消息")) == ""
 
 
+def test_extract_giveaway_title_accepts_ticket_label_line():
+    """@choujiang8_bot 的标题行以 🎟️ 开头、写成「抽奖标题：xxx」标签式，
+    也要能取到标题（否则发言任务提醒只显示「抽奖」没有标题）。"""
+    from tg_signer.giveaway_parsing import extract_giveaway_title
+
+    text = (
+        "🎟️ 抽奖标题：闵行【子怡 @ziyi88998】半价/红包券\n\n"
+        "📪抽奖说明：\n1、中奖3天内私信老师兑换。\n\n"
+        "🎫 参与条件: \n"
+        "🎫 加入-上海【学院】男群✅\n"
+        "└  🎟️ 发言数大于 5条❌"
+    )
+    assert (
+        extract_giveaway_title(_msg(text=text)) == "闵行【子怡 @ziyi88998】半价/红包券"
+    )
+
+
 def test_win_sweep_paces_between_bots(tmp_path, monkeypatch):
     """回扫相邻 bot 之间要留间隔，避免单账号连发 GetHistory 触发 429。"""
     import asyncio
@@ -5519,3 +5536,69 @@ def test_verify_after_click_entry_card_is_not_success(tmp_path, monkeypatch):
     )
     assert completed is False
     assert any("参与入口卡片" in line for line in logs)
+
+
+def test_verify_after_click_detail_echo_without_button_is_not_success(
+    tmp_path, monkeypatch
+):
+    """点完只回一张无按钮的「抽奖标题：…」详情卡 → 未报名，不能记已参与。
+
+    真实日志：@Lottery_2_bot 重发 start 后回复「TG抽奖福利中心…抽奖标题：闵行神」
+    无任何确认按钮，旧逻辑落到兜底 return True，把回显详情当成功持久化，
+    账号实际根本没进抽奖。
+    """
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"Lottery_2_bot"})
+    client.history = [
+        _msg(text="TG抽奖福利中心：https://t.me/hmflzx 🎟️ 抽奖标题：闵行神", id=7)
+    ]
+    completed = asyncio.run(
+        engine._verify_after_click("acc", client, "Lottery_2_bot", [])
+    )
+    assert completed is False
+    assert any("仅回显抽奖详情" in line for line in logs)
+    assert not any("参与成功" in line for line in logs)
+
+
+def test_verify_after_click_detail_echo_then_success_message(tmp_path, monkeypatch):
+    """详情卡之后几秒才到「参加抽奖成功…」→ 轮询到成功消息仍记参与成功。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"Lottery_2_bot"})
+    detail = _msg(text="TG抽奖福利中心：https://t.me/hmflzx 🎟️ 抽奖标题：闵行神", id=7)
+    success = _msg(
+        text="参加抽奖成功，请耐心等待，中奖通知机器人会私发给您！抽奖编号：L1793178",
+        id=8,
+    )
+    client.history = [detail]
+    calls = {"n": 0}
+
+    async def _fast_sleep(_s=0):
+        # 第 1 次是 verify 开头的固定等待（此时只能读到详情卡）；
+        # 之后进入详情回显的轮询等待，才补进成功消息，模拟
+        # @Lottery_2_bot 慢校验下成功回复晚几秒到
+        calls["n"] += 1
+        if calls["n"] >= 2 and not any(m is success for m in client.history):
+            client.history.insert(0, success)
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _fast_sleep)
+    completed = asyncio.run(
+        engine._verify_after_click("acc", client, "Lottery_2_bot", [])
+    )
+    assert completed is True
+    assert any("参与成功" in line for line in logs)

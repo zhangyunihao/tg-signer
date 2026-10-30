@@ -1029,11 +1029,15 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         eng = get_engine(name)
         if cfg is None or eng is None:
             return False
-        cfg["last_joined"] = int(eng.joined)
-        cfg["last_joined_by_account"] = dict(eng.joined_by_account)
-        cfg["last_joined_by_account_chat"] = {
-            k: dict(v) for k, v in eng.joined_by_account_chat.items()
-        }
+        # 反复启动：新一往往 0 参与（都参与过、断网或很快停掉），
+        # 空的本轮统计不能把上一轮「上次运行」明细冲成「暂无参与记录」；
+        # 只有本轮真的产生新参与才覆盖，明细与计数始终同进同退
+        if int(eng.joined) > 0 or eng.joined_by_account:
+            cfg["last_joined"] = int(eng.joined)
+            cfg["last_joined_by_account"] = dict(eng.joined_by_account)
+            cfg["last_joined_by_account_chat"] = {
+                k: dict(v) for k, v in eng.joined_by_account_chat.items()
+            }
         cfg["last_sweep"] = str(getattr(eng, "win_sweep_text", "") or "")
         return True
 
@@ -1329,14 +1333,18 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             if cfg_now is None:
                 return
             joined = int(payload.get("joined") or 0)
-            cfg_now["last_joined"] = joined
-            cfg_now["last_joined_by_account"] = {
+            by_account = {
                 str(k): int(v) for k, v in (payload.get("by_account") or {}).items()
             }
-            cfg_now["last_joined_by_account_chat"] = {
+            by_chat = {
                 str(k): {str(c): int(n) for c, n in (v or {}).items()}
                 for k, v in (payload.get("by_chat") or {}).items()
             }
+            # 每秒一次的空 stats（本轮 0 参与）不得清空上一轮明细，见 capture_engine_stats
+            if joined > 0 or by_account:
+                cfg_now["last_joined"] = joined
+                cfg_now["last_joined_by_account"] = by_account
+                cfg_now["last_joined_by_account_chat"] = by_chat
             # 每秒刷新卡片/表格里的运行状态与扫描进度（如「扫描中 (3/12)」），
             # 中奖消息回扫进度单独刷新
             sig = (
@@ -2058,13 +2066,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                 stop_btn.set_visibility(False)
                             card_start_btns[n] = start_btn
                             card_stop_btns[n] = stop_btn
-                            pin_color = "primary" if row["pinned"] else "grey-7"
-                            ui.button(
-                                icon="push_pin",
-                                on_click=lambda nn=n: toggle_pin(nn),
-                            ).props(f"flat dense color={pin_color}").tooltip(
-                                "取消置顶" if row["pinned"] else "置顶"
-                            )
                             ui.button(
                                 "编辑",
                                 on_click=lambda nn=n: edit_task(nn),
@@ -2081,6 +2082,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                 "删除",
                                 on_click=lambda nn=n: remove_task(nn),
                             ).props("flat dense color=negative")
+                            pin_color = "primary" if row["pinned"] else "grey-7"
+                            ui.button(
+                                icon="push_pin",
+                                on_click=lambda nn=n: toggle_pin(nn),
+                            ).props(f"flat dense color={pin_color}").tooltip(
+                                "取消置顶" if row["pinned"] else "置顶"
+                            )
                 if len(rows) > 5:
                     if mobile_state["show_all"]:
                         ui.button(
@@ -2158,9 +2166,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "删除所有账号的已参与抽奖记录（保留中奖消息去重与回扫进度），"
                 "清除后相同链接可再次参与"
             )
-            ui.button(
-                "添加任务", icon="add", on_click=open_add_dialog
-            ).props("outline")
+            ui.button("添加任务", icon="add", on_click=open_add_dialog).props("outline")
     task_list_container = ui.column().classes("w-full gap-2")
     mobile_state = {"show_all": False}
 
@@ -2314,9 +2320,17 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         by_acct_chat = joined_by_account_chat(name)
         total = joined_count(name)
         engine = get_engine(name)
-        scope = "本次运行" if engine is not None and engine.running else "上次运行"
+        running = engine is not None and engine.running
+        live_joined = int(getattr(engine, "joined", 0) or 0) if engine else 0
+        scope = "本次运行" if running else "上次运行"
+        # 明细只在产生新参与时更新：运行中但本轮还没参与时，看到的是上次运行的记录
+        hint = (
+            "（本次运行暂无新参与，以下为上次运行记录）"
+            if (running and live_joined <= 0)
+            else ""
+        )
         detail_title_label.text = f"任务 #{name} 参与明细"
-        detail_total_label.text = f"{scope}共新参加 {total} 个抽奖"
+        detail_total_label.text = f"{scope}共新参加 {total} 个抽奖{hint}"
         detail_list.clear()
         with detail_list:
             if not by_acct:

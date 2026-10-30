@@ -58,6 +58,13 @@ JOIN_REQUIRED_POPUP_RE = re.compile(
 )
 
 
+# bot 把抽奖帖原样回显（「TG抽奖福利中心…抽奖标题：X」/「🎟️ 抽奖标题：X」）
+# ＝仅展示抽奖详情，不是报名确认。真实日志里 @Lottery_2_bot、
+# @choujiang8_bot 的 start/点击后会先回这样一张卡，此前被当成「无法判定」
+# 记成功，造成日志显示已参与、实际根本没进抽奖
+ECHO_GIVEAWAY_DETAIL_RE = re.compile(r"抽奖标题[：:]")
+
+
 def callback_answer_text(answer: Any) -> str:
     """取 callback 弹窗文案。
 
@@ -291,14 +298,29 @@ def _giveaway_title(message: Any, limit: int = 30) -> str:
     return snippet if len(snippet) <= limit else snippet[:limit] + "…"
 
 
+# 「🎟️ 抽奖标题：xxx」式标题行（@choujiang8_bot 等）：标题写在冒号后，
+# 行首 emoji 不限于 🎰/🎉/🎊
+_GIVEAWAY_TITLE_LABEL_RE = re.compile(r"抽奖标题\s*[：:]\s*(.+)")
+
+
 def extract_giveaway_title(message: Any, limit: int = 40) -> str:
-    """提取抽奖标题行（以 🎰/🎉/🎊 开头），取不到返回空串。"""
+    """提取抽奖标题行，取不到返回空串。
+
+    支持两种写法：以 🎰/🎉/🎊 开头的标题行，以及「🎟️ 抽奖标题：xxx」
+    标签式标题行（标签式不限 emoji，其他 emoji 开头的行同样命中）。
+    """
     text = _message_text(message)
     for raw_line in text.split("\n"):
         line = raw_line.strip()
-        if not line.startswith(("🎰", "🎉", "🎊")):
+        if not line:
             continue
-        title = line.lstrip("🎰🎉🎊").strip()
+        title = ""
+        if line.startswith(("🎰", "🎉", "🎊")):
+            title = line.lstrip("🎰🎉🎊").strip()
+        else:
+            tm = _GIVEAWAY_TITLE_LABEL_RE.search(line)
+            if tm:
+                title = tm.group(1).strip()
         if title:
             return title if len(title) <= limit else title[:limit] + "…"
     return ""

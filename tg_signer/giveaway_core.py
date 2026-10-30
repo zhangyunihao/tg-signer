@@ -33,6 +33,7 @@ from tg_signer.giveaway_parsing import (
     _TME_RE,
     DEFAULT_CONFIRM_KEYWORDS,
     DEFAULT_KEYWORDS,
+    ECHO_GIVEAWAY_DETAIL_RE,
     JOIN_REQUIRED_POPUP_RE,
     JOIN_RETRY_BUTTON_KEYWORDS,
     PASSWORD_REQUIRE_RE,
@@ -165,6 +166,15 @@ RESCUE_RESUME_COOLDOWN = 1800  # 熔断后的自动恢复等待（秒）
 RESCUE_FETCH_TIMEOUT = 60  # 单频道补漏拉取消息的超时（秒）
 
 
+# —— 账号级网络超时熔断 ——
+# 同一账号连续 NET_TIMEOUT_PAUSE_STREAK 次网络超时/连接失败后，该账号本轮
+# 扫描暂停 NET_TIMEOUT_PAUSE_SECONDS 秒，避免整体断网时仍逐条硬等 30 秒
+# 超时把整轮任务空转到数小时。
+NET_TIMEOUT_PAUSE_STREAK = 3
+
+NET_TIMEOUT_PAUSE_SECONDS = 300
+
+
 SEEN_CAP_PER_CHAT = 500  # 每频道保留的已处理消息 id 上限
 
 
@@ -251,6 +261,22 @@ async def _timeout_aiter(agen: Any, timeout: float, name: str = "") -> Any:
                 f"网络请求 {name or '消息拉取'} 超时（{timeout:.0f} 秒，网络异常）"
             ) from None
         yield item
+
+
+def _is_network_failure(exc: BaseException) -> bool:
+    """判断异常是否为网络类失败（超时/连接断开/代理僵死）。
+
+    _TimeoutClient 会把网络超时包成 RuntimeError，消息含「网络请求 … 超时」
+    「网络异常」；原生 TimeoutError/ConnectionError/OSError 作为兜底。
+    """
+    msg = str(exc)
+    if "网络请求" in msg and "超时" in msg:
+        return True
+    if "网络异常" in msg:
+        return True
+    return isinstance(
+        exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)
+    )
 
 
 def _is_transport_flood(exc: BaseException) -> bool:
@@ -394,12 +420,16 @@ class _TimeoutClient:
         account: str = "",
         on_transport_flood: Optional[Callable[[str, float], None]] = None,
         global_limiter: Optional[_GlobalRateLimiter] = None,
+        on_net_result: Optional[Callable[[str, bool], None]] = None,
     ) -> None:
         self._raw = client
         self._timeout = timeout
         self._account = account or "default"
         # 跨账号共享的全局令牌桶：限制同进程所有账号的合计调用速率
         self._global_limiter = global_limiter
+        # 每次调用成功/网络失败回写引擎，用于账号级连续超时熔断
+        self._on_net_result = on_net_result
+
         # 每个 _TimeoutClient 实例共享 per-account 锁（GiveawayEngine
         # 里通常一账号一 client，所以 key 就是 account）
         self._lock = _CLIENT_API_LOCKS.setdefault(self._account, asyncio.Lock())
@@ -4689,6 +4719,31 @@ class GiveawayEngine:
                 logger.debug("点击超时后核对 bot 回复失败", exc_info=True)
         return False
 
+    async def _wait_signup_success(
+        self, account: str, client: Any, username: str
+    ) -> bool:
+        """bot 回显抽奖详情后的短轮询：慢校验 bot 的成功回复可能晚几秒到。
+
+        只认被点回复之后新到的 bot 消息中的报名成功文案；轮询结束仍未见
+        成功回复返回 False（本次不记已参与，留给下一轮重试）。
+        """
+        for _ in range(3):
+            await asyncio.sleep(3)
+            if self._stop is not None and self._stop.is_set():
+                return False
+            try:
+                async for item in client.get_chat_history(username, limit=4):
+                    if getattr(item, "outgoing", False):
+                        continue
+                    text = str(_message_text(item) or "")
+                    if "已参加" in text or reply_says_signup_success(item):
+                        flat = " ".join(text.split())[:40]
+                        self.log(f"@{username} 参与成功（{flat}）")
+                        return True
+            except Exception:
+                logger.debug("轮询报名成功回复失败", exc_info=True)
+        return False
+
     async def _verify_after_click(
         self,
         account: str,
@@ -4698,9 +4753,10 @@ class GiveawayEngine:
     ) -> bool:
         """点击确认/参与按钮后核对 bot 回复，把结果写进日志（不再盲点）。
 
-        返回 False 表示本次点击未生效（bot 仍要求先加入频道，或对本次操作
-        没有回复、最新消息只是自己发出的 /start）；其余情况返回
-        True（成功、终态或无法判定，沿用原来的完成口径）。
+        返回 False 表示本次点击未生效（bot 仍要求先加入频道、对本次操作
+        没有回复、最新消息只是自己发出的 /start，或仅回显抽奖详情而未给出
+        报名确认）；其余情况返回 True（成功、终态或无法判定，沿用原来的
+        完成口径）。
         """
         try:
             await asyncio.sleep(3)
@@ -4763,6 +4819,17 @@ class GiveawayEngine:
                 # @Lottery_2_bot 会一直重发同一张卡片）。按「无法判定」记成功
                 # 会造成日志显示已参与、实际根本没报名，必须判未完成
                 self.log(f"@{username} 点击后仍是参与入口卡片，本次未真正报名：{flat}")
+                return False
+            if ECHO_GIVEAWAY_DETAIL_RE.search(text):
+                # 详情卡上没有可点的确认按钮：bot 只把抽奖帖原样回显
+                # （「抽奖标题：…」），不是报名确认。@Lottery_2_bot 首次要
+                # 逐个校验多个频道身份，真正的成功消息（「参加抽奖成功…」）
+                # 可能晚几秒到，先短轮询一次；仍无成功回复则判未完成，
+                # 否则会记「已参与」并持久化，后续扫描永久跳过，
+                # 实际根本没进抽奖
+                if await self._wait_signup_success(account, client, username):
+                    return True
+                self.log(f"@{username} 点击后仅回显抽奖详情，未确认报名：{flat}")
                 return False
             if not reply_says_ended(msg):
                 self.log(f"@{username} 点击后回复：{flat}")
