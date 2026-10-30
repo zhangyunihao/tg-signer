@@ -31,7 +31,13 @@ EVENTS_POLL_INTERVAL = 0.2
 
 
 class GiveawayProcess:
-    """管理一个抽奖任务子进程，接口与 GiveawayEngine 的展示部分保持一致。"""
+    """管理一个抽奖任务子进程，接口与 GiveawayEngine 的展示部分保持一致。
+
+    每一轮运行（start → 子进程退出）的读取线程、事件文件与结束回调都绑定本轮
+    传入的参数，收尾时先核对「还是不是当前这一轮」：否则上一轮的收尾线程迟到时，
+    会把新一轮的事件文件删掉、把新一轮的结束回调提前触发，导致任务反复启动后
+    状态卡在「运行中」、统计与结束信号丢失。
+    """
 
     def __init__(self, name: str, workdir) -> None:
         self.name = name
@@ -86,14 +92,15 @@ class GiveawayProcess:
 
         log_dir = self.workdir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        self._events_file = log_dir / f"giveaway-{self.name}-{uuid.uuid4().hex}.jsonl"
+        events_file = log_dir / f"giveaway-{self.name}-{uuid.uuid4().hex}.jsonl"
+        self._events_file = events_file
 
         spec = self._build_spec(cfg)
-        spec["events_file"] = str(self._events_file)
+        spec["events_file"] = str(events_file)
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
         try:
-            self.proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 [
                     sys.executable,
                     "-m",
@@ -108,15 +115,21 @@ class GiveawayProcess:
                 bufsize=1,
                 env=env,
             )
-            _assign_to_job(self.proc)
+            _assign_to_job(proc)
         except Exception:
             logger.debug("抽奖任务子进程启动失败", exc_info=True)
             self.proc = None
             self._cleanup_events_file()
             return False
 
-        threading.Thread(target=self._read_stdout, daemon=True).start()
-        threading.Thread(target=self._read_events, daemon=True).start()
+        self.proc = proc
+        # 线程持有本轮自己的参数：下一轮 start 覆盖实例属性后，旧线程仍按本轮收尾
+        threading.Thread(target=self._read_stdout, args=(proc, log), daemon=True).start()
+        threading.Thread(
+            target=self._read_events,
+            args=(proc, events_file, on_event, on_finish, self._loop),
+            daemon=True,
+        ).start()
         return True
 
     def stop(self) -> None:
@@ -130,7 +143,9 @@ class GiveawayProcess:
         except subprocess.TimeoutExpired:
             try:
                 proc.kill()
-            except OSError:
+                # 等它真正退出，停止后紧接着点「启动」才不会提示「收尾中」
+                proc.wait(timeout=STOP_TIMEOUT)
+            except (OSError, subprocess.TimeoutExpired):
                 pass
         except OSError:
             logger.debug("停止抽奖任务子进程失败", exc_info=True)
@@ -167,11 +182,14 @@ class GiveawayProcess:
             "join_flood_buffer": cfg.get("join_flood_buffer"),
         }
 
-    def _read_stdout(self) -> None:
-        proc = self.proc
+    def _read_stdout(
+        self, proc: Optional[subprocess.Popen] = None, log=None
+    ) -> None:
+        proc = self.proc if proc is None else proc
+        if log is None:
+            log = self._log
         if proc is None or proc.stdout is None:
             return
-        log = self._log
         for raw in proc.stdout:
             line = raw.rstrip("\r\n")
             if line and log is not None:
@@ -184,9 +202,19 @@ class GiveawayProcess:
         except OSError:
             pass
 
-    def _read_events(self) -> None:
-        path = self._events_file
-        proc = self.proc
+    def _read_events(
+        self,
+        proc: Optional[subprocess.Popen] = None,
+        path: Optional[Path] = None,
+        on_event: Optional[Callable[[dict], None]] = None,
+        on_finish: Optional[Callable[[], None]] = None,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
+        proc = self.proc if proc is None else proc
+        path = self._events_file if path is None else path
+        on_event = self._on_event if on_event is None else on_event
+        on_finish = self._on_finish if on_finish is None else on_finish
+        loop = self._loop if loop is None else loop
         if path is None or proc is None:
             return
         try:
@@ -195,7 +223,7 @@ class GiveawayProcess:
                 if proc.poll() is not None:
                     # 子进程没来得及回报就退出：仍需走结束回调，
                     # 否则任务状态与统计不会落盘
-                    self._finalize()
+                    self._finalize(proc, path, on_finish, loop)
                     return
                 time.sleep(EVENTS_POLL_INTERVAL)
             with open(path, "rb") as fp:
@@ -206,22 +234,28 @@ class GiveawayProcess:
                         buf += chunk
                         *lines, buf = buf.split(b"\n")
                         for raw in lines:
-                            self._handle_event_line(raw.decode("utf-8", "replace"))
+                            self._handle_event_line(
+                                raw.decode("utf-8", "replace"), proc
+                            )
                         continue
                     if proc.poll() is not None:
                         break
                     time.sleep(EVENTS_POLL_INTERVAL)
                 # 进程已退出：写出时通常带换行，残留半行也尝试解析
                 if buf:
-                    self._handle_event_line(buf.decode("utf-8", "replace"))
+                    self._handle_event_line(buf.decode("utf-8", "replace"), proc)
         except OSError:
             logger.debug("读取抽奖任务事件文件失败", exc_info=True)
         finally:
-            self._finalize()
+            self._finalize(proc, path, on_finish, loop)
 
-    def _handle_event_line(self, line: str) -> None:
+    def _handle_event_line(self, line: str, proc: Optional[object] = None) -> None:
+        proc = self.proc if proc is None else proc
         line = line.strip()
         if not line:
+            return
+        # 上一轮子进程迟到的回报：直接忽略，避免污染新一轮的状态与回调
+        if proc is not None and proc is not self.proc:
             return
         try:
             payload = json.loads(line)
@@ -229,13 +263,15 @@ class GiveawayProcess:
             return
         kind = payload.get("kind")
         if kind == "stats":
-            self._apply_stats(payload)
+            self._apply_stats(payload, proc)
         elif kind == "event":
             ev = payload.get("event")
             if isinstance(ev, dict) and self._on_event is not None and self._loop:
                 self._loop.call_soon_threadsafe(self._on_event, ev)
 
-    def _apply_stats(self, payload: dict) -> None:
+    def _apply_stats(self, payload: dict, proc: Optional[object] = None) -> None:
+        if proc is not None and proc is not self.proc:
+            return
         try:
             self.joined = int(payload.get("joined") or 0)
         except (TypeError, ValueError):
@@ -258,24 +294,46 @@ class GiveawayProcess:
             except RuntimeError:
                 logger.debug("回报抽奖统计失败", exc_info=True)
 
-    def _finalize(self) -> None:
+    def _finalize(
+        self,
+        proc: Optional[object] = None,
+        path: Optional[Path] = None,
+        on_finish: Optional[Callable[[], None]] = None,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
+        proc = self.proc if proc is None else proc
+        path = self._events_file if path is None else path
+        on_finish = self._on_finish if on_finish is None else on_finish
+        loop = self._loop if loop is None else loop
+        # 旧一轮的收尾线程迟到：只清理它自己的事件文件，
+        # 不得重置新一轮的完成标记、也不得触发新一轮的结束回调
+        if proc is not None and proc is not self.proc:
+            if path is not None and path != self._events_file:
+                self._unlink_events(path)
+            return
         if self._finished_cb_called:
             return
         self._finished_cb_called = True
-        self._cleanup_events_file()
-        if self._on_finish is None:
+        if path is not None and path == self._events_file:
+            self._events_file = None
+        self._unlink_events(path)
+        if on_finish is None:
             return
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._on_finish)
+        if loop is not None:
+            loop.call_soon_threadsafe(on_finish)
         else:
-            self._on_finish()
+            on_finish()
 
-    def _cleanup_events_file(self) -> None:
-        path = self._events_file
-        self._events_file = None
+    @staticmethod
+    def _unlink_events(path: Optional[Path]) -> None:
         if path is None:
             return
         try:
             path.unlink()
         except OSError:
             pass
+
+    def _cleanup_events_file(self) -> None:
+        path = self._events_file
+        self._events_file = None
+        self._unlink_events(path)

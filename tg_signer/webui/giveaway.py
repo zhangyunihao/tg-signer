@@ -948,6 +948,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     # 移动端卡片「执行时间」元素：运行中按启动时间每秒刷新耗时
     card_time_els: Dict[str, ui.html] = {}
     card_time_texts: Dict[str, str] = {}
+    # 「添加任务」弹窗当前目标：None=添加新任务，值=正在编辑的任务编号
+    editing_name: Dict[str, Optional[str]] = {"name": None}
 
     def _persist() -> None:
         clean = {}
@@ -983,6 +985,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "win_detect": bool(cfg.get("win_detect", True)),
                 # 列表置顶（仅影响任务展示顺序）
                 "pinned": bool(cfg.get("pinned")),
+                # 累计启动次数：反复启动时给每次运行分段标记日志
+                "run_count": int(cfg.get("run_count") or 0),
                 # 限流保护：加入/解析节奏与配额（0=不限制，缺省用常量默认值）
                 "join_pace_min": max(0, int(cfg.get("join_pace_min") or 0)),
                 "join_pace_max": max(0, int(cfg.get("join_pace_max") or 0)),
@@ -1169,15 +1173,17 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         if cfg is None:
             return
         cfg["pinned"] = not bool(cfg.get("pinned"))
-        _persist()
-        render_tasks()
+        # 先通知再重渲染：render_tasks 会清空任务列表，当前点击按钮的 slot 随之删除，
+        # 之后再 ui.notify 会抛「The parent element this slot belongs to has been deleted」
         ui.notify(
             f"任务 #{name} 已{'置顶' if cfg['pinned'] else '取消置顶'}",
             type="positive",
         )
+        _persist()
+        render_tasks()
 
-    def duplicate_task(name: str) -> None:
-        cfg = tasks[name]
+    def _fill_form(cfg: dict) -> None:
+        """把任务配置回填到「添加任务」弹窗表单（复制、编辑共用）。"""
         source_type = giveaway_source_type(cfg)
         account_select.value = list(cfg["accounts"])
         refresh_options()
@@ -1238,7 +1244,38 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             resolve_pace_max_input,
         ):
             el.update()
+
+    def _set_dialog_mode(edit: Optional[str]) -> None:
+        """切换弹窗标题与确认按钮文案：None=添加新任务，否则=编辑对应任务。"""
+        editing_name["name"] = edit
+        add_dlg_title.text = f"编辑任务 #{edit}" if edit else "添加任务"
+        add_dlg_title.update()
+        add_dlg_submit.text = "保存修改" if edit else "确定添加"
+        add_dlg_submit.update()
+
+    def open_add_dialog() -> None:
+        _set_dialog_mode(None)
+        add_dlg.open()
+
+    def duplicate_task(name: str) -> None:
+        cfg = tasks.get(name)
+        if cfg is None:
+            return
+        _fill_form(cfg)
+        _set_dialog_mode(None)
         ui.notify("已复制任务参数，可修改后点击「确定添加」", type="positive")
+        add_dlg.open()
+
+    def edit_task(name: str) -> None:
+        """编辑已有任务：回填参数到弹窗，保存时覆盖原任务（不新建、不自动启动）。"""
+        cfg = tasks.get(name)
+        if cfg is None:
+            return
+        if task_running(name):
+            ui.notify(f"任务 #{name} 正在运行，请先停止再编辑", type="warning")
+            return
+        _fill_form(cfg)
+        _set_dialog_mode(str(name))
         add_dlg.open()
 
     async def start_task(name: str, set_status: Callable[[bool], None]) -> None:
@@ -1282,6 +1319,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         last_saved = {"joined": -1, "ts": 0.0}
         # 卡片状态刷新的去重标记：进度没变就不重绘，避免每秒无谓更新
         last_status = {"sig": None}
+        # 本次运行序号与日志句柄：反复启动时用「第 N 次启动/结束」分隔线切分日志，
+        # 同一份共用日志里也能一眼看出每段属于第几次运行
+        run_no = int(cfg.get("run_count") or 0) + 1
+        log = make_log(name)
 
         def _on_stats(payload: dict, _n: str = name) -> None:
             cfg_now = tasks.get(_n)
@@ -1326,6 +1367,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     )
                 capture_engine_stats(_n)
                 _persist()
+                # 结束分隔线：与启动线配对，标明这一段是第几次运行
+                log(
+                    f"──── 第 {run_no} 次结束：耗时 "
+                    f"{cfg_done.get('last_duration') or '—'}，"
+                    f"新参与 {int(cfg_done.get('last_joined') or 0)} 个 ────"
+                )
             cb = _GLOBAL_STATUS_CBS.get(engine_key(_n))
             if cb is not None:
                 _apply_status(cb, False)
@@ -1380,7 +1427,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         # 引擎在独立子进程运行：WebUI 不再承载长时间扫描/并发账号的 CPU 与内存
         started = engine.start(
             cfg,
-            log=make_log(name),
+            log=log,
             on_event=_on_event,
             on_finish=_on_finish,
             on_stats=_on_stats,
@@ -1389,6 +1436,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
             cfg["last_duration"] = ""
             cfg["_start_ts"] = start_ts
+            # 启动分隔线：子进程冷启动要数百毫秒，先落线再接它的首批日志
+            cfg["run_count"] = run_no
+            log(f"════ 第 {run_no} 次启动 ════")
             _persist()
             set_status(True)
             ui.notify(f"任务 #{name} 已启动", type="positive")
@@ -1415,13 +1465,14 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         except Exception:
             logger.debug("更新任务运行状态回调执行失败", exc_info=True)
 
-    async def on_add_task() -> None:
+    def _collect_cfg() -> Optional[dict]:
+        """读取弹窗表单并校验，构造任务配置；校验不通过返回 None。"""
         accounts = list(account_select.value or [])
         # 清理历史标签后缀
         accounts = [str(a).replace(" ⚠️未授权", "") for a in accounts]
         if not accounts:
             ui.notify("请至少选择一个账号", type="warning")
-            return
+            return None
         source_type = str(source_type_toggle.value or SOURCE_CHANNEL)
         source_type = (
             source_type if source_type in SOURCE_TYPE_LABELS else SOURCE_CHANNEL
@@ -1432,7 +1483,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         if source_type in (SOURCE_BOT, SOURCE_WIN):
             if not bot_username:
                 ui.notify("请填写要监控的机器人用户名", type="warning")
-                return
+                return None
             chats = [bot_username]
         else:
             for cid in list(channel_select.value or []):
@@ -1443,7 +1494,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     chats.append(str(parsed))
             if not chats:
                 ui.notify("请至少选择或手动填写一个监控对象", type="warning")
-                return
+                return None
         keywords = _split_items(keywords_input.value or "")
         try:
             max_joins = (
@@ -1473,7 +1524,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             )
         except (TypeError, ValueError):
             ui.notify("参与上限/延迟/补漏/限流参数需为数字", type="warning")
-            return
+            return None
         if delay_min > delay_max:
             delay_min, delay_max = delay_max, delay_min
         if join_pace_min > join_pace_max:
@@ -1519,6 +1570,42 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "resolve_pace_min": resolve_pace_min,
             "resolve_pace_max": resolve_pace_max,
         }
+        return cfg
+
+    async def on_add_task() -> None:
+        cfg = _collect_cfg()
+        if cfg is None:
+            return
+        edit = editing_name.get("name")
+        if edit and edit in tasks:
+            # 编辑模式：保留会话目录、置顶与上次运行统计等非表单字段，
+            # 就地覆盖原任务，编号不变，也不自动启动（改完可反复点「启动」运行）
+            old = tasks[edit]
+            for key in (
+                "session_dir",
+                "pinned",
+                "run_count",
+                "last_start_time",
+                "last_duration",
+                "last_joined",
+                "last_joined_by_account",
+                "last_joined_by_account_chat",
+                "last_sweep",
+                "_start_ts",
+                "_set_status",
+            ):
+                if key in old:
+                    cfg[key] = old[key]
+            tasks[edit] = cfg
+            _persist()
+            _set_dialog_mode(None)
+            add_dlg.close()
+            render_tasks()
+            ui.notify(
+                f"任务 #{edit} 已保存修改，可点击「启动」运行",
+                type="positive",
+            )
+            return
         # 编号以磁盘顺序为准并在文件锁内落盘：其它页面/实例的旧快照不会冲掉新任务
         try:
             name = add_task_to_store(workdir, cfg)
@@ -1528,6 +1615,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         store["seq"] = max(int(store.get("seq") or 1), int(name) + 1)
         tasks[name] = cfg
         ensure_engine(name)
+        _set_dialog_mode(None)
         render_tasks()
         add_dlg.close()
         ui.notify(f"任务 #{name} 已添加，正在启动...", type="positive")
@@ -1764,6 +1852,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "<q-tooltip>{{ props.row.pinned ? '取消置顶' : '置顶' }}"
                 "</q-tooltip></q-btn>"
                 '<q-btn flat dense color="primary" '
+                'label="编辑" @click="$parent.$emit(\'editTask\', props.row)" />'
+                '<q-btn flat dense color="primary" '
                 'label="明细" @click="$parent.$emit(\'detailTask\', props.row)" />'
                 '<q-btn flat dense color="primary" '
                 'label="复制" @click="$parent.$emit(\'copyTask\', props.row)" />'
@@ -1847,6 +1937,11 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 if isinstance(row, dict) and row.get("name"):
                     duplicate_task(str(row["name"]))
 
+            def on_edit_event(e) -> None:
+                row = e.args
+                if isinstance(row, dict) and row.get("name"):
+                    edit_task(str(row["name"]))
+
             def on_detail_event(e) -> None:
                 row = e.args
                 if isinstance(row, dict) and row.get("name"):
@@ -1865,6 +1960,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             table.on("startTask", on_start_event)
             table.on("stopTask", on_stop_event)
             table.on("copyTask", on_copy_event)
+            table.on("editTask", on_edit_event)
             table.on("detailTask", on_detail_event)
             table.on("deleteTask", on_delete_event)
             table.on("pinTask", on_pin_event)
@@ -1970,6 +2066,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                 "取消置顶" if row["pinned"] else "置顶"
                             )
                             ui.button(
+                                "编辑",
+                                on_click=lambda nn=n: edit_task(nn),
+                            ).props("flat dense color=primary")
+                            ui.button(
                                 "明细",
                                 on_click=lambda nn=n: open_detail(nn),
                             ).props("flat dense color=primary")
@@ -2058,9 +2158,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "删除所有账号的已参与抽奖记录（保留中奖消息去重与回扫进度），"
                 "清除后相同链接可再次参与"
             )
-            ui.button("添加任务", icon="add", on_click=lambda: add_dlg.open()).props(
-                "outline"
-            )
+            ui.button(
+                "添加任务", icon="add", on_click=open_add_dialog
+            ).props("outline")
     task_list_container = ui.column().classes("w-full gap-2")
     mobile_state = {"show_all": False}
 
@@ -2245,7 +2345,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     # —— 添加任务弹窗 ——
     with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl"):
         add_dialog_close_button(add_dlg)
-        ui.label("添加任务").classes("text-lg font-semibold")
+        add_dlg_title = ui.label("添加任务").classes("text-lg font-semibold")
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             source_type_toggle = ui.toggle(
                 {
@@ -2512,7 +2612,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         ).classes("text-xs text-amber-600")
         with ui.row().classes("w-full justify-end"):
             ui.button("取消", on_click=add_dlg.close).props("flat")
-            ui.button("确定添加", color="primary", on_click=on_add_task)
+            add_dlg_submit = ui.button(
+                "确定添加", color="primary", on_click=on_add_task
+            )
 
     refresh_options()
     render_tasks()
