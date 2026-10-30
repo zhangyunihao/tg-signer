@@ -1405,6 +1405,147 @@ class TaskRunnerBlock:
         )
         return True
 
+    def _launch_sign_retry(
+        self,
+        task_name: str,
+        account_chats: dict[str, list[dict]],
+    ) -> bool:
+        """只对勾选的失败频道重新执行签到：每账号一个 run-once 子进程。
+
+        ``account_chats`` 为 {账号: [{"token": "chat_id#thread", ...}]}；只有能在
+        签到配置里定位到的频道才会重试。与「重新加入」不同，这里只重发签到动作，
+        不改动群成员关系。
+        """
+        cfg_labels = self._config_chat_tokens(task_name)
+        if not cfg_labels:
+            ui.notify("读取签到配置失败，无法重试签到", type="negative")
+            return False
+        matched: dict[str, list[str]] = {}
+        skipped = 0
+        for account, items in account_chats.items():
+            wanted = {str(it.get("token") or "") for it in items if it.get("token")}
+            tokens = [t for t in cfg_labels if t in wanted]
+            skipped += len([t for t in wanted if t not in cfg_labels])
+            if tokens:
+                matched[account] = tokens
+        accounts = list(matched)
+        if not accounts:
+            ui.notify(
+                "失败项都无法在签到配置中定位（请等新的任务执行后再试）",
+                type="negative",
+            )
+            return False
+        random.shuffle(accounts)
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(SOURCE_ROOT)
+        stagger_delays: Dict[str, int] = {}
+        if len(accounts) > 1:
+            gap = ACCOUNT_STAGGER_SPREAD / len(accounts)
+            for i, account in enumerate(accounts):
+                stagger_delays[account] = int(i * gap + random.uniform(0, gap * 0.5))
+        total = sum(len(v) for v in matched.values())
+        record = {
+            "id": f"{time.time_ns()}",
+            "start_time": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+            "task_type": "签到 (失败重试)",
+            "task_name": task_name,
+            "accounts": ", ".join(accounts),
+            "status": "运行中",
+            "duration": "",
+            "result": "重试勾选的失败频道中…",
+        }
+        procs: list[dict] = []
+        run_queue: queue.Queue = queue.Queue()
+        detail_rows: list[dict] = []
+        for account in accounts:
+            tokens = matched[account]
+            # 按配置顺序传入标签，日志轮转取标签时才与子进程实际顺序一致
+            chats_labels = [cfg_labels[t] for t in tokens]
+            args = ["-w", str(state.workdir), "-a", account, "run-once", task_name]
+            cmd = [sys.executable, "-m", "tg_signer.task_runner"] + args
+            stats = {
+                "started": 0,
+                "failed": 0,
+                "current_pos": None,
+                "last_sign": None,
+                "next_run": None,
+            }
+            proc_env = env.copy()
+            # 只重跑这些频道；不设 TG_SIGNER_SHUFFLE_CHATS，保证与 chats_labels 对得上
+            proc_env["TG_SIGNER_ONLY_CHATS"] = json.dumps(tokens, ensure_ascii=False)
+            start_delay = stagger_delays.get(account, 0)
+            if start_delay > 0:
+                proc_env["TG_SIGNER_START_DELAY"] = str(start_delay)
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    env=proc_env,
+                )
+                _assign_to_job(proc)
+            except Exception as exc:
+                notify_error(exc)
+                for label in chats_labels:
+                    detail_rows.append(
+                        {
+                            "account": account,
+                            "chat": label,
+                            "status": "失败",
+                            "note": "子进程启动失败",
+                        }
+                    )
+                continue
+            reader = threading.Thread(
+                target=self._reader,
+                args=(
+                    proc,
+                    task_name,
+                    account,
+                    run_queue,
+                    stats,
+                    chats_labels,
+                    detail_rows,
+                ),
+                daemon=True,
+            )
+            reader.start()
+            procs.append(
+                {
+                    "proc": proc,
+                    "reader": reader,
+                    "account": account,
+                    "stats": stats,
+                    "sub_labels": [],
+                }
+            )
+        if not procs:
+            ui.notify("未能启动重试签到任务", type="negative")
+            return False
+        record["accounts"] = ", ".join(i["account"] for i in procs)
+        self.runs[record["id"]] = {
+            "record": record,
+            "procs": procs,
+            "queue": run_queue,
+            "start_ts": time.time(),
+            "total_chats": total,
+            "details": detail_rows,
+            "combo_subs": [],
+        }
+        append_task_history(record)
+        self._refresh_history_table()
+        self._poll_enabled = True
+        self._update_status()
+        msg = f"已开始重试签到: {task_name}（{len(procs)} 个账号，{total} 个频道）"
+        if skipped:
+            msg += f"，另有 {skipped} 条无法定位未重试"
+        ui.notify(msg, type="positive" if not skipped else "warning")
+        return True
+
     def _join_reader(
         self,
         proc: subprocess.Popen,
@@ -1465,6 +1606,25 @@ class TaskRunnerBlock:
         except Exception:
             return []
 
+    def _config_chat_tokens(self, task_name: str) -> dict[str, str]:
+        """签到配置里「频道定位串 -> 展示标签」的映射（保持配置顺序）。
+
+        定位串与明细行的 ``_detail_chat_token`` 一致（chat_id 或 chat_id#thread）。
+        """
+        try:
+            entry = load_config("signer", task_name, workdir=state.workdir)
+        except Exception:
+            logger.debug("读取签到配置失败：%s", task_name, exc_info=True)
+            return {}
+        labels: dict[str, str] = {}
+        for chat in getattr(entry.cfg, "chats", []) or []:
+            chat_id = str(chat.chat_id)
+            thread = getattr(chat, "message_thread_id", None)
+            token = f"{chat_id}#{thread}" if thread is not None else chat_id
+            name = str(getattr(chat, "name", "") or "").strip()
+            labels[token] = f"{name}({chat_id})" if name else chat_id
+        return labels
+
     def _format_progress(self, run: dict) -> str:
         """根据各账号进程的日志统计生成进度文本。"""
         total = run.get("total_chats") or 0
@@ -1479,7 +1639,10 @@ class TaskRunnerBlock:
         ok = max(0, completed - failed)
         task_type = run["record"].get("task_type", "")
         if total > 0 and (
-            "run-once" in task_type or "组合" in task_type or "加群" in task_type
+            "run-once" in task_type
+            or "组合" in task_type
+            or "加群" in task_type
+            or "重试" in task_type
         ):
             return f"进度 {ok}/{total} · 失败 {failed}"
         if started > 0:
@@ -1602,8 +1765,8 @@ class TaskRunnerBlock:
             ).classes("text-sm text-gray-600")
             if can_rerun:
                 ui.label(
-                    "勾选失败的频道后点「重新加入」，将立即让对应账号重新加入这些群组/频道"
-                    "（签到失败常因账号已不在群里）。"
+                    "勾选失败的频道后点「重试签到」，只对这些频道重新执行签到；"
+                    "若失败原因是账号已不在群里，可先点「重新加入」再加入后再重试。"
                 ).classes("text-xs text-gray-500")
             # 分账号失败统计：点击可直接筛选该账号
             if acc_stats:
@@ -1654,17 +1817,26 @@ class TaskRunnerBlock:
                     on_click=lambda: clear_selection(),
                 ).props("flat dense size=sm")
                 with ui.row().classes("ml-auto gap-2"):
-                    rerun_btn = ui.button(
-                        "重新加入", color="primary", on_click=lambda: rerun_failed()
+                    retry_btn = ui.button(
+                        "重试签到", color="primary", on_click=lambda: retry_sign()
+                    ).tooltip("只对勾选的失败频道重新执行签到，不会重新加入群组")
+                    retry_btn.set_enabled(False)
+                    join_btn = (
+                        ui.button("重新加入", on_click=lambda: rerun_failed())
+                        .props("outline")
+                        .tooltip(
+                            "先让对应账号重新加入勾选的群组/频道，再点「重试签到」"
+                        )
                     )
-                    rerun_btn.set_enabled(False)
+                    join_btn.set_enabled(False)
                     ui.button("关闭", on_click=dlg.close).props("flat")
 
             def refresh_selection() -> None:
                 n = len([i for i in selected if details[i].get("status") == "失败"])
                 sel_label.text = f"已选 {n} 个失败频道"
                 sel_label.update()
-                rerun_btn.set_enabled(n > 0)
+                retry_btn.set_enabled(n > 0)
+                join_btn.set_enabled(n > 0)
 
             def toggle(index: int, checked: bool) -> None:
                 if checked:
@@ -1682,6 +1854,40 @@ class TaskRunnerBlock:
             def clear_selection() -> None:
                 selected.clear()
                 render()
+
+            def retry_sign() -> None:
+                picked = [
+                    (i, details[i])
+                    for i in sorted(selected)
+                    if details[i].get("status") == "失败"
+                ]
+                if not picked:
+                    ui.notify("请先勾选要重试签到的失败频道", type="warning")
+                    return
+                by_account: dict[str, list[dict]] = {}
+                missing = 0
+                for _, d in picked:
+                    account = str(d.get("account") or "")
+                    token = self._detail_chat_token(d)
+                    if not account or not token:
+                        missing += 1
+                        continue
+                    bucket = by_account.setdefault(account, [])
+                    if all(x["token"] != token for x in bucket):
+                        bucket.append({"token": token})
+                if not by_account:
+                    ui.notify(
+                        "失败项缺少 Chat ID，无法定位频道（请等新的任务执行后再试）",
+                        type="negative",
+                    )
+                    return
+                if missing:
+                    ui.notify(
+                        f"另有 {missing} 条缺少 Chat ID，未包含在本次重试",
+                        type="warning",
+                    )
+                if self._launch_sign_retry(task_name, by_account):
+                    dlg.close()
 
             def rerun_failed() -> None:
                 picked = [

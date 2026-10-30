@@ -1093,6 +1093,14 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
     def _time_to_crontab(sign_at: dt_time) -> str:
         return f"{sign_at.minute} {sign_at.hour} * * *"
 
+    @staticmethod
+    def _sign_chat_token(chat: SignChatV3) -> str:
+        """频道定位串：chat_id，带话题时追加 ``#message_thread_id``。"""
+        token = str(chat.chat_id)
+        if chat.message_thread_id is not None:
+            token = f"{token}#{chat.message_thread_id}"
+        return token
+
     async def sign_a_chat(
         self,
         chat: SignChatV3,
@@ -1165,8 +1173,23 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
             if start_delay > 0:
                 self.log(f"多账号错峰启动：等待 {int(start_delay)} 秒后开始签到")
                 await asyncio.sleep(start_delay)
-            # TG_SIGNER_SHUFFLE_CHATS=1 时随机打乱频道执行顺序（每个账号进程各自独立打乱）
+            # TG_SIGNER_ONLY_CHATS（JSON 数组）非空时只执行指定频道，
+            # 由 WebUI「重试签到」下发，用于只重跑之前失败的频道
             chats = list(config.chats)
+            only_chats_raw = os.environ.get("TG_SIGNER_ONLY_CHATS", "").strip()
+            if only_chats_raw:
+                try:
+                    only_chats = {str(x) for x in json.loads(only_chats_raw)}
+                except (ValueError, TypeError):
+                    only_chats = set()
+                    self.log(
+                        "TG_SIGNER_ONLY_CHATS 解析失败，按全部频道执行",
+                        level="WARNING",
+                    )
+                if only_chats:
+                    chats = [c for c in chats if self._sign_chat_token(c) in only_chats]
+                    self.log(f"仅重试指定频道: 共 {len(chats)} 个")
+            # TG_SIGNER_SHUFFLE_CHATS=1 时随机打乱频道执行顺序（每个账号进程各自独立打乱）
             if os.environ.get("TG_SIGNER_SHUFFLE_CHATS") == "1":
                 random.shuffle(chats)
                 self.log("已随机打乱频道执行顺序")
