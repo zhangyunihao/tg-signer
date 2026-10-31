@@ -208,6 +208,11 @@ bot 回复「您已成功报名抽奖（未达标β）您还需完成激活任�
 双向账号不建任务（无法在群里发言），同一账号/群组/要求/标题在消息
 中心只提醒一次，与报名成功清单的提醒同键去重。
 
+组合任务里的抽奖子任务同样会提醒：WebUI 为每个抽奖子任务生成 events
+文件并跟随读取（`task_panel.watch_combo_giveaway_events`），再把
+`speech_required` 等事件交给 `handle_giveaway_event`，因此经
+`combo_runner` 中转也不会丢失消息中心提示。
+
 ## 五、配置常量速查
 
 | 常量 | 默认值 | 说明 |

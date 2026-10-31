@@ -598,3 +598,55 @@ def test_drain_output_collects_logs_without_dashboard_polling():
         TaskRunnerBlock.output_lines.clear()
         TaskRunnerBlock.output_lines.extend(saved_lines)
         TaskRunnerBlock._line_seq = saved_seq
+
+
+def test_combo_giveaway_events_reach_message_center(tmp_path):
+    """组合任务抽奖子进程的 speech_required 事件要进入消息中心提醒。"""
+
+    class _DeadProc:
+        def poll(self):
+            return 0
+
+    class _FakeLoop:
+        def __init__(self):
+            self.calls = []
+
+        def call_soon_threadsafe(self, fn, *args):
+            self.calls.append((fn, args))
+
+    from tg_signer.webui.task_panel import (
+        handle_giveaway_event,
+        watch_combo_giveaway_events,
+    )
+
+    events = tmp_path / "giveaway-combo.jsonl"
+    events.write_text(
+        json.dumps(
+            {
+                "kind": "event",
+                "event": {
+                    "type": "speech_required",
+                    "account": "alice",
+                    "bot": "LotteryBot",
+                    "title": "上海抽奖",
+                    "group": "上海群",
+                    "required": 6,
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    loop = _FakeLoop()
+    watch_combo_giveaway_events(_DeadProc(), events, None, loop, str(tmp_path))
+
+    assert loop.calls
+    fn, args = loop.calls[0]
+    assert fn is handle_giveaway_event
+    fn(*args)
+    alerts = json.loads(
+        (tmp_path / "webui_speech_alerts.json").read_text(encoding="utf-8")
+    )["alerts"]
+    assert alerts[0]["group"] == "上海群" and alerts[0]["required"] == 6
+    assert not events.exists()  # 事件文件读取完即清理

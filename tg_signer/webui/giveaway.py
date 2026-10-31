@@ -948,6 +948,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     # 移动端卡片「执行时间」元素：运行中按启动时间每秒刷新耗时
     card_time_els: Dict[str, ui.html] = {}
     card_time_texts: Dict[str, str] = {}
+    # 中奖扫描任务卡片的「中奖回扫」元素：显示回扫是否进行中/上次进度
+    card_sweep_els: Dict[str, ui.html] = {}
+    card_sweep_texts: Dict[str, str] = {}
     # 「添加任务」弹窗当前目标：None=添加新任务，值=正在编辑的任务编号
     editing_name: Dict[str, Optional[str]] = {"name": None}
 
@@ -1640,6 +1643,30 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "</div></div>"
         )
 
+    def _card_sweep_html(text: str) -> str:
+        """中奖扫描卡片的「中奖回扫」行：运行中/结束后都保留显示。"""
+        return (
+            '<div class="tgs-fields">'
+            '<div class="tgs-field tgs-field-full">'
+            '<span class="tgs-field-k">中奖回扫</span>'
+            f'<span class="tgs-field-v">{escape(str(text))}</span>'
+            "</div></div>"
+        )
+
+    def _card_sweep_state(name: str) -> str:
+        """「中奖回扫」文案：任务运行中即视为回扫进行中，否则未进行。"""
+        return "进行中" if task_running(name) else "未进行"
+
+    def _update_card_sweep(name: str, text: str) -> None:
+        el = card_sweep_els.get(name)
+        if el is None or card_sweep_texts.get(name) == text:
+            return
+        card_sweep_texts[name] = text
+        try:
+            el.content = _card_sweep_html(text)
+        except Exception:
+            logger.debug("刷新卡片中奖回扫状态失败", exc_info=True)
+
     def _card_time_text(name: str, running: bool) -> str:
         """卡片「执行时间」文案：运行中实时计算耗时，结束后用持久化时长。"""
         cfg = tasks.get(name) or {}
@@ -1675,6 +1702,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         table_ref["table"] = None
         card_time_els.clear()
         card_time_texts.clear()
+        card_sweep_els.clear()
+        card_sweep_texts.clear()
         with task_list_container:
             if not tasks:
                 ui.label("暂无任务，请点击「添加任务」创建。").classes(
@@ -1705,12 +1734,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     "name": "keywords",
                     "label": "关键词",
                     "field": "keywords",
-                    "align": "left",
-                },
-                {
-                    "name": "scan",
-                    "label": "参与上限",
-                    "field": "scan",
                     "align": "left",
                 },
                 {
@@ -1787,6 +1810,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     {
                         "name": str(name),
                         "pinned": bool(cfg.get("pinned")),
+                        "source_type": source_type,
+                        "is_win": source_type == SOURCE_WIN,
                         "task_type": giveaway_type_label(cfg),
                         "accounts": ", ".join(cfg["accounts"]),
                         # 移动端单行摘要（数量 + 前两项）+ 点击展开的完整列表
@@ -1798,9 +1823,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         "chats_summary": _list_text(chat_names, 2),
                         "chats_full": _list_text(chat_names),
                         "keywords": "、".join(cfg.get("keywords") or []) or "全部链接",
-                        "scan": "不限"
-                        if not cfg.get("max_joins")
-                        else str(cfg["max_joins"]),
                         "ignore_hist": (
                             "是" if cfg.get("ignore_history", True) else "否"
                         ),
@@ -1903,6 +1925,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     if badge is not None:
                         try:
                             badge.props(f"color={'info' if running else 'grey-6'}")
+                            # 状态徽标拼接回扫进度：回扫时显示「状态 · 回扫进度」
                             badge.text = f"{text} · {sweep}" if sweep else text
                             badge.update()
                         except Exception:
@@ -1923,6 +1946,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         except Exception:
                             logger.debug("刷新卡片停止按钮失败", exc_info=True)
                     _update_card_time(str(n), _card_time_text(str(n), running))
+                    # 中奖扫描卡片的「中奖回扫」行随运行状态刷新
+                    if str(n) in card_sweep_els:
+                        _update_card_sweep(str(n), "进行中" if running else "未进行")
 
                 return _set
 
@@ -2013,29 +2039,34 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                 f"color={'info' if running else 'grey-6'}"
                             )
                             card_badges[n] = badge
-                        mobile_card_fields(
-                            [
-                                ("类型", row["task_type"]),
-                                ("重复参与", row["ignore_hist"]),
-                                (
-                                    "账号",
-                                    row["accounts_summary"],
-                                    True,
-                                    True,
-                                    row["accounts_full"],
-                                ),
-                                (
-                                    "监控对象",
-                                    row["chats_summary"],
-                                    True,
-                                    True,
-                                    row["chats_full"],
-                                ),
-                                ("关键词", row["keywords"], True),
-                                ("参与上限", row["scan"]),
-                                ("新参加", f"{row['joined']}抽奖"),
-                            ]
-                        )
+                        card_fields = [
+                            ("类型", row["task_type"]),
+                            ("重复参与", row["ignore_hist"]),
+                            (
+                                "账号",
+                                row["accounts_summary"],
+                                True,
+                                True,
+                                row["accounts_full"],
+                            ),
+                            (
+                                "监控对象",
+                                row["chats_summary"],
+                                True,
+                                True,
+                                row["chats_full"],
+                            ),
+                            ("关键词", row["keywords"], True),
+                        ]
+                        card_fields.append(("新参加", f"{row['joined']}抽奖"))
+                        mobile_card_fields(card_fields)
+                        if row["is_win"]:
+                            # 中奖回扫是否进行中（运行中显示回扫进度）
+                            sweep_text = _card_sweep_state(n)
+                            card_sweep_els[n] = ui.html(
+                                _card_sweep_html(sweep_text)
+                            ).classes("w-full")
+                            card_sweep_texts[n] = sweep_text
                         # 执行时间单独渲染，运行中由状态回调/轮询每秒刷新耗时
                         card_time_els[n] = ui.html(_card_time_html(time_text)).classes(
                             "w-full"
@@ -2498,11 +2529,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 )
             return low_input, high_input
 
-        with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+        with ui.row().classes("items-end w-full gap-3 flex-wrap") as delay_row:
             delay_min_input, delay_max_input = _range_inputs(
                 "参与前随机延迟（秒）", low=3, high=10, max_value=600
             )
 
+        with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             rescue_interval_input = ui.number(
                 label="补漏扫描间隔（分钟）",
                 value=30,
@@ -2520,8 +2552,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
         with ui.expansion("限流保护（加入/解析节奏与配额）", icon="shield").classes(
             "w-full"
-        ):
-            with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+        ) as rate_limit_expansion:
+            with ui.row().classes("items-end w-full gap-3 flex-wrap") as join_limit_row:
                 join_pace_min_input, join_pace_max_input = _range_inputs(
                     "加入间隔（秒）",
                     low=int(JOIN_PACE_RANGE[0]),
@@ -2570,12 +2602,20 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             )
 
         def _apply_rescue_visibility() -> None:
+            """补漏项：中奖扫描没有频道可重拉，只保留回扫间隔。"""
+            source_type = str(source_type_toggle.value or SOURCE_CHANNEL)
+            is_win = source_type == SOURCE_WIN
             visible = bool(rescue_switch.value)
             rescue_interval_input.visible = visible
-            rescue_limit_input.visible = visible
+            rescue_limit_input.visible = visible and not is_win
 
         def _apply_source_visibility() -> None:
-            """按任务类型切换表单项：机器人任务只保留机器人/关键词/回扫参数。"""
+            """按任务类型切换表单项：机器人任务只保留与回扫相关的配置。
+
+            中奖扫描只回扫机器人私聊里的中奖通知，不扫描频道、不参与抽奖，
+            因此参与相关的关键词、参与上限、重复参与、参与延迟、限流节奏
+            以及中奖识别开关都隐藏（引擎侧强制关闭/开启）。
+            """
             source_type = str(source_type_toggle.value or SOURCE_CHANNEL)
             is_bot = source_type == SOURCE_BOT
             is_win = source_type == SOURCE_WIN
@@ -2584,6 +2624,18 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             bot_scan_limit_input.visible = is_bot_like
             channel_pick_row.visible = not is_bot_like
             auto_join_switch.visible = not is_bot_like
+            # 机器人任务不自动加群：TG 频道列表更新与加入配额/节奏都无意义
+            update_btn.visible = not is_bot_like
+            join_limit_row.visible = not is_bot_like
+            join_flood_buffer_input.visible = not is_bot_like
+            # 中奖扫描：参与/频道相关选项一律隐藏
+            keywords_input.visible = not is_win
+            max_joins_input.visible = not is_win
+            ignore_hist_switch.visible = not is_win
+            auto_scan_switch.visible = not is_win
+            delay_row.visible = not is_win
+            rate_limit_expansion.visible = not is_win
+            win_switch.visible = not is_win
             if is_bot:
                 default_kw = "，".join(DEFAULT_KEYWORDS)
                 if not (keywords_input.value or "").strip() or (
@@ -2594,6 +2646,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             if is_win:
                 auto_join_switch.value = False
                 auto_scan_switch.value = True
+            _apply_rescue_visibility()
             for el in (
                 bot_username_input,
                 bot_scan_limit_input,
@@ -2601,6 +2654,16 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 auto_join_switch,
                 auto_scan_switch,
                 keywords_input,
+                max_joins_input,
+                ignore_hist_switch,
+                delay_row,
+                rate_limit_expansion,
+                win_switch,
+                update_btn,
+                join_limit_row,
+                join_flood_buffer_input,
+                rescue_interval_input,
+                rescue_limit_input,
             ):
                 try:
                     el.update()

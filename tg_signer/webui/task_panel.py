@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -61,6 +62,7 @@ from tg_signer.webui.giveaway import (
     giveaway_type_label as _giveaway_type_label,
 )
 from tg_signer.webui.giveaway import (
+    handle_giveaway_event,
     load_giveaway_timeout_min,
 )
 from tg_signer.webui.giveaway import (
@@ -227,6 +229,81 @@ def _combo_sub_accounts(sub: dict, workdir) -> list[str]:
                 parts = str(r.get("accounts") or "").split(",")
                 return [a.strip() for a in parts if a.strip()]
     return []
+
+
+# 组合任务抽奖事件文件轮询间隔（秒），与独立抽奖任务的 GiveawayProcess 一致
+COMBO_EVENTS_POLL_INTERVAL = 0.2
+
+
+def _dispatch_combo_giveaway_event(line: str, client, loop, workdir: str) -> None:
+    """解析组合抽奖事件文件的一行，把 event 交给消息中心（线程安全）。"""
+    line = line.strip()
+    if not line:
+        return
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if payload.get("kind") != "event":
+        return
+    ev = payload.get("event")
+    if not isinstance(ev, dict):
+        return
+    try:
+        if loop is not None:
+            loop.call_soon_threadsafe(handle_giveaway_event, client, workdir, ev)
+        else:
+            # 拿不到事件循环（非 UI 上下文启动）时仍落盘提醒，只是不弹顶部通知
+            handle_giveaway_event(None, workdir, ev)
+    except RuntimeError:
+        logger.debug("派发组合任务抽奖事件失败", exc_info=True)
+
+
+def watch_combo_giveaway_events(
+    proc: subprocess.Popen,
+    path: Path,
+    client,
+    loop,
+    workdir: str,
+) -> None:
+    """跟随组合任务抽奖子进程的 events 文件，进程退出后清理。
+
+    combo_runner 以 ``python -m giveaway_runner '<spec>'`` 起子进程，WebUI 只
+    持有 combo_runner 的句柄，没有独立抽奖任务那样的 GiveawayProcess；这里
+    直接读子进程写的 events 文件，让「发言数任务」等提醒同样进入消息中心。
+    """
+    try:
+        while not path.exists():
+            if proc.poll() is not None:
+                return
+            time.sleep(COMBO_EVENTS_POLL_INTERVAL)
+        with open(path, "rb") as fp:
+            buf = b""
+            while True:
+                chunk = fp.read(65536)
+                if chunk:
+                    buf += chunk
+                    *lines, buf = buf.split(b"\n")
+                    for raw in lines:
+                        _dispatch_combo_giveaway_event(
+                            raw.decode("utf-8", "replace"), client, loop, workdir
+                        )
+                    continue
+                if proc.poll() is not None:
+                    break
+                time.sleep(COMBO_EVENTS_POLL_INTERVAL)
+            # 进程已退出：残留半行也尝试解析
+            if buf:
+                _dispatch_combo_giveaway_event(
+                    buf.decode("utf-8", "replace"), client, loop, workdir
+                )
+    except OSError:
+        logger.debug("读取组合任务抽奖事件文件失败", exc_info=True)
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def close_pending_details(run: dict, default_status: str) -> None:
@@ -998,7 +1075,15 @@ class TaskRunnerBlock:
         run_queue: queue.Queue = queue.Queue()
         chats_labels = [] if is_combo else self._chat_labels(task_name)
         detail_rows: list[dict] = []
+        # 组合任务里抽奖子任务的 events 文件：WebUI 侧跟随并把提醒写入消息中心
+        combo_event_loop = None
+        if is_combo:
+            try:
+                combo_event_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                combo_event_loop = None
         for account in accounts:
+            combo_events: list[Path] = []
             if is_combo:
                 # 组合任务：每账号一个进程，进程内按顺序执行该账号参与的全部子任务
                 spec_subs = []
@@ -1007,6 +1092,17 @@ class TaskRunnerBlock:
                         continue
                     built = build_combo_sub_spec(account, sub, state.workdir)
                     if built:
+                        if (
+                            str(built.get("module") or "")
+                            == "tg_signer.giveaway_runner"
+                        ):
+                            log_dir = Path(state.workdir) / "logs"
+                            log_dir.mkdir(parents=True, exist_ok=True)
+                            events_path = (
+                                log_dir / f"giveaway-combo-{uuid.uuid4().hex}.jsonl"
+                            )
+                            built["spec"]["events_file"] = str(events_path)
+                            combo_events.append(events_path)
                         spec_subs.append(built)
                 if not spec_subs:
                     ui.notify(f"无法构建命令: {account}", type="warning")
@@ -1075,6 +1171,18 @@ class TaskRunnerBlock:
                 daemon=True,
             )
             reader.start()
+            for events_path in combo_events:
+                threading.Thread(
+                    target=watch_combo_giveaway_events,
+                    args=(
+                        proc,
+                        events_path,
+                        self._poll_client,
+                        combo_event_loop,
+                        str(state.workdir),
+                    ),
+                    daemon=True,
+                ).start()
             procs.append(
                 {
                     "proc": proc,
