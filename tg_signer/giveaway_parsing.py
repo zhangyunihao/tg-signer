@@ -80,7 +80,12 @@ def callback_answer_text(answer: Any) -> str:
 class BotPolicy:
     """单个抽奖 bot 的专属行为开关；未登记的用户名一律使用默认通用策略。"""
 
-    __slots__ = ("blocked", "join_status_checklist", "restart_after_join")
+    __slots__ = (
+        "blocked",
+        "join_status_checklist",
+        "restart_after_join",
+        "callback_timeout",
+    )
 
     def __init__(
         self,
@@ -88,6 +93,7 @@ class BotPolicy:
         blocked: bool = False,
         join_status_checklist: bool = False,
         restart_after_join: bool = False,
+        callback_timeout: Optional[float] = None,
     ) -> None:
         # 黑名单：链接不作为抽奖链接参与，整条消息跳过（不 start、不加频道）
         self.blocked = blocked
@@ -95,6 +101,9 @@ class BotPolicy:
         self.join_status_checklist = join_status_checklist
         # 即使消息里没有加频道要求，也重发一次 start 让 bot 校验参与资格
         self.restart_after_join = restart_after_join
+        # 点击回调按钮后的答复超时（秒）；None=用客户端默认值。
+        # 报名时要逐个校验多个频道身份的慢 bot 答复常要数十秒
+        self.callback_timeout = callback_timeout
 
 
 DEFAULT_BOT_POLICY = BotPolicy()
@@ -107,6 +116,10 @@ BOT_POLICIES: Dict[str, BotPolicy] = {
     # 无加入要求时也需重发 start 才会校验参与资格
     "realsaberbot": BotPolicy(restart_after_join=True),
     "lotterybestbot": BotPolicy(join_status_checklist=True, restart_after_join=True),
+    # 报名时要逐个校验多个频道成员身份，回调答复常超过客户端默认超时，
+    # 按默认值点击会全部超时，白白进入 60 秒冷却
+    "lotteryba_bot": BotPolicy(callback_timeout=45),
+    "choujiang8_bot": BotPolicy(callback_timeout=45),
 }
 
 

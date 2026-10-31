@@ -244,9 +244,9 @@ _CLIENT_TRANSPORT_FLOOD_BACKOFF = [5, 10, 20, 30]  # Transport 429 指数退避�
 # 网络超时后的重试退避（秒）：连续超时逐级加大，成功一次即清零。
 # 网络差时 Pyrogram 会反复重试同一请求，不加退避会形成重试风暴。
 _CLIENT_TIMEOUT_BACKOFF = [2, 5, 10, 20]
-# 部分调用的独立超时（秒）：callback 答复是毫秒级小包，健康网络秒回；
-# 与普通请求共用 30 秒会在网络故障/限流时把每次按钮点击都拖满 30 秒
-_CALL_TIMEOUT_OVERRIDES: Dict[str, float] = {"request_callback_answer": 15}
+# 部分调用的独立超时（秒）：callback 答复默认与普通请求齐平（30 秒），
+# 需校验多个频道身份的慢 bot 再按 bot 策略放宽（见 BotPolicy.callback_timeout）
+_CALL_TIMEOUT_OVERRIDES: Dict[str, float] = {"request_callback_answer": 30}
 
 
 async def _timeout_aiter(agen: Any, timeout: float, name: str = "") -> Any:
@@ -450,12 +450,14 @@ class _TimeoutClient:
             if hasattr(result, "__anext__"):
                 return self._throttled_aiter(result, item)
             if inspect.isawaitable(result):
-                return self._throttled_bounded(result, item)
+                return self._throttled_bounded(result, item, kwargs)
             return result
 
         return method
 
-    async def _throttled_bounded(self, coro: Any, name: str) -> Any:
+    async def _throttled_bounded(
+        self, coro: Any, name: str, kwargs: Optional[Dict[str, Any]] = None
+    ) -> Any:
         """带统一节流的单次 API 调用。"""
         async with self._lock:
             # 1) 最小间隔补齐
@@ -470,25 +472,37 @@ class _TimeoutClient:
             #    调用期间被 429 重启会话时据此判定是本账号被限流
             await self._throttled_enter()
             conn_before = self._connection_ref()
-            timeout = _CALL_TIMEOUT_OVERRIDES.get(name, self._timeout)
+            timeout = self._call_timeout(name, kwargs or {})
             try:
                 result = await asyncio.wait_for(coro, timeout)
             except asyncio.TimeoutError:
                 self._on_timeout()
                 self._note_transport_flood(conn_before, timeout_failure=True)
+                self._report_net_result(False)
                 raise RuntimeError(
                     f"网络请求 {name} 超时（{timeout:.0f} 秒，网络异常）"
                 ) from None
             except BaseException as exc:
                 self._on_call_exception(exc)
                 self._note_transport_flood(conn_before, timeout_failure=True)
+                if _is_network_failure(exc):
+                    self._report_net_result(False)
                 raise
             else:
                 self._note_transport_flood(conn_before, timeout_failure=False)
                 self._backoff_idx = 0
                 self._timeout_backoff_idx = 0
                 _CLIENT_API_LAST_CALL[self._account] = self._loop_time()
+                self._report_net_result(True)
                 return result
+
+    def _call_timeout(self, name: str, kwargs: Dict[str, Any]) -> float:
+        """单次调用超时（秒）：callback 答复按目标 bot 的专属策略放宽。"""
+        if name == "request_callback_answer":
+            policy = bot_policy(kwargs.get("chat_id"))
+            if policy.callback_timeout is not None:
+                return float(policy.callback_timeout)
+        return _CALL_TIMEOUT_OVERRIDES.get(name, self._timeout)
 
     async def _throttled_aiter(self, agen: Any, name: str) -> Any:
         """带统一节流的异步迭代器（get_chat_history 等）。
@@ -515,6 +529,7 @@ class _TimeoutClient:
                 except asyncio.TimeoutError:
                     self._on_timeout()
                     self._note_transport_flood(conn_before, timeout_failure=True)
+                    self._report_net_result(False)
                     raise RuntimeError(
                         f"网络请求 {name or '数据拉取'} 超时"
                         f"（{self._timeout:.0f} 秒，网络异常）"
@@ -522,13 +537,25 @@ class _TimeoutClient:
                 except BaseException as exc:
                     self._on_call_exception(exc)
                     self._note_transport_flood(conn_before, timeout_failure=True)
+                    if _is_network_failure(exc):
+                        self._report_net_result(False)
                     raise
                 self._note_transport_flood(conn_before, timeout_failure=False)
                 self._timeout_backoff_idx = 0
                 _CLIENT_API_LAST_CALL[self._account] = self._loop_time()
+                self._report_net_result(True)
             yield item
 
     # —— 节流内部辅助 ——
+
+    def _report_net_result(self, ok: bool) -> None:
+        """把单次调用的网络结果回写引擎，用于账号级连续超时熔断。"""
+        if self._on_net_result is None:
+            return
+        try:
+            self._on_net_result(self._account, ok)
+        except Exception:
+            logger.debug("网络结果回调执行失败", exc_info=True)
 
     async def _wait_global(self) -> None:
         """全局令牌桶等待：所有账号共享同一速率上限。"""
@@ -729,6 +756,9 @@ class GiveawayEngine:
         # 补漏连续失败轮数与熔断恢复时间
         self._rescue_fail_streak = 0
         self._rescue_suspended_until: Optional[datetime] = None
+        # 账号级网络超时熔断：{account: 连续失败次数} / {account: 暂停恢复时刻}
+        self._net_timeout_streak: Dict[str, int] = {}
+        self._net_paused_until: Dict[str, datetime] = {}
         # 聊天类型缓存 {str(chat): 是否群组}：群组只扫置顶，频道才全量扫描
         self._chat_types: Dict[str, bool] = {}
         # 监控对象 chat_id -> @username 映射（来自用户缓存）：数字 id 无法加入时兜底
@@ -1063,6 +1093,8 @@ class GiveawayEngine:
                     account=account,
                     on_transport_flood=self._note_transport_flood,
                     global_limiter=self._api_limiter,
+                    # 连续网络超时回写：达到阈值后暂停该账号本轮扫描
+                    on_net_result=self._note_net_call_result,
                 )
                 self._locks[account] = asyncio.Lock()
                 try:
@@ -1093,6 +1125,38 @@ class GiveawayEngine:
         except Exception:
             logger.debug("重连客户端连接失败", exc_info=True)
         return bool(getattr(client, "is_connected", False))
+
+    def _note_net_call_result(self, account: str, ok: bool) -> None:
+        """记录单次网络调用结果；连续失败达阈值则暂停该账号本轮扫描。"""
+        if ok:
+            self._net_timeout_streak.pop(account, None)
+            return
+        if self._is_net_paused(account):
+            return
+        streak = self._net_timeout_streak.get(account, 0) + 1
+        self._net_timeout_streak[account] = streak
+        if streak < NET_TIMEOUT_PAUSE_STREAK:
+            return
+        self._net_timeout_streak.pop(account, None)
+        until = datetime.now() + timedelta(seconds=NET_TIMEOUT_PAUSE_SECONDS)
+        self._net_paused_until[account] = until
+        self.log(
+            f"[{account}] 连续 {NET_TIMEOUT_PAUSE_STREAK} 次网络超时，"
+            f"暂停该账号本轮扫描 {NET_TIMEOUT_PAUSE_SECONDS // 60} 分钟"
+            f"（{until:%H:%M:%S} 后恢复）"
+        )
+
+    def _is_net_paused(self, account: str) -> bool:
+        """账号是否处于网络超时暂停期；到期自动解除并清理计数。"""
+        until = self._net_paused_until.get(account)
+        if until is None:
+            return False
+        if datetime.now() >= until:
+            self._net_paused_until.pop(account, None)
+            self._net_timeout_streak.pop(account, None)
+            self.log(f"[{account}] 网络超时暂停结束，恢复扫描")
+            return False
+        return True
 
     async def _run(self, accounts: List[str], auto_scan: bool) -> None:
         try:
@@ -1213,8 +1277,14 @@ class GiveawayEngine:
         if not await self._ensure_connected(client):
             self.log(f"[{account}] 连接不可用，跳过该账号本轮扫描")
             return
+        if self._is_net_paused(account):
+            self.log(f"[{account}] 网络超时暂停中，跳过该账号本轮扫描")
+            return
         for chat in self.chats:
             if self._stop is not None and self._stop.is_set():
+                return
+            if self._is_net_paused(account):
+                self.log(f"[{account}] 网络连续超时，暂停剩余监控对象扫描")
                 return
             if self.source_type == "bot":
                 # 机器人私聊：无需加入，也不走群组置顶逻辑，直接回扫历史消息
@@ -1261,6 +1331,9 @@ class GiveawayEngine:
             hard_cap = self.scan_cap
         try:
             async for message in client.get_chat_history(chat):
+                if self._is_net_paused(account):
+                    self.log(f"[{account}] 网络连续超时，暂停扫描 {chat}")
+                    return
                 scanned += 1
                 if scanned > hard_cap:
                     self.log(
@@ -1347,6 +1420,9 @@ class GiveawayEngine:
         for msg in pinned_list:
             if self._stop is not None and self._stop.is_set():
                 break
+            if self._is_net_paused(account):
+                self.log(f"[{account}] 网络连续超时，暂停置顶扫描 {chat}")
+                return
             if not self._mark_seen(account, str(chat), getattr(msg, "id", None)):
                 self.log(
                     f"[{account}] 置顶消息 {getattr(msg, 'id', '?')} 本轮已处理过，跳过"
@@ -1735,6 +1811,9 @@ class GiveawayEngine:
             self.log(f"[{account}] 补漏：连接不可用，跳过该账号")
             failures["n"] += 1
             return
+        if self._is_net_paused(account):
+            self.log(f"[{account}] 网络超时暂停中，跳过该账号本轮补漏")
+            return
         if self.source_type == "win":
             # 中奖扫描：补漏轮只重扫中奖通知，不读取 bot 私聊里的抽奖链接
             await self._sweep_bot_wins(
@@ -1743,6 +1822,9 @@ class GiveawayEngine:
             return
         for chat in self.chats:
             if self._stop is not None and self._stop.is_set():
+                return
+            if self._is_net_paused(account):
+                self.log(f"[{account}] 网络连续超时，暂停剩余补漏扫描")
                 return
             done["n"] += 1
             self.scan_text = f"补漏 ({done['n']}/{total})"
@@ -2018,6 +2100,9 @@ class GiveawayEngine:
             return
         for idx, bot in enumerate(bots):
             if self._stop is not None and self._stop.is_set():
+                return
+            if self._is_net_paused(account):
+                self.log(f"[{account}] 网络连续超时，暂停中奖回扫")
                 return
             # bot 之间随机间隔：一个账号 10+ 个 bot 连发 GetHistory 会在很短的
             # 时间内把连接打到 Transport flood 429（尤其多个账号同时回扫时）
@@ -2412,14 +2497,14 @@ class GiveawayEngine:
                 participated += 1
         return participated
 
-    async def _is_bot(self, account: str, client: Any, username: str) -> bool:
-        """判断链接目标是否为机器人；解析失败不缓存，允许下一轮重试。
+    async def _is_bot(self, account: str, client: Any, username: str) -> Optional[bool]:
+        """判断链接目标是否为机器人；返回三态便于区分失败原因。
 
         get_users 在限流/网络超时时会抛错。此前把任何异常都当成「不是机器人」
         并写入 _bot_cache，导致该账号本轮任务内永久跳过这条链接（日志反复出现
         「跳过非机器人链接 @Lottery_2_bot」）。这里区分异常类型：
-        解析成功 → 缓存结果；用户名无效/不存在 → 缓存 False（重试无意义）；
-        其余临时异常（限流/超时/网络抖动）→ 仅本次返回 False、不写缓存。
+        解析成功 → True/False 并缓存；用户名无效/不存在 → 缓存 False；
+        其余临时异常（限流/超时/网络抖动）→ 返回 None（不缓存，仅本次跳过）。
         """
         cache_key = f"{account}|{username.lower()}"
         cached = self._bot_cache.get(cache_key)
@@ -2432,14 +2517,14 @@ class GiveawayEngine:
         except Exception as exc:
             if _is_username_resolve_error(exc):
                 self._bot_cache[cache_key] = False
-            else:
-                logger.debug(
-                    "[%s] 解析 @%s 是否为机器人失败（不缓存，稍后重试）：%s",
-                    account,
-                    username,
-                    exc,
-                )
-            return False
+                return False
+            logger.debug(
+                "[%s] 解析 @%s 是否为机器人失败（不缓存，稍后重试）：%s",
+                account,
+                username,
+                exc,
+            )
+            return None
         is_bot = bool(getattr(users, "is_bot", False))
         self._bot_cache[cache_key] = is_bot
         return is_bot
@@ -2931,7 +3016,14 @@ class GiveawayEngine:
     ) -> None:
         if not self._can_participate_link(account, username, param):
             return
-        if not await self._is_bot(account, client, username):
+        is_bot = await self._is_bot(account, client, username)
+        if is_bot is None:
+            self.log(
+                f"[{account}] 解析 @{username} 是否为机器人失败（网络异常），"
+                "本次跳过，稍后重试"
+            )
+            return
+        if not is_bot:
             self.log(f"[{account}] 跳过非机器人链接 @{username}")
             return
         lo, hi = self.delay_range
@@ -4703,8 +4795,14 @@ class GiveawayEngine:
         只认被点击消息之后的新消息，避免把历史成功误当本次结果。
         """
         clicked_id = int(getattr(message, "id", 0) or 0)
-        for _ in range(4):
-            await asyncio.sleep(3)
+        # 慢校验 bot 的回调答复本身可能要数十秒，成功消息来得更晚，
+        # 核对窗口相应放宽（短 bot 仍用 4×3 秒，避免无谓空等）
+        if bot_policy(username).callback_timeout is not None:
+            attempts, interval = 6, 5.0
+        else:
+            attempts, interval = 4, 3.0
+        for _ in range(attempts):
+            await asyncio.sleep(interval)
             try:
                 async for item in client.get_chat_history(username, limit=4):
                     if getattr(item, "outgoing", False):

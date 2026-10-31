@@ -954,7 +954,7 @@ def test_is_bot_transient_error_not_cached(tmp_path):
 
     @Lottery_2_bot 场景：解析被限流或超时打断一次，旧实现会写入
     _bot_cache[key]=False，整个任务期间反复「跳过非机器人链接」，再也不会
-    重试。修复后仅本次返回 False，下一轮解析成功即恢复为机器人。
+    重试。修复后临时失败返回 None（不缓存），下一轮解析成功即恢复为机器人。
     """
     import asyncio
 
@@ -967,7 +967,7 @@ def test_is_bot_transient_error_not_cached(tmp_path):
         return first, second
 
     first, second = asyncio.run(_scenario())
-    assert first is False
+    assert first is None
     assert second is True
     assert client.calls == 2
     assert engine._bot_cache["acc|lotterybot"] is True
@@ -1016,7 +1016,7 @@ def test_engine_retries_bot_after_transient_resolve_error(tmp_path):
 
     asyncio.run(_run_process(engine, client, "acc", message))
     assert client.started == []
-    assert any("跳过非机器人链接" in line for line in logs)
+    assert any("解析 @LotteryBot 是否为机器人失败" in line for line in logs)
 
     asyncio.run(_run_process(engine, client, "acc", message))
     assert client.started == [("LotteryBot", "act1")]
@@ -5313,6 +5313,25 @@ def test_win_sweep_paces_between_bots(tmp_path, monkeypatch):
     assert sleeps == [gc.WIN_SWEEP_BOT_GAP_RANGE[1]] * 2
 
 
+def test_callback_timeout_uses_bot_policy():
+    """需校验多个频道身份的慢 bot，callback 答复超时按策略放宽。"""
+    import tg_signer.giveaway_core as gc
+
+    client = gc._TimeoutClient(object(), account="acc-callback-timeout")
+    assert (
+        client._call_timeout("request_callback_answer", {"chat_id": "@lotteryBa_bot"})
+        == 45
+    )
+    assert (
+        client._call_timeout("request_callback_answer", {"chat_id": "choujiang8_bot"})
+        == 45
+    )
+    assert (
+        client._call_timeout("request_callback_answer", {"chat_id": "OtherBot"}) == 30
+    )
+    assert client._call_timeout("get_chat", {}) == gc.NET_CALL_TIMEOUT
+
+
 def test_timeout_client_backs_off_and_resets(monkeypatch):
     """连续超时按等级退避，成功一次后回退到 0。
 
@@ -5602,3 +5621,62 @@ def test_verify_after_click_detail_echo_then_success_message(tmp_path, monkeypat
     )
     assert completed is True
     assert any("参与成功" in line for line in logs)
+
+
+def test_net_timeout_breaker_pauses_account_after_consecutive_failures(tmp_path):
+    """连续 N 次网络超时后暂停该账号；暂停到期自动解除并清理计数。"""
+    from datetime import datetime, timedelta
+
+    import tg_signer.giveaway_core as gc
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    account = "acc"
+
+    for _ in range(gc.NET_TIMEOUT_PAUSE_STREAK - 1):
+        engine._note_net_call_result(account, False)
+    assert engine._is_net_paused(account) is False
+
+    engine._note_net_call_result(account, False)
+    assert engine._is_net_paused(account) is True
+    assert any("暂停该账号本轮扫描" in line for line in logs)
+
+    # 暂停到期：自动解除并清空暂停记录
+    engine._net_paused_until[account] = datetime.now() - timedelta(seconds=1)
+    assert engine._is_net_paused(account) is False
+    assert account not in engine._net_paused_until
+
+
+def test_net_timeout_streak_resets_on_success(tmp_path):
+    """连续计数被一次成功调用清零，网络抖动时不会误触发暂停。"""
+    engine, _state = _engine(tmp_path)
+    account = "acc"
+
+    engine._note_net_call_result(account, False)
+    engine._note_net_call_result(account, False)
+    engine._note_net_call_result(account, True)
+    engine._note_net_call_result(account, False)
+
+    assert engine._is_net_paused(account) is False
+    assert engine._net_timeout_streak[account] == 1
+
+
+def test_scan_one_skips_account_while_net_paused(tmp_path):
+    """处于网络超时暂停期的账号不再扫描监控对象，避免继续硬等超时。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    engine.chats = ["chat"]
+
+    engine._note_net_call_result("acc", False)
+    for _ in range(2):
+        engine._note_net_call_result("acc", False)
+    assert engine._is_net_paused("acc") is True
+
+    done = {"n": 0}
+    asyncio.run(engine._scan_one("acc", FakeClient(), done, 1))
+    assert done["n"] == 0
+    assert any("网络超时暂停中" in line for line in logs)
