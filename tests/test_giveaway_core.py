@@ -790,6 +790,58 @@ def test_scan_now_participates_pinned_message(tmp_path):
     assert any("[已参与]" in line and "置顶抽奖" in line for line in logs)
 
 
+def test_pinned_giveaway_button_logs_actual_reason(tmp_path):
+    """置顶按钮型抽奖不再笼统打「无可用抽奖 bot 链接，跳过」：
+    有参与按钮就点击参与，没有则打印真实的跳过原因。"""
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    engine.auto_join = False
+    logs: list = []
+    engine.log = logs.append
+
+    class _BtnClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.callback_clicks = []
+
+        async def request_callback_answer(self, chat_id, message_id, callback_data):
+            self.callback_clicks.append((chat_id, message_id, callback_data))
+            return SimpleNamespace(message="参与成功")
+
+    client = _BtnClient()
+    giveaway = _msg(
+        id=3323454,
+        text="🎉 本次抽奖由 如果你也听说 发起 🆔 抽奖ID: 983",
+        buttons=[[_btn("参与抽奖", callback_data="start_draw&983")]],
+    )
+    asyncio.run(
+        engine._process_message(
+            "acc", client, giveaway, skip_keywords=True, log_skips=True
+        )
+    )
+    assert client.callback_clicks == [(-1001234567890, 3323454, "start_draw&983")]
+    assert state.has("acc", "source_btn", "-1001234567890|3323454")
+    assert any("[已参与]" in line for line in logs)
+    assert not any("无可用抽奖 bot 链接" in line for line in logs)
+
+    # 名单类置顶帖：按钮不是参与按钮，打印具体原因而不是链接跳过
+    namelist = _msg(
+        id=3326053,
+        text="今日在岗名单三 27/79 人 浦东（12人）",
+        buttons=[[_btn("普减优惠", url="https://t.me/some_channel/1")]],
+    )
+    logs.clear()
+    asyncio.run(
+        engine._process_message(
+            "acc", client, namelist, skip_keywords=True, log_skips=True
+        )
+    )
+    assert client.callback_clicks == [(-1001234567890, 3323454, "start_draw&983")]
+    assert any("帖内没有「参与/确认」类按钮" in line for line in logs)
+    assert not any("无可用抽奖 bot 链接" in line for line in logs)
+
+
 def test_scan_now_pinned_expired_counts_toward_cap(tmp_path):
     """置顶消息也受参与条数上限约束，达到上限后跳过历史扫描。"""
     import asyncio

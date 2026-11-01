@@ -1544,7 +1544,12 @@ class GiveawayEngine:
         return pinned_list
 
     async def _participate_via_source_button(
-        self, account: str, client: Any, message: Any
+        self,
+        account: str,
+        client: Any,
+        message: Any,
+        tag: str = "",
+        log_skips: bool = False,
     ) -> None:
         """群组置顶的「按钮型」抽奖：帖上「参与抽奖」按钮就在群聊消息里，
         直接点击源帖按钮完成参与（无需向任何 bot 发 start）。
@@ -1552,9 +1557,10 @@ class GiveawayEngine:
         callback 按钮发送 callback 并读取弹窗文案（终态弹窗＝抽奖已结束）；
         URL 按钮若解析为 bot start 深度链接（非黑名单 bot）则走常规
         _participate 流程。以 source_btn|chat|msg_id 持久化去重，
-        避免每轮扫描重复点击同一帖。
+        避免每轮扫描重复点击同一帖。log_skips=True 时逐条打印未参与原因
+        （置顶排查），避免被「无可用抽奖 bot 链接，跳过」盖住真实入口。
         """
-        ctx = await self._source_button_ctx(account, message)
+        ctx = await self._source_button_ctx(account, message, tag, log_skips)
         if ctx is None:
             return
         chat_id, msg_id, btn = ctx
@@ -1564,7 +1570,7 @@ class GiveawayEngine:
         url = str(getattr(btn, "url", "") or "").strip()
         if url and not getattr(btn, "callback_data", None):
             await self._join_via_source_url(
-                account, client, url, channel, title, message
+                account, client, url, channel, title, message, tag, log_skips
             )
             return
         await self._click_source_button(
@@ -1572,24 +1578,49 @@ class GiveawayEngine:
         )
 
     async def _source_button_ctx(
-        self, account: str, message: Any
+        self,
+        account: str,
+        message: Any,
+        tag: str = "",
+        log_skips: bool = False,
     ) -> Optional[Tuple[int, int, Any]]:
         """按钮型抽奖参与前的守卫检查；返回 (chat_id, msg_id, 按钮)，跳过时 None。"""
         if self._stop is not None and self._stop.is_set():
+            self._log_source_button_skip(account, tag, "任务已停止", log_skips)
             return None
         chat_id = getattr(getattr(message, "chat", None), "id", None)
         msg_id = getattr(message, "id", None)
         if chat_id is None or msg_id is None:
+            self._log_source_button_skip(
+                account, tag, "置顶帖缺少 chat/id，无法定位按钮", log_skips
+            )
             return None
         state_key = f"{chat_id}|{msg_id}"
         if self._source_btn_seen(account, state_key):
+            self._log_source_button_skip(
+                account, tag, "该帖已在参与记录中（已参与或已结束）", log_skips
+            )
             return None
         if self.max_joins is not None and self.joined >= self.max_joins:
+            self._log_source_button_skip(
+                account, tag, f"已达参与上限 {self.max_joins} 个", log_skips
+            )
             return None
         btn = self._find_confirm_button(message)
         if btn is None:
+            self._log_source_button_skip(
+                account, tag, "帖内没有「参与/确认」类按钮", log_skips
+            )
             return None
         return chat_id, msg_id, btn
+
+    def _log_source_button_skip(
+        self, account: str, tag: str, reason: str, log_skips: bool
+    ) -> None:
+        if not log_skips:
+            return
+        prefix = f"[{account}]" + (f" {tag}" if tag else "")
+        self.log(f"{prefix} {reason}，跳过")
 
     def _source_btn_seen(self, account: str, state_key: str) -> bool:
         """该置顶帖是否已处理过/已终态（source_btn 持久化去重）。"""
@@ -1606,6 +1637,8 @@ class GiveawayEngine:
         channel: str,
         title: str,
         message: Any,
+        tag: str = "",
+        log_skips: bool = False,
     ) -> None:
         """URL 按钮指向 bot start 深度链接（非黑名单 bot）时走常规参与流程。"""
         link = parse_bot_start_link(url)
@@ -1619,6 +1652,13 @@ class GiveawayEngine:
                 title,
                 source_message=message,
             )
+            return
+        self._log_source_button_skip(
+            account,
+            tag,
+            f"按钮链接 {url[:60]} 不是可参与的 bot start 链接（或该 bot 已列入黑名单）",
+            log_skips,
+        )
 
     async def _click_source_button(
         self,
@@ -2459,15 +2499,18 @@ class GiveawayEngine:
         skip_keywords: bool,
         log_skips: bool,
     ) -> None:
-        if log_skips:
-            self.log(f"[{account}] {tag} 无可用抽奖 bot 链接，跳过")
         if skip_keywords:
             # 群组置顶的「按钮型」抽奖：帖内无可 start 的 bot 链接
             # （或仅剩黑名单推广链接），但帖上带「参与抽奖」按钮，
-            # 直接点击源帖按钮完成参与
+            # 直接点击源帖按钮完成参与。这里不再笼统打「跳过」：
+            # 由按钮流程按实际结果输出（参与成功/参与失败/已处理/无按钮）
             self._emit_source_speech_tasks(account, message, [])
-            await self._participate_via_source_button(account, client, message)
+            await self._participate_via_source_button(
+                account, client, message, tag, log_skips
+            )
             return
+        if log_skips:
+            self.log(f"[{account}] {tag} 无可用抽奖 bot 链接，跳过")
         if self.source_type == "bot":
             # 机器人私聊的「按钮型」抽奖（按钮为 callback，无 start 链接）：
             # 与历史帖同一口径，先过关键词与开奖时间，再点击参与按钮
@@ -2476,7 +2519,9 @@ class GiveawayEngine:
             if self._expired_draw_status(account, message, tag) is not None:
                 return
             self._emit_source_speech_tasks(account, message, [])
-            await self._participate_via_source_button(account, client, message)
+            await self._participate_via_source_button(
+                account, client, message, tag, log_skips
+            )
 
     def _message_filtered_out(
         self,
