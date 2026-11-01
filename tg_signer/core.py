@@ -228,6 +228,20 @@ get_timezone = _get_timezone
 # session 数据库等待锁的最长时间（秒）：并发任务短暂冲突时排队等待而不是直接报错
 _SESSION_DB_TIMEOUT_SECONDS = 30.0
 
+# 仍被其他任务占用（busy_timeout 到点 / WAL 切换被拒）时的重开重试次数与退避
+_SESSION_DB_RETRY_ATTEMPTS = 3
+_SESSION_DB_RETRY_DELAYS = (1.0, 3.0)
+
+
+def _is_session_db_locked(exc: BaseException) -> bool:
+    """判断异常是否为 session 数据库被其他任务占用（sqlite locked/busy）。"""
+    text = str(exc).lower()
+    return (
+        "database is locked" in text
+        or "database table is locked" in text
+        or "database is busy" in text
+    )
+
 
 class ResilientSQLiteStorage(SQLiteStorage):
     """session 数据库：WAL + 长等待，避免并发任务互相报 "database is locked"。
@@ -236,11 +250,35 @@ class ResilientSQLiteStorage(SQLiteStorage):
     执行一次 ``VACUUM``（需要独占锁）。只要另一个任务或另一个 WebUI 实例
     正持有同一个 session，启动就会立刻抛 "database is locked"。
     这里改为 WAL（读写不互斥）+ busy_timeout，并跳过每次打开的 VACUUM。
+    同一账号被多个任务（如常驻的中奖扫描与组合子任务）同时打开时，
+    busy_timeout 只对部分锁生效（``PRAGMA journal_mode`` 与 VACUUM 类
+    独占锁会立刻返回 busy），因此这里再对锁冲突做有限次重开重试。
     """
 
     async def open(self) -> None:
         if self.in_memory or self.session_string:
             return await super().open()
+        delays = _SESSION_DB_RETRY_DELAYS
+        for attempt in range(_SESSION_DB_RETRY_ATTEMPTS + 1):
+            try:
+                await self._open_once()
+                return
+            except sqlite3.OperationalError as exc:
+                # 只重试锁冲突；文件损坏/权限等异常直接抛出
+                if not _is_session_db_locked(exc) or attempt >= len(delays):
+                    raise
+                self._discard_conn()
+                delay = delays[attempt]
+                logger.warning(
+                    "session 数据库被其他任务占用（%s），%.0f 秒后重试"
+                    f"（第 {attempt + 1}/{len(delays)} 次）",
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+    async def _open_once(self) -> None:
+        """打开 session 数据库一次；锁冲突以外的异常由调用方处理。"""
         path = self.database
         file_exists = isinstance(path, pathlib.Path) and path.is_file()
         self.conn = sqlite3.connect(
@@ -251,13 +289,28 @@ class ResilientSQLiteStorage(SQLiteStorage):
         )
         try:
             self.conn.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if _is_session_db_locked(exc):
+                # WAL 切换被其他连接拒绝：交给 open() 重试，切到 WAL 后
+                # 并发读写才不会互相阻塞
+                raise
             # 只读介质等场景无法切换：保持原有日志模式即可
             logger.debug("session 数据库切换到 WAL 失败", exc_info=True)
         if file_exists:
             await self.update()
         else:
             await self.create()
+
+    def _discard_conn(self) -> None:
+        """丢弃打开失败的连接，避免残留句柄继续持有数据库锁。"""
+        conn = getattr(self, "conn", None)
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception:
+            logger.debug("关闭 session 数据库连接失败", exc_info=True)
+        self.conn = None
 
 
 class Client(SafeGetForumTopics, BaseClient):

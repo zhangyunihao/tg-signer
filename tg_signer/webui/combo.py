@@ -21,7 +21,6 @@ from tg_signer.webui.auto_leave import load_leave_tasks
 from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
-    copy_text_to_clipboard,
     format_duration,
     mobile_card_fields,
     mobile_card_result,
@@ -31,6 +30,10 @@ from tg_signer.webui.common import (
 from tg_signer.webui.components import (
     LOG_AREA_CLASS,
     LOG_AREA_STYLE,
+    LogFullscreen,
+    copy_log_lines,
+    exit_fullscreen_button,
+    log_toolbar,
     progress_summary,
     stop_with_feedback,
 )
@@ -373,6 +376,10 @@ def _sub_config_params_brief(sub: dict, workdir) -> list[tuple[str, str, str]] |
                     short = f"{'、'.join(names)}（共 {total} 个）"
                 rows.append((lbl, short, str(val)))
             elif lbl in (
+                # 任务类型（频道/群组、百宝箱扫描、中奖扫描）：同一组合里
+                # 可能有多个抽奖子任务，必须在进度页直接看出子类型
+                "任务类型",
+                "监控机器人",
                 "消息关键词",
                 "参与条数上限",
                 "允许重复参与",
@@ -403,6 +410,19 @@ def _sub_task_display(sub: dict, workdir) -> str:
     if "退频道" in str(sub.get("type") or ""):
         return _leave_task_display(task_name, workdir)
     return task_name
+
+
+def _giveaway_sub_type_text(sub: dict, workdir) -> str:
+    """抽奖子任务的任务类型文案（频道/群组、百宝箱扫描、中奖扫描）。
+
+    进度页需要区分同一组合里的多个抽奖子任务；非抽奖子任务返回空串。
+    """
+    if "抽奖" not in str(sub.get("type") or ""):
+        return ""
+    cfg = (load_task_store(workdir).get("tasks") or {}).get(
+        str(sub.get("task") or "")
+    )
+    return giveaway_type_label(cfg) if isinstance(cfg, dict) else ""
 
 
 def giveaway_chats_text(task_name, workdir: Path | str | None = None) -> str:
@@ -1126,6 +1146,9 @@ class ComboTaskBlock:
                 ui.label(str(sub.get("type") or "子任务")).classes(
                     "text-sm font-semibold tgs-prog-sub-title"
                 )
+                sub_type_text = _giveaway_sub_type_text(sub, self.workdir)
+                if sub_type_text:
+                    ui.badge(sub_type_text).props("color=teal-6 outline")
                 ui.space()
                 ui.badge(status).props(f"color={color} outline")
             ui.label(_sub_task_display(sub, self.workdir)).classes(
@@ -1699,8 +1722,10 @@ class ComboTaskBlock:
             ui.label("子任务（勾选本次要执行的，默认全部执行）").classes(
                 "text-sm text-gray-600"
             )
+            # shrink-0：弹窗卡片是 flex 列且有 max-height，勾选列表作为普通列
+            # 会被后续的账号/时间控件压缩到 0 高度（表现为子任务看不见、点不到）
             self.new_task_subs_container = ui.column().classes(
-                "w-full gap-1 max-h-56 overflow-y-auto"
+                "w-full gap-1 max-h-56 overflow-y-auto shrink-0"
             )
             self._new_task_checks = {}
             self.new_task_accounts = ui.select(
@@ -2065,16 +2090,14 @@ def _build_progress_page(record_id: str) -> None:
 
     # 运行日志区常驻页面：轮询只就地更新文本，不随进度卡片重建，
     # 这样移动端阅读日志时滚动条不会被重置回顶部。
-    log_state: dict = {"lines": [], "body": None, "full": False}
-    with ui.row().classes("w-full items-center justify-between mt-1"):
-        ui.label("运行日志").classes("text-xs font-semibold text-gray-600")
-        with ui.row().classes("gap-1 items-center"):
-            ui.button(icon="content_copy", on_click=lambda: copy_log()).props(
-                "flat round dense"
-            ).tooltip("一键复制日志")
-            ui.button(icon="fullscreen", on_click=lambda: toggle_log_full()).props(
-                "flat round dense"
-            ).tooltip("全屏显示")
+    log_state: dict = {"lines": [], "body": None}
+    log_toolbar(
+        "运行日志",
+        on_copy=lambda: copy_log_lines(log_state["lines"]),
+        on_fullscreen=lambda: fullscreen.toggle(),
+        title_classes="text-xs font-semibold text-gray-600",
+        row_classes="w-full items-center justify-between mt-1",
+    )
     # pre-wrap：保留日志缩进但允许长行折行，避免移动端横向溢出
     log_box = (
         ui.column()
@@ -2090,30 +2113,8 @@ def _build_progress_page(record_id: str) -> None:
             ui.html("<pre>暂无日志输出</pre>").classes("w-full").style("margin: 0")
         )
     # 退出全屏悬浮按钮：默认隐藏，全屏时 fixed 显示在视口右上角
-    log_exit = (
-        ui.button(icon="close", on_click=lambda: toggle_log_full())
-        .props("flat round dense unelevated")
-        .classes("tgs-log-exit-full")
-    )
-
-    def copy_log() -> None:
-        if not log_state["lines"]:
-            ui.notify("暂无可复制的日志", type="warning")
-            return
-        copy_text_to_clipboard("\n".join(log_state["lines"]))
-        ui.notify(f"已复制 {len(log_state['lines'])} 行日志", type="positive")
-
-    def toggle_log_full() -> None:
-        """切换日志全屏态：日志区 fixed 铺满视口，右上角显示退出按钮。"""
-        log_state["full"] = not log_state["full"]
-        if log_state["full"]:
-            log_box.classes(add="tgs-page-log-fullscreen")
-            log_exit.classes(add="tgs-log-exit-visible")
-        else:
-            log_box.classes(remove="tgs-page-log-fullscreen")
-            log_exit.classes(remove="tgs-log-exit-visible")
-        log_box.update()
-        log_exit.update()
+    log_exit = exit_fullscreen_button(lambda: fullscreen.toggle())
+    fullscreen = LogFullscreen(log_box, log_exit)
 
     def update_log() -> None:
         """就地更新日志文本；内容未变时不触发 DOM 更新。"""

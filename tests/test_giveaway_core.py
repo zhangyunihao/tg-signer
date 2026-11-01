@@ -670,6 +670,74 @@ def test_scan_now_stops_at_scan_cap_when_keywords_miss(tmp_path):
     ]
 
 
+def test_scan_now_stops_at_watermark_when_no_repeat(tmp_path):
+    """不重复参与：第二轮扫到上次水位线即停，不再回扫旧消息。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.ignore_history = False
+    engine.chats = [123]
+    client = FakeClient(bot_users={"LotteryBot"})
+    engine._clients = {"acc": client}
+    logs: list = []
+    engine.log = logs.append
+    client.history = [_msg(text="抽奖 https://t.me/LotteryBot?start=w1", id=10)]
+    asyncio.run(engine.scan_now())
+    assert client.started == [("LotteryBot", "w1")]
+    # 第二轮无新消息：到水位线即停，不再重复处理
+    asyncio.run(engine.scan_now())
+    assert client.started == [("LotteryBot", "w1")]
+    assert any("已到上次扫描水位线 10" in line for line in logs)
+
+
+def test_scan_now_processes_new_then_stops_at_watermark(tmp_path):
+    """不重复参与：只处理水位线以上的新消息，随后在水位线处停止。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.ignore_history = False
+    engine.chats = [123]
+    client = FakeClient(bot_users={"AlphaBot", "BetaBot", "GammaBot"})
+    engine._clients = {"acc": client}
+    logs: list = []
+    engine.log = logs.append
+    client.history = [_msg(text="抽奖 https://t.me/AlphaBot?start=old", id=10)]
+    asyncio.run(engine.scan_now())
+    assert client.started == [("AlphaBot", "old")]
+    client.history = [
+        _msg(text="抽奖 https://t.me/BetaBot?start=n12", id=12),
+        _msg(text="抽奖 https://t.me/GammaBot?start=n11", id=11),
+        _msg(text="抽奖 https://t.me/AlphaBot?start=old", id=10),
+    ]
+    asyncio.run(engine.scan_now())
+    assert client.started == [
+        ("AlphaBot", "old"),
+        ("BetaBot", "n12"),
+        ("GammaBot", "n11"),
+    ]
+    assert any("已到上次扫描水位线 10" in line for line in logs)
+
+
+def test_scan_now_keeps_rescanning_when_repeat_allowed(tmp_path):
+    """允许重复参与（ignore_history=True）时不按水位线停止，仍每轮回扫。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.ignore_history = True
+    engine.chats = [123]
+    client = FakeClient(bot_users={"AlphaBot", "BetaBot", "GammaBot"})
+    engine._clients = {"acc": client}
+    client.history = [
+        _msg(text="抽奖 https://t.me/AlphaBot?start=r3", id=3),
+        _msg(text="抽奖 https://t.me/BetaBot?start=r2", id=2),
+        _msg(text="抽奖 https://t.me/GammaBot?start=r1", id=1),
+    ]
+    asyncio.run(engine.scan_now())
+    engine._last_start_at.clear()  # 避免同一 bot 的最小 start 间隔等待
+    asyncio.run(engine.scan_now())
+    assert len(client.started) == 6
+
+
 def test_scan_now_enumerates_all_pinned_messages(tmp_path):
     """群组可置顶多条消息：全部枚举处理并打印数量，get_chat 只给最新一条。"""
     import asyncio

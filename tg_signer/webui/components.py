@@ -8,6 +8,7 @@
 - ``classify_log_line``：按日志级别返回文字颜色（原先在 app.py 与
   task_panel.py 各复制了一份）
 - ``apply_log_fullscreen`` / ``LogFullscreen``：统一的页面内嵌全屏切换
+- ``log_toolbar`` / ``copy_log_lines``：统一的日志标题行（复制 + 全屏）与复制提示
 - ``progress_summary``：统一的进度行（标题 + 百分比 + 进度条）
 - ``stop_with_feedback``：统一的「停止中…」等待反馈
 """
@@ -15,9 +16,11 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from nicegui import ui
+
+from tg_signer.webui.common import copy_text_to_clipboard
 
 # 日志区统一外观与限高；页面可在其后追加自己的类（如 sign-log-area 的移动端限高）
 LOG_AREA_CLASS = "w-full bg-gray-50 rounded-lg border border-gray-200 tgs-log-area"
@@ -82,6 +85,35 @@ def exit_fullscreen_button(on_click) -> ui.button:
         .props("flat round dense unelevated")
         .classes("tgs-log-exit-full")
     )
+
+
+def copy_log_lines(lines: Sequence[str]) -> None:
+    """统一复制提示：无日志时警告，成功后提示复制行数。"""
+    if not lines:
+        ui.notify("暂无可复制的日志", type="warning")
+        return
+    copy_text_to_clipboard("\n".join(lines))
+    ui.notify(f"已复制 {len(lines)} 行日志", type="positive")
+
+
+def log_toolbar(
+    title: str,
+    *,
+    on_copy: Callable[[], None],
+    on_fullscreen: Callable[[], None],
+    title_classes: str = "font-semibold text-sm",
+    row_classes: str = "w-full items-center justify-between mt-2",
+) -> None:
+    """统一日志标题行：标题 + 复制/全屏按钮，各页面日志区外观一致。"""
+    with ui.row().classes(row_classes):
+        ui.label(title).classes(title_classes)
+        with ui.row().classes("gap-1 items-center"):
+            ui.button(icon="content_copy", on_click=on_copy).props(
+                "flat round dense"
+            ).tooltip("一键复制日志")
+            ui.button(icon="fullscreen", on_click=on_fullscreen).props(
+                "flat round dense"
+            ).tooltip("全屏显示")
 
 
 def progress_summary(

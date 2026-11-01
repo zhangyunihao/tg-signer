@@ -1282,7 +1282,7 @@ class TaskRunnerBlock:
                     stats["failed"] += 1
                 q.put(prefix + line.rstrip("\r\n"))
                 continue
-            # CLI 日志带格式前缀（[INFO] [name] 时间 ... 账户「x」- 任务「y」: 开始执行: ...），用子串匹配
+            # CLI 日志带格式前缀（[时间] [级别] [#任务 账号] ... 开始执行: ...），用子串匹配
             if not combo and "开始执行" in stripped:
                 # 上一轮聊天结束，视为成功
                 pos = stats["current_pos"]

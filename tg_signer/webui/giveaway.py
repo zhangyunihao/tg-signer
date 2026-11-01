@@ -127,8 +127,7 @@ def giveaway_type_label(cfg: dict) -> str:
     return SOURCE_TYPE_LABELS[giveaway_source_type(cfg)]
 
 
-# 百宝箱机器人任务默认监控对象与关键词（已达标消息才可点「点击参与抽奖」）
-BAIBAOXIANG_BOT = "BaibaoxiangCjBot"
+# 百宝箱机器人任务默认关键词与回扫条数（已达标消息才可点「点击参与抽奖」）
 BAIBAOXIANG_KEYWORD = "您已获得抽奖资格（已达标）"
 BAIBAOXIANG_SCAN_LIMIT = 200
 # 账号未加入监控对象且自动加入失败的提醒（持久化，加入成功后自动消除）
@@ -1275,9 +1274,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         account_select.value = list(cfg["accounts"])
         refresh_options()
         source_type_toggle.value = source_type
-        bot_username_input.value = cfg.get("bot_username") or (
-            BAIBAOXIANG_BOT if source_type == SOURCE_BOT else ""
-        )
+        bot_username_input.value = cfg.get("bot_username") or ""
         bot_scan_limit_input.value = cfg.get("scan_limit") or BAIBAOXIANG_SCAN_LIMIT
         channel_select.value = (
             []
@@ -2490,7 +2487,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             ).props("dense")
             bot_username_input = ui.input(
                 label="机器人用户名",
-                value=BAIBAOXIANG_BOT,
+                value="",
             ).classes("w-56")
             bot_scan_limit_input = ui.number(
                 label="回扫消息条数",

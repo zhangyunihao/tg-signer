@@ -181,6 +181,15 @@ NET_TIMEOUT_PAUSE_STREAK = 3
 NET_TIMEOUT_PAUSE_SECONDS = 300
 
 
+# —— session 数据库被其他任务占用 ——
+# 同一账号被另一个任务（常驻中奖扫描、另一轮组合任务等）同时打开时，
+# session 数据库会报 "database is locked"。连接阶段遇到该错误时按退避重试，
+# 否则组合里的抽奖/中奖回扫子任务会在一次锁冲突后直接「没有可用账号，任务结束」。
+# 重试次数与等待区间（秒，区间内随机取值，避免多账号同一时刻一起重连）
+CONNECT_LOCK_RETRIES = 4
+CONNECT_LOCK_RETRY_RANGE = (5.0, 15.0)
+
+
 SEEN_CAP_PER_CHAT = 500  # 每频道保留的已处理消息 id 上限
 
 
@@ -283,6 +292,16 @@ def _is_network_failure(exc: BaseException) -> bool:
     return isinstance(
         exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)
     )
+
+
+def _is_db_locked_error(exc: BaseException) -> bool:
+    """判断异常是否为 session 数据库被其他任务占用（sqlite database is locked）。
+
+    多个任务使用同一账号时 session 文件互斥：连接阶段抛该错误不代表账号
+    不可用，稍后重连通常即可恢复（见 CONNECT_LOCK_RETRIES）。
+    """
+    text = str(exc).lower()
+    return "database is locked" in text or "database table is locked" in text
 
 
 def _is_transport_flood(exc: BaseException) -> bool:
@@ -759,6 +778,9 @@ class GiveawayEngine:
         self._skip_logged: set = set()
         # 历史补漏：已处理消息 id 水位线 {account|chat_key: {msg_id: None}（保序）}
         self._seen_msgs: Dict[str, Dict[int, None]] = {}
+        # 完整扫描水位线 {account|chat_key: 上次历史扫描扫到的最大消息 id}；
+        # 仅「不重复参与」（ignore_history=False）时用于到水位线提前停止
+        self._scan_watermarks: Dict[str, int] = {}
         # 补漏连续失败轮数与熔断恢复时间
         self._rescue_fail_streak = 0
         self._rescue_suspended_until: Optional[datetime] = None
@@ -995,6 +1017,7 @@ class GiveawayEngine:
         self._ended_counts.clear()
         self._ended_bots.clear()
         self._seen_msgs.clear()
+        self._scan_watermarks.clear()
         # 每次启动重新尝试自动加入监控对象（账号可能已手动加入/限流已解除）
         self._join_cache.clear()
         self._join_suspended.clear()
@@ -1080,45 +1103,67 @@ class GiveawayEngine:
 
         async def _connect_one(account: str) -> None:
             client = None
-            try:
-                client = get_client(account, workdir=str(self.session_dir))
-                ok = await asyncio.wait_for(
-                    client.connect(), timeout=self.CONNECT_TIMEOUT
-                )
-                if not ok:
-                    self.log(f"「{account}」会话未授权，已跳过")
-                    await safe_disconnect(client)
-                    return
-                # 连接成功即纳入账号表；昵称仅用于展示，获取失败不断开。
-                # 统一包一层网络超时代理，防半开连接永久挂起任务协程；
-                # 传入 account 让 _TimeoutClient 复用账号级节流锁与最小调用间隔。
-                # on_transport_flood：协议层 429 不抛异常，需由日志探针+会话
-                # 重连判定后回写账号限流，否则账户页会显示「正常」。
-                self._clients[account] = _TimeoutClient(
-                    client,
-                    account=account,
-                    on_transport_flood=self._note_transport_flood,
-                    global_limiter=self._api_limiter,
-                    # 连续网络超时回写：达到阈值后暂停该账号本轮扫描
-                    on_net_result=self._note_net_call_result,
-                )
-                self._locks[account] = asyncio.Lock()
+            attempt = 0
+            while True:
+                attempt += 1
                 try:
-                    me = await asyncio.wait_for(
-                        client.get_me(), timeout=self.CONNECT_TIMEOUT
+                    client = get_client(account, workdir=str(self.session_dir))
+                    ok = await asyncio.wait_for(
+                        client.connect(), timeout=self.CONNECT_TIMEOUT
                     )
-                    nickname = getattr(me, "first_name", "") or ""
-                    self.log(f"「{account}」已连接（{nickname}）")
-                except Exception:
-                    self.log(f"「{account}」已连接（昵称获取超时，已忽略）")
-            except asyncio.TimeoutError:
-                self.log(f"「{account}」连接超时（网络或代理异常），已跳过")
-                if client is not None:
-                    await safe_disconnect(client)
-            except Exception as exc:
-                self.log(f"「{account}」连接失败: {exc}")
-                if client is not None:
-                    await safe_disconnect(client)
+                    if not ok:
+                        self.log(f"「{account}」会话未授权，已跳过")
+                        await safe_disconnect(client)
+                        return
+                    # 连接成功即纳入账号表；昵称仅用于展示，获取失败不断开。
+                    # 统一包一层网络超时代理，防半开连接永久挂起任务协程；
+                    # 传入 account 让 _TimeoutClient 复用账号级节流锁与最小调用间隔。
+                    # on_transport_flood：协议层 429 不抛异常，需由日志探针+会话
+                    # 重连判定后回写账号限流，否则账户页会显示「正常」。
+                    self._clients[account] = _TimeoutClient(
+                        client,
+                        account=account,
+                        on_transport_flood=self._note_transport_flood,
+                        global_limiter=self._api_limiter,
+                        # 连续网络超时回写：达到阈值后暂停该账号本轮扫描
+                        on_net_result=self._note_net_call_result,
+                    )
+                    self._locks[account] = asyncio.Lock()
+                    try:
+                        me = await asyncio.wait_for(
+                            client.get_me(), timeout=self.CONNECT_TIMEOUT
+                        )
+                        nickname = getattr(me, "first_name", "") or ""
+                        self.log(f"「{account}」已连接（{nickname}）")
+                    except Exception:
+                        self.log(f"「{account}」已连接（昵称获取超时，已忽略）")
+                    return
+                except asyncio.TimeoutError:
+                    self.log(f"「{account}」连接超时（网络或代理异常），已跳过")
+                    if client is not None:
+                        await safe_disconnect(client)
+                    return
+                except Exception as exc:
+                    # 连接失败可能留下半开连接/未关闭的 session 句柄，先断开再判断
+                    if client is not None:
+                        await safe_disconnect(client)
+                    if _is_db_locked_error(exc) and attempt <= CONNECT_LOCK_RETRIES:
+                        delay = random.uniform(*CONNECT_LOCK_RETRY_RANGE)
+                        self.log(
+                            f"「{account}」session 数据库被其他任务占用，"
+                            f"{delay:.0f} 秒后重连"
+                            f"（第 {attempt}/{CONNECT_LOCK_RETRIES} 次）"
+                        )
+                        try:
+                            await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                        except asyncio.TimeoutError:
+                            pass
+                        if self._stop.is_set():
+                            self.log(f"「{account}」任务已停止，放弃重连")
+                            return
+                        continue
+                    self.log(f"「{account}」连接失败: {exc}")
+                    return
 
         await asyncio.gather(*[_connect_one(account) for account in accounts])
 
@@ -1232,6 +1277,7 @@ class GiveawayEngine:
         """对所有账号 × 频道回溯扫描历史消息并自动参与（多账号并行扫描）。
 
         每个频道持续向前扫描，直到满足任一停止条件：
+          - 不重复参与（ignore_history=False）时，扫到上次完整扫描的水位线
           - 参与数达到参与条数上限（若设置）
           - 连续 EXPIRED_STOP_STREAK 条已开奖的抽奖帖（再往前都是旧抽奖）
           - 达到单频道扫描上限（全局设置，默认 DEFAULT_SCAN_CAP 条；
@@ -1322,7 +1368,11 @@ class GiveawayEngine:
         await self._with_account_slot(self._scan_one, account, client, done, total)
 
     async def _scan_chat_history(self, account: str, client: Any, chat: Any) -> None:
-        """单频道回溯扫描历史消息：水位线去重 + 处理，命中停止条件即止。"""
+        """单频道回溯扫描历史消息：水位线去重 + 处理，命中停止条件即止。
+
+        不重复参与（ignore_history=False）时按上次完整扫描水位线增量扫描，
+        到达该水位线即停止；允许重复参与时仍每轮按上限回扫。
+        """
         expired_streak = 0
         scanned = 0
         # 机器人私聊来源可单独限制回扫条数；频道/群组按全局扫描上限兜底，
@@ -1335,11 +1385,23 @@ class GiveawayEngine:
             )
         else:
             hard_cap = self.scan_cap
+        # 不重复参与时按上次完整扫描的水位线做增量扫描：新消息处理完、
+        # 到达上次扫过的最大消息 id 即停止，避免每轮重复回扫旧消息
+        watermark_key = f"{account}|{chat}"
+        stop_mark = (
+            None if self.ignore_history else self._scan_watermarks.get(watermark_key)
+        )
         try:
             async for message in client.get_chat_history(chat):
                 if self._is_net_paused(account):
                     self.log(f"[{account}] 网络连续超时，暂停扫描 {chat}")
                     return
+                mid = getattr(message, "id", None)
+                if stop_mark is not None and mid is not None and mid <= stop_mark:
+                    self.log(
+                        f"[{account}] {chat} 已到上次扫描水位线 {stop_mark}，停止扫描"
+                    )
+                    break
                 scanned += 1
                 if scanned > hard_cap:
                     self.log(
@@ -1358,10 +1420,12 @@ class GiveawayEngine:
                             }
                         )
                     break
-                mid = getattr(message, "id", None)
                 if mid is not None:
                     self._mark_seen(account, str(chat), mid)
                 outcome = await self._process_message(account, client, message)
+                if mid is not None and not self.ignore_history:
+                    prev = self._scan_watermarks.get(watermark_key, mid)
+                    self._scan_watermarks[watermark_key] = max(prev, mid)
                 expired_streak, stop = self._advance_expired_streak(
                     account, chat, outcome, expired_streak
                 )

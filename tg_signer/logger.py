@@ -90,10 +90,13 @@ def install_transport_log_aggregator(window: float = 1.0) -> None:
     target.addFilter(SecondWindowAggregator(window))
 
 
-format_str = (
-    "[%(levelname)s] [%(name)s] %(asctime)s %(filename)s %(lineno)s %(message)s"
+# 控制台只保留时间/级别，落盘文件带完整日期，避免每行前缀过长
+console_formatter = logging.Formatter(
+    "[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
 )
-formatter = logging.Formatter(format_str)
+file_formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
 
 
 class TaskLogger(logging.LoggerAdapter):
@@ -101,16 +104,24 @@ class TaskLogger(logging.LoggerAdapter):
 
     又提供标准 ``.info/.warning/.error/.debug`` 方法。
 
-    自动在消息前拼接 ``[#task]`` 前缀（task 来自 extra）；
-    account 字段不自动拼接——多账号共享同一 engine 时由调用方动态注入，
-    避免与内部 ``[{account}]`` 重复。
+    自动在消息前拼接 ``[#task account]`` 前缀（来自 extra）；调用方在消息里
+    再写一遍的 ``[account]`` 会被合并掉，避免同一账号重复出现。
     """
 
     def process(self, msg, kwargs):
         extra = self.extra or {}
+        tags = []
         task = extra.get("task")
+        account = extra.get("account")
         if task:
-            msg = f"[#{task}] {msg}"
+            tags.append(f"#{task}")
+        if account:
+            lead = f"[{account}]"
+            if msg.startswith(lead):
+                msg = msg[len(lead) :].lstrip()
+            tags.append(account)
+        if tags:
+            msg = f"[{' '.join(tags)}] {msg}"
         return msg, kwargs
 
     def __call__(self, msg: str) -> None:  # 兼容 giveaway_core 等的 Callable 注入
@@ -156,7 +167,7 @@ def make_task_logger(
     # 避免重复添加 handler（同一进程多次调用时）
     if not logger.handlers:
         console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
+        console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
 
         file_handler = RotatingFileHandler(
@@ -165,7 +176,7 @@ def make_task_logger(
             backupCount=backup_count,
             encoding="utf-8",
         )
-        file_handler.setFormatter(formatter)
+        file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
 
     extra = {"task": task_name, "account": account}
@@ -188,7 +199,7 @@ def configure_logger(
     install_transport_log_aggregator()
 
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
+    console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
 
     log_dir = pathlib.Path(log_dir)
@@ -200,7 +211,7 @@ def configure_logger(
         backupCount=10,
         encoding="utf-8",
     )
-    file_handler.setFormatter(formatter)
+    file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
 
     if logging.WARNING >= level_no:
@@ -212,7 +223,7 @@ def configure_logger(
         )
         warn_file_handler.setLevel(logging.WARNING)
         warn_file_handler.addFilter(ExactLevelFilter(logging.WARNING))
-        warn_file_handler.setFormatter(formatter)
+        warn_file_handler.setFormatter(file_formatter)
         logger.addHandler(warn_file_handler)
 
     if logging.ERROR >= level_no:
@@ -224,7 +235,7 @@ def configure_logger(
         )
         error_file_handler.setLevel(logging.ERROR)
         error_file_handler.addFilter(MinLevelFilter(logging.ERROR))
-        error_file_handler.setFormatter(formatter)
+        error_file_handler.setFormatter(file_formatter)
 
         logger.addHandler(error_file_handler)
     if os.environ.get("PYROGRAM_LOG_ON", "0") == "1":
