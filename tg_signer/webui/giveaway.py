@@ -271,6 +271,13 @@ def format_speech_alert(a: dict) -> str:
     )
 
 
+def format_speech_merge_note(a: dict) -> str:
+    """合并到已有未读消息时的追加文案：补上新的抽奖标题与还需发言条数。"""
+    title = str(a.get("title") or "")
+    title_part = f"抽奖「{title}」" if title else "抽奖"
+    return f"另需完成{title_part}发言（还需 {a.get('required')} 条）"
+
+
 def load_win_alerts(workdir) -> List[dict]:
     return _WIN_ALERTS.load(workdir)
 
@@ -948,7 +955,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     # 移动端卡片「执行时间」元素：运行中按启动时间每秒刷新耗时
     card_time_els: Dict[str, ui.html] = {}
     card_time_texts: Dict[str, str] = {}
-    # 中奖扫描任务卡片的「中奖回扫」元素：显示回扫是否进行中/上次进度
+    # 移动端卡片「中奖回扫」元素：显示是否开启与回扫进度
     card_sweep_els: Dict[str, ui.html] = {}
     card_sweep_texts: Dict[str, str] = {}
     # 「添加任务」弹窗当前目标：None=添加新任务，值=正在编辑的任务编号
@@ -1645,7 +1652,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         )
 
     def _card_sweep_html(text: str) -> str:
-        """中奖扫描卡片的「中奖回扫」行：运行中/结束后都保留显示。"""
+        """任务卡片的「中奖回扫」行：是否开启/运行中/上次进度都保留显示。"""
         return (
             '<div class="tgs-fields">'
             '<div class="tgs-field tgs-field-full">'
@@ -1655,8 +1662,14 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         )
 
     def _card_sweep_state(name: str) -> str:
-        """「中奖回扫」文案：任务运行中即视为回扫进行中，否则未进行。"""
-        return "进行中" if task_running(name) else "未进行"
+        """「中奖回扫」文案：未开启时明确标注，开启时展示进度或运行状态。"""
+        cfg = tasks.get(name) or {}
+        if not bool(cfg.get("win_detect", True)):
+            return "未开启"
+        sweep = _sweep_text(name)
+        if sweep:
+            return sweep
+        return "进行中" if task_running(name) else "已开启"
 
     def _update_card_sweep(name: str, text: str) -> None:
         el = card_sweep_els.get(name)
@@ -1814,7 +1827,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         "name": str(name),
                         "pinned": bool(cfg.get("pinned")),
                         "source_type": source_type,
-                        "is_win": source_type == SOURCE_WIN,
                         "task_type": giveaway_type_label(cfg),
                         "accounts": ", ".join(cfg["accounts"]),
                         # 移动端单行摘要（数量 + 前两项）+ 点击展开的完整列表
@@ -1949,9 +1961,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         except Exception:
                             logger.debug("刷新卡片停止按钮失败", exc_info=True)
                     _update_card_time(str(n), _card_time_text(str(n), running))
-                    # 中奖扫描卡片的「中奖回扫」行随运行状态刷新
+                    # 卡片的「中奖回扫」行随运行状态刷新
                     if str(n) in card_sweep_els:
-                        _update_card_sweep(str(n), "进行中" if running else "未进行")
+                        _update_card_sweep(str(n), _card_sweep_state(str(n)))
 
                 return _set
 
@@ -2063,13 +2075,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         ]
                         card_fields.append(("新参加", f"{row['joined']}抽奖"))
                         mobile_card_fields(card_fields)
-                        if row["is_win"]:
-                            # 中奖回扫是否进行中（运行中显示回扫进度）
-                            sweep_text = _card_sweep_state(n)
-                            card_sweep_els[n] = ui.html(
-                                _card_sweep_html(sweep_text)
-                            ).classes("w-full")
-                            card_sweep_texts[n] = sweep_text
+                        # 中奖回扫：所有任务都显示是否开启，开启时展示回扫进度
+                        sweep_text = _card_sweep_state(n)
+                        card_sweep_els[n] = ui.html(
+                            _card_sweep_html(sweep_text)
+                        ).classes("w-full")
+                        card_sweep_texts[n] = sweep_text
                         # 执行时间单独渲染，运行中由状态回调/轮询每秒刷新耗时
                         card_time_els[n] = ui.html(_card_time_html(time_text)).classes(
                             "w-full"

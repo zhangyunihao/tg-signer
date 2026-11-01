@@ -1139,7 +1139,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     )
                     mobile_card_fields(
                         [
-                            ("账号", row["accounts"], True),
+                            ("账号", row["accounts_text"], True),
                             ("执行时间", time_text, True),
                         ]
                     )
@@ -1184,6 +1184,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             if task["id"] not in task_states:
                 task_states[task["id"]] = _default_state(task)
             st = task_states[task["id"]]
+            account_names = [str(a) for a in (task.get("accounts") or [])]
             rows.append(
                 {
                     "id": task["id"],
@@ -1194,8 +1195,13 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                         if st.get("running") and st.get("start_ts")
                         else (str(task.get("duration") or "") or "—")
                     ),
-                    "accounts": "、".join(str(a) for a in (task.get("accounts") or []))
-                    or "未选择",
+                    "accounts": "、".join(account_names) or "未选择",
+                    # 移动端卡片先显示账号数，再列出账号
+                    "accounts_text": (
+                        f"{len(account_names)} 个：{'、'.join(account_names)}"
+                        if account_names
+                        else "未选择"
+                    ),
                     "status": _short_status(st),
                     "result": str(st.get("status") or "—"),
                     "running": bool(st.get("running")),

@@ -34,6 +34,7 @@ from tg_signer.webui.giveaway import (
     format_scan_cap_alert,
     format_speak_alert,
     format_speech_alert,
+    format_speech_merge_note,
     format_win_alert,
     load_channels_full_alerts,
     load_join_alerts,
@@ -149,8 +150,12 @@ def message_sort_key(
     )
 
 
-def collect_messages(workdir) -> List[dict]:
-    """汇总全部消息：中奖、加入失败、频道已满与未完成发言任务（排序见 message_sort_key）。"""
+def collect_messages(workdir, read_keys: Set[str] | None = None) -> List[dict]:
+    """汇总全部消息：中奖、加入失败、频道已满与未完成发言任务（排序见 message_sort_key）。
+
+    传入 read_keys 时，同一账号 + 同一频道的未读「发言数未达标」消息会合并为一条：
+    新提醒只把抽奖标题追加到已有消息，不再单独产生新消息。
+    """
     wd = Path(workdir)
     messages: List[dict] = []
     # 0) 中奖提醒（最重要，置顶展示）
@@ -230,24 +235,30 @@ def collect_messages(workdir) -> List[dict]:
             }
         )
     # 3) 报名成功后仍未达标的发言数任务（还需发言 N 条）
+    # 同账号 + 同频道的未读消息只保留一条，其余提醒把抽奖标题追加进去
+    unread_speech: dict[tuple[str, str], dict] = {}
     for a in load_speech_alerts(wd):
         acct = str(a.get("account") or "")
         bot = str(a.get("bot") or "")
         group = str(a.get("group") or "")
         time_str = str(a.get("time") or "")
-        messages.append(
-            {
-                "key": (
-                    f"speech_required|{acct}|{bot}|{group}|"
-                    f"{a.get('required')}|{time_str}"
-                ),
-                "tag": "发言数未达标",
-                "color": "blue",
-                "account": acct,
-                "time": time_str,
-                "text": format_speech_alert(a),
-            }
-        )
+        key = f"speech_required|{acct}|{bot}|{group}|{a.get('required')}|{time_str}"
+        existing = unread_speech.get((acct, group))
+        if read_keys is not None and key not in read_keys and existing is not None:
+            existing["text"] += "；" + format_speech_merge_note(a)
+            continue
+        message = {
+            "key": key,
+            "tag": "发言数未达标",
+            "color": "blue",
+            "account": acct,
+            "group": group,
+            "time": time_str,
+            "text": format_speech_alert(a),
+        }
+        messages.append(message)
+        if read_keys is not None and key not in read_keys:
+            unread_speech[(acct, group)] = message
     return messages
 
 
@@ -261,7 +272,7 @@ def message_center_button() -> Callable[[], None]:
 
     def refresh_badge() -> None:
         read_keys = load_read_keys(state.workdir)
-        messages = collect_messages(state.workdir)
+        messages = collect_messages(state.workdir, read_keys)
         unread = [m for m in messages if m["key"] not in read_keys]
         count = len(unread)
         has_unread_win = any(m["tag"] == "中奖" for m in unread)
@@ -304,7 +315,7 @@ def _filter_options(read_keys: Set[str]) -> dict:
     """
     accounts: Set[str] = set()
     unread_counts: dict[str, int] = {}
-    for m in collect_messages(state.workdir):
+    for m in collect_messages(state.workdir, read_keys):
         acct = str(m.get("account") or "")
         if not acct:
             continue
@@ -348,7 +359,7 @@ def _build_center_page() -> None:
 
     def visible_messages() -> List[dict]:
         """按当前用户/类型过滤条件取可见消息（未排序）。"""
-        messages = collect_messages(state.workdir)
+        messages = collect_messages(state.workdir, read_keys)
         sel = str(filter_sel.value or "")
         if sel:
             messages = [m for m in messages if m.get("account") == sel]
@@ -475,7 +486,9 @@ def _build_center_page() -> None:
 
     def refresh_unread_badge() -> None:
         count = sum(
-            1 for m in collect_messages(state.workdir) if m["key"] not in read_keys
+            1
+            for m in collect_messages(state.workdir, read_keys)
+            if m["key"] not in read_keys
         )
         unread_badge.set_text(str(count))
         unread_badge.set_visibility(count > 0)
@@ -485,8 +498,8 @@ def _build_center_page() -> None:
         pin_keys = load_pin_keys(state.workdir)
         return json.dumps(
             [
-                [m["key"], m["key"] in read_keys, m["key"] in pin_keys]
-                for m in collect_messages(state.workdir)
+                [m["key"], m.get("text"), m["key"] in read_keys, m["key"] in pin_keys]
+                for m in collect_messages(state.workdir, read_keys)
             ]
         )
 
