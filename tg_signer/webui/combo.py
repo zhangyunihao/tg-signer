@@ -12,7 +12,6 @@ import time
 from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
-from typing import Callable
 
 from nicegui import app, ui
 
@@ -111,6 +110,31 @@ def save_combo_progress(store: dict, workdir: Path | str | None = None) -> None:
 
 # 组合任务进度独立页面路由（替代原「查看进度」弹窗），?record_id=任务记录ID
 COMBO_PROGRESS_PAGE_PATH = "/combo-progress"
+
+# 进度页重绘时保存/恢复页面滚动位置：整块内容重建会把移动端滚动条拉回顶部
+_SCROLL_CAPTURE_JS = """
+(() => {
+  let el = document.querySelector('.nicegui-content');
+  while (el) {
+    if (/(auto|scroll)/.test(getComputedStyle(el).overflowY)) break;
+    el = el.parentElement;
+  }
+  return [Math.round(window.scrollY || 0), el ? Math.round(el.scrollTop || 0) : 0];
+})()
+"""
+
+_SCROLL_RESTORE_JS = """
+(() => {
+  const winTop = %d, elTop = %d;
+  window.scrollTo(0, winTop);
+  let el = document.querySelector('.nicegui-content');
+  while (el) {
+    if (/(auto|scroll)/.test(getComputedStyle(el).overflowY)) break;
+    el = el.parentElement;
+  }
+  if (el) { el.scrollTop = elTop; }
+})()
+"""
 
 
 class _SharedRunner:
@@ -549,17 +573,14 @@ class ComboTaskBlock:
         ui.timer(2.0, self._tick)
 
     @classmethod
-    def headless(cls, workdir, rerender: Callable[[], None]) -> "ComboTaskBlock":
+    def headless(cls, workdir) -> "ComboTaskBlock":
         """构造只用于进度渲染的实例（独立进度页面使用，不构建 tab 界面）。"""
         view = cls.__new__(cls)
         view.workdir = workdir
         view.runner = _SharedRunner()
-        view._combo_log_full = False
         view._live_ids = set()
         view._live_names = {}
         view._snap_sigs = {}
-        # _render_run_card 的日志全屏切换会调用该方法，由页面传入重绘函数
-        view._render_progress_content = rerender
         return view
 
     # ---- 数据 ----
@@ -958,14 +979,12 @@ class ComboTaskBlock:
             )
         return entries
 
-    def _render_run_card(
-        self,
-        run: dict,
-        *,
-        logs: list[str] | None = None,
-        live: bool = True,
-    ) -> None:
-        """渲染任务进度卡片；live=False 时用进度快照展示已停止/已结束的任务。"""
+    def _render_run_card(self, run: dict, *, live: bool = True) -> None:
+        """渲染任务进度卡片；live=False 时用进度快照展示已停止/已结束的任务。
+
+        日志区不在这里渲染：进度页把它作为常驻元素就地更新，避免轮询重绘时
+        整块 DOM 重建，导致移动端日志滚动位置被重置到顶部。
+        """
         rec = run["record"]
         if live:
             elapsed = format_duration(max(0, time.time() - run["start_ts"]))
@@ -989,7 +1008,10 @@ class ComboTaskBlock:
                 )
             time_text = f"执行时间：{rec.get('start_time') or '—'}　"
             time_text += f"已运行：{elapsed}" if live else f"时长：{elapsed}"
-            ui.label(time_text).classes("text-xs text-gray-600")
+            # 运行时长每秒变化，由进度页就地改写文本，不为刷新时间重建整页
+            self._run_elapsed_label = ui.label(time_text).classes(
+                "text-xs text-gray-600"
+            )
             if not live and rec.get("result"):
                 ui.label(f"结果：{rec['result']}").classes("text-xs text-gray-600")
             # 整体进度：一步 = 一个账号执行一个子任务，配进度条与状态徽章
@@ -1037,65 +1059,6 @@ class ComboTaskBlock:
             with ui.element("div").classes("w-full tgs-combo-sub-grid"):
                 for i, sub in enumerate(combo_subs, 1):
                     self._render_subtask_card(run, sub, i)
-            # 运行日志区：只显示本组合任务的输出行；不再独立滚动，
-            # 统一由进度页面的滚动承载（避免出现两条滚动条）
-            if logs is None:
-                prefix = f"[{rec.get('task_name') or ''}:"
-                lines = [
-                    line for line in self.runner.output_lines if line.startswith(prefix)
-                ]
-            else:
-                lines = list(logs)
-            if not live:
-                lines = lines[-COMBO_PROGRESS_LOG_LINES:]
-
-            def _copy_log() -> None:
-                if not lines:
-                    ui.notify("暂无可复制的日志", type="warning")
-                    return
-                copy_text_to_clipboard("\n".join(lines))
-                ui.notify(f"已复制 {len(lines)} 行日志", type="positive")
-
-            def _toggle_log_fullscreen() -> None:
-                """切换组合任务日志全屏态：日志区 fixed 铺满视口，右上角显示退出按钮。"""
-                self._combo_log_full = not getattr(self, "_combo_log_full", False)
-                # 内容由页面轮询重建，这里立即按最新状态重绘
-                self._render_progress_content()
-
-            with ui.row().classes("w-full items-center justify-between mt-1"):
-                ui.label("运行日志").classes("text-xs font-semibold text-gray-600")
-                with ui.row().classes("gap-1 items-center"):
-                    ui.button(icon="content_copy", on_click=_copy_log).props(
-                        "flat round dense"
-                    ).tooltip("一键复制日志")
-                    ui.button(icon="fullscreen", on_click=_toggle_log_fullscreen).props(
-                        "flat round dense"
-                    ).tooltip("全屏显示")
-            log_classes = f"{LOG_AREA_CLASS} gap-0 p-2 font-mono text-sm"
-            if getattr(self, "_combo_log_full", False):
-                log_classes += " tgs-page-log-fullscreen"
-            # pre-wrap：保留日志缩进但允许长行折行，避免移动端横向溢出
-            with (
-                ui.column()
-                .classes(log_classes)
-                .style(
-                    f"white-space: pre-wrap; overflow-wrap: anywhere; "
-                    f"{LOG_AREA_STYLE}; overflow-y: auto;"
-                )
-            ):
-                if not lines:
-                    ui.label("暂无日志输出").classes("text-xs text-gray-400")
-                else:
-                    # 整段日志用一个 <pre> 渲染：200 行时元素数从 200 降为 1，
-                    # 且进度页每秒重绘时序列化体积与 DOM 压力都显著降低
-                    body = "\n".join(escape(line) for line in lines[-200:])
-                    # 字体/折行继承外层日志列样式，这里只去掉 pre 默认外边距
-                    ui.html(f"<pre>{body}</pre>").classes("w-full").style("margin: 0")
-            # 退出全屏悬浮按钮：仅全屏时 fixed 显示在视口右上角，平时不占布局
-            if getattr(self, "_combo_log_full", False):
-                ui.button(icon="close", on_click=_toggle_log_fullscreen).props(
-                    "flat round dense unelevated"
-                ).classes("tgs-log-exit-full tgs-log-exit-visible")
 
     def _acc_sub_status(self, run: dict, acc: str, label: str) -> str:
         """某账号在某个子任务上的状态；无明细但进程存在时视为等待。"""
@@ -1916,9 +1879,7 @@ class ComboTaskBlock:
                 or snapshot.get("logs")
                 or snapshot.get("combo_subs")
             ):
-                self._render_run_card(
-                    snapshot, logs=snapshot.get("logs") or [], live=False
-                )
+                self._render_run_card(snapshot, live=False)
                 ui.label("以上为该任务结束时的进度快照。").classes(
                     "text-xs text-gray-400"
                 )
@@ -2065,10 +2026,10 @@ _PROGRESS_PAGE_STYLE = """
 
 
 def _build_progress_page(record_id: str) -> None:
-    """渲染任务进度页内容；容器每次轮询变化时清空重绘。"""
+    """渲染任务进度页内容；进度卡片变化时重绘，日志区就地更新。"""
     install_activity_tracking()
     page_client = ui.context.client
-    view = ComboTaskBlock.headless(state.workdir, rerender=lambda: render_content())
+    view = ComboTaskBlock.headless(state.workdir)
     record = next(
         (
             r
@@ -2102,6 +2063,79 @@ def _build_progress_page(record_id: str) -> None:
             )
         return
 
+    # 运行日志区常驻页面：轮询只就地更新文本，不随进度卡片重建，
+    # 这样移动端阅读日志时滚动条不会被重置回顶部。
+    log_state: dict = {"lines": [], "body": None, "full": False}
+    with ui.row().classes("w-full items-center justify-between mt-1"):
+        ui.label("运行日志").classes("text-xs font-semibold text-gray-600")
+        with ui.row().classes("gap-1 items-center"):
+            ui.button(icon="content_copy", on_click=lambda: copy_log()).props(
+                "flat round dense"
+            ).tooltip("一键复制日志")
+            ui.button(icon="fullscreen", on_click=lambda: toggle_log_full()).props(
+                "flat round dense"
+            ).tooltip("全屏显示")
+    # pre-wrap：保留日志缩进但允许长行折行，避免移动端横向溢出
+    log_box = (
+        ui.column()
+        .classes(f"{LOG_AREA_CLASS} gap-0 p-2 font-mono text-sm tgs-combo-logbox")
+        .style(
+            f"white-space: pre-wrap; overflow-wrap: anywhere; "
+            f"{LOG_AREA_STYLE}; overflow-y: auto;"
+        )
+    )
+    with log_box:
+        # 整段日志用一个 <pre> 渲染，元素数始终为 1
+        log_pre = (
+            ui.html("<pre>暂无日志输出</pre>").classes("w-full").style("margin: 0")
+        )
+    # 退出全屏悬浮按钮：默认隐藏，全屏时 fixed 显示在视口右上角
+    log_exit = (
+        ui.button(icon="close", on_click=lambda: toggle_log_full())
+        .props("flat round dense unelevated")
+        .classes("tgs-log-exit-full")
+    )
+
+    def copy_log() -> None:
+        if not log_state["lines"]:
+            ui.notify("暂无可复制的日志", type="warning")
+            return
+        copy_text_to_clipboard("\n".join(log_state["lines"]))
+        ui.notify(f"已复制 {len(log_state['lines'])} 行日志", type="positive")
+
+    def toggle_log_full() -> None:
+        """切换日志全屏态：日志区 fixed 铺满视口，右上角显示退出按钮。"""
+        log_state["full"] = not log_state["full"]
+        if log_state["full"]:
+            log_box.classes(add="tgs-page-log-fullscreen")
+            log_exit.classes(add="tgs-log-exit-visible")
+        else:
+            log_box.classes(remove="tgs-page-log-fullscreen")
+            log_exit.classes(remove="tgs-log-exit-visible")
+        log_box.update()
+        log_exit.update()
+
+    def update_log() -> None:
+        """就地更新日志文本；内容未变时不触发 DOM 更新。"""
+        run = view.runner.runs.get(record_id)
+        if run is not None:
+            name = str((run.get("record") or {}).get("task_name") or "")
+            lines = view._combo_log_lines(name)
+        elif log_state["body"] is None:
+            snap = load_combo_progress(view.workdir).get(record_id) or {}
+            lines = [str(x) for x in (snap.get("logs") or [])]
+            lines = lines[-COMBO_PROGRESS_LOG_LINES:]
+        else:
+            # 已结束任务的快照日志不再变化，无需每 2 秒重读快照文件
+            return
+        body = "\n".join(escape(line) for line in lines)
+        log_state["lines"] = lines
+        if body == log_state["body"]:
+            return
+        log_state["body"] = body
+        log_pre.set_content(f"<pre>{body or '暂无日志输出'}</pre>")
+        log_pre.update()
+
     async def stop_task() -> None:
         outcome, stopped = await view._stop_shared(record_id)
         if outcome == "stopped" and stopped is not None:
@@ -2122,6 +2156,8 @@ def _build_progress_page(record_id: str) -> None:
     def live_sig() -> tuple:
         run = view.runner.runs.get(record_id)
         if run is not None:
+            # 运行时长与日志行数不参与签名：它们每秒变化，交给就地更新处理，
+            # 否则每 2 秒都会重建整页，移动端滚动条会被反复拉回顶部
             return (
                 "live",
                 tuple(
@@ -2142,14 +2178,6 @@ def _build_progress_page(record_id: str) -> None:
                     int((p.get("stats") or {}).get("joined_total") or 0)
                     for p in run.get("procs") or []
                 ),
-                len(
-                    [
-                        line
-                        for line in view.runner.output_lines
-                        if line.startswith(f"[{run['record'].get('task_name') or ''}:")
-                    ]
-                ),
-                int(time.time() - run["start_ts"]),
             )
         fresh = next(
             (
@@ -2168,14 +2196,37 @@ def _build_progress_page(record_id: str) -> None:
             len(snap.get("logs") or []),
         )
 
+    def update_elapsed() -> None:
+        """就地刷新「已运行」时长，避免为每秒变化的时间重建整页。"""
+        run = view.runner.runs.get(record_id)
+        label = getattr(view, "_run_elapsed_label", None)
+        if run is None or label is None:
+            return
+        label.text = (
+            f"执行时间：{(run.get('record') or {}).get('start_time') or '—'}　"
+            f"已运行：{format_duration(max(0, time.time() - run['start_ts']))}"
+        )
+
     def render_content() -> None:
         # 进度页常单独打开（主控台已关闭/手机切页），先收集子进程输出再渲染
         view.runner.drain_output()
         title.text = f"任务进度：{record.get('task_name') or record_id}"
         stop_btn.set_visibility(view.runner.runs.get(record_id) is not None)
         view._render_progress_into(content, record)
+        update_log()
 
-    def tick() -> None:
+    async def render_content_preserving_scroll() -> None:
+        """重绘前记住页面滚动位置，重绘后恢复，避免移动端滚动条跳回顶部。"""
+        if not page_client.has_socket_connection:
+            render_content()
+            return
+        pos = await ui.run_javascript(_SCROLL_CAPTURE_JS, timeout=1.0)
+        values = pos if isinstance(pos, list) and len(pos) == 2 else [0, 0]
+        win_top, el_top = (int(v or 0) for v in values)
+        render_content()
+        ui.run_javascript(_SCROLL_RESTORE_JS % (win_top, el_top))
+
+    async def tick() -> None:
         try:
             # 页面独立打开时也持续落盘快照，不依赖主控台是否开着
             view._sync_progress_snapshots()
@@ -2185,10 +2236,14 @@ def _build_progress_page(record_id: str) -> None:
             sig = live_sig()
             if sig != last_sig["value"]:
                 last_sig["value"] = sig
-                render_content()
+                await render_content_preserving_scroll()
+            else:
+                update_elapsed()
+                update_log()
         except Exception:
             logger.debug("刷新任务进度页面失败", exc_info=True)
 
+    last_sig["value"] = live_sig()
     render_content()
     ui.timer(2.0, tick)
 

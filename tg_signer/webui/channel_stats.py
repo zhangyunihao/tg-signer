@@ -487,7 +487,9 @@ def channel_stats_block(workdir) -> None:
 
     with ui.row().classes("w-full items-center justify-between mt-2"):
         ui.label("更新日志").classes("font-semibold text-sm")
-    log_area = ui.log(max_lines=300).classes("w-full h-40")
+    # shrink-0：弹窗卡片是 flex 列且有 max-height，日志区作为滚动容器
+    # 会被压缩到 0 高度（表现为「更新日志」整块不显示），禁止收缩以保留 160px
+    log_area = ui.log(max_lines=300).classes("w-full h-40 shrink-0")
     # 回放上次执行日志（含后台自动刷新）：否则重新打开弹窗日志区总是空白
     for line in load_stats_log(workdir):
         try:

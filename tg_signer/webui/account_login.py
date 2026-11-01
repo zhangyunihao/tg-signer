@@ -193,12 +193,72 @@ def _limit_text(limits: List[dict]) -> tuple[str, str]:
     return "限流中：" + "；".join(parts), cls
 
 
+def _channels_full_text(alert: dict | None) -> tuple[str, str]:
+    """账号频道名额已满的提示文字；无提醒时返回空文字与默认样式。"""
+    if not alert:
+        return "", "text-xs text-gray-500"
+    time_str = str(alert.get("time") or "")
+    detail = str(alert.get("detail") or "").strip()
+    if len(detail) > 60:
+        detail = detail[:60] + "…"
+    text = "频道名额已满"
+    if time_str:
+        text += f"（{time_str}）"
+    text += "，已自动创建退频道任务"
+    if detail:
+        text += f" · {detail}"
+    return text, "text-xs text-red-600"
+
+
 def user_info_block() -> Callable[[], None]:
     container = ui.column().classes("w-full gap-2")
     # 账户卡片上的限流标签与快照：定时器每秒刷新剩余时长，每 5 秒重读落盘状态
     limit_labels: Dict[str, object] = {}
     limit_snapshot: Dict[str, List[dict]] = {}
     limit_loaded_at = [0.0]
+    # 频道名额已满标签：来自抽奖任务写入的频道已满提醒，按账号展示
+    full_labels: Dict[str, object] = {}
+    full_snapshot: Dict[str, dict] = {}
+    full_loaded_at = [0.0]
+
+    def _reload_channels_full() -> None:
+        """读取频道已满提醒；统计显示名额已恢复宽裕时自动不再展示。"""
+        from tg_signer.webui.channel_stats import STATS_FILE, load_stats
+        from tg_signer.webui.giveaway import (
+            CHANNELS_FULL_ALERTS_FILE,
+            load_channels_full_alerts,
+        )
+
+        alerts = load_channels_full_alerts(state.workdir)
+        stats = load_stats(state.workdir).get("accounts") or {}
+        base = get_workdir(state.workdir)
+        try:
+            stats_mtime = (base / STATS_FILE).stat().st_mtime
+        except OSError:
+            stats_mtime = 0.0
+        try:
+            alerts_mtime = (base / CHANNELS_FULL_ALERTS_FILE).stat().st_mtime
+        except OSError:
+            alerts_mtime = 0.0
+        snapshot: Dict[str, dict] = {}
+        for item in alerts:
+            name = str(item.get("account") or "")
+            if not name:
+                continue
+            rec = stats.get(name) or {}
+            joined, limit = rec.get("joined"), rec.get("limit")
+            # 统计比提醒更新，且名额已有空余：退频道任务已释放名额，不再提示
+            if (
+                stats_mtime > alerts_mtime
+                and isinstance(joined, int)
+                and isinstance(limit, int)
+                and joined < limit
+            ):
+                continue
+            snapshot[name] = item
+        full_snapshot.clear()
+        full_snapshot.update(snapshot)
+        full_loaded_at[0] = time.time()
 
     def _tick_limits() -> None:
         if not limit_labels:
@@ -208,6 +268,8 @@ def user_info_block() -> Callable[[], None]:
             limit_snapshot.clear()
             limit_snapshot.update(load_account_limits(state.workdir))
             limit_loaded_at[0] = now
+        if now - full_loaded_at[0] >= 5:
+            _reload_channels_full()
         for name, lbl in list(limit_labels.items()):
             text, cls = _limit_text(limit_snapshot.get(name) or [])
             try:
@@ -217,6 +279,16 @@ def user_info_block() -> Callable[[], None]:
                 lbl.update()
             except Exception:  # noqa: BLE001 - 元素已被 refresh 清理
                 limit_labels.pop(name, None)
+        for name, lbl in list(full_labels.items()):
+            text, cls = _channels_full_text(full_snapshot.get(name))
+            try:
+                if lbl.text != text:
+                    lbl.text = text
+                lbl.classes(replace=cls)
+                lbl.set_visibility(bool(text))
+                lbl.update()
+            except Exception:  # noqa: BLE001 - 元素已被 refresh 清理
+                full_labels.pop(name, None)
 
     ui.timer(1.0, _tick_limits)
 
@@ -442,6 +514,8 @@ def user_info_block() -> Callable[[], None]:
         limit_snapshot.clear()
         limit_snapshot.update(load_account_limits(state.workdir))
         limit_loaded_at[0] = time.time()
+        full_labels.clear()
+        _reload_channels_full()
         with container:
             # —— 账户管理 ——
             with ui.card().classes("w-full shadow-sm tgs-account-card"):
@@ -675,6 +749,13 @@ def user_info_block() -> Callable[[], None]:
                                 limit_labels[name] = ui.label(limit_text).classes(
                                     limit_cls
                                 )
+                                full_text, full_cls = _channels_full_text(
+                                    full_snapshot.get(name)
+                                )
+                                full_labels[name] = ui.label(full_text).classes(
+                                    full_cls
+                                )
+                                full_labels[name].set_visibility(bool(full_text))
                 ui.label(
                     "停用的账户不会出现在签到/随机发言/批量退频道的账号下拉列表中"
                 ).classes("text-xs text-gray-500")
