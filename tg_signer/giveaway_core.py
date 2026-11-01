@@ -1623,10 +1623,18 @@ class GiveawayEngine:
         self.log(f"{prefix} {reason}，跳过")
 
     def _source_btn_seen(self, account: str, state_key: str) -> bool:
-        """该置顶帖是否已处理过/已终态（source_btn 持久化去重）。"""
-        return self._state is not None and (
-            self._state.has(account, "source_btn", state_key)
-            or self._state.is_ended(account, "source_btn", state_key)
+        """该置顶帖是否已处理过/已终态（source_btn 持久化去重）。
+
+        与普通链接口径一致：开启「允许重复参与」（ignore_history）后，
+        已参与的置顶帖不再跳过，允许再次点击；bot 回复「已结束」的终态
+        记录不受该开关影响，仍然跳过。
+        """
+        if self._state is None:
+            return False
+        if self._state.is_ended(account, "source_btn", state_key):
+            return True
+        return not self.ignore_history and self._state.has(
+            account, "source_btn", state_key
         )
 
     async def _join_via_source_url(

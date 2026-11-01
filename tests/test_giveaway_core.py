@@ -842,6 +842,54 @@ def test_pinned_giveaway_button_logs_actual_reason(tmp_path):
     assert not any("无可用抽奖 bot 链接" in line for line in logs)
 
 
+def test_pinned_button_respects_repeat_join_switch(tmp_path):
+    """「允许重复参与」（ignore_history）对置顶按钮型抽奖同样生效：
+    开启时已参与记录不再跳过，关闭时才按记录跳过。"""
+    import asyncio
+
+    engine, state = _engine(tmp_path)
+    engine.auto_join = False
+
+    class _BtnClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.callback_clicks = []
+
+        async def request_callback_answer(self, chat_id, message_id, callback_data):
+            self.callback_clicks.append((chat_id, message_id, callback_data))
+            return SimpleNamespace(message="参与成功")
+
+    client = _BtnClient()
+    state_key = "-1001234567890|3323454"
+    state.add("acc", "source_btn", state_key, note="btn_joined")
+    giveaway = _msg(
+        id=3323454,
+        text="🎉 本次抽奖由 如果你也听说 发起 🆔 抽奖ID: 983",
+        buttons=[[_btn("参与抽奖", callback_data="start_draw&983")]],
+    )
+
+    # 允许重复参与：已参与过的置顶帖仍会再次点击
+    engine.ignore_history = True
+    asyncio.run(
+        engine._process_message(
+            "acc", client, giveaway, skip_keywords=True, log_skips=True
+        )
+    )
+    assert client.callback_clicks == [(-1001234567890, 3323454, "start_draw&983")]
+
+    # 关闭「允许重复参与」：按参与记录跳过，不再点击
+    engine.ignore_history = False
+    logs: list = []
+    engine.log = logs.append
+    asyncio.run(
+        engine._process_message(
+            "acc", client, giveaway, skip_keywords=True, log_skips=True
+        )
+    )
+    assert client.callback_clicks == [(-1001234567890, 3323454, "start_draw&983")]
+    assert any("该帖已在参与记录中" in line for line in logs)
+
+
 def test_scan_now_pinned_expired_counts_toward_cap(tmp_path):
     """置顶消息也受参与条数上限约束，达到上限后跳过历史扫描。"""
     import asyncio
