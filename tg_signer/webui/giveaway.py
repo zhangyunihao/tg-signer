@@ -140,6 +140,9 @@ SPEAK_ALERTS_MAX = 200
 # 报名成功后仍未达标的发言数任务（持久化，消息中心提示还需发言条数）
 SPEECH_ALERTS_FILE = "webui_speech_alerts.json"
 SPEECH_ALERTS_MAX = 200
+# 置顶抽奖帖点击「参与抽奖」弹窗提示发言数不够（参与失败）的提醒
+SPEECH_INSUFFICIENT_ALERTS_FILE = "webui_speech_insufficient_alerts.json"
+SPEECH_INSUFFICIENT_ALERTS_MAX = 200
 # 中奖提醒（bot 私聊识别到中奖消息，持久化，不清除仅限量）
 WIN_ALERTS_FILE = "webui_win_alerts.json"
 WIN_ALERTS_MAX = 200
@@ -209,6 +212,9 @@ class _AlertStore:
 _JOIN_ALERTS = _AlertStore(JOIN_ALERTS_FILE, JOIN_ALERTS_MAX, "加入失败提醒")
 _SPEAK_ALERTS = _AlertStore(SPEAK_ALERTS_FILE, SPEAK_ALERTS_MAX, "未完成发言任务")
 _SPEECH_ALERTS = _AlertStore(SPEECH_ALERTS_FILE, SPEECH_ALERTS_MAX, "未达标发言数任务")
+_SPEECH_INSUFFICIENT_ALERTS = _AlertStore(
+    SPEECH_INSUFFICIENT_ALERTS_FILE, SPEECH_INSUFFICIENT_ALERTS_MAX, "发言数不够提醒"
+)
 _WIN_ALERTS = _AlertStore(WIN_ALERTS_FILE, WIN_ALERTS_MAX, "中奖提醒")
 _CHANNELS_FULL_ALERTS = _AlertStore(
     CHANNELS_FULL_ALERTS_FILE, CHANNELS_FULL_ALERTS_MAX, "频道已满提醒"
@@ -268,6 +274,32 @@ def format_speech_alert(a: dict) -> str:
         f"账号 {a.get('account')} {title_part}发言任务未完成："
         f"群组「{a.get('group')}」还需发言 {a.get('required')} 条"
         f"（{a.get('time')}）"
+    )
+
+
+def load_speech_insufficient_alerts(workdir) -> List[dict]:
+    return _SPEECH_INSUFFICIENT_ALERTS.load(workdir)
+
+
+def save_speech_insufficient_alerts(workdir, alerts: List[dict]) -> None:
+    _SPEECH_INSUFFICIENT_ALERTS.save(workdir, alerts)
+
+
+def format_speech_insufficient_alert(a: dict) -> str:
+    """置顶抽奖帖点击参与被弹窗拦下（发言数不够）的提醒文案。"""
+    title = str(a.get("title") or "").strip()
+    button = str(a.get("button") or "").strip()
+    if title:
+        target = f"抽奖「{title}」"
+    elif button:
+        target = f"置顶抽奖帖「{button}」"
+    else:
+        target = "置顶抽奖帖"
+    detail = str(a.get("detail") or "").strip()
+    detail_part = f"，弹窗「{detail}」" if detail else ""
+    return (
+        f"账号 {a.get('account')} {target}参与失败：发言数不够，"
+        f"需先在群组发言再重试{detail_part}（{a.get('time')}）"
     )
 
 
@@ -351,6 +383,7 @@ def _notify_alert(client, text: str, level: str, debug_msg: str) -> None:
 JOIN_ALERT_KEY = ("account", "chat")
 SPEAK_ALERT_KEY = ("account", "group", "password")
 SPEECH_ALERT_KEY = ("account", "bot", "group", "required", "title")
+SPEECH_INSUFFICIENT_ALERT_KEY = ("account", "bot", "channel", "title", "detail")
 CHANNELS_FULL_ALERT_KEY = ("account",)
 SCAN_CAP_ALERT_KEY = ("account", "chat")
 
@@ -510,8 +543,46 @@ def _handle_speech_event(client, workdir, ev: dict) -> None:
     )
 
 
+def _handle_speech_insufficient_event(client, workdir, ev: dict) -> None:
+    """点击「参与抽奖」被弹窗拦下（发言数不够）：写消息中心并弹顶部提醒。
+
+    同一账号 + 频道 + 抽奖标题 + 弹窗文案只保留最新一条，避免每轮扫描重复刷屏。
+    """
+    acct = str(ev.get("account") or "")
+    detail = str(ev.get("detail") or "").strip()
+    if not acct or not detail:
+        return
+    bot = str(ev.get("bot") or "")
+    channel = str(ev.get("channel") or "")
+    title = str(ev.get("title") or "")
+    alerts = _drop_alert(
+        load_speech_insufficient_alerts(workdir),
+        SPEECH_INSUFFICIENT_ALERT_KEY,
+        f"{acct}|{bot}|{channel}|{title}|{detail}",
+    )
+    alerts.insert(
+        0,
+        {
+            "account": acct,
+            "bot": bot,
+            "button": str(ev.get("button") or "")[:40],
+            "channel": channel,
+            "title": title[:60],
+            "detail": detail[:200],
+            "time": _alert_time(),
+        },
+    )
+    save_speech_insufficient_alerts(workdir, alerts)
+    _notify_alert(
+        client,
+        format_speech_insufficient_alert(alerts[0]),
+        "warning",
+        "推送发言数不够提醒失败",
+    )
+
+
 def handle_giveaway_event(client, workdir, ev: dict) -> None:
-    """引擎事件分发：中奖 / 加入失败或解除 / 口令 / 发言数 / 频道已满 / 扫描上限。"""
+    """引擎事件分发：中奖 / 加入失败或解除 / 口令 / 发言数 / 发言数不够 / 频道已满 / 扫描上限。"""
     etype = ev.get("type")
     if etype == "win":
         _handle_win_event(client, workdir, ev)
@@ -521,6 +592,8 @@ def handle_giveaway_event(client, workdir, ev: dict) -> None:
         _handle_speak_event(client, workdir, ev)
     elif etype == "speech_required":
         _handle_speech_event(client, workdir, ev)
+    elif etype == "speech_insufficient":
+        _handle_speech_insufficient_event(client, workdir, ev)
     elif etype == "channels_full":
         _handle_channels_full_event(client, workdir, ev)
     elif etype == "scan_cap":

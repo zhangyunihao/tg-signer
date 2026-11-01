@@ -29,6 +29,7 @@ from tg_signer.core import get_client, safe_disconnect
 from tg_signer.giveaway_parsing import (
     _INVITE_LINK_RE,
     _POPUP_ENDED_RE,
+    _POPUP_FAILED_RE,
     _POPUP_SUCCESS_RE,
     _TME_RE,
     DEFAULT_CONFIRM_KEYWORDS,
@@ -99,6 +100,11 @@ START_MIN_INTERVAL = 8.0
 # 重发 start→点击超时 30 秒→下一轮扫描立刻重试」会形成重试风暴，
 # 每轮白烧一次完整超时且无法收敛（FLOOD 有冷却，网络超时没有）。
 CLICK_FAILURE_COOLDOWN = 60
+
+
+# _try_confirm_button 遇到「抽奖已结束」弹窗时返回的未完成原因标记：
+# 上层据此走已结束终态处理（不记参与、不重试），而不是按参与成功记录
+CONFIRM_REASON_ENDED = "__ended__"
 
 
 # —— 加入频道限流保护 ——
@@ -1589,7 +1595,7 @@ class GiveawayEngine:
         if popup is None:
             return
         if self._source_btn_popup_blocked(
-            account, btn, popup, state_key, channel, reserved
+            account, btn, popup, state_key, channel, reserved, title
         ):
             return
         self._record_source_btn_join(
@@ -1628,6 +1634,7 @@ class GiveawayEngine:
         state_key: str,
         channel: str,
         reserved: bool,
+        title: str = "",
     ) -> bool:
         """终态/条件未满足弹窗处理：归还名额并记录，返回 True 表示终止参与。"""
         if popup and _POPUP_ENDED_RE.search(popup):
@@ -1641,6 +1648,31 @@ class GiveawayEngine:
             self.log(
                 f"[{account}] 置顶抽奖帖「{btn.text}」弹窗提示「{popup[:40]}」，"
                 "抽奖已结束，跳过"
+            )
+            return True
+        # 「参与失败」类弹窗（如「您的发言数:0 反馈数:0 参与失败」）：点击发生了
+        # 但条件未达标，既不是成功也不是终态，不能记「已参与」
+        if popup and _POPUP_FAILED_RE.search(popup):
+            if reserved:
+                self.joined -= 1
+            self.failed += 1
+            self.log(
+                f"[{account}] 置顶抽奖帖「{btn.text}」弹窗提示「{popup[:60]}」，"
+                "参与未成功（发言数/反馈数等条件未达标），稍后重试"
+            )
+            # 事件带 type：WebUI 消息中心据此新增「发言数不够」类别提醒
+            self._emit(
+                {
+                    "type": "speech_insufficient",
+                    "account": account,
+                    "bot": "source_button",
+                    "button": str(getattr(btn, "text", "") or ""),
+                    "channel": channel,
+                    "title": title,
+                    "detail": popup[:200],
+                    "ok": False,
+                    "error": "参与失败（发言数/反馈数等条件未达标），稍后重试",
+                }
             )
             return True
         # 「您未加入 XXX」类弹窗：参与条件未满足，点击未生效，不能记为成功
@@ -3098,6 +3130,12 @@ class GiveawayEngine:
             account, client, username, start_msg, param, source_message=source_message
         )
         if not completed:
+            if fail_reason == CONFIRM_REASON_ENDED:
+                # 确认按钮弹窗报「已结束」＝终态：按已结束处理，不能记「已参与」
+                self._handle_start_ended(
+                    account, username, param, channel, title, reserved
+                )
+                return
             # 跟进未完成（加入未生效/点击超时/仍要求加入等）：不能记「已参与」，
             # 否则后续扫描会当成功跳过、用户看到假成功；具体原因透传到日志
             self._handle_join_blocked(
@@ -4632,12 +4670,11 @@ class GiveawayEngine:
                 # 命中终态即返回，不进入回复核对（避免误读旧消息）
                 popup = callback_answer_text(answer)
                 if popup and _POPUP_ENDED_RE.search(popup):
-                    self._note_ended(account, username)
                     self.log(
                         f"[{account}] @{username} 弹窗提示「{popup[:40]}」，"
                         "抽奖已结束，跳过后续跟进"
                     )
-                    return True, True, ""
+                    return True, False, CONFIRM_REASON_ENDED
                 if popup and _POPUP_SUCCESS_RE.search(popup):
                     # 部分 bot 只弹窗确认、不再发新消息：弹窗即成功凭据，
                     # 否则后续核对读不到新回复会把成功误判成未完成

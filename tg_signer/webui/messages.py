@@ -6,6 +6,7 @@
 - 抽奖过程中记录的未完成发言任务（口令发送失败）：webui_speak_alerts.json
   （口令发送成功后由任务自动消除）
 - 报名成功后仍未达标的发言数任务（还需发言 N 条）：webui_speech_alerts.json
+- 置顶抽奖帖点击参与被弹窗拦下（发言数不够）：webui_speech_insufficient_alerts.json
 - 账号频道/群组已满（自动触发退频道任务）：webui_channels_full_alerts.json
 
 主控台右上角铃铛只负责展示未读数徽标，点击在新标签页打开 /messages
@@ -34,6 +35,7 @@ from tg_signer.webui.giveaway import (
     format_scan_cap_alert,
     format_speak_alert,
     format_speech_alert,
+    format_speech_insufficient_alert,
     format_speech_merge_note,
     format_win_alert,
     load_channels_full_alerts,
@@ -41,6 +43,7 @@ from tg_signer.webui.giveaway import (
     load_scan_cap_alerts,
     load_speak_alerts,
     load_speech_alerts,
+    load_speech_insufficient_alerts,
     load_win_alerts,
 )
 
@@ -259,6 +262,23 @@ def collect_messages(workdir, read_keys: Set[str] | None = None) -> List[dict]:
         messages.append(message)
         if read_keys is not None and key not in read_keys:
             unread_speech[(acct, group)] = message
+    # 4) 置顶抽奖帖点击「参与抽奖」被弹窗拦下：发言数不够，参与失败
+    for a in load_speech_insufficient_alerts(wd):
+        acct = str(a.get("account") or "")
+        time_str = str(a.get("time") or "")
+        messages.append(
+            {
+                "key": (
+                    f"speech_insufficient|{acct}|{a.get('bot')}|{a.get('channel')}"
+                    f"|{a.get('title')}|{a.get('detail')}|{time_str}"
+                ),
+                "tag": "发言数不够",
+                "color": "blue",
+                "account": acct,
+                "time": time_str,
+                "text": format_speech_insufficient_alert(a),
+            }
+        )
     return messages
 
 
