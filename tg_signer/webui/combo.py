@@ -419,10 +419,27 @@ def _giveaway_sub_type_text(sub: dict, workdir) -> str:
     """
     if "抽奖" not in str(sub.get("type") or ""):
         return ""
-    cfg = (load_task_store(workdir).get("tasks") or {}).get(
-        str(sub.get("task") or "")
-    )
+    cfg = (load_task_store(workdir).get("tasks") or {}).get(str(sub.get("task") or ""))
     return giveaway_type_label(cfg) if isinstance(cfg, dict) else ""
+
+
+def _giveaway_sub_note(sub: dict, workdir) -> str:
+    """抽奖子任务在勾选列表里的补充说明：任务子类型、监控对象、是否允许重复参与。"""
+    task_name = str(sub.get("task") or "")
+    cfg = (load_task_store(workdir).get("tasks") or {}).get(task_name)
+    if not isinstance(cfg, dict):
+        return ""
+    parts = [giveaway_type_label(cfg)]
+    if str(cfg.get("source_type") or "channel") in ("bot", "win"):
+        bot = str(cfg.get("bot_username") or "")
+        if bot:
+            parts.append(f"机器人 @{bot}")
+    else:
+        chats = giveaway_chats_text(task_name, workdir)
+        if chats:
+            parts.append(f"监控对象：{chats}")
+    parts.append("允许重复参与：" + ("是" if cfg.get("ignore_history", True) else "否"))
+    return "｜".join(parts)
 
 
 def giveaway_chats_text(task_name, workdir: Path | str | None = None) -> str:
@@ -1784,6 +1801,12 @@ class ComboTaskBlock:
                 display = _sub_task_display(sub, self.workdir)
                 if display:
                     label += f" · {display}"
+                # 抽奖子任务补充：子类型（频道/群组、百宝箱扫描、中奖扫描）、
+                # 监控对象、是否允许重复参与，便于同名任务区分
+                if "抽奖" in str(sub.get("type") or ""):
+                    note = _giveaway_sub_note(sub, self.workdir)
+                    if note:
+                        label += f"｜{note}"
                 self._new_task_checks[i] = ui.checkbox(label, value=True).classes(
                     "text-sm"
                 )

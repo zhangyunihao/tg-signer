@@ -650,3 +650,39 @@ def test_combo_giveaway_events_reach_message_center(tmp_path):
     )["alerts"]
     assert alerts[0]["group"] == "上海群" and alerts[0]["required"] == 6
     assert not events.exists()  # 事件文件读取完即清理
+
+
+def test_giveaway_sub_note_shows_type_chats_and_repeat(tmp_path):
+    """启动弹窗勾选列表：抽奖子任务展示子类型、监控对象、是否允许重复参与。"""
+    from tg_signer.webui.combo import _giveaway_sub_note
+
+    store = {
+        "tasks": {
+            "1": {"chats": ["@c1", "-100x"], "ignore_history": False},
+            "2": {
+                "chats": ["BaibaoxiangCjBot"],
+                "source_type": "bot",
+                "bot_username": "BaibaoxiangCjBot",
+            },
+        }
+    }
+    (tmp_path / "giveaway_tasks.json").write_text(
+        json.dumps(store, ensure_ascii=False), encoding="utf-8"
+    )
+
+    note = _giveaway_sub_note(
+        {"type": "自动抽奖 (giveaway run)", "task": "1"}, tmp_path
+    )
+    assert note == "频道/群组｜监控对象：@c1、-100x｜允许重复参与：否"
+
+    # 机器人类来源展示机器人用户名；未配置时默认允许重复参与
+    note = _giveaway_sub_note(
+        {"type": "自动抽奖 (giveaway run)", "task": "2"}, tmp_path
+    )
+    assert note == "百宝箱扫描｜机器人 @BaibaoxiangCjBot｜允许重复参与：是"
+
+    # 任务不存在 → 无补充说明（不影响勾选）
+    assert (
+        _giveaway_sub_note({"type": "自动抽奖 (giveaway run)", "task": "9"}, tmp_path)
+        == ""
+    )
