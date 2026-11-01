@@ -1040,6 +1040,14 @@ def build_ui(auth_code: str = None) -> None:
                 box-shadow: 0 4px 24px rgba(0, 0, 0, 0.18);
                 padding: 8px;
             }
+            /* 弹窗内的日志区全屏态：移动端 `.q-dialog .tgs-log-area` 有 42dvh
+               限高，优先级高于 `.tgs-page-log-fullscreen`，此处用更高优先级覆盖，
+               否则弹窗里的日志全屏后仍被截断 */
+            .q-dialog .tgs-log-area.tgs-page-log-fullscreen {
+                width: calc(100vw - 24px) !important;
+                height: calc(100vh - 24px) !important;
+                max-height: none !important;
+            }
             /* 退出全屏悬浮按钮：默认隐藏，全屏时显示在视口右上角 */
             .tgs-log-exit-full { display: none !important; }
             .tgs-log-exit-full.tgs-log-exit-visible {

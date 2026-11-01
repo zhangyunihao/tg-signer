@@ -21,8 +21,14 @@ from tg_signer.core import get_client, safe_disconnect, timeout_aiter
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.common import (
     attach_select_all,
+    copy_text_to_clipboard,
     format_duration,
     with_select_all,
+)
+from tg_signer.webui.components import (
+    LOG_AREA_CLASS,
+    LogFullscreen,
+    exit_fullscreen_button,
 )
 from tg_signer.webui.random_chat import build_account_options, list_session_names
 
@@ -294,12 +300,15 @@ def channel_stats_block(workdir) -> None:
     store = load_stats(workdir)
     names = list_session_names(session_dir, workdir)
     running = {"flag": False}
+    log_lines: List[str] = []
     _stats_path = Path(workdir) / STATS_FILE
     _last_mtime: int = 0
 
     def log(message: str) -> None:
+        line = f"{datetime.now():%H:%M:%S} {message}"
+        log_lines.append(line)
         try:
-            log_area.push(f"{datetime.now():%H:%M:%S} {message}")
+            log_area.push(line)
         except Exception:
             logger.debug("推送频道统计日志失败", exc_info=True)
         # 同步落盘：弹窗重开、页面刷新后仍能看到上次执行日志
@@ -485,14 +494,40 @@ def channel_stats_block(workdir) -> None:
     _last_mtime = _current_mtime()
     ui.timer(3.0, _poll_file)
 
+    def copy_log() -> None:
+        if not log_lines:
+            ui.notify("暂无可复制的日志", type="warning")
+            return
+        copy_text_to_clipboard("\n".join(log_lines))
+        ui.notify(f"已复制 {len(log_lines)} 行日志", type="positive")
+
+    def toggle_fullscreen() -> None:
+        """切换日志全屏态：日志区 fixed 铺满视口，右上角显示退出按钮。"""
+        fullscreen.toggle()
+
     with ui.row().classes("w-full items-center justify-between mt-2"):
         ui.label("更新日志").classes("font-semibold text-sm")
+        with ui.row().classes("gap-1 items-center"):
+            ui.button(icon="content_copy", on_click=copy_log).props(
+                "flat round dense"
+            ).tooltip("一键复制日志")
+            ui.button(icon="fullscreen", on_click=toggle_fullscreen).props(
+                "flat round dense"
+            ).tooltip("全屏显示")
     # shrink-0：弹窗卡片是 flex 列且有 max-height，日志区作为滚动容器
-    # 会被压缩到 0 高度（表现为「更新日志」整块不显示），禁止收缩以保留 160px
-    log_area = ui.log(max_lines=300).classes("w-full h-40 shrink-0")
+    # 会被压缩到 0 高度（表现为「更新日志」整块不显示），禁止收缩以保证显示
+    log_area = (
+        ui.log(max_lines=300)
+        .classes(f"{LOG_AREA_CLASS} shrink-0")
+        .style("height: 160px")
+    )
     # 回放上次执行日志（含后台自动刷新）：否则重新打开弹窗日志区总是空白
     for line in load_stats_log(workdir):
         try:
             log_area.push(line)
+            log_lines.append(line)
         except Exception:
             logger.debug("回放频道统计执行日志失败", exc_info=True)
+    # 退出全屏悬浮按钮：仅全屏时 fixed 显示在视口右上角，平时不占布局
+    exit_full_btn = exit_fullscreen_button(toggle_fullscreen)
+    fullscreen = LogFullscreen(log_area, exit_full_btn)

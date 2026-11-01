@@ -1492,10 +1492,11 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         bot_username = str(bot_username_input.value or "").lstrip("@").strip()
         chats: List[str] = []
         if source_type in (SOURCE_BOT, SOURCE_WIN):
-            if not bot_username:
+            if not bot_username and source_type == SOURCE_BOT:
                 ui.notify("请填写要监控的机器人用户名", type="warning")
                 return None
-            chats = [bot_username]
+            # 中奖扫描留空 = 回扫全部已知机器人（抽奖任务参与过的 bot 记录在状态库）
+            chats = [bot_username] if bot_username else []
         else:
             for cid in list(channel_select.value or []):
                 chats.append(str(cid))
@@ -1794,11 +1795,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 source_type = giveaway_source_type(cfg)
                 is_bot_like = source_type in (SOURCE_BOT, SOURCE_WIN)
                 bot_username = str(cfg.get("bot_username") or "").lstrip("@")
-                chat_names = (
-                    [f"@{bot_username}"]
-                    if is_bot_like and bot_username
-                    else [chat_display(c) for c in cfg["chats"]]
-                )
+                if is_bot_like and bot_username:
+                    chat_names = [f"@{bot_username}"]
+                elif source_type == SOURCE_WIN:
+                    # 中奖扫描留空机器人：回扫全部已知 bot
+                    chat_names = ["全部已知机器人"]
+                else:
+                    chat_names = [chat_display(c) for c in cfg["chats"]]
                 running_now = task_running(name)
                 start_ts = cfg.get("_start_ts")
                 duration_text = (
@@ -2679,7 +2682,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "机器人回复消息中出现的频道/群组链接会被逐一加入（激进模式，可能误加）。"
             "「百宝箱扫描」类型直接扫描该 bot 私聊里的「您已获得抽奖资格（已达标）」"
             "消息并点击「点击参与抽奖」，无需监控频道、也不会自动加群。"
-            "「中奖扫描」类型只回扫该 bot 私聊里的中奖通知并提醒，不参与抽奖、不加群。"
+            "「中奖扫描」类型只回扫该 bot 私聊里的中奖通知并提醒，不参与抽奖、不加群；"
+            "机器人用户名留空时回扫全部已知机器人（即抽奖任务参与过的 bot）。"
             "补漏扫描会按设定间隔重拉各频道最近若干条消息，"
             "捞回此前因网络异常/中断漏掉的抽奖帖，连续多轮拉取失败会自动暂停一段时间。"
             "中奖识别会在 bot 私聊出现中奖消息时转发提醒并写入消息中心，"
