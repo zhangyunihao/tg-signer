@@ -397,7 +397,10 @@ def _build_dashboard(container) -> None:
             max_concurrent = await run.io_bound(
                 load_giveaway_max_concurrent, state.workdir
             )
-            with ui.dialog() as dialog, ui.card().classes("w-full max-w-xl"):
+            with (
+                ui.dialog() as dialog,
+                ui.card().classes("w-full max-w-xl tgs-dialog-card"),
+            ):
                 add_dialog_close_button(dialog)
                 ui.label("设置").classes("text-lg font-semibold")
                 workdir_input = ui.input(
@@ -560,7 +563,7 @@ def _build_dashboard(container) -> None:
                     ui.notify("设置已保存，新启动的抽奖任务生效", type="positive")
                     dialog.close()
 
-                with ui.row().classes("w-full justify-end gap-2"):
+                with ui.row().classes("w-full justify-end gap-2 tgs-dialog-footer"):
                     ui.button("取消", on_click=dialog.close).props("outline")
                     ui.button("应用并刷新", color="primary", on_click=apply_settings)
             dialog.open()
@@ -1247,6 +1250,23 @@ def build_ui(auth_code: str = None) -> None:
                     border-radius: 10px;
                     padding-bottom: calc(12px + env(safe-area-inset-bottom));
                 }
+                /* 长弹窗的底部操作栏：内容随整卡滚动，按钮吸底始终可见可点。
+                   padding-bottom 交给底栏统一处理（含手势条安全区），
+                   底栏位于文档流末尾，滚到底时不会压住最后一行内容 */
+                .q-dialog .q-card.tgs-dialog-card { padding-bottom: 0; }
+                .tgs-dialog-footer {
+                    position: sticky;
+                    bottom: 0;
+                    z-index: 6;
+                    width: calc(100% + 32px);
+                    margin: 0 -16px;
+                    padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+                    background: #fff;
+                    border-top: 1px solid rgba(0, 0, 0, 0.08);
+                    box-shadow: 0 -4px 10px rgba(0, 0, 0, 0.04);
+                }
+                /* 窄屏下两个按钮等分宽度，高度仍由 .q-btn 的 min-height: 40px 保证 */
+                .tgs-dialog-footer .q-btn { flex: 1 1 0; min-width: 0; }
                 /* 用户信息弹窗：账户卡片由 3 列改为单列，避免窄列里文字竖排 */
                 .accounts-grid {
                     grid-template-columns: minmax(0, 1fr) !important;

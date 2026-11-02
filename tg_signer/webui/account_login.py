@@ -777,10 +777,12 @@ def user_info_block() -> Callable[[], None]:
             if not entries:
                 ui.label("未找到用户信息").classes("text-gray-500")
                 return
-            for entry in entries:
-                name = entry.data.get("first_name") or ""
-                header = f"{entry.user_id} {name}".strip()
-                with ui.expansion(header, icon="person"):
+            # 展开项按需构建：初始只渲染标题，首次展开时才创建 JSON/表格子树，
+            # 避免账号多时一次性构建数千个 DOM 节点；折叠后再次展开不会重复构建
+            built_expansions: set[int] = set()
+
+            def _build_entry_content(exp, entry) -> None:
+                with exp:
                     ui.label(f"文件: {entry.path}")
                     ui.code(pretty_json(entry.data), language="json").classes("w-full")
 
@@ -837,5 +839,19 @@ def user_info_block() -> Callable[[], None]:
                         ui.label("未找到最近聊天记录").classes(
                             "text-gray-500 text-sm mt-2"
                         )
+
+            def _lazy_build(e, exp, entry) -> None:
+                if not e.value or exp.id in built_expansions:
+                    return
+                built_expansions.add(exp.id)
+                _build_entry_content(exp, entry)
+
+            for entry in entries:
+                name = entry.data.get("first_name") or ""
+                header = f"{entry.user_id} {name}".strip()
+                expansion = ui.expansion(header, icon="person")
+                expansion.on_value_change(
+                    lambda e, exp=expansion, item=entry: _lazy_build(e, exp, item)
+                )
 
     return refresh

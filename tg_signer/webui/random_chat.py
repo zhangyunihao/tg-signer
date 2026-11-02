@@ -1473,7 +1473,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
     asyncio.create_task(_poll_loop())
 
     # —— 添加任务弹窗 ——
-    with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl"):
+    with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl tgs-dialog-card"):
         add_dialog_close_button(add_dlg)
         ui.label("添加任务").classes("text-lg font-semibold")
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
@@ -1581,7 +1581,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         ui.label(
             "提示：发送过于频繁可能触发 Telegram 风控，建议间隔不小于 5 秒；同一账号不能同时用于多个运行中的任务。"
         ).classes("text-xs text-amber-600")
-        with ui.row().classes("w-full justify-end"):
+        with ui.row().classes("w-full justify-end tgs-dialog-footer"):
             ui.button("取消", on_click=add_dlg.close).props("flat")
             ui.button("确定添加", color="primary", on_click=on_add_task)
 

@@ -2685,7 +2685,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         detail_dlg.open()
 
     # —— 添加任务弹窗 ——
-    with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl"):
+    with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl tgs-dialog-card"):
         add_dialog_close_button(add_dlg)
         add_dlg_title = ui.label("添加任务").classes("text-lg font-semibold")
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
@@ -2985,7 +2985,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             "任务启动与每轮补漏时也会回扫各 bot 私聊，补捡停机期间的中奖通知。"
             "请确保账号已加入所监控的频道。"
         ).classes("text-xs text-amber-600")
-        with ui.row().classes("w-full justify-end"):
+        with ui.row().classes("w-full justify-end tgs-dialog-footer"):
             ui.button("取消", on_click=add_dlg.close).props("flat")
             add_dlg_submit = ui.button(
                 "确定添加", color="primary", on_click=on_add_task

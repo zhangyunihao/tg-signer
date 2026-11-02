@@ -60,8 +60,11 @@ def set_active_tab(name: str, client=None) -> None:
 def should_poll(client, tab: Optional[str] = None) -> bool:
     """轮询循环是否应继续刷新：页面可见，且（可选）所在 tab 处于激活状态。
 
-    未安装活跃度跟踪的页面（如独立进度页）没有状态记录，返回 True 保持原行为。
+    未安装活跃度跟踪的页面（如独立进度页）没有状态记录，返回 True 保持原行为；
+    但已删除或已断连的 client 无论有无记录都不再轮询。
     """
+    if client.is_deleted or not client.has_socket_connection:
+        return False
     entry = _STATE.get(client.id)
     if entry is None:
         return True
