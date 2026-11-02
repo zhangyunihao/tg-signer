@@ -17,7 +17,12 @@ from nicegui import app, ui
 
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.activity import install_activity_tracking, should_poll
-from tg_signer.webui.auto_leave import load_leave_tasks
+from tg_signer.webui.auto_leave import (
+    _fire_refresh_stats,
+    _leave_rows,
+    _patch_leave_task,
+    load_leave_tasks,
+)
 from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
@@ -402,6 +407,19 @@ def _leave_task_display(task_name: str, workdir) -> str:
         if str(t.get("name")) == task_name:
             return f"{i}｜{task_name}"
     return task_name
+
+
+def _find_leave_task(task_name: str, workdir) -> dict | None:
+    """按名称查找组合退频道子任务绑定的退频道任务配置。"""
+    name = str(task_name or "")
+    return next(
+        (t for t in load_leave_tasks(workdir) if str(t.get("name")) == name), None
+    )
+
+
+def _leave_targets(rows: list[dict], skipped: set[str]) -> list[dict]:
+    """退频道明细里本次要退出的行：剔除已勾选跳过（skipped）的频道。"""
+    return [r for r in rows if str(r.get("key") or "") not in skipped]
 
 
 def _sub_task_display(sub: dict, workdir) -> str:
@@ -1167,6 +1185,11 @@ class ComboTaskBlock:
                 if sub_type_text:
                     ui.badge(sub_type_text).props("color=teal-6 outline")
                 ui.space()
+                if "退频道" in str(sub.get("type") or ""):
+                    ui.button(
+                        "明细",
+                        on_click=lambda s=sub: self._open_leave_detail(s),
+                    ).props("flat dense color=primary")
                 ui.badge(status).props(f"color={color} outline")
             ui.label(_sub_task_display(sub, self.workdir)).classes(
                 "text-xs font-medium text-gray-700"
@@ -1210,6 +1233,14 @@ class ComboTaskBlock:
                             ui.label(note).classes("text-xs font-medium text-gray-500")
                         ui.space()
                         ui.badge(acc_status).props(f"color={acc_color} outline")
+
+    def _open_leave_detail(self, sub: dict) -> None:
+        """打开退频道子任务的明细弹窗（仅进度页注册了开启器）。"""
+        opener = getattr(self, "_leave_detail_opener", None)
+        if opener is None:
+            ui.notify("请在任务进度页查看退频道明细", type="warning")
+            return
+        opener(sub)
 
     def _tick(self) -> None:
         """每 2 秒轮询：落盘进度快照；历史状态或运行中任务进度变化时刷新列表。"""
@@ -1745,11 +1776,15 @@ class ComboTaskBlock:
                 "w-full gap-1 max-h-56 overflow-y-auto shrink-0"
             )
             self._new_task_checks = {}
-            self.new_task_accounts = ui.select(
-                label="账号（可选，选了则所有子任务仅用所选账号）",
-                options={},
-                multiple=True,
-            ).classes("w-full")
+            self.new_task_accounts = (
+                ui.select(
+                    label="账号（可选，选了则所有子任务仅用所选账号）",
+                    options={},
+                    multiple=True,
+                )
+                .classes("w-full")
+                .props("clearable")
+            )
             attach_select_all(self.new_task_accounts)
             ui.label(
                 "留空：各子任务使用其绑定的账号执行（账号之间并行启动）。"
@@ -2180,6 +2215,175 @@ def _build_progress_page(record_id: str) -> None:
 
     stop_btn.on_click(stop_task)
     # 「停止」只在页面头部提供；headless 实例没有历史列表可刷新，这里无需额外处理
+
+    # ---- 退频道子任务「明细」弹窗：勾选跳过退出的频道后确认退出 ----
+    # 弹窗在页面级常驻创建，避免放在每 2 秒重绘的进度卡片里被连带删除
+    leave_state: dict = {"task": None, "rows": [], "skipped": set()}
+    leave_refs: dict = {}
+
+    def _leave_count_text() -> str:
+        rows = leave_state["rows"]
+        skipped = leave_state["skipped"]
+        return f"将退出 {len(_leave_targets(rows, skipped))} 个，跳过 {len(skipped)} 个"
+
+    def _update_leave_count() -> None:
+        label = leave_refs.get("count")
+        if label is not None:
+            label.text = _leave_count_text()
+
+    def _toggle_leave_skip(key: str, checked: bool) -> None:
+        skipped = leave_state["skipped"]
+        if checked:
+            skipped.add(key)
+        else:
+            skipped.discard(key)
+        _update_leave_count()
+
+    def _render_leave_rows() -> None:
+        body = leave_refs.get("body")
+        if body is None:
+            return
+        body.clear()
+        rows = leave_state["rows"]
+        skipped = leave_state["skipped"]
+        with body:
+            if not rows:
+                ui.label("暂无待确认的频道").classes("text-sm text-gray-400")
+                return
+            for row in rows:
+                key = str(row.get("key") or "")
+                account = str(row.get("account") or "")
+                age = row.get("age_days")
+                meta = account
+                if isinstance(age, (int, float)):
+                    meta = (
+                        f"{account}　{age:g} 天未更新"
+                        if account
+                        else f"{age:g} 天未更新"
+                    )
+                with ui.column().classes("w-full gap-0 px-2 py-1 rounded border"):
+                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        ui.checkbox(
+                            value=key in skipped,
+                            on_change=lambda e, k=key: _toggle_leave_skip(k, e.value),
+                        ).props("dense")
+                        ui.label(str(row.get("title") or key)).classes("text-sm").style(
+                            "overflow-wrap: anywhere;"
+                        )
+                    if meta:
+                        ui.label(meta).classes("text-xs text-gray-500 pl-8")
+
+    def _leave_select_all(skip_all: bool) -> None:
+        rows = leave_state["rows"]
+        leave_state["skipped"] = (
+            {str(r.get("key") or "") for r in rows} if skip_all else set()
+        )
+        _render_leave_rows()
+        _update_leave_count()
+
+    async def _confirm_leave() -> None:
+        task = leave_state.get("task")
+        rows = leave_state["rows"]
+        targets = _leave_targets(rows, leave_state["skipped"])
+        if task is None:
+            return
+        if view.runner.runs.get(record_id) is not None:
+            ui.notify(
+                "组合任务运行中，请等任务结束后再手动退出，避免同一账号会话冲突",
+                type="warning",
+            )
+            return
+        if not targets:
+            ui.notify("没有要退出的频道（已勾选的都会跳过）", type="warning")
+            return
+        leave_detail_dialog.close()
+        ui.notify(f"开始退出 {len(targets)} 个频道…", type="info")
+        by_account: dict[str, list[dict]] = {}
+        for row in targets:
+            by_account.setdefault(str(row.get("account") or ""), []).append(row)
+        accounts = [a for a in by_account if a]
+        done: set[str] = set()
+        try:
+            for account in accounts:
+                done |= await _leave_rows(
+                    account,
+                    Path("."),
+                    by_account[account],
+                    lambda msg: logger.info("退频道明细：%s", msg),
+                    workdir=view.workdir,
+                )
+        except Exception as exc:
+            logger.debug("组合进度页手动退出频道失败", exc_info=True)
+            ui.notify(f"退出失败：{exc}", type="negative")
+            return
+        remaining = [r for r in rows if str(r.get("key") or "") not in done]
+        status = f"手动退出 {len(done)} 个，剩余待确认 {len(remaining)} 个"
+        task["rows"] = remaining
+        task["status"] = status
+        _patch_leave_task(
+            view.workdir,
+            str(task.get("id") or ""),
+            rows=remaining,
+            status=status,
+        )
+        _fire_refresh_stats(view.workdir, ".", accounts)
+        leave_state["rows"] = remaining
+        leave_state["skipped"] = set()
+        ui.notify(
+            f"退出完成：成功 {len(done)}/{len(targets)} 个，"
+            f"剩余待确认 {len(remaining)} 个",
+            type="positive",
+        )
+
+    def open_leave_detail(sub: dict) -> None:
+        name = str(sub.get("task") or "")
+        task = _find_leave_task(name, view.workdir)
+        if task is None:
+            ui.notify(f"未找到退频道任务「{name}」", type="warning")
+            return
+
+        def _age(row: dict) -> float:
+            try:
+                return float(row.get("age_days") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        rows = [
+            dict(r)
+            for r in (task.get("rows") or [])
+            if isinstance(r, dict) and r.get("key")
+        ]
+        rows.sort(key=lambda r: (-_age(r), str(r.get("account") or "")))
+        leave_state.update({"task": task, "rows": rows, "skipped": set()})
+        title_label = leave_refs.get("title")
+        if title_label is not None:
+            title_label.text = f"退频道明细 — {_leave_task_display(name, view.workdir)}"
+        _render_leave_rows()
+        _update_leave_count()
+        leave_detail_dialog.open()
+
+    with (
+        ui.dialog() as leave_detail_dialog,
+        ui.card().classes("w-[560px] max-w-[96vw] max-h-[88vh] overflow-auto"),
+    ):
+        add_dialog_close_button(leave_detail_dialog)
+        leave_refs["title"] = ui.label("退频道明细").classes("text-lg font-semibold")
+        ui.label(
+            "勾选表示跳过该频道；未勾选的频道点「确定退出」后立即退出（不可撤销）。"
+        ).classes("text-xs text-gray-500")
+        with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+            ui.button("全选跳过", on_click=lambda: _leave_select_all(True)).props(
+                "flat dense"
+            )
+            ui.button("全不选", on_click=lambda: _leave_select_all(False)).props(
+                "flat dense"
+            )
+            ui.button("确定退出", on_click=_confirm_leave).props(
+                "outline dense color=negative"
+            )
+            leave_refs["count"] = ui.label("").classes("text-xs text-gray-500 ml-auto")
+        leave_refs["body"] = ui.column().classes("w-full gap-1")
+    view._leave_detail_opener = open_leave_detail
 
     last_sig: dict[str, tuple | None] = {"value": None}
 

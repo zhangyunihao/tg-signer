@@ -2299,7 +2299,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
 
             # —— 移动端卡片列表 ——
             mobile_cards = ui.column().classes("w-full gap-2 tgs-mobile-cards")
-            shown_rows = rows if mobile_state["show_all"] else rows[:5]
+            shown_rows = rows[: mobile_state["limit"]]
 
             async def _card_start(nn: str, cb) -> None:
                 await start_task(nn, cb)
@@ -2417,23 +2417,23 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             ).props(f"flat dense color={pin_color}").tooltip(
                                 "取消置顶" if row["pinned"] else "置顶"
                             )
-                if len(rows) > 5:
-                    if mobile_state["show_all"]:
-                        ui.button(
-                            "收起",
-                            on_click=lambda: (
-                                mobile_state.update(show_all=False),
-                                render_tasks(),
-                            ),
-                        ).props("flat dense").classes("w-full")
-                    else:
-                        ui.button(
-                            f"展开更多（共 {len(rows)} 条）",
-                            on_click=lambda: (
-                                mobile_state.update(show_all=True),
-                                render_tasks(),
-                            ),
-                        ).props("flat dense").classes("w-full")
+                limit = mobile_state["limit"]
+                if len(rows) > limit:
+                    ui.button(
+                        f"展开更多（共 {len(rows)} 条）",
+                        on_click=lambda: (
+                            mobile_state.update(limit=limit + 5),
+                            render_tasks(),
+                        ),
+                    ).props("flat dense").classes("w-full")
+                elif len(rows) > 5:
+                    ui.button(
+                        "收起",
+                        on_click=lambda: (
+                            mobile_state.update(limit=5),
+                            render_tasks(),
+                        ),
+                    ).props("flat dense").classes("w-full")
 
             for name in list(tasks):
                 set_status = make_set_status(str(name))
@@ -2496,7 +2496,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             )
             ui.button("添加任务", icon="add", on_click=open_add_dialog).props("outline")
     task_list_container = ui.column().classes("w-full gap-2")
-    mobile_state = {"show_all": False}
+    mobile_state = {"limit": 5}
 
     ui.separator()
 

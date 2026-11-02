@@ -30,6 +30,10 @@ from tg_signer.giveaway_core import GiveawayEngine
 from tg_signer.giveaway_state import GiveawayState
 from tg_signer.logger import make_task_logger
 
+# 网络异常导致本轮扫描未完成时的退出码：组合任务按「退出码非 0 即失败」
+# 展示进度，若不区分，网络超时导致的空扫描会被当成成功子任务
+NET_UNFINISHED_EXIT_CODE = 4
+
 
 def engine_kwargs_from_spec(spec: dict) -> Dict[str, Any]:
     """把 JSON spec 映射为 GiveawayEngine.start 的关键字参数（纯函数，便于测试）。"""
@@ -132,6 +136,11 @@ async def _stats_loop(engine: GiveawayEngine, emit: Callable[[dict], None]) -> N
         await asyncio.sleep(1)
 
 
+def unfinished_net_exit_code(engine: GiveawayEngine) -> int:
+    """本轮扫描是否因网络异常未完成：是则返回失败退出码，否则返回 0。"""
+    return NET_UNFINISHED_EXIT_CODE if engine.net_interrupted else 0
+
+
 async def run_giveaway(spec: dict) -> int:
     account = str(spec.get("account") or "")
     accounts = spec.get("accounts")
@@ -210,7 +219,13 @@ async def run_giveaway(spec: dict) -> int:
         await finished.wait()
     finally:
         stats_task.cancel()
-    return 0
+    if engine.net_interrupted:
+        accounts = "、".join(engine.net_interrupted)
+        print(
+            f"网络异常导致扫描未完成（账号：{accounts}），子任务按失败结束",
+            flush=True,
+        )
+    return unfinished_net_exit_code(engine)
 
 
 def main() -> None:

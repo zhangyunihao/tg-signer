@@ -835,6 +835,9 @@ class GiveawayEngine:
         # 本轮各账号按来源频道/群组的新参与数：{account: {chat标题: count}}
         self.joined_by_account_chat: Dict[str, Dict[str, int]] = {}
         self.failed = 0
+        # 本轮因网络异常中断的扫描：{account: 原因}（首次原因），
+        # 供组合任务判定「网络超时导致扫描未完成」的子任务为失败
+        self.net_interrupted: Dict[str, str] = {}
         self.scanning = False
         self.scan_text = ""
         # 中奖回扫进度（与频道扫描分开显示）：分母=本轮待回扫的账号×bot 数，
@@ -1007,6 +1010,7 @@ class GiveawayEngine:
         self.joined = 0
         self.joined_by_account = {}
         self.failed = 0
+        self.net_interrupted.clear()
         self.scan_text = ""
         self._stopping = False
         self._flood_counts.clear()
@@ -1139,6 +1143,7 @@ class GiveawayEngine:
                         self.log(f"「{account}」已连接（昵称获取超时，已忽略）")
                     return
                 except asyncio.TimeoutError:
+                    self._note_net_interrupt(account, "连接超时，未扫描")
                     self.log(f"「{account}」连接超时（网络或代理异常），已跳过")
                     if client is not None:
                         await safe_disconnect(client)
@@ -1162,6 +1167,8 @@ class GiveawayEngine:
                             self.log(f"「{account}」任务已停止，放弃重连")
                             return
                         continue
+                    if _is_network_failure(exc):
+                        self._note_net_interrupt(account, "连接失败，未扫描")
                     self.log(f"「{account}」连接失败: {exc}")
                     return
 
@@ -1191,6 +1198,7 @@ class GiveawayEngine:
         self._net_timeout_streak.pop(account, None)
         until = datetime.now() + timedelta(seconds=NET_TIMEOUT_PAUSE_SECONDS)
         self._net_paused_until[account] = until
+        self._note_net_interrupt(account, "连续网络超时，本轮扫描未完成")
         self.log(
             f"[{account}] 连续 {NET_TIMEOUT_PAUSE_STREAK} 次网络超时，"
             f"暂停该账号本轮扫描 {NET_TIMEOUT_PAUSE_SECONDS // 60} 分钟"
@@ -1208,6 +1216,16 @@ class GiveawayEngine:
             self.log(f"[{account}] 网络超时暂停结束，恢复扫描")
             return False
         return True
+
+    def _note_net_interrupt(self, account: str, reason: str) -> None:
+        """记录账号因网络异常未完成扫描（只留首次原因，避免重复刷记录）。
+
+        net_interrupted 非空表示本轮扫描被网络问题打断，组合任务据此把
+        该账号的自动抽奖子任务判定为失败，而不是按退出码 0 当成功。
+        """
+        if account in self.net_interrupted:
+            return
+        self.net_interrupted[account] = reason
 
     async def _run(self, accounts: List[str], auto_scan: bool) -> None:
         try:
@@ -1327,6 +1345,7 @@ class GiveawayEngine:
     ) -> None:
         """单账号扫描全部监控对象（scan_now 的并行子任务）。"""
         if not await self._ensure_connected(client):
+            self._note_net_interrupt(account, "连接不可用，未扫描")
             self.log(f"[{account}] 连接不可用，跳过该账号本轮扫描")
             return
         if self._is_net_paused(account):
@@ -1434,6 +1453,8 @@ class GiveawayEngine:
                 if self.max_joins is not None and self.joined >= self.max_joins:
                     break
         except Exception as exc:
+            if _is_network_failure(exc):
+                self._note_net_interrupt(account, f"扫描 {chat} 失败")
             self.log(f"[{account}] 扫描 {chat} 失败: {exc}")
 
     def _advance_expired_streak(
@@ -1464,6 +1485,8 @@ class GiveawayEngine:
         try:
             chat_info = await client.get_chat(chat)
         except Exception as exc:
+            if _is_network_failure(exc):
+                self._note_net_interrupt(account, f"获取 {chat} 信息失败")
             self.log(f"[{account}] 获取 {chat} 信息失败，跳过类型识别: {exc}")
             return self._chat_types.get(str(chat)), None
         type_name = getattr(getattr(chat_info, "type", None), "name", "")
@@ -1517,6 +1540,8 @@ class GiveawayEngine:
             try:
                 chat_info = await client.get_chat(chat)
             except Exception as exc:
+                if _is_network_failure(exc):
+                    self._note_net_interrupt(account, f"获取 {chat} 信息失败")
                 self.log(f"[{account}] 获取 {chat} 信息失败，跳过置顶扫描: {exc}")
                 return []
         pinned = getattr(chat_info, "pinned_message", None)
@@ -1529,6 +1554,8 @@ class GiveawayEngine:
             async for m in client.search_messages(chat, filter=MessagesFilter.PINNED):
                 pinned_list.append(m)
         except Exception as exc:
+            if _is_network_failure(exc):
+                self._note_net_interrupt(account, f"枚举 {chat} 置顶消息失败")
             self.log(f"[{account}] 枚举置顶消息失败，仅处理最新置顶: {exc}")
             pinned_list = []
         latest_id = getattr(pinned, "id", None)

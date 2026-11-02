@@ -5848,3 +5848,61 @@ def test_scan_one_skips_account_while_net_paused(tmp_path):
     asyncio.run(engine._scan_one("acc", FakeClient(), done, 1))
     assert done["n"] == 0
     assert any("网络超时暂停中" in line for line in logs)
+
+
+def test_note_net_interrupt_keeps_first_reason(tmp_path):
+    """网络中断只记录首次原因，避免多处失败时覆盖成最后一条。"""
+    engine, _state = _engine(tmp_path)
+
+    engine._note_net_interrupt("acc", "第一处失败")
+    engine._note_net_interrupt("acc", "第二处失败")
+
+    assert engine.net_interrupted == {"acc": "第一处失败"}
+
+
+def test_net_timeout_pause_marks_net_interrupt(tmp_path):
+    """触发账号级网络熔断即视为本轮扫描未完成，组合任务据此判子任务失败。"""
+    import tg_signer.giveaway_core as gc
+
+    engine, _state = _engine(tmp_path)
+
+    for _ in range(gc.NET_TIMEOUT_PAUSE_STREAK):
+        engine._note_net_call_result("acc", False)
+
+    assert engine.net_interrupted["acc"] == "连续网络超时，本轮扫描未完成"
+
+
+def test_scan_chat_history_network_failure_marks_net_interrupt(tmp_path):
+    """拉取历史消息网络超时：记入 net_interrupted，不再按成功结束。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    class _TimeoutClient:
+        def get_chat_history(self, chat):
+            async def _history():
+                raise RuntimeError("网络请求 get_chat_history 超时（30 秒，网络异常）")
+                yield
+
+            return _history()
+
+    asyncio.run(engine._scan_chat_history("acc", _TimeoutClient(), "chat"))
+
+    assert engine.net_interrupted == {"acc": "扫描 chat 失败"}
+    assert any("扫描 chat 失败" in line for line in logs)
+
+
+def test_scan_one_connection_unavailable_marks_net_interrupt(tmp_path):
+    """账号连不上时跳过扫描，同样计入网络中断（如整体断网/代理僵死）。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    engine.chats = ["chat"]
+    client = FakeClient()
+    client.is_connected = False
+
+    asyncio.run(engine._scan_one("acc", client, {"n": 0}, 1))
+
+    assert engine.net_interrupted == {"acc": "连接不可用，未扫描"}

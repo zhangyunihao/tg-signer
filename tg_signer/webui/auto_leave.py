@@ -1594,6 +1594,11 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     async def _poll_external_tasks() -> None:
         while True:
             await asyncio.sleep(3)
+            # 客户端断开后退出循环：should_poll 在状态记录被清理后返回 True，
+            # 否则会持续向已删除的 client 渲染列表（服务端日志出现
+            # "Client has been deleted but is still being used"）
+            if not poll_client.has_socket_connection:
+                return
             # 页面不可见或不在该 tab 时跳过磁盘检查，切回后自动恢复
             if not should_poll(poll_client, "leave"):
                 continue

@@ -459,6 +459,22 @@ def test_giveaway_runner_engine_kwargs_multi_accounts():
     assert kwargs["accounts"] == ["alice", "bob"]
 
 
+def test_giveaway_runner_exit_code_on_net_interrupt():
+    """网络异常导致扫描未完成时返回非 0，组合任务才把该子任务标为失败。"""
+    from types import SimpleNamespace
+
+    from tg_signer.giveaway_runner import (
+        NET_UNFINISHED_EXIT_CODE,
+        unfinished_net_exit_code,
+    )
+
+    assert unfinished_net_exit_code(SimpleNamespace(net_interrupted={})) == 0
+    assert (
+        unfinished_net_exit_code(SimpleNamespace(net_interrupted={"a": "扫描失败"}))
+        == NET_UNFINISHED_EXIT_CODE
+    )
+
+
 def test_giveaway_process_spec_and_stats(tmp_path):
     """子进程 spec 构建与统计回报解析：WebUI 只持有展示所需的快照。"""
     from tg_signer.webui.giveaway_process import GiveawayProcess
@@ -687,3 +703,40 @@ def test_giveaway_sub_note_shows_type_chats_and_repeat(tmp_path):
         _giveaway_sub_note({"type": "自动抽奖 (giveaway run)", "task": "9"}, tmp_path)
         == ""
     )
+
+
+def test_leave_detail_targets_skip_checked_rows():
+    """退频道明细：勾选（skipped）的频道不退出，仅退出未勾选的。"""
+    from tg_signer.webui.combo import _leave_targets
+
+    rows = [
+        {"key": "a", "title": "频道A"},
+        {"key": "b", "title": "频道B"},
+        {"key": "c", "title": "频道C"},
+    ]
+    assert _leave_targets(rows, set()) == rows
+    assert _leave_targets(rows, {"b"}) == [rows[0], rows[2]]
+    # 全部勾选跳过 → 没有要退出的频道
+    assert _leave_targets(rows, {"a", "b", "c"}) == []
+
+
+def test_find_leave_task_by_name(tmp_path):
+    """按名称查找组合退频道子任务绑定的任务配置。"""
+    from tg_signer.webui.auto_leave import save_leave_tasks
+    from tg_signer.webui.combo import _find_leave_task
+
+    save_leave_tasks(
+        tmp_path,
+        [
+            {
+                "id": "leave_t1",
+                "name": "退频道任务 10-20 01:35",
+                "accounts": ["alice"],
+                "rows": [{"key": "a", "title": "频道A", "account": "alice"}],
+            }
+        ],
+    )
+    task = _find_leave_task("退频道任务 10-20 01:35", tmp_path)
+    assert task is not None and task["id"] == "leave_t1"
+    assert task["rows"] == [{"key": "a", "title": "频道A", "account": "alice"}]
+    assert _find_leave_task("不存在", tmp_path) is None

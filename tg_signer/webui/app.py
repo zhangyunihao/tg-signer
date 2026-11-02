@@ -1114,6 +1114,13 @@ def build_ui(auth_code: str = None) -> None:
             .tgs-mobile-cards { display: none !important; }
             @media (max-width: 640px) {
                 .nicegui-content { padding: 8px !important; }
+                /* 触控目标：移动端按钮统一至少 40px 高（Quasar dense 默认 32~36px，
+                   低于可点面积建议值），纯图标按钮同时补足宽度 */
+                .q-btn { min-height: 40px !important; }
+                .q-btn--round { min-width: 40px !important; }
+                /* 输入框字号提升到 16px：低于 16px 时 iOS Safari 聚焦会自动放大整页 */
+                .q-field__native,
+                .q-field__input { font-size: 16px !important; }
                 /* 移动端排版压缩：说明文字与页面标题各缩一档，区块间距收紧 */
                 .nicegui-content .text-sm {
                     font-size: 12.5px;
@@ -1166,8 +1173,8 @@ def build_ui(auth_code: str = None) -> None:
                 }
                 .account-card-head > .q-btn { flex: 0 0 auto; }
                 .accounts-grid .q-btn {
-                    min-width: 30px;
-                    min-height: 30px;
+                    min-width: 36px;
+                    min-height: 36px;
                     padding: 3px;
                 }
                 .accounts-grid > div { padding: 6px 8px !important; gap: 2px !important; }
@@ -1218,13 +1225,14 @@ def build_ui(auth_code: str = None) -> None:
                 .tgs-header-version { display: none; }
                 .tgs-header-actions .q-btn { padding: 4px; }
                 .main-tabs { overflow: hidden; }
-                .main-tabs .q-tab { padding-left: 9px; padding-right: 9px; }
+                .main-tabs .q-tab { padding-left: 5px; padding-right: 5px; }
                 /* tab 文字用两字短名（data-short 由页面脚本写入 label 上）：
-                   原全名字号置 0 隐藏，::before 显示短名，五个 tab 一屏放下 */
+                   原全名字号置 0 隐藏，::before 显示短名，五个 tab 一屏放下；
+                   360px 窄屏下 15px 会挤压出横向滚动，缩到 14px 保证全部可见 */
                 .main-tabs .q-tab .q-tab__label { font-size: 0; }
                 .main-tabs .q-tab .q-tab__label::before {
                     content: attr(data-short);
-                    font-size: 15px;
+                    font-size: 14px;
                     letter-spacing: normal;
                 }
                 /* 弹窗：利用几乎全部宽度，高度限制在可视区内（dvh 适配地址栏伸缩），
