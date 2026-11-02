@@ -30,6 +30,7 @@ def test_build_combo_sub_spec_leave(tmp_path):
     inner = spec["spec"]
     assert inner["account"] == "alice"
     assert inner["session_dir"] == "."
+    assert inner["workdir"] == str(tmp_path)  # 限流同步到账户页用
     assert inner["days"] == 14
     assert inner["include_groups"] is True
     assert inner["skip_pinned"] is False

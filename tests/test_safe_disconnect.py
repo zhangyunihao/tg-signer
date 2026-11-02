@@ -75,6 +75,23 @@ def test_safe_disconnect_timeout_falls_back_to_storage_close():
     assert client.storage.closed is True
 
 
+def test_safe_disconnect_ignores_storage_conn_before_open():
+    """storage 未 open 时访问 conn 抛 RuntimeError，兜底断连不应再抛异常。"""
+
+    class NotOpenedStorage:
+        @property
+        def conn(self):
+            raise RuntimeError("`SQLiteStorage.conn` accessed before `open()`")
+
+        async def close(self) -> None:
+            raise AssertionError("未打开存储不应调用 close")
+
+    client = FakeClient(fail_all=True)
+    client.storage = NotOpenedStorage()
+    asyncio.run(safe_disconnect(client))
+    assert client.disconnect_calls == 2
+
+
 @pytest.mark.asyncio
 async def test_safe_disconnect_within_running_loop():
     client = FakeClient(fail_graceful=True)

@@ -3782,6 +3782,7 @@ class GiveawayEngine:
                 "group": group_name,
                 "password": password,
                 "error": "未在清单中定位到口令群组链接",
+                "session_dir": str(self.session_dir or "."),
             }
         )
 
@@ -3796,6 +3797,7 @@ class GiveawayEngine:
                 "group": group_name,
                 "password": password,
                 "error": f"加入口令群失败: {detail}",
+                "session_dir": str(self.session_dir or "."),
             }
         )
 
@@ -3950,6 +3952,9 @@ class GiveawayEngine:
                     "group": group_name,
                     "password": password,
                     "error": str(exc)[:120],
+                    # 重试按钮需要原始发送目标与会话目录（消息中心里直接重发口令）
+                    "target": str(send_target),
+                    "session_dir": str(self.session_dir or "."),
                 }
             )
 

@@ -112,6 +112,7 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
                 "spec": {
                     "account": account,
                     "session_dir": ".",
+                    "workdir": str(workdir),
                     "days": (
                         float(leave_task["days"])
                         if leave_task.get("days") is not None
@@ -134,6 +135,7 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
             "spec": {
                 "account": account,
                 "session_dir": ".",
+                "workdir": str(workdir),
                 "days": float(cfg["days"]) if cfg.get("days") is not None else 7,
                 "scan_types": _leave_scan_types(cfg),
                 "include_groups": bool(cfg.get("include_groups")),

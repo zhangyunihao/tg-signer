@@ -852,6 +852,47 @@ async def test_call_telegram_api_without_floodwait_retry_raises_immediately(
 
 
 @pytest.mark.asyncio
+async def test_call_telegram_api_records_account_limit_on_floodwait(
+    monkeypatch, signer_factory
+):
+    """签到路径的 FloodWait 同步写入 account_limits，供 WebUI 账户页展示。"""
+    import time
+
+    import tg_signer.core as core
+    from tg_signer.giveaway_state import GiveawayState
+
+    monkeypatch.setattr(core, "_API_MIN_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(core, "_API_FLOODWAIT_PADDING_SECONDS", 0.0)
+
+    async def fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(core.asyncio, "sleep", fake_sleep)
+
+    signer = signer_factory()
+
+    async def floodwait_once():
+        raise core.errors.FloodWait(30)
+
+    with pytest.raises(core.errors.FloodWait):
+        await signer._call_telegram_api(
+            "签到",
+            floodwait_once,
+            retry_on_floodwait=False,
+        )
+
+    state = GiveawayState(signer.workdir)
+    try:
+        limits = state.active_account_limits()
+    finally:
+        state.close()
+    entry = limits["acct"][0]
+    assert entry["kind"] == "flood_wait"
+    assert entry["note"] == "签到"
+    assert entry["until"] > time.time()
+
+
+@pytest.mark.asyncio
 async def test_call_telegram_api_is_serialized_for_same_account(
     monkeypatch, signer_factory
 ):

@@ -6,10 +6,12 @@
 
 spec 格式::
 
-    {"account": "账号名", "session_dir": "工作目录",
+    {"account": "账号名", "session_dir": "工作目录", "workdir": "状态库目录",
      "days": 7, "scan_types": "both", "skip_pinned": true,
      "include_keywords": ["签到", ...], "exclude_keywords": ["抽奖", ...],
      "auto_leave": true}
+
+workdir 为状态库目录（限流同步到 WebUI 账户页展示），可省略。
 
 days 为不更新天数阈值（支持小数，如 0.5），0 表示扫描全部频道/群组
 （此时不允许自动退出）。
@@ -64,6 +66,8 @@ async def run_leave(spec: dict) -> int:
     d = spec.get("days")
     days = _to_days(d, 7)
     session_dir = Path(str(spec.get("session_dir") or "."))
+    # 状态库目录：限流同步到 WebUI 账户页展示（旧 spec 无此字段时不记录）
+    workdir = str(spec["workdir"]) if spec.get("workdir") else None
     rows = await scan_stale_chats(
         account,
         session_dir,
@@ -72,6 +76,7 @@ async def run_leave(spec: dict) -> int:
         bool(spec.get("skip_pinned", True)),
         log,
         skip_keywords=load_skip_keywords(session_dir),
+        workdir=workdir,
     )
     inc_kws = [str(k) for k in (spec.get("include_keywords") or []) if k]
     if inc_kws:
@@ -115,7 +120,14 @@ async def run_leave(spec: dict) -> int:
 
         async def _do_leave(row: Dict) -> None:
             async with sem:
-                success = await leave_one(client, row["chat_id"], row["title"], log)
+                success = await leave_one(
+                    client,
+                    row["chat_id"],
+                    row["title"],
+                    log,
+                    account=account,
+                    workdir=workdir,
+                )
                 if success:
                     async with done_lock:
                         done_keys.add(row["key"])

@@ -124,7 +124,9 @@ class GiveawayProcess:
 
         self.proc = proc
         # 线程持有本轮自己的参数：下一轮 start 覆盖实例属性后，旧线程仍按本轮收尾
-        threading.Thread(target=self._read_stdout, args=(proc, log), daemon=True).start()
+        threading.Thread(
+            target=self._read_stdout, args=(proc, log), daemon=True
+        ).start()
         threading.Thread(
             target=self._read_events,
             args=(proc, events_file, on_event, on_finish, self._loop),
@@ -182,9 +184,7 @@ class GiveawayProcess:
             "join_flood_buffer": cfg.get("join_flood_buffer"),
         }
 
-    def _read_stdout(
-        self, proc: Optional[subprocess.Popen] = None, log=None
-    ) -> None:
+    def _read_stdout(self, proc: Optional[subprocess.Popen] = None, log=None) -> None:
         proc = self.proc if proc is None else proc
         if log is None:
             log = self._log

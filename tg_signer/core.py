@@ -60,6 +60,7 @@ from tg_signer.config import (
 
 from ._kurigram import SafeGetForumTopics
 from .ai_tools import AITools, OpenAIConfigManager
+from .giveaway_state import record_account_limit
 from .utils import (
     UserInput,
     atomic_write_json,
@@ -498,7 +499,13 @@ async def safe_disconnect(client: Optional[Client], timeout: float = 15.0) -> No
             logger.debug("safe_disconnect %s 阶段失败", stage, exc_info=True)
     if not closed:
         storage = getattr(client, "storage", None)
-        if getattr(storage, "conn", None) is not None:
+        # storage 未成功 open 时访问 conn 会抛 RuntimeError（而非 AttributeError），
+        # getattr 的默认值兜不住，需要显式捕获，避免兜底断连本身再抛异常
+        try:
+            conn = getattr(storage, "conn", None)
+        except Exception:
+            conn = None
+        if conn is not None:
             try:
                 await storage.close()
             except Exception:
@@ -665,13 +672,21 @@ class BaseUserWorker(Generic[ConfigT]):
                     return result
                 except errors.FloodWait as e:
                     _API_LAST_CALL_AT[key] = loop.time()
-                    if not retry_on_floodwait or retries_left <= 0:
-                        raise
-                    retries_left -= 1
                     wait_seconds = (
                         max(float(getattr(e, "value", 0) or 0), 0)
                         + _API_FLOODWAIT_PADDING_SECONDS
                     )
+                    # 同步限流到状态库，WebUI 账户页可展示（重试前/重试耗尽都记）
+                    record_account_limit(
+                        getattr(self, "_workdir", None),
+                        getattr(self, "_account", None),
+                        "flood_wait",
+                        time.time() + wait_seconds,
+                        operation,
+                    )
+                    if not retry_on_floodwait or retries_left <= 0:
+                        raise
+                    retries_left -= 1
                     self.log(
                         f"{operation} 触发 FloodWait，等待 {wait_seconds:.1f}s 后重试（剩余重试 {retries_left} 次）",
                         level="WARNING",

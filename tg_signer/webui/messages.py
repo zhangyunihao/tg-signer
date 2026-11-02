@@ -45,6 +45,9 @@ from tg_signer.webui.giveaway import (
     load_speech_alerts,
     load_speech_insufficient_alerts,
     load_win_alerts,
+    remove_speak_alert,
+    retry_all_speak_alerts,
+    retry_speak_alert,
 )
 
 logger = logging.getLogger(__name__)
@@ -235,6 +238,8 @@ def collect_messages(workdir, read_keys: Set[str] | None = None) -> List[dict]:
                 "account": acct,
                 "time": time_str,
                 "text": format_speak_alert(a),
+                # 原始提醒（含账号/目标/会话目录），供「重试」按钮直接重发口令
+                "retry": a,
             }
         )
     # 3) 报名成功后仍未达标的发言数任务（还需发言 N 条）
@@ -431,6 +436,46 @@ def _build_center_page() -> None:
         save_pin_keys(state.workdir, pin_keys)
         render_list()
 
+    async def retry_speak(alert: dict) -> None:
+        """口令发言提醒的重试：重发口令，成功后自动消除该提醒。"""
+        ui.notify("正在重试发送口令…", type="info")
+        ok, detail = await retry_speak_alert(state.workdir, alert)
+        if ok:
+            remove_speak_alert(state.workdir, alert)
+            refresh_all()
+        ui.notify(detail, type="positive" if ok else "negative", multi_line=True)
+
+    async def retry_all_speak() -> None:
+        """一键重发：串行重发全部口令提醒，逐条成功消除，结束汇总。"""
+        alerts = load_speak_alerts(state.workdir)
+        if not alerts:
+            ui.notify("没有待重发的口令提醒", type="info")
+            return
+        retry_all_btn.disable()
+        try:
+            retry_all_btn.set_text("重发中…")
+
+            def _on_progress(idx: int, total: int) -> None:
+                retry_all_btn.set_text(f"重发中 {idx}/{total}")
+
+            ok_count, failures = await retry_all_speak_alerts(
+                state.workdir, on_progress=_on_progress
+            )
+        finally:
+            retry_all_btn.set_text("重发口令")
+            retry_all_btn.enable()
+            refresh_all()
+        if failures:
+            ui.notify(
+                f"重发完成：成功 {ok_count} 条，失败 {len(failures)} 条\n"
+                + "\n".join(failures[:5])
+                + ("\n…" if len(failures) > 5 else ""),
+                type="warning",
+                multi_line=True,
+            )
+        else:
+            ui.notify(f"重发完成：{ok_count} 条口令全部发送成功", type="positive")
+
     def render_list() -> None:
         list_container.clear()
         messages = visible_messages()
@@ -480,6 +525,16 @@ def _build_center_page() -> None:
                         "text-sm flex-1 min-w-0 "
                         + ("text-gray-900" if unread else "text-gray-500")
                     )
+                    if m.get("retry"):
+                        # click.stop 阻止冒泡，避免重试时把消息同时标为已读
+                        async def _on_retry_click(
+                            *_args, _alert: dict = m["retry"]
+                        ) -> None:
+                            await retry_speak(_alert)
+
+                        ui.button(icon="replay").props(
+                            "flat round dense size=sm color=primary"
+                        ).on("click.stop", _on_retry_click).tooltip("重试发送口令")
                     # click.stop 阻止冒泡，避免点图钉时同时把消息标记为已读
                     ui.button(icon="push_pin").props(
                         "flat round dense size=sm "
@@ -501,6 +556,8 @@ def _build_center_page() -> None:
             type_sel.value = ALL_TYPES
             app.storage.user[TYPE_FILTER_STORAGE_KEY] = ALL_TYPES
         type_sel.update()
+        # 只要还有口令提醒就显示「重发口令」（重发成功后随提醒消除自动隐藏）
+        retry_all_btn.set_visibility(bool(load_speak_alerts(state.workdir)))
         render_list()
         refresh_unread_badge()
 
@@ -531,11 +588,16 @@ def _build_center_page() -> None:
             ui.label("消息中心").classes("text-xl font-semibold")
             unread_badge = ui.badge("0").props("color=red").classes("text-[10px]")
             ui.space()
+            # 重发口令：与右侧单条重试同数据源，仅存在口令提醒时显示
+            retry_all_btn = ui.button("重发口令", on_click=retry_all_speak).props(
+                "outline dense color=primary"
+            )
             ui.button("全部已读", on_click=mark_all_read).props("outline dense")
             ui.button(icon="refresh").props("flat round dense").on_click(refresh_all)
         ui.label(
             "汇总抽奖中奖提醒、监控对象加入失败提醒与抽奖过程中未完成的发言任务"
             "（口令发送失败/发言数未达标，显示还需发言条数），点击消息标记为已读，"
+            "「发言任务」右侧的刷新按钮可重试发送口令，顶部「重发口令」可批量重发全部，"
             "点击右侧图钉可置顶/取消置顶（置顶消息始终排在最前）。"
         ).classes("text-xs text-gray-500")
         # 恢复上次选择的过滤用户/消息类型（刷新页面、重开标签页后仍保留）

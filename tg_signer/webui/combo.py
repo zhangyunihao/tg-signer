@@ -1755,12 +1755,15 @@ class ComboTaskBlock:
                 "留空：各子任务使用其绑定的账号执行（账号之间并行启动）。"
                 "选择账号后：所有子任务仅用所选账号执行。"
             ).classes("text-xs text-gray-500")
-            ui.label("开始时间（可选）").classes("text-sm text-gray-600")
-            self.new_task_start_time = (
-                ui.time(value=None).classes("w-full").props("clearable")
-            )
+            # 用单行输入替代 ui.time 时钟弹层：弹层占满弹窗、手机上尤其笨重，
+            # 这里只需 HH:MM，输入框更简洁，格式由启动时校验兜底
+            self.new_task_start_time = ui.input(
+                label="开始时间（可选，HH:MM，留空立即执行）",
+                placeholder="如 14:30",
+                clearable=True,
+            ).classes("w-56")
             ui.label(
-                "留空立即执行；所选时间已过则从明天该时间开始。"
+                "所选时间已过则从明天该时间开始。"
                 "开始时间到达后先检测 TG 网络，不通则按下方间隔重试，"
                 "次数用尽仍不通则放弃本次任务。"
             ).classes("text-xs text-gray-500")
@@ -1834,7 +1837,7 @@ class ComboTaskBlock:
         self.new_task_accounts.set_value(
             [a for a in (accounts or []) if a in valid_accounts]
         )
-        self.new_task_start_time.set_value(None)
+        self.new_task_start_time.set_value("")
         self.new_task_retry_interval.set_value(30)
         self.new_task_retry_times.set_value(3)
         self.new_task_dialog.open()
@@ -1862,7 +1865,7 @@ class ComboTaskBlock:
                     hour=hour, minute=minute, second=0, microsecond=0
                 )
             except ValueError:
-                ui.notify("开始时间格式无效，请重新选择", type="warning")
+                ui.notify("开始时间格式无效，请按 HH:MM 输入", type="warning")
                 return
             if target <= datetime.now():
                 target += timedelta(days=1)

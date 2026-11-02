@@ -1,6 +1,7 @@
 """账号频道/群组已满（CHANNELS_TOO_MUCH）→ 消息提醒 + 自动退频道的回归测试。"""
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 
 from tg_signer.giveaway_core import GiveawayEngine
@@ -102,7 +103,14 @@ def test_run_auto_leave_task_leaves_unprotected(tmp_path, monkeypatch):
     calls = {}
 
     async def fake_scan(
-        account, session_dir, days, scan_types, skip_pinned, log, skip_keywords=None
+        account,
+        session_dir,
+        days,
+        scan_types,
+        skip_pinned,
+        log,
+        skip_keywords=None,
+        workdir=None,
     ):
         calls.update(
             account=account,
@@ -110,10 +118,13 @@ def test_run_auto_leave_task_leaves_unprotected(tmp_path, monkeypatch):
             scan_types=scan_types,
             skip_pinned=skip_pinned,
             skip_keywords=skip_keywords,
+            workdir=workdir,
         )
         return [dict(r) for r in found]
 
-    async def fake_leave(account, session_dir, rows, log, should_stop=None):
+    async def fake_leave(
+        account, session_dir, rows, log, should_stop=None, workdir=None
+    ):
         calls["left"] = [r["title"] for r in rows]
         return {r["key"] for r in rows}
 
@@ -128,6 +139,7 @@ def test_run_auto_leave_task_leaves_unprotected(tmp_path, monkeypatch):
     assert saved["start_time"]
     assert calls["days"] == 1
     assert calls["scan_types"] == "channel"
+    assert calls["workdir"] == tmp_path
     assert calls["left"] == ["普通频道"]
 
 
@@ -137,7 +149,14 @@ def test_days_threshold_supports_fractional_values(tmp_path, monkeypatch):
     calls = {}
 
     async def fake_scan(
-        account, session_dir, days, scan_types, skip_pinned, log, skip_keywords=None
+        account,
+        session_dir,
+        days,
+        scan_types,
+        skip_pinned,
+        log,
+        skip_keywords=None,
+        workdir=None,
     ):
         calls["days"] = days
         return []
@@ -267,6 +286,89 @@ def test_scan_stale_chats_skips_configured_titles(tmp_path, monkeypatch):
     )
     assert [r["title"] for r in rows] == ["普通频道"]
     assert any("跳过指定频道/群组" in line for line in logs)
+
+
+def _read_limits(workdir):
+    from tg_signer.giveaway_state import GiveawayState
+
+    state = GiveawayState(workdir)
+    try:
+        return state.active_account_limits()
+    finally:
+        state.close()
+
+
+def test_leave_one_floodwait_records_account_limit(tmp_path, monkeypatch):
+    """退出时的 FloodWait 同步写入 account_limits（账户页可展示）。"""
+    from pyrogram.errors import FloodWait
+
+    class FloodLeaveClient:
+        async def leave_chat(self, chat_id):
+            raise FloodWait(value=2)
+
+    async def fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(auto_leave.asyncio, "sleep", fake_sleep)
+
+    logs = []
+    ok = asyncio.run(
+        auto_leave.leave_one(
+            FloodLeaveClient(),
+            -100123,
+            "测试频道",
+            logs.append,
+            account="alice",
+            workdir=tmp_path,
+        )
+    )
+    assert ok is False
+    entry = _read_limits(tmp_path)["alice"][0]
+    assert entry["kind"] == "flood_wait"
+    assert entry["note"] == "测试频道"
+    assert entry["until"] > time.time()
+
+
+def test_scan_stale_chats_floodwait_records_account_limit(tmp_path, monkeypatch):
+    """扫描对话时的 FloodWait 同步写入 account_limits（账户页可展示）。"""
+    from pyrogram.errors import FloodWait
+
+    class FloodDialogsClient:
+        async def connect(self):
+            return True
+
+        async def get_dialogs(self):
+            raise FloodWait(value=5)
+            yield  # pragma: no cover
+
+    async def fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(auto_leave.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(auto_leave, "get_client", lambda *a, **k: FloodDialogsClient())
+
+    async def _noop_disconnect(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(auto_leave, "safe_disconnect", _noop_disconnect)
+
+    logs = []
+    rows = asyncio.run(
+        auto_leave.scan_stale_chats(
+            "alice",
+            tmp_path,
+            1,
+            "channel",
+            True,
+            logs.append,
+            workdir=tmp_path,
+        )
+    )
+    assert rows == []
+    assert any("扫描触发限流" in line for line in logs)
+    entry = _read_limits(tmp_path)["alice"][0]
+    assert entry["kind"] == "flood_wait"
+    assert entry["until"] > time.time()
 
 
 def test_message_sort_key_orders_by_time_without_strptime():

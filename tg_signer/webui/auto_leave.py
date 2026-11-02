@@ -21,6 +21,7 @@ from nicegui import ui
 from pyrogram.errors import FloodWait, RPCError
 
 from tg_signer.core import get_client, safe_disconnect, timeout_aiter
+from tg_signer.giveaway_state import record_account_limit
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.activity import should_poll
 from tg_signer.webui.channel_stats import refresh_stats_for_accounts
@@ -359,6 +360,7 @@ async def run_auto_leave_task(
                 bool(task.get("skip_pinned", True)),
                 log_fn,
                 skip_keywords=skip_keywords,
+                workdir=workdir,
             )
             auto_rows = [r for r in found if not _kw_hit(task, r["title"])]
             kept = [r for r in found if _kw_hit(task, r["title"])]
@@ -370,6 +372,7 @@ async def run_auto_leave_task(
                     auto_rows,
                     log_fn,
                     should_stop=lambda: stop_flag["stop"],
+                    workdir=workdir,
                 )
                 auto_left += len(done)
             rows.extend(kept)
@@ -413,12 +416,14 @@ async def scan_stale_chats(
     skip_pinned: bool = True,
     log: Callable[[str], None] = None,
     skip_keywords: List[str] | None = None,
+    workdir=None,
 ) -> List[Dict]:
     """扫描单个账号，返回超过 days 天不更新的对话列表（只读，不做任何退出）
 
     scan_types: 扫描范围——"channel" 仅频道 / "group" 仅群组 / "both" 频道+群组
     days: 不更新天数阈值（支持小数，如 0.5），0 表示不按天数过滤（扫描全部符合条件的对话）
     skip_keywords: 页面级跳过关键字，标题命中即直接跳过（不进入结果）
+    workdir: 状态库目录（限流同步到账户页展示），不传则不记录
     """
     scan_types = str(scan_types or "both")
     want_channel = scan_types in ("channel", "both")
@@ -484,6 +489,12 @@ async def scan_stale_chats(
         log(f"[{account}] 扫描完成，共 {scanned} 个对话，{len(found)} 个{stale_desc}")
     except asyncio.TimeoutError:
         log(f"[{account}] 连接超时（30s），跳过")
+    except FloodWait as exc:
+        wait = min(int(getattr(exc, "value", 0) or 60), 120)
+        record_account_limit(
+            workdir, account, "flood_wait", time.time() + wait, "扫描对话"
+        )
+        log(f"[{account}] 扫描触发限流（{wait}s）: {exc}")
     except Exception as exc:
         log(f"[{account}] 扫描失败: {exc}")
     finally:
@@ -492,8 +503,18 @@ async def scan_stale_chats(
     return found
 
 
-async def leave_one(client, chat_id, title: str, log: Callable[[str], None]) -> bool:
-    """退出单个对话，处理 FloodWait（等待后重试一次）；单次调用限时网络超时"""
+async def leave_one(
+    client,
+    chat_id,
+    title: str,
+    log: Callable[[str], None],
+    account: str | None = None,
+    workdir=None,
+) -> bool:
+    """退出单个对话，处理 FloodWait（等待后重试一次）；单次调用限时网络超时
+
+    account/workdir 用于把限流同步到状态库（账户页展示），不传则不记录。
+    """
 
     for attempt in (1, 2):
         try:
@@ -505,6 +526,9 @@ async def leave_one(client, chat_id, title: str, log: Callable[[str], None]) -> 
             return False
         except FloodWait as exc:
             wait = min(int(getattr(exc, "value", 0) or 60), 120)
+            record_account_limit(
+                workdir, account, "flood_wait", time.time() + wait, title
+            )
             if attempt == 2:
                 log(f"[失败] {title}: FloodWait 超时放弃")
                 return False
@@ -522,6 +546,7 @@ async def _leave_rows(
     rows: List[Dict],
     log: Callable[[str], None],
     should_stop: Callable[[], bool] | None = None,
+    workdir=None,
 ) -> set:
     """按账号并发退出给定对话（并发 8），返回成功退出的 key 集合"""
     done: set = set()
@@ -547,6 +572,8 @@ async def _leave_rows(
                     row["chat_id"],
                     row["title"],
                     log,  # noqa: B023
+                    account=account,  # noqa: B023
+                    workdir=workdir,  # noqa: B023
                 )
                 if success:
                     async with done_lock:  # noqa: B023
@@ -694,6 +721,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     bool(task.get("skip_pinned", True)),
                     log,
                     skip_keywords=skip_keywords,
+                    workdir=workdir,
                 )
                 inc_kws = [str(k) for k in (task.get("include_keywords") or []) if k]
                 if inc_kws:
@@ -711,6 +739,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                             auto_rows,
                             log,
                             should_stop=lambda: st["stop"],
+                            workdir=workdir,
                         )
                         st["auto_left"] += len(done)
                     kept = [r for r in found if _kw_hit(task, r["title"])]
@@ -804,6 +833,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     items,
                     log,
                     should_stop=lambda: st["stop"],
+                    workdir=workdir,
                 )
             if done_keys:
                 st["rows"] = [r for r in st["rows"] if r["key"] not in done_keys]

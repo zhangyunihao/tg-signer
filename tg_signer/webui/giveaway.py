@@ -14,10 +14,11 @@ import time
 from datetime import datetime
 from html import escape
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from nicegui import ui
 
+from tg_signer.core import get_client, safe_disconnect
 from tg_signer.giveaway_core import (
     DEFAULT_GLOBAL_QPS,
     DEFAULT_MAX_CONCURRENT_ACCOUNTS,
@@ -258,6 +259,105 @@ def format_speak_alert(a: dict) -> str:
     )
 
 
+def remove_speak_alert(workdir, alert: dict) -> None:
+    """重试成功后移除提醒；键与任务发口令成功时的消除键保持一致。"""
+    key = _alert_key(alert, SPEAK_ALERT_KEY)
+    save_speak_alerts(
+        workdir, _drop_alert(load_speak_alerts(workdir), SPEAK_ALERT_KEY, key)
+    )
+
+
+async def _find_chat_by_title(client, title: str) -> Optional[int]:
+    """按群名在账号已加入会话中精确匹配 chat id（重试口令的兜底路径）。"""
+    target = (title or "").strip()
+    if not target:
+        return None
+    try:
+        async for dlg in client.get_dialogs(limit=300):
+            chat = getattr(dlg, "chat", None)
+            if (getattr(chat, "title", "") or "").strip() != target:
+                continue
+            chat_id = getattr(chat, "id", None)
+            if chat_id is not None:
+                return chat_id
+    except Exception:
+        logger.debug("重试口令时按群名匹配会话失败", exc_info=True)
+    return None
+
+
+async def retry_speak_alert(workdir, alert: dict) -> Tuple[bool, str]:
+    """消息中心「重试」：用提醒里的账号/目标重新发送口令。
+
+    优先按原始发送目标发送；目标缺失或失效时按群名匹配已加入会话兜底
+    （与引擎发送失败时的兜底一致）。返回 (是否成功, 提示文案)，
+    成功后由调用方移除该提醒，失败则保留提醒便于再次重试。
+    """
+    account = str(alert.get("account") or "").strip()
+    group = str(alert.get("group") or "").strip()
+    password = str(alert.get("password") or "")
+    if not account or not group or not password:
+        return False, "提醒缺少账号/群组/口令，无法重试"
+    session_dir = Path(str(alert.get("session_dir") or "."))
+    raw_target = str(alert.get("target") or "").strip()
+    retry_key = str(session_dir.joinpath(account).resolve())
+    if retry_key in _SPEAK_RETRY_IN_FLIGHT:
+        return False, f"账号 {account} 正在重试中，请等待上一次重试结束后再试"
+    _SPEAK_RETRY_IN_FLIGHT.add(retry_key)
+    client = None
+    try:
+        client = get_client(account, workdir=str(session_dir), reuse=False)
+        if not await asyncio.wait_for(client.connect(), timeout=30):
+            return False, f"账号 {account} 会话未授权，请先重新登录"
+        try:
+            if not raw_target:
+                raise ValueError("提醒未记录口令群组链接")
+            target = parse_chat_id(raw_target) or raw_target
+            await asyncio.wait_for(client.send_message(target, password), timeout=60)
+        except Exception:
+            chat_id = await _find_chat_by_title(client, group)
+            if chat_id is None:
+                raise
+            await asyncio.wait_for(client.send_message(chat_id, password), timeout=60)
+    except Exception as exc:
+        logger.debug("重试发送口令失败", exc_info=True)
+        return False, f"重试发送口令失败：{exc}"
+    finally:
+        _SPEAK_RETRY_IN_FLIGHT.discard(retry_key)
+        if client is not None:
+            try:
+                await safe_disconnect(client)
+            except Exception:
+                # 兜底断连失败不能影响重试结果提示
+                logger.debug("重试后断开客户端失败", exc_info=True)
+    return True, f"已在「{group}」重新发送口令「{password}」"
+
+
+async def retry_all_speak_alerts(
+    workdir,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> Tuple[int, List[str]]:
+    """一键重发：按当前提醒顺序串行重发全部口令，成功即消除该提醒。
+
+    串行执行以复用 retry_speak_alert 的账号级重试锁（并发会撞 session
+    数据库锁并阻塞事件循环）；on_progress(当前序号, 总数) 用于界面进度。
+    返回 (成功条数, 失败详情列表，每项「群组：原因」)。
+    """
+    alerts = load_speak_alerts(workdir)
+    total = len(alerts)
+    ok_count = 0
+    failures: List[str] = []
+    for idx, alert in enumerate(alerts, 1):
+        if on_progress is not None:
+            on_progress(idx, total)
+        ok, detail = await retry_speak_alert(workdir, alert)
+        if ok:
+            remove_speak_alert(workdir, alert)
+            ok_count += 1
+        else:
+            failures.append(f"{alert.get('group') or ''}：{detail}")
+    return ok_count, failures
+
+
 def load_speech_alerts(workdir) -> List[dict]:
     return _SPEECH_ALERTS.load(workdir)
 
@@ -386,6 +486,11 @@ SPEECH_INSUFFICIENT_ALERT_KEY = ("account", "bot", "channel", "title", "detail")
 CHANNELS_FULL_ALERT_KEY = ("account",)
 SCAN_CAP_ALERT_KEY = ("account", "chat")
 
+# 正在重试口令的账号（session 绝对路径）。同一账号并发重试会各自新建客户端
+# 打开同一个 session 数据库，锁冲突时的同步等待会阻塞 WebUI 事件循环（页面卡住），
+# 因此后到的重试直接拒绝，等前一次结束再点。
+_SPEAK_RETRY_IN_FLIGHT: Set[str] = set()
+
 
 def _handle_scan_cap_event(client, workdir, ev: dict) -> None:
     """单频道扫描达到上限：写入消息中心并弹顶部提醒（按账号+频道去重）。"""
@@ -498,6 +603,9 @@ def _handle_speak_event(client, workdir, ev: dict) -> None:
                 "group": group,
                 "password": password,
                 "error": str(ev.get("error") or "")[:200],
+                # 消息中心「重试」按钮用：原始发送目标 + 会话目录
+                "target": str(ev.get("target") or ""),
+                "session_dir": str(ev.get("session_dir") or ""),
                 "time": _alert_time(),
             },
         )

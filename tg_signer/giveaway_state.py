@@ -500,3 +500,27 @@ class GiveawayState:
                 }
             )
         return result
+
+
+def record_account_limit(
+    workdir, account, kind: str, until: float, note: str = ""
+) -> bool:
+    """把账号限流写入 account_limits（供 WebUI 账户页展示），失败返回 False。
+
+    供签到/退频道等非抽奖任务复用同一张表；写库异常只记 debug 日志，
+    不影响调用方主流程（限流本身仍按原逻辑处理）。
+    """
+    if not account or workdir is None:
+        return False
+    try:
+        state = GiveawayState(workdir)
+        try:
+            state.set_account_limit(account, kind, until, note)
+        finally:
+            state.close()
+        return True
+    except Exception:
+        logger.debug(
+            "记录账号限流失败 account=%s kind=%s", account, kind, exc_info=True
+        )
+        return False
