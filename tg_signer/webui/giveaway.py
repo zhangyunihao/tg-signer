@@ -137,6 +137,10 @@ JOIN_ALERTS_MAX = 200
 # 抽奖过程中记录的未完成口令发言任务（持久化，口令发送成功后自动消除）
 SPEAK_ALERTS_FILE = "webui_speak_alerts.json"
 SPEAK_ALERTS_MAX = 200
+# 口令重试日志（持久化，消息中心「显示日志」弹窗查看；刷新页面、重启服务后仍保留）
+SPEAK_RETRY_LOGS_FILE = "webui_speak_retry_logs.json"
+SPEAK_RETRY_LOGS_MAX_KEYS = 100
+SPEAK_RETRY_LOGS_MAX_LINES = 200
 # 报名成功后仍未达标的发言数任务（持久化，消息中心提示还需发言条数）
 SPEECH_ALERTS_FILE = "webui_speech_alerts.json"
 SPEECH_ALERTS_MAX = 200
@@ -267,6 +271,86 @@ def remove_speak_alert(workdir, alert: dict) -> None:
     )
 
 
+# 口令重试日志缓存（键 -> 行列表）：消息中心每 10s 轮询读取，
+# 用 mtime 指纹避免每次刷新都重新读盘解析（同 _AlertStore 的做法）
+_SPEAK_RETRY_LOGS_CACHE: Optional[
+    Tuple[Path, Optional[Tuple[int, int]], Dict[str, List[str]]]
+] = None
+
+
+def speak_retry_log_key(alert: dict) -> str:
+    """日志键与提醒键一致（账号|群组|口令），同一提醒的历次重试日志归到一起。"""
+    return _alert_key(alert, SPEAK_ALERT_KEY)
+
+
+def load_speak_retry_logs(workdir) -> Dict[str, List[str]]:
+    global _SPEAK_RETRY_LOGS_CACHE
+    path = Path(workdir) / SPEAK_RETRY_LOGS_FILE
+    try:
+        st = path.stat()
+        fingerprint: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        fingerprint = None
+    cached = _SPEAK_RETRY_LOGS_CACHE
+    if cached is not None and cached[0] == path and cached[1] == fingerprint:
+        return {k: list(v) for k, v in cached[2].items()}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        raw = data.get("logs") if isinstance(data, dict) else None
+        logs = (
+            {
+                str(k): [str(line) for line in v]
+                for k, v in raw.items()
+                if isinstance(v, list)
+            }
+            if isinstance(raw, dict)
+            else {}
+        )
+    except FileNotFoundError:
+        logs = {}
+    except (OSError, ValueError):
+        logger.debug("读取口令重试日志失败", exc_info=True)
+        logs = {}
+    _SPEAK_RETRY_LOGS_CACHE = (path, fingerprint, logs)
+    return {k: list(v) for k, v in logs.items()}
+
+
+def _save_speak_retry_logs(workdir, logs: Dict[str, List[str]]) -> None:
+    global _SPEAK_RETRY_LOGS_CACHE
+    path = Path(workdir) / SPEAK_RETRY_LOGS_FILE
+    try:
+        atomic_write_json(path, {"logs": logs})
+    except OSError:
+        logger.debug("写入口令重试日志失败", exc_info=True)
+        return
+    try:
+        st = path.stat()
+        fingerprint: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        fingerprint = None
+    _SPEAK_RETRY_LOGS_CACHE = (path, fingerprint, logs)
+
+
+def append_speak_retry_log(workdir, alert: dict, message: str) -> None:
+    """追加一行重试日志（带时间戳）并落盘。
+
+    键数超限时淘汰最久未活动的键、单键行数超限时截断最早行，
+    防止长期运行后日志文件无限膨胀。写盘失败只记 debug，不影响重试流程。
+    """
+    key = speak_retry_log_key(alert)
+    if not key.strip("|"):
+        return
+    logs = load_speak_retry_logs(workdir)
+    lines = logs.pop(key, [])
+    lines.append(f"{_alert_time()} {message}")
+    del lines[:-SPEAK_RETRY_LOGS_MAX_LINES]
+    # 重新插入键（dict 保持插入顺序），淘汰时最久未活动的键排在最前
+    logs[key] = lines
+    while len(logs) > SPEAK_RETRY_LOGS_MAX_KEYS:
+        logs.pop(next(iter(logs)))
+    _save_speak_retry_logs(workdir, logs)
+
+
 async def _find_chat_by_title(client, title: str) -> Optional[int]:
     """按群名在账号已加入会话中精确匹配 chat id（重试口令的兜底路径）。"""
     target = (title or "").strip()
@@ -301,25 +385,46 @@ async def retry_speak_alert(workdir, alert: dict) -> Tuple[bool, str]:
     raw_target = str(alert.get("target") or "").strip()
     retry_key = str(session_dir.joinpath(account).resolve())
     if retry_key in _SPEAK_RETRY_IN_FLIGHT:
+        append_speak_retry_log(workdir, alert, "重试被拒绝：上一次重试仍在进行中")
         return False, f"账号 {account} 正在重试中，请等待上一次重试结束后再试"
     _SPEAK_RETRY_IN_FLIGHT.add(retry_key)
     client = None
+    append_speak_retry_log(
+        workdir,
+        alert,
+        f"开始重试：账号 {account} → 群组「{group}」，"
+        + (f"目标 {raw_target}" if raw_target else "未记录目标，将按群名匹配"),
+    )
     try:
         client = get_client(account, workdir=str(session_dir), reuse=False)
+        append_speak_retry_log(workdir, alert, "正在连接账号会话…")
         if not await asyncio.wait_for(client.connect(), timeout=30):
+            append_speak_retry_log(workdir, alert, "会话未授权，重试失败")
             return False, f"账号 {account} 会话未授权，请先重新登录"
         try:
             if not raw_target:
                 raise ValueError("提醒未记录口令群组链接")
             target = parse_chat_id(raw_target) or raw_target
+            append_speak_retry_log(workdir, alert, f"按原始目标 {target} 发送口令…")
             await asyncio.wait_for(client.send_message(target, password), timeout=60)
-        except Exception:
+            append_speak_retry_log(workdir, alert, "口令发送成功")
+        except Exception as exc:
+            append_speak_retry_log(
+                workdir,
+                alert,
+                f"按原始目标发送失败（{exc}），改按群名「{group}」匹配会话",
+            )
             chat_id = await _find_chat_by_title(client, group)
             if chat_id is None:
                 raise
+            append_speak_retry_log(
+                workdir, alert, f"匹配到会话 {chat_id}，重新发送口令…"
+            )
             await asyncio.wait_for(client.send_message(chat_id, password), timeout=60)
+            append_speak_retry_log(workdir, alert, "口令发送成功（群名兜底）")
     except Exception as exc:
         logger.debug("重试发送口令失败", exc_info=True)
+        append_speak_retry_log(workdir, alert, f"重试失败：{exc}")
         return False, f"重试发送口令失败：{exc}"
     finally:
         _SPEAK_RETRY_IN_FLIGHT.discard(retry_key)

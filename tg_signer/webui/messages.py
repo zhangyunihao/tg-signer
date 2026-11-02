@@ -5,6 +5,8 @@
 - 抽奖任务监控对象加入失败提醒：webui_join_alerts.json（加入成功后由任务自动消除）
 - 抽奖过程中记录的未完成发言任务（口令发送失败）：webui_speak_alerts.json
   （口令发送成功后由任务自动消除）
+- 口令重试日志：webui_speak_retry_logs.json（「重试」/「重发口令」执行时逐阶段
+  追加，消息中心「显示日志」弹窗查看；刷新页面、重启服务后仍保留）
 - 报名成功后仍未达标的发言数任务（还需发言 N 条）：webui_speech_alerts.json
 - 置顶抽奖帖点击参与被弹窗拦下（发言数不够）：webui_speech_insufficient_alerts.json
 - 账号频道/群组已满（自动触发退频道任务）：webui_channels_full_alerts.json
@@ -27,7 +29,8 @@ from nicegui import app, ui
 
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.activity import install_activity_tracking, should_poll
-from tg_signer.webui.common import state
+from tg_signer.webui.common import add_dialog_close_button, state
+from tg_signer.webui.components import LOG_AREA_CLASS
 from tg_signer.webui.giveaway import (
     channel_title_map,
     format_channels_full_alert,
@@ -42,12 +45,14 @@ from tg_signer.webui.giveaway import (
     load_join_alerts,
     load_scan_cap_alerts,
     load_speak_alerts,
+    load_speak_retry_logs,
     load_speech_alerts,
     load_speech_insufficient_alerts,
     load_win_alerts,
     remove_speak_alert,
     retry_all_speak_alerts,
     retry_speak_alert,
+    speak_retry_log_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -442,7 +447,8 @@ def _build_center_page() -> None:
         ok, detail = await retry_speak_alert(state.workdir, alert)
         if ok:
             remove_speak_alert(state.workdir, alert)
-            refresh_all()
+        # 无论成败都刷新：失败时重试日志已落盘，旁边的「日志」按钮需要立即出现
+        refresh_all()
         ui.notify(detail, type="positive" if ok else "negative", multi_line=True)
 
     async def retry_all_speak() -> None:
@@ -480,6 +486,8 @@ def _build_center_page() -> None:
         list_container.clear()
         messages = visible_messages()
         pin_keys = load_pin_keys(state.workdir)
+        # 重试日志（持久化）：有日志的发言任务才显示「日志」按钮，刷新后仍在
+        retry_logs = load_speak_retry_logs(state.workdir)
         # 置顶最优先；未读次之；未读内部中奖消息最优先；同组内按新消息优先（时间倒序）
         messages.sort(key=lambda m: message_sort_key(m, read_keys, pin_keys))
         with list_container:
@@ -535,6 +543,18 @@ def _build_center_page() -> None:
                         ui.button(icon="replay").props(
                             "flat round dense size=sm color=primary"
                         ).on("click.stop", _on_retry_click).tooltip("重试发送口令")
+                        # 日志按钮：重试过（已有落盘日志）才显示；刷新后日志仍在，
+                        # 因此按钮与内容刷新后依然可见
+                        if speak_retry_log_key(m["retry"]) in retry_logs:
+
+                            def _on_log_click(
+                                *_args, _alert: dict = m["retry"]
+                            ) -> None:
+                                open_retry_log(_alert)
+
+                            ui.button(icon="subject").props(
+                                "flat round dense size=sm color=grey-7"
+                            ).on("click.stop", _on_log_click).tooltip("显示重试日志")
                     # click.stop 阻止冒泡，避免点图钉时同时把消息标记为已读
                     ui.button(icon="push_pin").props(
                         "flat round dense size=sm "
@@ -580,6 +600,30 @@ def _build_center_page() -> None:
             ]
         )
 
+    # 重试日志弹窗：预创建卡片，打开时才填充内容（日志来自持久化文件，
+    # 刷新页面后重新进入本函数会重建弹窗，日志按钮与内容仍按文件显示）
+    with ui.dialog() as retry_log_dialog, ui.card().classes("w-full max-w-2xl"):
+        add_dialog_close_button(retry_log_dialog)
+        retry_log_title = ui.label("重试日志").classes("text-lg font-semibold")
+        retry_log_view = (
+            ui.log(max_lines=500).classes(LOG_AREA_CLASS).style("height: 320px")
+        )
+
+    def open_retry_log(alert: dict) -> None:
+        """弹窗展示该提醒的历次重试日志（无日志时提示空）。"""
+        lines = load_speak_retry_logs(state.workdir).get(speak_retry_log_key(alert), [])
+        retry_log_title.set_text(
+            f"重试日志 · 账号 {alert.get('account') or ''}"
+            f"「{alert.get('group') or ''}」"
+        )
+        retry_log_view.clear()
+        if lines:
+            for line in lines:
+                retry_log_view.push(line)
+        else:
+            retry_log_view.push("暂无日志")
+        retry_log_dialog.open()
+
     with ui.column().classes("w-full gap-3"):
         with ui.row().classes("w-full items-center gap-2 no-wrap"):
             ui.button(icon="arrow_back").props("flat round dense").on_click(
@@ -597,7 +641,8 @@ def _build_center_page() -> None:
         ui.label(
             "汇总抽奖中奖提醒、监控对象加入失败提醒与抽奖过程中未完成的发言任务"
             "（口令发送失败/发言数未达标，显示还需发言条数），点击消息标记为已读，"
-            "「发言任务」右侧的刷新按钮可重试发送口令，顶部「重发口令」可批量重发全部，"
+            "「发言任务」右侧的刷新按钮可重试发送口令，重试过的消息旁的文档按钮"
+            "可查看重试日志（刷新后仍保留），顶部「重发口令」可批量重发全部，"
             "点击右侧图钉可置顶/取消置顶（置顶消息始终排在最前）。"
         ).classes("text-xs text-gray-500")
         # 恢复上次选择的过滤用户/消息类型（刷新页面、重开标签页后仍保留）
