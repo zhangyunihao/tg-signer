@@ -1757,11 +1757,14 @@ class ComboTaskBlock:
             ).classes("text-xs text-gray-500")
             # 用单行输入替代 ui.time 时钟弹层：弹层占满弹窗、手机上尤其笨重，
             # 这里只需 HH:MM，输入框更简洁，格式由启动时校验兜底
-            self.new_task_start_time = ui.input(
-                label="开始时间（可选，HH:MM，留空立即执行）",
-                placeholder="如 14:30",
-                clearable=True,
-            ).classes("w-56")
+            self.new_task_start_time = (
+                ui.input(
+                    label="开始时间（可选，HH:MM，留空立即执行）",
+                    placeholder="如 14:30",
+                )
+                .classes("w-56")
+                .props("clearable")
+            )
             ui.label(
                 "所选时间已过则从明天该时间开始。"
                 "开始时间到达后先检测 TG 网络，不通则按下方间隔重试，"
