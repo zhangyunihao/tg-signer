@@ -2606,8 +2606,13 @@ def test_click_confirm_poll_ended_checks_newest_only(tmp_path, monkeypatch):
     assert engine._ended_counts == {"acc|lottery8bot": 1}
 
 
-def test_engine_join_invite_request_sent_is_not_failure(tmp_path):
-    """私有群审批制：INVITE_REQUEST_SENT 视为申请已提交，不算失败。"""
+def test_engine_join_invite_request_sent_is_pending_not_joined(tmp_path):
+    """私有群审批制：INVITE_REQUEST_SENT 只是申请已提交，账号还不是成员。
+
+    旧行为把它当作已加入（joined_any=True），会立刻重发 start/点参与按钮，
+    bot 校验不过又记「未参与」，还会反复提交加入申请。现在单列「待审批」：
+    不算加入成功、不触发后续点击，并在冷却期内不重复提交。
+    """
     import asyncio
 
     class RequestClient:
@@ -2630,10 +2635,13 @@ def test_engine_join_invite_request_sent_is_not_failure(tmp_path):
     joined_any, blocked = asyncio.run(
         engine._join_from_message("acc", client, "LotteryBot", msg)
     )
-    assert joined_any is True
+    assert joined_any is False
     assert blocked is False
     assert any("已提交加入" in line and "待管理员审批" in line for line in logs)
     assert not any("失败" in line for line in logs)
+    # 审批冷却期内不重复提交加入申请
+    asyncio.run(engine._join_from_message("acc", client, "LotteryBot", msg))
+    assert len(client.calls) == 1
 
 
 def test_ensure_monitor_membership_emits_join_events(tmp_path):
@@ -5988,3 +5996,142 @@ def test_scan_one_connection_unavailable_marks_net_interrupt(tmp_path):
     asyncio.run(engine._scan_one("acc", client, {"n": 0}, 1))
 
     assert engine.net_interrupted == {"acc": "连接不可用，未扫描"}
+
+
+def test_join_target_resolve_transient_error_not_cached(tmp_path):
+    """解析目标一次超时不能把有效频道永久判死：下一轮仍要能加入。"""
+    import asyncio
+
+    class FlakyResolveClient(JoinClient):
+        def __init__(self):
+            super().__init__()
+            self.fail_once = True
+
+        async def get_chat(self, target):
+            if self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("网络请求 get_chat 超时（30 秒，网络异常）")
+            return await super().get_chat(target)
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FlakyResolveClient()
+    msg = _msg(text="加入 @FlakyChan 参与")
+
+    joined1, _ = asyncio.run(
+        engine._join_from_message("acc", client, "LotteryBot", msg)
+    )
+    assert joined1 is False
+    assert any("解析目标 FlakyChan 失败" in line for line in logs)
+    assert not any("跳过无效目标 FlakyChan" in line for line in logs)
+
+    joined2, _ = asyncio.run(
+        engine._join_from_message("acc", client, "LotteryBot", msg)
+    )
+    assert joined2 is True
+    assert client.joined == ["FlakyChan"]
+
+
+def test_join_target_type_cache_is_per_account(tmp_path):
+    """目标类型缓存按账号隔离：一个账号的负结果不能污染其他账号。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    msg = _msg(text="加入 @GoodChan 参与")
+
+    ok_client = JoinClient()
+    joined, _ = asyncio.run(
+        engine._join_from_message("acc_ok", ok_client, "LotteryBot", msg)
+    )
+    assert joined is True
+    assert ok_client.joined == ["GoodChan"]
+
+    bad_client = JoinClient()
+    bad_client.target_types = {"GoodChan": None}  # 该账号解析为失效
+    joined2, _ = asyncio.run(
+        engine._join_from_message("acc_bad", bad_client, "LotteryBot", msg)
+    )
+    assert joined2 is False
+    assert bad_client.joined == []
+    assert any("跳过无效目标 GoodChan" in line for line in logs)
+
+
+def test_verify_after_click_joins_revealed_checklist_and_retries(tmp_path, monkeypatch):
+    """点击后才回「您需加入…」清单：就地补加入并重发 start，复核通过。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    class RetryJoinClient(FakeClient):
+        def __init__(self):
+            super().__init__(bot_users={"LotteryBestBot"})
+            self.success = _msg(text="已参加抽奖「上海福利」", id=11)
+
+        async def join_chat(self, target):
+            self.history = [self.success]
+            return await super().join_chat(target)
+
+    client = RetryJoinClient()
+    text = "您需加入指定的群组/频道\n🎫 加入-JoinNeededChan ❌\n"
+    offset = text.index("加入-JoinNeededChan")
+    reply = _msg(
+        text=text,
+        entities=[
+            SimpleNamespace(
+                type="MessageEntityType.TEXT_LINK",
+                url="https://t.me/JoinNeededChan",
+                offset=offset,
+            )
+        ],
+        id=10,
+    )
+    client.history = [reply]
+
+    completed = asyncio.run(
+        engine._verify_after_click("acc", client, "LotteryBestBot", [], param="p1")
+    )
+
+    assert completed is True
+    assert client.joined_targets == ["JoinNeededChan"]
+    assert any("点击后要求加入频道，已补加入" in line for line in logs)
+    assert any("参与成功" in line for line in logs)
+
+
+def test_message_filter_skips_username_and_score_conditions(tmp_path):
+    """必须设置用户名（账号无用户名）/ 需消耗积分的抽奖提前跳过。"""
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    username_msg = _msg(text="🎰 测试抽奖\n📮 参与条件：🪪 必须设置用户名")
+    engine._account_usernames["acc"] = ""
+    assert (
+        engine._message_filtered_out("acc", username_msg, "抽奖帖", True, True) is True
+    )
+    assert any("要求设置用户名" in line for line in logs)
+
+    # 有用户名 / 未知时不跳过，避免误杀
+    logs.clear()
+    engine._account_usernames["acc"] = "acc_name"
+    assert (
+        engine._message_filtered_out("acc", username_msg, "抽奖帖", True, True) is False
+    )
+    engine._account_usernames.pop("acc")
+    assert (
+        engine._message_filtered_out("acc", username_msg, "抽奖帖", True, True) is False
+    )
+
+    score_msg = _msg(text="🎰 测试抽奖\n🎯 参与（100 分）")
+    assert engine._message_filtered_out("acc", score_msg, "抽奖帖", True, True) is True
+    assert any("需消耗积分" in line for line in logs)

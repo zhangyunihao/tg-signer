@@ -518,6 +518,28 @@ def message_requires_password(message: Any) -> bool:
     return bool(PASSWORD_REQUIRE_RE.search(_message_text(message) or ""))
 
 
+# 账号必须设置 @用户名 才能参与的条件（如「🪪 必须设置用户名」）。
+# 未设置用户名的账号无论点多少次都进不去，应提前跳过
+USERNAME_REQUIRE_RE = re.compile(r"(必须|需|需要)\s*设置\s*用户名")
+
+
+def message_requires_username(message: Any) -> bool:
+    """消息是否带「必须设置用户名」类参与条件。"""
+    return bool(USERNAME_REQUIRE_RE.search(_message_text(message) or ""))
+
+
+# 需要扣除积分的参与条件（如「参与（100 分）」「花费 100 积分」）：
+# 自动参与不应消耗账号积分，出现即跳过
+SCORE_REQUIRE_RE = re.compile(
+    r"参与\s*[（(]\s*\d+\s*分[)）]|花费\s*\d+\s*积分|消耗\s*\d+\s*积分"
+)
+
+
+def message_requires_score(message: Any) -> bool:
+    """消息是否带「扣除积分」类参与条件。"""
+    return bool(SCORE_REQUIRE_RE.search(_message_text(message) or ""))
+
+
 # —— 口令任务解析 ——
 # 「└  🔑 发送口令﹝出击泡芙宝宝﹞」子行归属上方最近的「🎫 加入-名称」行，
 # 得到（群名 → 口令文本）对应关系，加入该群组后发送口令完成激活。

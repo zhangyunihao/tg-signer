@@ -66,7 +66,9 @@ from tg_signer.giveaway_parsing import (
     message_matches_keywords,
     message_region_allowed,
     message_requires_password,
+    message_requires_score,
     message_requires_speech,
+    message_requires_username,
     parse_bot_start_link,
     parse_draw_date,
     reply_says_ended,
@@ -109,6 +111,11 @@ CLICK_FAILURE_COOLDOWN = 60
 # 抽奖发 start；参与成功后计数清零（重复参与重新计算）。
 ENTRY_CARD_FAIL_LIMIT = 3
 ENTRY_CARD_COOLDOWN = 1800
+
+
+# 审批制私有群提交加入申请后、审批通过前的重试冷却（秒）：期间不重复
+# 提交加入申请，也不把「申请已提交」当作已加入去发 start/点按钮
+JOIN_PENDING_RETRY = 1800
 
 
 # _try_confirm_button 遇到「抽奖已结束」弹窗时返回的未完成原因标记：
@@ -805,8 +812,18 @@ class GiveawayEngine:
         self._chat_types: Dict[str, bool] = {}
         # 监控对象 chat_id -> @username 映射（来自用户缓存）：数字 id 无法加入时兜底
         self.chat_usernames: Dict[str, str] = {}
-        # 加入目标的类型缓存 {target_lower: 类型名/None}：过滤个人用户与失效目标
+        # 加入目标的类型缓存 {"account|target_lower": 类型名}：过滤个人用户与失效目标。
+        # 只缓存「确认失效」的结果；网络超时/限流等临时失败不写缓存，避免一次
+        # 抖动把有效频道在整个任务里判死；按账号隔离，因为私有频道对已加入账
+        # 号可解析、对未加入账号不可解析
         self._join_target_types: Dict[str, Optional[str]] = {}
+        # 私有群/频道加入申请待审批的截止时刻 {"account|target": monotonic 秒}
+        self._join_pending_until: Dict[str, float] = {}
+        # 各账号最近一次提交加入申请的时刻 {account: monotonic 秒}
+        self._join_pending_hits: Dict[str, float] = {}
+        # 各账号的 @用户名（连接时缓存；None=未知）。用于提前跳过「必须设置用户
+        # 名」类抽奖，避免每轮白发 start
+        self._account_usernames: Dict[str, Optional[str]] = {}
         # 忽略历史成功记录（start 时可覆盖）：默认 True＝已参与过的链接允许重新参与
         self.ignore_history = True
         # 中奖识别：bot 私聊消息命中关键词时转发提醒（默认开启，转发到收藏夹）
@@ -1154,8 +1171,13 @@ class GiveawayEngine:
                             client.get_me(), timeout=self.CONNECT_TIMEOUT
                         )
                         nickname = getattr(me, "first_name", "") or ""
+                        # 缓存 @用户名：用于提前跳过「必须设置用户名」类抽奖
+                        self._account_usernames[account] = str(
+                            getattr(me, "username", "") or ""
+                        )
                         self.log(f"「{account}」已连接（{nickname}）")
                     except Exception:
+                        self._account_usernames.setdefault(account, None)
                         self.log(f"「{account}」已连接（昵称获取超时，已忽略）")
                     return
                 except asyncio.TimeoutError:
@@ -2406,22 +2428,39 @@ class GiveawayEngine:
         return reached, reached and len(batch) >= min_count
 
     async def _resolve_join_target_type(
-        self, client: Any, target: str
-    ) -> Optional[str]:
+        self, client: Any, target: str, account: str = ""
+    ) -> Tuple[Optional[str], bool]:
         """识别加入目标的聊天类型名（GROUP/SUPERGROUP/CHANNEL/USER/BOT）。
 
-        无法解析（用户名不存在/已失效）返回 None。结果按目标缓存。
+        返回（类型名, 是否临时失败）。只有「确认失效」（用户名不存在等）
+        才写入缓存并把类型名置 None；网络超时、Transport flood、FLOOD_WAIT
+        等临时异常返回 (None, True) 且不缓存——否则一次抖动就会把有效频道
+        在整个任务里判死（日志表现为同一目标其他账号能正常加入、该账号却
+        连续报「无法解析或已失效」）。缓存按账号隔离：私有频道对已加入账号
+        可解析、对未加入账号不可解析，共用缓存会互相污染。
         """
-        key = target.lower()
+        key = f"{account}|{target.lower()}" if account else target.lower()
         if key in self._join_target_types:
-            return self._join_target_types[key]
+            return self._join_target_types[key], False
         try:
             chat_info = await client.get_chat(target)
             type_name = getattr(getattr(chat_info, "type", None), "name", "") or None
-        except Exception:
+        except Exception as exc:
+            msg = str(exc).upper()
+            permanent = _is_username_resolve_error(exc) or any(
+                code in msg
+                for code in (
+                    "PEER_ID_INVALID",
+                    "CHANNEL_INVALID",
+                    "CHAT_INVALID",
+                    "USER_NOT_FOUND",
+                )
+            )
+            if not permanent:
+                return None, True
             type_name = None
         self._join_target_types[key] = type_name
-        return type_name
+        return type_name, False
 
     def _chat_title(self, message: Any) -> str:
         chat = getattr(message, "chat", None)
@@ -2589,6 +2628,19 @@ class GiveawayEngine:
         if not message_region_allowed(message):
             if log_skips:
                 self.log(f"[{account}] {tag} 含地区限制，跳过")
+            return True
+        # 必须设置用户名：账号没有 @用户名时点多少次都进不去，提前跳过。
+        # 用户名未知（连接时 get_me 超时）时不跳过，避免误杀
+        if message_requires_username(message):
+            username = self._account_usernames.get(account)
+            if username is not None and not username:
+                if log_skips:
+                    self.log(f"[{account}] {tag} 要求设置用户名，该账号未设置，跳过")
+                return True
+        # 需扣除积分：自动参与不应消耗账号积分
+        if message_requires_score(message):
+            if log_skips:
+                self.log(f"[{account}] {tag} 需消耗积分，跳过")
             return True
         # 发言数要求/口令要求 + 双向账户：无法达标，自动跳过（对群组置顶同样生效）
         if account in self.two_way_accounts and (
@@ -3524,9 +3576,19 @@ class GiveawayEngine:
             # 已判定不可访问（私密/失效）：冷却期内不再重复尝试，也不消耗加入配额
             if self._target_unreachable(account, target):
                 continue
-            self._join_cache.add(key)
-            if not await self._should_join_target(account, client, target, label):
+            # 私有群加入申请待审批：审批通过前不重复提交，也不当作已加入
+            if self._join_pending(account, target):
                 continue
+            should_join, transient = await self._should_join_target(
+                account, client, target, label
+            )
+            if not should_join:
+                # 临时失败（网络超时/限流）不占去重缓存：下一轮扫描仍会重试，
+                # 否则一次抖动就把有效目标在该账号上永久判死
+                if not transient:
+                    self._join_cache.add(key)
+                continue
+            self._join_cache.add(key)
             joined, flood_paused = await self._join_single_target(
                 account, client, target, label
             )
@@ -3569,6 +3631,35 @@ class GiveawayEngine:
                 return True
             self._unreachable_targets.pop(key, None)
         return False
+
+    def _mark_join_pending(self, account: str, target: Any) -> None:
+        """标记「加入申请已提交、待管理员审批」。
+
+        审批制私有群调用 join_chat 只会返回 INVITE_REQUEST_SENT，账号此时
+        还不是成员。按已加入处理会立刻重发 start/点按钮，bot 校验不过又记
+        未参与，还会反复提交加入申请；这里单独记状态，审批通过前不再提交。
+        """
+        now = time.monotonic()
+        self._join_pending_until[self._target_key(account, target)] = (
+            now + JOIN_PENDING_RETRY
+        )
+        self._join_pending_hits[account] = now
+
+    def _join_pending(self, account: str, target: Any) -> bool:
+        """目标是否仍在加入申请审批冷却期内；过期条目顺手清理。"""
+        key = self._target_key(account, target)
+        until = self._join_pending_until.get(key)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            self._join_pending_until.pop(key, None)
+            return False
+        return True
+
+    def _account_join_pending(self, account: str) -> bool:
+        """该账号是否刚提交过加入申请（避免去点注定失败的参与按钮）。"""
+        hit = self._join_pending_hits.get(account)
+        return hit is not None and (time.monotonic() - hit) < 60.0
 
     def _join_flood_paused(self, account: str) -> bool:
         """是否因限流（PEER_FLOOD / JoinChannel FLOOD_WAIT）暂停加入，不写日志。
@@ -3663,28 +3754,37 @@ class GiveawayEngine:
 
     async def _should_join_target(
         self, account: str, client: Any, target: str, label: str
-    ) -> bool:
+    ) -> Tuple[bool, bool]:
+        """加入前预检；返回（是否继续加入, 是否临时失败可稍后重试）。"""
         # 用户名目标先识别类型：个人用户/机器人/失效目标直接跳过，
         # 避免发出注定失败的 JoinChannel（CHANNEL_INVALID 噪音）。
         # 私有邀请链接（+hash/joinchat）无法预解析，仍直接尝试加入。
         if not target.lower().startswith(("http://", "https://")):
-            type_name = await self._resolve_join_target_type(client, target)
+            type_name, transient = await self._resolve_join_target_type(
+                client, target, account
+            )
+            if transient:
+                self.log(
+                    f"[{account}] 解析目标 {target} 失败（网络异常或限流），"
+                    "本轮跳过，稍后重试"
+                )
+                return False, True
             if type_name is None:
                 self.log(f"[{account}] 跳过无效目标 {target}（无法解析或已失效）")
-                return False
+                return False, False
             if type_name not in ("GROUP", "SUPERGROUP", "CHANNEL"):
-                return False  # 个人用户/机器人，静默跳过
+                return False, False  # 个人用户/机器人，静默跳过
             # 加入前检查成员身份：能看到哪些目标还没加入（bot 常要求
             # 加入频道后才给抽奖资格）
             already_member = await self._is_member(client, target)
             if already_member:
                 self.log(f"[{account}] 已在 {target} 中，跳过加入")
-                return False
+                return False, False
             self.log(
                 f"[{account}] 尚未加入 {target}"
                 f"（{label} 要求加入后才能参与，自动加入中）"
             )
-        return True
+        return True, False
 
     async def _wait_same_target_gap(self, target: str) -> None:
         """同一加入目标跨账号错峰：多账号并行扫描常在同一秒加入同一条邀请
@@ -3737,11 +3837,15 @@ class GiveawayEngine:
             if "ALREADY_PARTICIPANT" in msg or "already" in msg.lower():
                 self.log(f"[{account}] 已在 {target} 中，跳过加入")
             elif "INVITE_REQUEST_SENT" in msg:
+                # 审批制私有群：申请已提交但尚未通过，账号还不是成员。不能
+                # 当作已加入，否则会立刻重发 start/点按钮，bot 校验不过又记
+                # 未参与，并反复提交加入申请
+                self._mark_join_pending(account, target)
                 self.log(
                     f"[{account}] 已提交加入 {target} 的申请"
-                    "（私有群/频道，待管理员审批）"
+                    "（私有群/频道，待管理员审批；审批通过前不再参与该目标）"
                 )
-                return True, False
+                return False, False
             elif "FLOOD_WAIT" in msg or _is_transport_flood(exc):
                 wait = self._flood_seconds(exc) or 60
                 self._suspend_joins(account, wait, target)
@@ -4713,6 +4817,20 @@ class GiveawayEngine:
         # 加入过，不必本次有新加入）。注意：只有本轮真加入了新频道
         # （did_join=True）才重发 start——bot 判定身份需要新的 start
         # 触发；旧消息残留被 join_cache 挡住（did_join=False）不算。
+        # 有加入申请刚提交、还在等管理员审批：账号还不是成员，此时发 start
+        # 或点按钮注定被 bot 拒回「仍需加入」，直接跳过本轮参与，审批后再试
+        if had_join_targets and self._account_join_pending(account):
+            self.log(
+                f"[{account}] @{username} 加入申请待管理员审批，本次跳过参与"
+                "（审批通过后自动重试）"
+            )
+            return (
+                False,
+                did_join,
+                had_join_targets,
+                candidates,
+                "加入申请待管理员审批（审批通过后重试）",
+            )
         if had_join_targets and did_join:
             retried, retry_completed = await self._click_join_retry_button(
                 account, client, username, candidates, param=param
@@ -5103,6 +5221,7 @@ class GiveawayEngine:
         username: str,
         candidates: Optional[List[Any]] = None,
         param: str = "",
+        allow_join_retry: bool = True,
     ) -> bool:
         """点击确认/参与按钮后核对 bot 回复，把结果写进日志（不再盲点）。
 
@@ -5164,14 +5283,30 @@ class GiveawayEngine:
                 return True
             if JOIN_REQUIRED_POPUP_RE.search(text):
                 # bot 仍在要求加入频道：这次 start/点击没有真正报名成功，
-                # 不能记「已参与」，留给下一轮扫描重试
+                # 不能记「已参与」。LotteryBestBot 常在点「立刻参加抽奖」后
+                # 才回「您需加入指定的群组/频道」清单，旧流程只记未参与等
+                # 下一轮，导致每轮都只点击不加入——这里就地补加入并重试一次
                 self.log(f"@{username} 仍要求加入频道，本次参与未生效：{flat}")
+                if allow_join_retry and await self._join_after_click_and_retry(
+                    account, client, username, msg, candidates, param
+                ):
+                    return True
                 return False
             if self._find_confirm_button(msg) is not None:
                 # 回复仍是带「参与」按钮的入口卡片 = 本次点击没生效（
                 # @Lottery_2_bot 会一直重发同一张卡片）。按「无法判定」记成功
-                # 会造成日志显示已参与、实际根本没报名，必须判未完成
+                # 会造成日志显示已参与、实际根本没报名，必须判未完成。
+                # 卡片里若带 ❌ 加入清单，说明卡在频道成员校验：先补加入
+                # 再重发 start，仍失败才计入入口卡片熔断
                 self.log(f"@{username} 点击后仍是参与入口卡片，本次未真正报名：{flat}")
+                if (
+                    allow_join_retry
+                    and extract_join_status_targets(msg)
+                    and await self._join_after_click_and_retry(
+                        account, client, username, msg, candidates, param
+                    )
+                ):
+                    return True
                 self._note_entry_card_fail(account, username, param)
                 return False
             if ECHO_GIVEAWAY_DETAIL_RE.search(text):
@@ -5191,6 +5326,71 @@ class GiveawayEngine:
         except Exception:
             logger.debug("核对确认按钮回复失败", exc_info=True)
         return True
+
+    async def _join_after_click_and_retry(
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        message: Any,
+        candidates: Optional[List[Any]],
+        param: str,
+    ) -> bool:
+        """点击后才暴露的加入要求：就地补加入并重发 start 复核一次。
+
+        LotteryBestBot 等 bot 常在点「立刻参加抽奖」后才回「您需加入指定的
+        群组/频道」清单。旧流程只记未参与、等下一轮扫描，而下一轮又是
+        start→点击→仍要求加入，永远加不进这个频道，于是一整天 0 参与。
+        返回 True 表示补加入后复核通过（已确认参与）。
+        """
+        if not self.auto_join or self._join_paused(account):
+            return False
+        if self._account_join_pending(account):
+            self.log(f"[{account}] @{username} 加入申请待管理员审批，本次不重试参与")
+            return False
+        try:
+            did_join, had_targets, blocked = await self._auto_join_candidates(
+                account, client, username, [message]
+            )
+            if not did_join:
+                if had_targets and blocked:
+                    self.log(
+                        f"[{account}] @{username} 点击后补加入被限流/配额阻塞，"
+                        "本轮记未参与，稍后重试"
+                    )
+                return False
+            self.log(
+                f"[{account}] @{username} 点击后要求加入频道，已补加入，"
+                "重新发送 start 复核"
+            )
+            await asyncio.sleep(3)
+            restart_msg = await self._start_bot(client, account, username, param)
+            retry_candidates: List[Any] = (
+                [restart_msg] if restart_msg is not None else []
+            )
+            try:
+                async for recent in client.get_chat_history(username, limit=4):
+                    retry_candidates.append(recent)
+                    await self._check_win_message(account, client, username, recent)
+            except Exception:
+                logger.debug("补加入后拉取 bot 最新消息失败", exc_info=True)
+            retry_candidates.extend(candidates or [])
+            retry_candidates.append(message)
+            await self._send_password_tasks(
+                account, client, username, None, retry_candidates
+            )
+            # 只允许补加入一次，避免 bot 每次回复都要求新频道时无限循环
+            return await self._verify_after_click(
+                account,
+                client,
+                username,
+                retry_candidates,
+                param=param,
+                allow_join_retry=False,
+            )
+        except Exception as exc:
+            self.log(f"[{account}] @{username} 补加入后重试参与失败：{exc}")
+            return False
 
     def _find_confirm_button(self, message: Any) -> Optional[Any]:
         # 「花费 N 积分」确认提示（如积分兑换）：点「确认」会消耗积分，
