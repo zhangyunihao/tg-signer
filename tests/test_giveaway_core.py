@@ -5791,6 +5791,88 @@ def test_verify_after_click_detail_echo_then_success_message(tmp_path, monkeypat
     assert any("参与成功" in line for line in logs)
 
 
+def test_verify_after_click_join_required_reply_is_not_success(tmp_path, monkeypatch):
+    """点击后回「您需加入指定的群组/频道」→ 参与条件未满足，不能记已参与。
+
+    真实日志：@LotteryBestBot 的清单回复含该句，但旧 JOIN_REQUIRED_POPUP_RE
+    缺这个模式，落入 _verify_after_click 兜底 return True，把明确拒绝
+    记成「已参与」（假成功）。
+    """
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    client.history = [_msg(text="您需加入指定的群组/频道后方可参与本抽奖")]
+    completed = asyncio.run(
+        engine._verify_after_click("acc", client, "LotteryBestBot", [], param="p1")
+    )
+    assert completed is False
+    assert any("仍要求加入频道" in line for line in logs)
+    assert not any("参与成功" in line for line in logs)
+
+
+def test_entry_card_cooldown_after_consecutive_failures(tmp_path, monkeypatch):
+    """连续 3 次点击后仍是入口卡片 → 熔断冷却，冷却期内不再发 start。
+
+    入口卡片代表参与条件疑似永久不满足（目标失效/未设用户名/归属地不符），
+    每轮重复参与都白烧一次 start 且永不收敛，达到上限后必须熔断。
+    """
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"Lottery_2_bot"})
+    client.history = [
+        _msg(
+            text="TG抽奖福利中心：https://t.me/hmflzx 抽奖标题：普陀思",
+            buttons=[[_btn("立即参加抽奖", callback_data="join:2")]],
+        )
+    ]
+    for _ in range(gc.ENTRY_CARD_FAIL_LIMIT):
+        completed = asyncio.run(
+            engine._verify_after_click("acc", client, "Lottery_2_bot", [], param="p1")
+        )
+        assert completed is False
+
+    # 达到上限：冷却生效，发 start 前的两道守卫都拦截
+    assert engine._entry_card_paused("acc", "Lottery_2_bot", "p1") is True
+    assert engine._can_participate_link("acc", "Lottery_2_bot", "p1") is False
+    assert engine._link_is_actionable("acc", "Lottery_2_bot", "p1") is False
+    # 同一 bot 的其他抽奖参数互不影响
+    assert engine._link_is_actionable("acc", "Lottery_2_bot", "p2") is True
+    assert any("冷却 30 分钟" in line for line in logs)
+
+    # 冷却到期自动解除并清零计数，允许重试
+    key = engine._entry_card_key("acc", "Lottery_2_bot", "p1")
+    engine._entry_card_until[key] = time.monotonic() - 1
+    assert engine._entry_card_paused("acc", "Lottery_2_bot", "p1") is False
+    assert key not in engine._entry_card_fails
+
+    # 参与成功清零：重复参与（ignore_history）重新计算，不沿用旧计数
+    engine._note_entry_card_fail("acc", "Lottery_2_bot", "p1")
+    engine._note_entry_card_fail("acc", "Lottery_2_bot", "p1")
+    engine._record_participate_success(
+        "acc", "Lottery_2_bot", "p1", "频道A", "标题", False
+    )
+    assert engine._entry_card_paused("acc", "Lottery_2_bot", "p1") is False
+    assert engine._link_is_actionable("acc", "Lottery_2_bot", "p1") is True
+
+
 def test_net_timeout_breaker_pauses_account_after_consecutive_failures(tmp_path):
     """连续 N 次网络超时后暂停该账号；暂停到期自动解除并清理计数。"""
     from datetime import datetime, timedelta

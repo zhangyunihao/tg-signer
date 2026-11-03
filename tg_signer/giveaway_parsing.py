@@ -51,10 +51,12 @@ SCORE_BUTTON_RE = re.compile(
 JOIN_RETRY_BUTTON_KEYWORDS = ("我已加入", "重试参与")
 
 
-# callback 弹窗提示「您未加入 XXX」类：参与条件未满足（需先加入指定
-# 频道/群），点击并未真正参与，不能记为成功
+# 弹窗/回复提示「您未加入 XXX」「您需加入指定的群组/频道」类：参与条件
+# 未满足（需先加入指定频道/群），点击并未真正参与，不能记为成功。
+# 「需加入指定」来自 @LotteryBestBot 的清单回复——缺这个模式时该回复
+# 落入 _verify_after_click 兜底 return True，把明确拒绝记成已参与
 JOIN_REQUIRED_POPUP_RE = re.compile(
-    r"未加入|未满足|请先加入|需要先加入|加入后.{0,6}(参与|重试)"
+    r"未加入|未满足|请先加入|需要先加入|需加入指定|加入后.{0,6}(参与|重试)"
 )
 
 

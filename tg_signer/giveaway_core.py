@@ -102,6 +102,15 @@ START_MIN_INTERVAL = 8.0
 CLICK_FAILURE_COOLDOWN = 60
 
 
+# 「点击后仍是参与入口卡片」连续失败熔断：同一（账号, bot, start 参数）
+# 连续多次点击后 bot 都回同一张入口卡片，说明参与条件疑似永久不满足
+# （加入目标已失效、未设置用户名、归属地不符等），每轮重复参与都会
+# 白烧一次 start 且永不收敛。达到次数后进入冷却，冷却期内不再对该
+# 抽奖发 start；参与成功后计数清零（重复参与重新计算）。
+ENTRY_CARD_FAIL_LIMIT = 3
+ENTRY_CARD_COOLDOWN = 1800
+
+
 # _try_confirm_button 遇到「抽奖已结束」弹窗时返回的未完成原因标记：
 # 上层据此走已结束终态处理（不记参与、不重试），而不是按参与成功记录
 CONFIRM_REASON_ENDED = "__ended__"
@@ -771,6 +780,11 @@ class GiveawayEngine:
         self._last_start_at: Dict[str, float] = {}
         # 确认按钮点击失败后的 bot 级冷却：{account|bot_lower: 恢复时刻}
         self._click_failed_until: Dict[str, float] = {}
+        # 「点击后仍是参与入口卡片」熔断：{account|bot|param: 连续失败次数}
+        # 与冷却恢复时刻（monotonic 秒）；键含 start 参数，同一 bot 上
+        # 不同抽奖互不影响
+        self._entry_card_fails: Dict[str, int] = {}
+        self._entry_card_until: Dict[str, float] = {}
         # 「已结束」回复熔断：{account|bot_lower: 次数}；达到上限加入 _ended_bots
         self._ended_counts: Dict[str, int] = {}
         self._ended_bots: set = set()
@@ -1018,6 +1032,8 @@ class GiveawayEngine:
         self._flood_until.clear()
         self._last_start_at.clear()
         self._click_failed_until.clear()
+        self._entry_card_fails.clear()
+        self._entry_card_until.clear()
         self._ended_counts.clear()
         self._ended_bots.clear()
         self._seen_msgs.clear()
@@ -2634,6 +2650,10 @@ class GiveawayEngine:
             return False  # 账号已被 PEER_FLOOD 熔断，本轮不再参与任何抽奖
         if self._flood_paused(account, username):
             return False  # 该 bot 仍在限流暂停期内，等恢复后下一轮再试
+        if self._entry_card_paused(account, username, param):
+            # 该抽奖已连续多次停在入口卡片（参与条件疑似永久不满足），
+            # 冷却期内不再发 start，避免每轮白烧一次点击
+            return False
         if self._flood_key(account, username) in self._ended_bots:
             return False  # 已结束回复熔断的 bot，静默跳过
         return True
@@ -2997,6 +3017,46 @@ class GiveawayEngine:
             return False
         return True
 
+    def _entry_card_key(self, account: str, username: str, param: str) -> str:
+        """入口卡片熔断键：账号 + bot + start 参数（同一 bot 不同抽奖互不影响）。"""
+        return f"{self._flood_key(account, username)}|{param}"
+
+    def _entry_card_paused(self, account: str, username: str, param: str) -> bool:
+        """「点击后仍是参与入口卡片」熔断冷却是否生效（到期自动解除并清零计数）。
+
+        冷却到期后再给几次重试机会，避免条件后来满足了却永久跳过。
+        """
+        key = self._entry_card_key(account, username, param)
+        until = self._entry_card_until.get(key)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            self._entry_card_until.pop(key, None)
+            self._entry_card_fails.pop(key, None)
+            return False
+        return True
+
+    def _note_entry_card_fail(self, account: str, username: str, param: str) -> None:
+        """记录一次「点击后仍是参与入口卡片」；连续达到上限后进入冷却。"""
+        key = self._entry_card_key(account, username, param)
+        if key in self._entry_card_until:
+            return  # 已在冷却中
+        fails = self._entry_card_fails.get(key, 0) + 1
+        self._entry_card_fails[key] = fails
+        if fails >= ENTRY_CARD_FAIL_LIMIT:
+            self._entry_card_until[key] = time.monotonic() + ENTRY_CARD_COOLDOWN
+            self.log(
+                f"[{account}] @{username}（{param or '无参数'}）连续 {fails} 次"
+                "点击后仍为参与入口卡片（参与条件疑似永久不满足），"
+                f"冷却 {ENTRY_CARD_COOLDOWN // 60} 分钟内不再尝试该抽奖"
+            )
+
+    def _reset_entry_card_fails(self, account: str, username: str, param: str) -> None:
+        """参与成功后清零入口卡片失败计数与冷却（重复参与重新计算）。"""
+        key = self._entry_card_key(account, username, param)
+        self._entry_card_fails.pop(key, None)
+        self._entry_card_until.pop(key, None)
+
     def _log_transport_flood_429(self, account: str) -> None:
         """记录每次 429 的账号与时刻，并区分「单账号过密」和「多账号同时被风控」。
 
@@ -3249,6 +3309,10 @@ class GiveawayEngine:
             # 确认按钮刚点击失败（超时/网络异常）：冷却期内不重发 start，
             # 避免「start→点击超时 30 秒→下一轮扫描立刻重试」的重试风暴
             return False
+        if self._entry_card_paused(account, username, param):
+            # 该抽奖已连续多次停在入口卡片（参与条件疑似永久不满足），
+            # 冷却期内不再发 start，避免每轮白烧一次 start
+            return False
         return True
 
     async def _handle_start_reply(
@@ -3371,6 +3435,9 @@ class GiveawayEngine:
         reserved: bool,
     ) -> None:
         """记录参与成功：持久化记录、计数与事件推送。"""
+        # 真实参与成功：清零该抽奖的入口卡片熔断计数（若此前连续失败，
+        # 之后再出现失败需重新计数，不能沿用旧计数立即触发冷却）
+        self._reset_entry_card_fails(account, username, param)
         if self._state is not None:
             self._state.add(account, username, param, channel=channel)
             self._state.save()
@@ -4361,6 +4428,7 @@ class GiveawayEngine:
         client: Any,
         username: str,
         candidates: List[Any],
+        param: str = "",
     ) -> Tuple[bool, bool]:
         """优先点击「我已加入/重试参与」按钮完成重试参与。
 
@@ -4405,7 +4473,7 @@ class GiveawayEngine:
                             account, client, username, candidates
                         )
                         return True, await self._verify_after_click(
-                            account, client, username, candidates
+                            account, client, username, candidates, param=param
                         )
                     except Exception as exc:
                         self.log(
@@ -4647,7 +4715,7 @@ class GiveawayEngine:
         # 触发；旧消息残留被 join_cache 挡住（did_join=False）不算。
         if had_join_targets and did_join:
             retried, retry_completed = await self._click_join_retry_button(
-                account, client, username, candidates
+                account, client, username, candidates, param=param
             )
             if retried:
                 return (
@@ -4831,7 +4899,7 @@ class GiveawayEngine:
                     return True, True, ""
                 self.log(self._format_confirm_button_log(username, btn.text))
                 completed = await self._verify_after_click(
-                    account, client, username, candidates
+                    account, client, username, candidates, param=param
                 )
                 return (
                     True,
@@ -4860,7 +4928,7 @@ class GiveawayEngine:
                     f"已点击 @{username} 的参与按钮「{btn.text}」（按链接参数重新参与）"
                 )
                 completed = await self._verify_after_click(
-                    account, client, username, candidates
+                    account, client, username, candidates, param=param
                 )
                 return (
                     True,
@@ -4875,7 +4943,7 @@ class GiveawayEngine:
                 await self._start_bot(client, account, username, "")
                 self.log(f"已点击 @{username} 的参与按钮「{btn.text}」（重发 start）")
                 completed = await self._verify_after_click(
-                    account, client, username, candidates
+                    account, client, username, candidates, param=param
                 )
                 return (
                     True,
@@ -5034,6 +5102,7 @@ class GiveawayEngine:
         client: Any,
         username: str,
         candidates: Optional[List[Any]] = None,
+        param: str = "",
     ) -> bool:
         """点击确认/参与按钮后核对 bot 回复，把结果写进日志（不再盲点）。
 
@@ -5103,6 +5172,7 @@ class GiveawayEngine:
                 # @Lottery_2_bot 会一直重发同一张卡片）。按「无法判定」记成功
                 # 会造成日志显示已参与、实际根本没报名，必须判未完成
                 self.log(f"@{username} 点击后仍是参与入口卡片，本次未真正报名：{flat}")
+                self._note_entry_card_fail(account, username, param)
                 return False
             if ECHO_GIVEAWAY_DETAIL_RE.search(text):
                 # 详情卡上没有可点的确认按钮：bot 只把抽奖帖原样回显
