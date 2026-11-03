@@ -2479,8 +2479,12 @@ class ComboTaskBlock:
                     note = _giveaway_sub_note(sub, self.workdir)
                     if note:
                         label += f"｜{note}"
+                # shrink-0：勾选列表是定高滚动容器（max-h-56）的 flex 列，
+                # 默认 flex-shrink:1 会把每行压到比文字更矮，长标签的换行就会
+                # 溢出压到下一行（表现为文字重叠）。items-start 让多行标签与
+                # 勾选框首行对齐。
                 self._new_task_checks[i] = ui.checkbox(label, value=True).classes(
-                    "text-sm"
+                    "text-sm shrink-0 items-start"
                 )
 
     def open_new_task_dialog(

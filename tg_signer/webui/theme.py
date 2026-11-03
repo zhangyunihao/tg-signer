@@ -97,14 +97,18 @@ MOBILE_DESIGN_CSS = """
         transition: background-color 0.18s ease;
     }
     .main-tabs .q-tab__content { justify-content: center; min-width: 0; }
-    /* 标签字号由 ≤640px 样式段里的 ::before 统一控制（data-short 短名） */
+    /* 标签字号由 ≤640px 样式段统一控制（移动端由脚本改写为短名文本） */
     .main-tabs .q-tab__label { color: var(--tgs-text-2); }
-    .main-tabs .q-tab__label::before { font-weight: 600; }
     .main-tabs .q-tab--active { background: var(--tgs-brand-soft); }
-    .main-tabs .q-tab--active .q-tab__label,
-    .main-tabs .q-tab--active .q-tab__label::before { color: var(--tgs-brand-strong) !important; }
+    .main-tabs .q-tab--active .q-tab__label { color: var(--tgs-brand-strong) !important; }
     .main-tabs .q-tab__indicator { display: none; }
-    .tgs-header-actions .q-btn { padding: 0 !important; }
+    /* 铃铛/菜单收窄到 2rem 宽（高度仍保留 44px 便于点击），给 tab 栏多让出 24px */
+    .tgs-header-actions .q-btn {
+        padding: 0 !important;
+        width: 2rem;
+        min-width: 2rem !important;
+        min-height: 2.75rem !important;
+    }
     /* 卡片：统一 16px 圆角、细描边、轻投影 */
     .nicegui-content .q-card,
     .q-dialog .q-card {
@@ -177,6 +181,35 @@ MOBILE_DESIGN_CSS = """
         border-color: var(--tgs-line-strong) !important;
     }
     .q-btn-group > .q-btn { min-width: 44px; }
+    /* 分段控件（ui.toggle）：整行浅底轨道 + 等分内嵌选中块。Quasar 默认给
+       q-btn-group 铺了整块投影，再叠加全局按钮的 12px 圆角，会形成「白卡里
+       套胶囊」的错位观感；这里收敛成统一的移动端分段样式 */
+    .q-btn-toggle {
+        width: 100%;
+        gap: 2px;
+        padding: 3px;
+        background: var(--tgs-surface-soft);
+        border: 1px solid var(--tgs-line);
+        border-radius: var(--tgs-radius-md) !important;
+        box-shadow: none !important;
+    }
+    .q-btn-toggle > .q-btn {
+        flex: 1 1 0;
+        min-width: 0 !important;
+        min-height: 40px !important;
+        padding: 0 0.25rem !important;
+        border-radius: calc(var(--tgs-radius-md) - 3px) !important;
+        background: transparent !important;
+        color: var(--tgs-text-2) !important;
+        font-size: var(--tgs-fs-aux);
+        white-space: nowrap;
+    }
+    .q-btn-toggle > .q-btn:before { border: 0 !important; }
+    .q-btn-toggle > .q-btn:active { transform: none; }
+    .q-btn-toggle > .q-btn.bg-primary {
+        background: var(--tgs-brand) !important;
+        color: #ffffff !important;
+    }
     .q-btn:active { transform: scale(0.98); }
     /* 表单：48px 控件高度、12px 圆角，输入字号保持 16px */
     .q-field--outlined .q-field__control {
@@ -236,12 +269,19 @@ MOBILE_DESIGN_CSS = """
         box-shadow: var(--tgs-shadow-1) !important;
         background: var(--tgs-surface);
     }
-    .mobile-card-actions { margin-top: 0.5rem !important; gap: 0.5rem !important; }
+    /* 卡片按钮行：不换行、按钮等分整行，6 个按钮（含置顶图钉）在 360px 同处一行 */
+    .mobile-card-actions {
+        margin-top: 0.5rem !important;
+        gap: 0.125rem !important;
+        flex-wrap: nowrap !important;
+    }
     .mobile-card-actions .q-btn {
         min-height: 44px !important;
-        min-width: 44px !important;
-        flex: 0 0 auto;
+        min-width: 0 !important;
+        flex: 1 1 0;
+        padding: 0 0.125rem !important;
         font-size: 0.8125rem;
+        white-space: nowrap;
     }
     .tgs-fields { row-gap: 2px; }
     .tgs-field { font-size: 0.78125rem; line-height: 1.5; }

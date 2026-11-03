@@ -692,9 +692,6 @@ def _build_center_page() -> None:
                 ui.button(icon="refresh").props("flat round dense").on_click(
                     refresh_all
                 )
-        ui.label("中奖、加入失败与待补发言提醒；点消息标为已读。").classes(
-            "text-sm text-gray-500"
-        )
         # 恢复上次选择的过滤用户/消息类型（刷新页面、重开标签页后仍保留）
         options = _filter_options(read_keys)
         saved = str(app.storage.user.get(FILTER_STORAGE_KEY) or "")

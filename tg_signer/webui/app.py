@@ -660,23 +660,37 @@ def _build_dashboard(container) -> None:
                 ui.separator()
                 ui.menu_item("停止所有任务并解锁数据库", on_click=_stop_all_tasks)
 
-        # 移动端 tab 短标签：按 tab 顺序给每个 label 写入 data-short 短名，
-        # 宽度<=640px 时由媒体查询用短名替换全名（桌面端不受影响）。
+        # 移动端 tab 短标签：宽度<=640px 时把 label 文本换成两字短名，
+        # 宽屏恢复全名（桌面端不受影响）。直接改写文本节点而不是用
+        # font-size:0 + ::before 伪元素，避免部分浏览器把伪元素内容渲染成
+        # 空心方块；matchMedia 监听保证旋转/缩放时即时切换。
         # 注意：q-tab 的 name 属性不会反映到 DOM（getAttribute('name') 为 null），
         # 因此按索引匹配而非按 name
         _short_tab_names = ["签到", "组合", "发言", "退频道", "抽奖"]
         ui.run_javascript(
             "const shortNames = " + __import__("json").dumps(_short_tab_names) + ";"
-            # 带重试：Quasar 渲染 q-tab 标签可能晚于脚本执行，未全部写入则 200ms 后重试，
-            # 否则窄屏下 font-size:0 生效而 data-short 缺失，标签会全部空白
+            "const tabMq = window.matchMedia('(max-width: 640px)');"
+            # 带重试：Quasar 渲染 q-tab 标签可能晚于脚本执行，未全部处理则 200ms 后重试
             "(function(){let tries=0;const apply=()=>{"
             "  const labels=document.querySelectorAll('.main-tabs .q-tab .q-tab__label');"
             "  let done=0;"
             "  labels.forEach((label,i)=>{"
-            "    if(shortNames[i]){label.dataset.short=shortNames[i];done++;}"
+            "    if(!shortNames[i])return;"
+            "    if(!label.dataset.full)label.dataset.full=label.textContent.trim();"
+            "    label.textContent=tabMq.matches?shortNames[i]:label.dataset.full;"
+            "    done++;"
             "  });"
             "  if(done<labels.length&&tries++<30)setTimeout(apply,200);"
-            "};apply();})();"
+            "};apply();"
+            "if(!window.__tgsTabLabelMq){window.__tgsTabLabelMq=true;"
+            "  tabMq.addEventListener('change',()=>{"
+            "    document.querySelectorAll('.main-tabs .q-tab .q-tab__label')"
+            "      .forEach((label,i)=>{"
+            "        if(label.dataset.full)"
+            "          label.textContent=tabMq.matches?shortNames[i]:label.dataset.full;"
+            "      });"
+            "  });"
+            "}})();"
         )
         # 移动端点击卡片里的单行字段（账号/监控对象等）弹出完整内容
         ui.run_javascript(
@@ -1276,15 +1290,9 @@ def build_ui(auth_code: str = None) -> None:
                 .tgs-header-actions .q-btn { padding: 4px; }
                 .main-tabs { overflow: hidden; }
                 .main-tabs .q-tab { padding-left: 0; padding-right: 0; }
-                /* tab 文字用两字短名（data-short 由页面脚本写入 label 上）：
-                   原全名字号置 0 隐藏，::before 显示短名，五个 tab 一屏放下；
-                   去图标后按纯文字均分，360px 下 13px 保证「退频道」不溢出 */
-                .main-tabs .q-tab .q-tab__label { font-size: 0; }
-                .main-tabs .q-tab .q-tab__label::before {
-                    content: attr(data-short);
-                    font-size: 13px;
-                    letter-spacing: normal;
-                }
+                /* tab 文字由页面脚本按断点改写为两字短名（data-full 保存全名），
+                   五个 tab 一屏放下；360px 下 13px 保证「退频道」不溢出 */
+                .main-tabs .q-tab .q-tab__label { font-size: 13px; }
                 /* 弹窗：利用几乎全部宽度，高度限制在可视区内（dvh 适配地址栏伸缩），
                    整卡可滚动，并预留底部手势条安全区 */
                 .q-dialog__inner { padding: 8px; }
