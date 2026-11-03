@@ -189,11 +189,11 @@ def authz_cached(session_dir: Path, account: str) -> Optional[bool]:
 
 
 def build_account_options(session_dir: Path, names: List[str]) -> Dict[str, str]:
-    """把账号列表转成下拉选项。NiceGUI 字典选项格式为 {值: 显示名}，未授权的加 ⚠️ 标注"""
+    """把账号列表转成下拉选项。NiceGUI 字典选项格式为 {值: 显示名}，未授权的加文字标注"""
     opts: Dict[str, str] = {}
     for n in names:
         cached = authz_cached(session_dir, n)
-        opts[n] = f"{n} ⚠️未授权" if cached is False else n
+        opts[n] = f"{n}（未授权）" if cached is False else n
     return opts
 
 
@@ -1582,7 +1582,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             .props("outlined autogrow")
         )
 
-        ui.label("间隔建议 ≥5 秒；同一账号不可并行运行。").classes(
+        ui.label("间隔建议不少于 5 秒；同一账号不可并行运行。").classes(
             "text-xs text-amber-600"
         )
         with ui.row().classes("w-full justify-end tgs-dialog-footer"):

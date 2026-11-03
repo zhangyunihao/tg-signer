@@ -78,8 +78,11 @@ ALL_ACCOUNTS = ""
 # 消息类型过滤下拉的「全部」哨兵值
 ALL_TYPES = ""
 
-# 消息中心首屏渲染条数：其余按「加载更多」分批追加，控制 DOM 规模
-MESSAGE_PAGE_SIZE = 40
+# 未读消息全部展示；超过该阈值时只渲染前 N 条并明确提示，防止 DOM 爆炸
+UNREAD_RENDER_LIMIT = 100
+
+# 已读消息默认展示 5 条，每点一次「展开更多」再追加 5 条
+READ_PAGE_SIZE = 5
 
 # 消息中心独立页面路由（右上角铃铛在新标签页打开）
 MESSAGES_PAGE_PATH = "/messages"
@@ -166,6 +169,30 @@ def message_keys(m: dict) -> List[str]:
 def is_message_unread(m: dict, read_keys: Set[str]) -> bool:
     """合并消息里只要还有任一原始提醒未读，整条消息即视为未读。"""
     return any(key not in read_keys for key in message_keys(m))
+
+
+def partition_messages(
+    messages: List[dict], read_keys: Set[str]
+) -> tuple[List[dict], List[dict]]:
+    """按现有顺序拆成未读、已读两组，组内顺序保持不变。"""
+    unread: List[dict] = []
+    read: List[dict] = []
+    for m in messages:
+        (unread if is_message_unread(m, read_keys) else read).append(m)
+    return unread, read
+
+
+def visible_sections(
+    messages: List[dict], read_keys: Set[str], read_shown: int
+) -> tuple[List[dict], int, List[dict], int]:
+    """返回（未读切片, 未读总数, 已读切片, 已读总数）；未读超限与已读分页都在此收敛。"""
+    unread, read = partition_messages(messages, read_keys)
+    return (
+        unread[:UNREAD_RENDER_LIMIT],
+        len(unread),
+        read[:read_shown],
+        len(read),
+    )
 
 
 def message_sort_key(
@@ -413,9 +440,8 @@ def _build_center_page() -> None:
     install_activity_tracking()
     read_keys: Set[str] = load_read_keys(state.workdir)
     last_fp = {"value": ""}
-    # 列表分页：默认只渲染首屏 40 条，其余「加载更多」按需追加，
-    # 避免数百条消息一次性生成上万个 DOM 节点、拖慢首帧与手机滚动
-    shown = {"n": MESSAGE_PAGE_SIZE}
+    # 未读全量展示；已读默认 5 条，按「展开更多」每次追加 5 条
+    shown = {"n": READ_PAGE_SIZE}
 
     def visible_messages() -> List[dict]:
         """按当前用户/类型过滤条件取可见消息（未排序）。"""
@@ -459,12 +485,12 @@ def _build_center_page() -> None:
     def _on_filter_change(_e) -> None:
         # 持久化过滤选择：刷新页面、重开标签页后仍保留（clearable 清空存为「全部」）
         app.storage.user[FILTER_STORAGE_KEY] = str(filter_sel.value or "")
-        shown["n"] = MESSAGE_PAGE_SIZE
+        shown["n"] = READ_PAGE_SIZE
         render_list()
 
     def _on_type_filter_change(_e) -> None:
         app.storage.user[TYPE_FILTER_STORAGE_KEY] = str(type_sel.value or "")
-        shown["n"] = MESSAGE_PAGE_SIZE
+        shown["n"] = READ_PAGE_SIZE
         render_list()
 
     def toggle_pin(key: str) -> None:
@@ -518,7 +544,7 @@ def _build_center_page() -> None:
             ui.notify(f"重发完成：{ok_count} 条口令全部发送成功", type="positive")
 
     def show_more() -> None:
-        shown["n"] += MESSAGE_PAGE_SIZE
+        shown["n"] += READ_PAGE_SIZE
         render_list()
 
     def render_list() -> None:
@@ -529,84 +555,99 @@ def _build_center_page() -> None:
         retry_logs = load_speak_retry_logs(state.workdir)
         # 置顶最优先；未读次之；未读内部中奖消息最优先；同组内按新消息优先（时间倒序）
         messages.sort(key=lambda m: message_sort_key(m, read_keys, pin_keys))
+        unread_shown, unread_total, read_shown, read_total = visible_sections(
+            messages, read_keys, shown["n"]
+        )
+
+        def render_row(m: dict, unread: bool) -> None:
+            pinned = m["key"] in pin_keys
+
+            def _on_row_click(*_args, _msg: dict = m) -> None:
+                mark_one(_msg)
+
+            def _on_pin_click(*_args, _key: str = m["key"]) -> None:
+                toggle_pin(_key)
+
+            def _on_dot_click(*_args, _msg: dict = m) -> None:
+                toggle_read(_msg)
+
+            with (
+                ui.row()
+                .classes(
+                    "w-full items-start gap-2 p-2 rounded cursor-pointer tgs-msg-row "
+                    + ("bg-blue-50" if unread else "")
+                )
+                .on("click", _on_row_click)
+            ):
+                # click.stop 阻止冒泡：点圆点只切换已读状态，不触发整行的「标为已读」
+                ui.button(
+                    icon="fiber_manual_record" if unread else "radio_button_unchecked"
+                ).props(
+                    "flat round dense size=sm "
+                    + ("color=primary" if unread else "color=grey-5")
+                ).classes("shrink-0").on("click.stop", _on_dot_click).tooltip(
+                    "标为未读" if not unread else "标为已读"
+                )
+                ui.badge(m["tag"]).props(f"outline dense color={m['color']}").classes(
+                    "shrink-0"
+                )
+                ui.label(m["text"]).classes(
+                    "text-sm flex-1 min-w-0 "
+                    + ("text-gray-900" if unread else "text-gray-500")
+                )
+                if m.get("retry"):
+                    # click.stop 阻止冒泡，避免重试时把消息同时标为已读
+                    async def _on_retry_click(
+                        *_args, _alert: dict = m["retry"]
+                    ) -> None:
+                        await retry_speak(_alert)
+
+                    ui.button(icon="replay").props(
+                        "flat round dense size=sm color=primary"
+                    ).on("click.stop", _on_retry_click).tooltip("重试发送口令")
+                    # 日志按钮：重试过（已有落盘日志）才显示；刷新后日志仍在，
+                    # 因此按钮与内容刷新后依然可见
+                    if speak_retry_log_key(m["retry"]) in retry_logs:
+
+                        def _on_log_click(*_args, _alert: dict = m["retry"]) -> None:
+                            open_retry_log(_alert)
+
+                        ui.button(icon="subject").props(
+                            "flat round dense size=sm color=grey-7"
+                        ).on("click.stop", _on_log_click).tooltip("显示重试日志")
+                # click.stop 阻止冒泡，避免点图钉时同时把消息标记为已读
+                ui.button(icon="push_pin").props(
+                    "flat round dense size=sm "
+                    + ("color=orange" if pinned else "color=grey-5")
+                ).on("click.stop", _on_pin_click).tooltip(
+                    "取消置顶" if pinned else "置顶"
+                )
+
         with list_container:
             if not messages:
                 ui.label("暂无消息").classes("text-sm text-gray-400 tgs-empty")
                 return
-            for m in messages[: shown["n"]]:
-                unread = is_message_unread(m, read_keys)
-                pinned = m["key"] in pin_keys
-
-                def _on_row_click(*_args, _msg: dict = m) -> None:
-                    mark_one(_msg)
-
-                def _on_pin_click(*_args, _key: str = m["key"]) -> None:
-                    toggle_pin(_key)
-
-                def _on_dot_click(*_args, _msg: dict = m) -> None:
-                    toggle_read(_msg)
-
-                with (
-                    ui.row()
-                    .classes(
-                        "w-full items-start gap-2 p-2 rounded cursor-pointer tgs-msg-row "
-                        + ("bg-blue-50" if unread else "")
+            if unread_shown:
+                ui.label(f"未读 {unread_total}").classes("text-sm text-gray-400 px-1")
+                for m in unread_shown:
+                    render_row(m, True)
+                hidden = unread_total - len(unread_shown)
+                if hidden > 0:
+                    ui.label(f"其余 {hidden} 条未读未显示").classes(
+                        "text-xs text-gray-400 px-1"
                     )
-                    .on("click", _on_row_click)
-                ):
-                    # click.stop 阻止冒泡：点圆点只切换已读状态，不触发整行的「标为已读」
+            if read_shown:
+                ui.label(f"已读 {read_total}").classes(
+                    "text-sm text-gray-400 px-1 pt-2"
+                )
+                for m in read_shown:
+                    render_row(m, False)
+                remaining = read_total - len(read_shown)
+                if remaining > 0:
+                    # 每次只追加 5 条已读；过滤/类型切换重置，刷新保留已展开页数
                     ui.button(
-                        icon="fiber_manual_record"
-                        if unread
-                        else "radio_button_unchecked"
-                    ).props(
-                        "flat round dense size=sm "
-                        + ("color=primary" if unread else "color=grey-5")
-                    ).classes("shrink-0").on("click.stop", _on_dot_click).tooltip(
-                        "标为未读" if not unread else "标为已读"
-                    )
-                    ui.badge(m["tag"]).props(
-                        f"outline dense color={m['color']}"
-                    ).classes("shrink-0")
-                    ui.label(m["text"]).classes(
-                        "text-sm flex-1 min-w-0 "
-                        + ("text-gray-900" if unread else "text-gray-500")
-                    )
-                    if m.get("retry"):
-                        # click.stop 阻止冒泡，避免重试时把消息同时标为已读
-                        async def _on_retry_click(
-                            *_args, _alert: dict = m["retry"]
-                        ) -> None:
-                            await retry_speak(_alert)
-
-                        ui.button(icon="replay").props(
-                            "flat round dense size=sm color=primary"
-                        ).on("click.stop", _on_retry_click).tooltip("重试发送口令")
-                        # 日志按钮：重试过（已有落盘日志）才显示；刷新后日志仍在，
-                        # 因此按钮与内容刷新后依然可见
-                        if speak_retry_log_key(m["retry"]) in retry_logs:
-
-                            def _on_log_click(
-                                *_args, _alert: dict = m["retry"]
-                            ) -> None:
-                                open_retry_log(_alert)
-
-                            ui.button(icon="subject").props(
-                                "flat round dense size=sm color=grey-7"
-                            ).on("click.stop", _on_log_click).tooltip("显示重试日志")
-                    # click.stop 阻止冒泡，避免点图钉时同时把消息标记为已读
-                    ui.button(icon="push_pin").props(
-                        "flat round dense size=sm "
-                        + ("color=orange" if pinned else "color=grey-5")
-                    ).on("click.stop", _on_pin_click).tooltip(
-                        "取消置顶" if pinned else "置顶"
-                    )
-            remaining = len(messages) - shown["n"]
-            if remaining > 0:
-                # 只追加一页，未展开部分不进入 DOM；过滤/刷新仍保留当前展开页数
-                ui.button(f"加载更多（剩余 {remaining} 条）", on_click=show_more).props(
-                    "flat dense full-width"
-                ).classes("text-sm")
+                        f"展开更多（剩余 {remaining} 条）", on_click=show_more
+                    ).props("flat dense full-width").classes("text-sm")
 
     def refresh_all() -> None:
         # 重建过滤选项（未读账号置前并刷新未读数标注），选中项失效时回落「全部用户」

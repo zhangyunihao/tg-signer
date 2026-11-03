@@ -306,7 +306,14 @@ class InteractiveSignerConfig:
                                 inputs["text"] = ui.input("发送文本").classes("w-full")
                             elif t == SupportAction.SEND_DICE:
                                 inputs["dice"] = ui.select(
-                                    options=["🎲", "🎯", "🏀", "⚽", "🎳", "🎰"],
+                                    options={
+                                        "🎲": "骰子",
+                                        "🎯": "飞镖",
+                                        "🏀": "篮球",
+                                        "⚽": "足球",
+                                        "🎳": "保龄球",
+                                        "🎰": "老虎机",
+                                    },
                                     label="选择骰子",
                                     value="🎲",
                                 ).classes("w-full")

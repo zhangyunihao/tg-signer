@@ -733,7 +733,7 @@ def user_info_block() -> Callable[[], None]:
                                 if info:
                                     parts = []
                                     if info["name"]:
-                                        parts.append(f"→ {info['name']}")
+                                        parts.append(str(info["name"]))
                                     if info["username"]:
                                         parts.append(f"@{info['username']}")
                                     parts.append(f"ID {info['user_id']}")
@@ -748,7 +748,7 @@ def user_info_block() -> Callable[[], None]:
                                     ui.label(text).classes("text-xs text-gray-500")
                                 else:
                                     ui.label(
-                                        "→ 未获取到 Telegram 身份（未登录或缺少用户信息）"
+                                        "未获取到 Telegram 身份（未登录或缺少用户信息）"
                                     ).classes("text-xs text-gray-400")
                                 limit_text, limit_cls = _limit_text(
                                     limit_snapshot.get(name) or []

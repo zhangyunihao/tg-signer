@@ -776,7 +776,7 @@ def _sign_config_params(task_name: str, workdir) -> list[tuple[str, str]] | None
         chat_id = chat.get("chat_id")
         title = titles.get(str(chat_id)) or str(chat.get("name") or "")
         actions = (
-            " → ".join(_fmt_sign_action(a) for a in (chat.get("actions") or [])) or "—"
+            "、".join(_fmt_sign_action(a) for a in (chat.get("actions") or [])) or "—"
         )
         delete_after = chat.get("delete_after")
         lines = [
@@ -2435,15 +2435,15 @@ class ComboTaskBlock:
             # 这里只需 HH:MM，输入框更简洁，格式由启动时校验兜底
             self.new_task_start_time = (
                 ui.input(
-                    label="开始时间（可选，HH:MM，留空立即执行）",
+                    label="开始时间（可选，HH:MM）",
                     placeholder="如 14:30",
                 )
                 .classes("w-56")
                 .props("clearable")
             )
-            ui.label("时间已过则从明天开始；网络不通按间隔重试。").classes(
-                "text-xs text-gray-500"
-            )
+            ui.label(
+                "留空立即执行；时间已过则从明天开始；网络不通按间隔重试。"
+            ).classes("text-xs text-gray-500")
             with ui.row().classes("w-full gap-2 no-wrap"):
                 self.new_task_retry_interval = ui.number(
                     label="网络不通重试间隔（分钟）",

@@ -286,6 +286,94 @@ def log_block(card: Optional[ui.card] = None) -> Callable[[], None]:
     return refresh
 
 
+def build_configs_panel(
+    refresh_all: Callable[[], None],
+    refreshers: list[Callable[[], None]],
+    on_close: Optional[Callable[[], None]] = None,
+) -> Callable[[], None]:
+    """签到配置管理面板：导入导出 + 配置编辑器。
+
+    由「菜单 → 签到配置管理」抽屉调用，与内容构建逻辑集中在这里，
+    弹窗与将来可能的其它容器都能复用。返回配置列表刷新函数。
+    """
+    ui.label("查看、编辑或删除签到配置。").classes("text-sm text-gray-500")
+
+    # ---- 配置导入导出（用于备份或迁移到其他设备） ----
+    async def export_configs() -> None:
+        try:
+            # 打包 zip 是同步磁盘操作，放入线程池避免阻塞事件循环
+            data = await run.io_bound(export_backup, state.workdir)
+            ui.download(
+                data,
+                f"tg-signer-backup-{datetime.now():%Y%m%d-%H%M%S}.zip",
+                "application/zip",
+            )
+            ui.notify(
+                "备份已导出（不含 session 文件），浏览器已开始下载",
+                type="positive",
+            )
+        except Exception as exc:  # noqa: BLE001
+            notify_error(exc)
+
+    async def on_import_file(e) -> None:
+        try:
+            # NiceGUI 3.13：上传内容在 e.file（FileUpload），read() 为异步
+            raw = await e.file.read()
+            # 解包 zip 并逐个写配置同样是同步磁盘操作
+            counts = await run.io_bound(import_backup, raw, state.workdir)
+        except Exception as exc:  # noqa: BLE001
+            notify_error(exc)
+            return
+        ui.notify(
+            "导入完成：签到配置 {signer} 个、数据文件 {signer_data_files} 个".format(
+                **counts
+            ),
+            type="positive",
+        )
+        try:
+            refresh_all()
+        except Exception as exc:  # noqa: BLE001
+            # 导入已成功，仅界面刷新失败时单独提示，避免误报导入失败
+            notify_error(exc)
+
+    with ui.row().classes("gap-2 items-center flex-wrap"):
+        ui.button("导出全部配置", icon="download", on_click=export_configs)
+        ui.button("导入配置", icon="upload", on_click=lambda: import_dlg.open())
+
+    with (
+        ui.dialog() as import_dlg,
+        ui.card().classes("w-[420px] max-w-full"),
+    ):
+        add_dialog_close_button(import_dlg)
+        ui.label("导入备份").classes("text-lg font-semibold")
+        ui.label("覆盖同名配置，不含登录凭据。").classes("text-sm text-gray-600")
+        with ui.expansion("备份包含什么", icon="help_outline").classes("w-full"):
+            ui.label(
+                "支持此前「导出全部配置」生成的 .zip 或 .json。同名配置会被"
+                "覆盖，账户状态同步恢复；ZIP 还会还原最近聊天缓存和批量退频道"
+                "排除关键字配置。任务历史不随备份迁移；备份不含 session 登录"
+                "凭据，迁移账号需另行复制 .session 文件。"
+            ).classes("text-xs text-gray-500")
+        ui.upload(
+            label="选择备份文件",
+            on_upload=on_import_file,
+            auto_upload=True,
+        ).props("accept=.json,.zip").classes("w-full")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("关闭", on_click=import_dlg.close).props("outline")
+
+    signer_block = SignerBlock(SIGNER_TEMPLATE)
+    refreshers.append(signer_block)
+    # 块本身只创建空容器并返回 refresh，需立即调用一次填充配置列表
+    signer_block()
+
+    if on_close is not None:
+        with ui.row().classes("w-full justify-end"):
+            ui.button("关闭", on_click=on_close).props("outline")
+
+    return signer_block.refresh_options
+
+
 def _apply_paths(workdir_input, on_refresh: Callable[[], None]) -> None:
     try:
         state.set_workdir(workdir_input.value or str(DEFAULT_WORKDIR))
@@ -625,6 +713,16 @@ def _build_dashboard(container) -> None:
                 refreshers.append(message_center_button())
                 header_btn = ui.button(icon="more_vert").props("flat round dense")
 
+        # 网络自检提示条挂在 header 之后：普通块级元素，不遮挡导航也不拦截
+        # tab 点击（此前常驻 ui.notify 会盖住整个 header，自动化点 tab 直接超时）
+        net_banner = ui.column().classes("w-full gap-0")
+
+        async def _run_net_probe() -> None:
+            await _probe_telegram_connectivity(net_banner)
+
+        # 注意：必须传协程函数本身，传 lambda 返回协程不会被 NiceGUI await
+        ui.timer(0.5, _run_net_probe, once=True)
+
         # 默认选中「签到」：未选中任何 tab（首次访问、localStorage 无记录或值失效）时，
         # 面板区域不显示任何内容，这里显式设为 run 保证默认面板有内容
         tabs.value = "run"
@@ -826,85 +924,7 @@ def _build_dashboard(container) -> None:
             _configs_built = True
             with configs_card:
                 ui.label("签到配置管理").classes("text-lg font-semibold")
-                ui.label("查看、编辑或删除签到配置。").classes("text-sm text-gray-500")
-
-                # ---- 配置导入导出（用于备份或迁移到其他设备） ----
-                async def export_configs() -> None:
-                    try:
-                        # 打包 zip 是同步磁盘操作，放入线程池避免阻塞事件循环
-                        data = await run.io_bound(export_backup, state.workdir)
-                        ui.download(
-                            data,
-                            f"tg-signer-backup-{datetime.now():%Y%m%d-%H%M%S}.zip",
-                            "application/zip",
-                        )
-                        ui.notify(
-                            "备份已导出（不含 session 文件），浏览器已开始下载",
-                            type="positive",
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        notify_error(exc)
-
-                async def on_import_file(e) -> None:
-                    try:
-                        # NiceGUI 3.13：上传内容在 e.file（FileUpload），read() 为异步
-                        raw = await e.file.read()
-                        # 解包 zip 并逐个写配置同样是同步磁盘操作
-                        counts = await run.io_bound(import_backup, raw, state.workdir)
-                    except Exception as exc:  # noqa: BLE001
-                        notify_error(exc)
-                        return
-                    ui.notify(
-                        "导入完成：签到配置 {signer} 个、数据文件 {signer_data_files} 个".format(
-                            **counts
-                        ),
-                        type="positive",
-                    )
-                    try:
-                        refresh_all()
-                    except Exception as exc:  # noqa: BLE001
-                        # 导入已成功，仅界面刷新失败时单独提示，避免误报导入失败
-                        notify_error(exc)
-
-                with ui.row().classes("gap-2 items-center flex-wrap"):
-                    ui.button("导出全部配置", icon="download", on_click=export_configs)
-                    ui.button(
-                        "导入配置", icon="upload", on_click=lambda: import_dlg.open()
-                    )
-
-                with (
-                    ui.dialog() as import_dlg,
-                    ui.card().classes("w-[420px] max-w-full"),
-                ):
-                    add_dialog_close_button(import_dlg)
-                    ui.label("导入备份").classes("text-lg font-semibold")
-                    ui.label("覆盖同名配置，不含登录凭据。").classes(
-                        "text-sm text-gray-600"
-                    )
-                    with ui.expansion("备份包含什么", icon="help_outline").classes(
-                        "w-full"
-                    ):
-                        ui.label(
-                            "支持此前「导出全部配置」生成的 .zip 或 .json。同名配置会被"
-                            "覆盖，账户状态同步恢复；ZIP 还会还原最近聊天缓存和批量退频道"
-                            "排除关键字配置。任务历史不随备份迁移；备份不含 session 登录"
-                            "凭据，迁移账号需另行复制 .session 文件。"
-                        ).classes("text-xs text-gray-500")
-                    ui.upload(
-                        label="选择备份文件",
-                        on_upload=on_import_file,
-                        auto_upload=True,
-                    ).props("accept=.json,.zip").classes("w-full")
-                    with ui.row().classes("w-full justify-end"):
-                        ui.button("关闭", on_click=import_dlg.close).props("outline")
-
-                signer_block = SignerBlock(SIGNER_TEMPLATE)
-                refreshers.append(signer_block)
-                # 块本身只创建空容器并返回 refresh，需立即调用一次填充配置列表
-                signer_block()
-
-                with ui.row().classes("w-full justify-end"):
-                    ui.button("关闭", on_click=configs_dialog.close).props("outline")
+                build_configs_panel(refresh_all, refreshers, configs_dialog.close)
 
         _panel_builders = {
             "run": _build_run_panel,
@@ -983,21 +1003,37 @@ def _check_auth_code(input_code: str, auth_code: str) -> tuple[bool, str]:
 _NETWORK_CHECK_TIMEOUT = 8.0
 
 
-async def _probe_telegram_connectivity() -> None:
-    """通过当前代理配置连一次 Telegram DC，失败时在页面顶部弹出持久警告。"""
+async def _probe_telegram_connectivity(slot: ui.element) -> None:
+    """通过当前代理配置连一次 Telegram DC，失败时在头部下方显示页内提示条。
+
+    不用顶层 ui.notify：常驻通知固定覆盖页面顶部，会遮住 77px 高的吸顶
+    header 并拦截 tab 点击。改成插在 header 之后的普通块级元素，不参与
+    悬浮层，关掉后立即释放空间。
+    """
     dest = f"{TELEGRAM_DC_HOST}:{TELEGRAM_DC_PORT}"
     logger.info("网络自检开始（目标 %s，超时 %.0f 秒）", dest, _NETWORK_CHECK_TIMEOUT)
     ok, detail = await probe_telegram_connectivity(_NETWORK_CHECK_TIMEOUT)
     if not ok:
         logger.warning("网络自检失败：%s", detail)
-        ui.notify(
-            f"科学上网不可用：{detail}（{_NETWORK_CHECK_TIMEOUT:.0f} 秒内未握手成功）。"
-            "所有任务功能都无法正常使用，请检查代理/VPN 后刷新页面重试。",
-            type="warning",
-            position="top",
-            timeout=0,
-            close_button="知道了",
-        )
+        slot.clear()
+        with slot:
+            with (
+                ui.row()
+                .classes("w-full items-start no-wrap gap-2 px-3 py-2 tgs-net-banner")
+                .style(
+                    "background: #fff8e6; border: 1px solid #f0d9a8;"
+                    " border-radius: 12px;"
+                )
+            ):
+                ui.icon("wifi_off").classes("text-amber-600 mt-1")
+                ui.label(
+                    f"科学上网不可用：{detail}（{_NETWORK_CHECK_TIMEOUT:.0f} 秒内"
+                    "未握手成功）。所有任务功能都无法正常使用，请检查代理/VPN "
+                    "后刷新页面重试。"
+                ).classes("text-sm flex-1")
+                ui.button(icon="close", on_click=lambda: slot.clear()).props(
+                    'flat round dense aria-label="关闭提示"'
+                ).classes("tgs-banner-close").tooltip("关闭提示")
         return
     logger.info("网络自检通过：可连上 Telegram（%s，%s）", dest, detail)
 
@@ -1285,21 +1321,68 @@ def build_ui(auth_code: str = None) -> None:
                     overflow-wrap: anywhere;
                 }
                 .tgs-field-pre { white-space: pre-line; }
-                /* 账号/监控对象等长列表：强制单行，超出省略，避免把卡片撑高 */
+                /* 账号/监控对象等长列表：原先单行省略会吞掉关键信息，改为换行
+                   完整展示（overflow-wrap 允许超长账号/频道名在任意位置断行） */
                 .tgs-field-one { align-items: center; }
                 .tgs-field-one .tgs-field-v {
-                    white-space: nowrap;
-                    overflow: hidden;
-                    text-overflow: ellipsis;
-                    cursor: pointer;
+                    white-space: normal;
+                    overflow: visible;
+                    text-overflow: clip;
+                    overflow-wrap: anywhere;
                 }
                 .mobile-card-actions { margin-top: 2px; }
-                /* 顶部主标签：tab 与右上三点按钮同行（flex 布局自动分配宽度），
-                   tab 栏占满剩余空间，隐藏版本号让出空间 */
+                /* 顶部主标签：恢复旧版密度，单行满宽贴顶。
+                   去掉圆角容器/阴影/内边距，tab 与右侧铃铛/菜单之间留 8px 间隙 */
                 .tgs-header-version { display: none; }
-                .tgs-header-actions .q-btn { padding: 4px; }
-                .main-tabs { overflow: hidden; }
-                .main-tabs .q-tab { padding-left: 0; padding-right: 0; }
+                /* 提高一级选择器权重，保证与 theme.py 的同类规则冲突时样式稳定：
+                   内容区左右各 12px 内边距，头部用等量负边距 + 2×12px 宽度
+                   正好铺满视口（不再多出 4px 造成横向滚动） */
+                .nicegui-content > .tgs-header-row {
+                    margin: -12px -12px 0 !important;
+                    width: calc(100% + 24px) !important;
+                    padding: 4px 8px 6px !important;
+                    gap: 8px !important;
+                    background: rgba(246, 248, 252, 0.92);
+                    border-bottom: 1px solid rgba(227, 232, 240, 0.8);
+                }
+                /* 铃铛/菜单保持 44×44 命中区，图标本身仍用小尺寸视觉 */
+                .tgs-header-actions .q-btn {
+                    min-width: 44px !important;
+                    min-height: 44px !important;
+                    padding: 0 !important;
+                }
+                /* 网络自检提示条的关闭按钮：视觉小图标，命中区仍是 44×44 */
+                .tgs-banner-close {
+                    min-width: 44px !important;
+                    min-height: 44px !important;
+                }
+                .main-tabs {
+                    background: transparent !important;
+                    border: 0 !important;
+                    border-radius: 0 !important;
+                    box-shadow: none !important;
+                    padding: 0 !important;
+                    min-height: 44px !important;
+                    overflow: visible !important;
+                }
+                .main-tabs .q-tabs__content { width: 100%; }
+                .main-tabs .q-tab {
+                    min-height: 44px !important;
+                    padding: 0 !important;
+                    border-radius: 10px !important;
+                }
+                .main-tabs .q-tab--active { background: var(--tgs-brand-soft); }
+                /* 浏览器会把 0 宽度的 .q-focus-helper 当作可聚焦元素画出描边，
+                   安卓上表现为标签左侧的空心小方块；直接移除该元素，并禁用
+                   点击高亮/伪元素内容，保证 tab 内不再出现任何方框 */
+                .main-tabs .q-focus-helper { display: none !important; }
+                .main-tabs .q-tab,
+                .main-tabs .q-tab * {
+                    outline: none !important;
+                    -webkit-tap-highlight-color: transparent !important;
+                }
+                .main-tabs .q-tab__label::before,
+                .main-tabs .q-tab__label::after { content: none !important; }
                 /* tab 文字由页面脚本按断点改写为两字短名（data-full 保存全名），
                    五个 tab 一屏放下；360px 下 13px 保证「退频道」不溢出 */
                 .main-tabs .q-tab .q-tab__label { font-size: 13px; }
@@ -1378,8 +1461,6 @@ def build_ui(auth_code: str = None) -> None:
     ui.add_head_html(MOBILE_DESIGN_CSS)
     ui.page_title("TG Signer Web 控制台")
     root = ui.column().classes("w-full gap-3")
-    # 页面初始化即检测科学上网连通性（后台执行不阻塞首屏，失败弹持久报错）
-    ui.timer(0.5, _probe_telegram_connectivity, once=True)
 
     def render_dashboard() -> None:
         root.clear()

@@ -2061,9 +2061,6 @@ class TaskRunnerBlock:
                             "失败": "text-red-700",
                             "进行中": "text-blue-700",
                         }.get(status, "text-gray-500")
-                        mark = {"成功": "✓", "失败": "✗", "进行中": "…"}.get(
-                            status, "−"
-                        )
                         with ui.row().classes("w-full items-start gap-1 no-wrap"):
                             if can_rerun and status == "失败":
                                 ui.checkbox(

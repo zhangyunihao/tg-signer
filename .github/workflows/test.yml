@@ -48,3 +48,42 @@ jobs:
       - name: Run tests
         run: |
           pytest -W=ignore::DeprecationWarning:pyrogram.sync -vv tests/
+
+  ui-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[gui,yaml]"
+          python -m pip install --group dev
+          python -m pip install playwright
+
+      - name: Install Chromium
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Run WebUI regression
+        run: |
+          python scripts/ui_check.py --full --server-python python --timeout 60
+
+      - name: Upload screenshots and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-regression-artifacts
+          path: |
+            artifacts/ui-baseline
+            tests/e2e/ui_baseline.json
+          if-no-files-found: warn
+          retention-days: 14

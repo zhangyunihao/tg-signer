@@ -98,6 +98,31 @@ def git(*args: str) -> None:
     run(["git", *args])
 
 
+def preflight(skip_ui_check: bool) -> None:
+    """上传前门禁：ruff、格式、pytest、WebUI 回归；任一失败立即中止。
+
+    默认全部执行；--skip-ui-check 仅跳过 WebUI 回归（紧急回退用），
+    ruff 与 pytest 无论如何都会执行。
+    """
+    print("== 发版前置检查 ==")
+    commands = [
+        [sys.executable, "-m", "ruff", "check", "."],
+        [sys.executable, "-m", "ruff", "format", "--check", "."],
+        [sys.executable, "-m", "pytest", "-q", "tests/"],
+    ]
+    if skip_ui_check:
+        print("!! 已跳过 WebUI 回归（--skip-ui-check，仅供紧急回退）")
+    else:
+        commands.append([sys.executable, str(ROOT / "scripts" / "ui_check.py")])
+
+    for command in commands:
+        try:
+            run(command)
+        except subprocess.CalledProcessError:
+            sys.exit(f"前置检查失败，已中止发布：{' '.join(command)}")
+    print("== 前置检查全部通过 ==\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="本地发布 tg-signer-plus 到 PyPI")
     parser.add_argument(
@@ -110,7 +135,15 @@ def main() -> None:
         "--push", action="store_true", help="上传后推送 main 与 tag 到远端"
     )
     parser.add_argument("--skip-tag", action="store_true", help="不创建 git tag")
+    parser.add_argument(
+        "--skip-ui-check",
+        action="store_true",
+        help="紧急回退：跳过 WebUI 回归（ruff 与 pytest 仍会执行）",
+    )
     args = parser.parse_args()
+
+    # 先做前置检查再改版本号，避免失败时留下已修改的版本文件
+    preflight(skip_ui_check=args.skip_ui_check)
 
     name = project_name()
     if args.bump:

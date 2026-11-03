@@ -397,7 +397,7 @@ async def retry_speak_alert(workdir, alert: dict) -> Tuple[bool, str]:
     append_speak_retry_log(
         workdir,
         alert,
-        f"开始重试：账号 {account} → 群组「{group}」，"
+        f"开始重试：账号 {account} · 群组「{group}」，"
         + (f"目标 {raw_target}" if raw_target else "未记录目标，将按群名匹配"),
     )
     try:
@@ -2119,13 +2119,14 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         "source_type": source_type,
                         "task_type": giveaway_type_label(cfg),
                         "accounts": ", ".join(cfg["accounts"]),
-                        # 移动端单行摘要（数量 + 前两项）+ 点击展开的完整列表
-                        "accounts_summary": _list_text(cfg["accounts"], 2),
+                        # 移动端卡片改为完整展示并自动换行（原先前 2 项 + 省略号
+                        # 会把账号/频道名截断，手机上看不到关键信息）
+                        "accounts_summary": _list_text(cfg["accounts"]),
                         "accounts_full": _list_text(cfg["accounts"]),
                         "chats": f"{len(chat_names)} 个："
                         + "、".join(chat_names[:3])
                         + ("…" if len(chat_names) > 3 else ""),
-                        "chats_summary": _list_text(chat_names, 2),
+                        "chats_summary": _list_text(chat_names),
                         "chats_full": _list_text(chat_names),
                         "keywords": "、".join(cfg.get("keywords") or []) or "全部链接",
                         "ignore_hist": (
@@ -2508,6 +2509,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         log_buf.clear()
         _seen["n"] = len(log_buf)
         send_log.clear()
+        _sync_log_empty()
 
     def copy_log() -> None:
         if not log_buf:
@@ -2571,8 +2573,27 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "flat round dense"
             ).tooltip("全屏显示")
     send_log = ui.log(max_lines=1000).classes(LOG_AREA_CLASS).style("height: 320px")
+    # 无日志时不再留一个 370px 高的空框：换成统一空态（图标 + 一句话），
+    # 高度自适应到约 120px；有日志后切回日志区
+    log_empty = (
+        ui.column()
+        .classes("w-full items-center justify-center gap-1 tgs-log-empty")
+        .style("min-height: 120px")
+    )
+    with log_empty:
+        ui.icon("article").classes("text-2xl text-gray-400")
+        ui.label("暂无共用日志，任务开始运行后会显示在这里").classes(
+            "text-sm text-gray-500"
+        )
     log_buf = _GLOBAL_LOGS.setdefault(wd_key, [])
     _seen = {"n": len(log_buf)}
+
+    def _sync_log_empty() -> None:
+        has_log = bool(log_buf)
+        send_log.set_visibility(has_log)
+        log_empty.set_visibility(not has_log)
+
+    _sync_log_empty()
     for line in log_buf:
         try:
             send_log.push(line)
@@ -2639,6 +2660,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                             send_log.push(line)
                         except Exception:
                             logger.debug("推送新日志到界面日志区失败", exc_info=True)
+                    _sync_log_empty()
             except Exception:
                 failures += 1
                 logger.exception("抽奖面板轮询刷新失败（连续 %s 次）", failures)

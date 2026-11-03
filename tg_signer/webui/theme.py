@@ -56,7 +56,9 @@ MOBILE_DESIGN_CSS = """
         padding-bottom: calc(0.75rem + env(safe-area-inset-bottom)) !important;
         gap: 0.75rem !important;
     }
-    /* 顶部导航：纯文字短标签，吸顶并带毛玻璃，滚动时长页面仍可切 tab */
+    /* 顶部导航：单行满宽贴顶（恢复旧版密度）。不再用圆角悬浮胶囊容器：
+       360px 下胶囊左右留白 + 圆角会白白吃掉 tab 可用宽度，五个标签挤在一起。
+       吸顶 + 毛玻璃保留，滚动时长页面仍可切 tab。 */
     .tgs-header-row {
         position: sticky;
         top: 0;
@@ -67,32 +69,32 @@ MOBILE_DESIGN_CSS = """
            导致右侧比视口少 24px（12px 内边距 + 12px 负边距）。补回 2 个
            0.75rem 让吸顶栏铺满视口，铃铛/菜单贴右，tab 栏多出 24px。 */
         width: calc(100% + 1.5rem) !important;
-        padding: 0.5rem 0.75rem;
-        /* 右侧收紧到 8px，给 tab 栏多让出 4px（360px 下每个约 44.8px） */
-        padding-right: 0.5rem;
-        background: rgba(246, 248, 252, 0.88);
+        padding: 0.25rem 0.5rem;
+        background: rgba(246, 248, 252, 0.94);
         backdrop-filter: blur(12px);
         -webkit-backdrop-filter: blur(12px);
-        border-bottom: 1px solid rgba(227, 232, 240, 0.7);
-        /* 去图标后把 tab 栏与右侧按钮的间距压到 2px，5 个 tab 各约 44px 宽 */
-        gap: 0.125rem !important;
+        border-bottom: 1px solid rgba(227, 232, 240, 0.8);
+        /* tab 栏与右侧铃铛/菜单之间留 8px 视觉间隙 */
+        gap: 0.5rem !important;
     }
     .main-tabs {
-        background: var(--tgs-surface);
-        border: 1px solid var(--tgs-line);
-        border-radius: var(--tgs-radius-lg);
-        padding: 3px;
-        box-shadow: var(--tgs-shadow-1);
-        min-height: 58px;
+        background: transparent;
+        border: 0;
+        border-radius: 0;
+        padding: 0;
+        box-shadow: none;
+        min-height: 44px;
+        overflow: visible;
     }
     .main-tabs .q-tabs__content { width: 100%; }
-    /* 去图标后 5 个短标签均分整行：等宽 flex + 居中，360px 不挤不滚 */
+    /* 去图标后 5 个短标签均分整行：等宽 flex + 居中，360px 不挤不滚。
+       触控高度保持 44px（不小于可点面积建议值），只压缩上下内边距 */
     .main-tabs .q-tab {
         flex: 1 1 0;
         min-width: 0;
-        min-height: 52px !important;
+        min-height: 44px !important;
         padding: 0 !important;
-        border-radius: 0.8125rem;
+        border-radius: 0.625rem;
         justify-content: center;
         transition: background-color 0.18s ease;
     }
@@ -102,6 +104,15 @@ MOBILE_DESIGN_CSS = """
     .main-tabs .q-tab--active { background: var(--tgs-brand-soft); }
     .main-tabs .q-tab--active .q-tab__label { color: var(--tgs-brand-strong) !important; }
     .main-tabs .q-tab__indicator { display: none; }
+    /* 点击/脚本聚焦时，浏览器会在 tab 内那个尺寸为 0 的 .q-focus-helper 上
+       画默认聚焦描边，视觉上就是标签左侧一个空心小方块（选中态胶囊内尤其
+       明显）。tab 本身 tabindex=-1、不走键盘 Tab 焦点，这里连同元素一起隐藏 */
+    .main-tabs .q-tab:focus,
+    .main-tabs .q-tab *:focus { outline: none !important; }
+    .main-tabs .q-focus-helper,
+    .main-tabs .q-tab .q-focus-helper { display: none !important; outline: none !important; }
+    .main-tabs .q-tab__label::before,
+    .main-tabs .q-tab__label::after { content: none !important; }
     .tgs-header-actions .q-btn { padding: 0 !important; }
     /* 卡片：统一 16px 圆角、细描边、轻投影 */
     .nicegui-content .q-card,
@@ -159,6 +170,9 @@ MOBILE_DESIGN_CSS = """
     .q-btn,
     .q-btn.q-btn--dense {
         min-height: 44px !important;
+        /* 短标签按钮（编辑/删除/设置等实测 30–35px 宽）也补到 44px 命中宽度；
+           文字与视觉尺寸不变，只扩可点区域。分段控件在下方改回 min-width:0 */
+        min-width: 44px !important;
         border-radius: var(--tgs-radius-md) !important;
         font-size: 0.84375rem;
         font-weight: 600;
@@ -190,7 +204,7 @@ MOBILE_DESIGN_CSS = """
     .q-btn-toggle > .q-btn {
         flex: 1 1 0;
         min-width: 0 !important;
-        min-height: 40px !important;
+        min-height: 44px !important;
         padding: 0 0.25rem !important;
         border-radius: calc(var(--tgs-radius-md) - 3px) !important;
         background: transparent !important;
@@ -224,10 +238,20 @@ MOBILE_DESIGN_CSS = """
         color: var(--tgs-text-3);
     }
     .q-toggle,
-    .q-checkbox {
+    .q-checkbox,
+    .q-radio {
         min-height: 44px;
         min-width: 44px;
         align-items: center;
+    }
+    /* 输入/下拉的可清除图标（消息中心、设置筛选用到）：虽只有 24px 视觉图标，
+       命中区外扩到 44×44，避免误触 */
+    .q-field .q-icon.q-field__focusable-action {
+        min-width: 44px;
+        min-height: 44px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
     }
     .q-toggle__label,
     .q-checkbox__label { font-size: var(--tgs-fs-body); }
@@ -236,6 +260,14 @@ MOBILE_DESIGN_CSS = """
         border-radius: var(--tgs-radius-pill);
         font-size: var(--tgs-fs-cap);
         min-height: 28px;
+    }
+    /* 多选 chip 的删除图标实测 15×15：视觉图标不放大，用透明外扩把命中区补到
+       44×44；负外边距抵消扩张，避免把 chip 行撑高 */
+    .q-chip .q-chip__icon--remove {
+        width: 44px !important;
+        height: 44px !important;
+        margin: -8px -14px -8px -6px !important;
+        padding: 0 !important;
     }
     /* 状态标签：胶囊形，语义色统一为 AA 对比度的深色 */
     .q-badge {
@@ -474,6 +506,15 @@ MOBILE_DESIGN_CSS = """
     :focus-visible {
         outline: 2px solid rgba(25, 118, 210, 0.45);
         outline-offset: 2px;
+    }
+    /* Quasar 的 .q-focus-helper 是不可聚焦的焦点辅助层（tabindex=-1、零尺寸），
+       被脚本/点击聚焦时会命中上面的 :focus-visible，浏览器在其 0×0 盒外画
+       2px 浅蓝描边 → 视觉上就是标签左侧的空心小方块。它不是可交互控件，
+       统一不画焦点环（选中 tab 的胶囊底色已足够表达焦点） */
+    .q-focus-helper:focus-visible,
+    .q-focus-helper:focus {
+        outline: none !important;
+        box-shadow: none !important;
     }
     @media (prefers-reduced-motion: reduce) {
         * {
