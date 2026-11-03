@@ -664,20 +664,26 @@ def _build_dashboard(container) -> None:
         # 宽屏恢复全名（桌面端不受影响）。直接改写文本节点而不是用
         # font-size:0 + ::before 伪元素，避免部分浏览器把伪元素内容渲染成
         # 空心方块；matchMedia 监听保证旋转/缩放时即时切换。
+        # 全名缓存在 window 上而不是写进 DOM 的 data-* 属性：data-full 是
+        # 卡片字段的点击展开标记，tab 标签若也带 data-full 会被点击监听器
+        # 当成字段，点一下 tab 就弹出一个深色蒙层。
         # 注意：q-tab 的 name 属性不会反映到 DOM（getAttribute('name') 为 null），
         # 因此按索引匹配而非按 name
         _short_tab_names = ["签到", "组合", "发言", "退频道", "抽奖"]
         ui.run_javascript(
             "const shortNames = " + __import__("json").dumps(_short_tab_names) + ";"
             "const tabMq = window.matchMedia('(max-width: 640px)');"
+            "window.__tgsTabFullNames=window.__tgsTabFullNames||[];"
             # 带重试：Quasar 渲染 q-tab 标签可能晚于脚本执行，未全部处理则 200ms 后重试
             "(function(){let tries=0;const apply=()=>{"
             "  const labels=document.querySelectorAll('.main-tabs .q-tab .q-tab__label');"
             "  let done=0;"
             "  labels.forEach((label,i)=>{"
             "    if(!shortNames[i])return;"
-            "    if(!label.dataset.full)label.dataset.full=label.textContent.trim();"
-            "    label.textContent=tabMq.matches?shortNames[i]:label.dataset.full;"
+            "    if(!window.__tgsTabFullNames[i])"
+            "      window.__tgsTabFullNames[i]=label.textContent.trim();"
+            "    label.textContent=tabMq.matches"
+            "      ?shortNames[i]:window.__tgsTabFullNames[i];"
             "    done++;"
             "  });"
             "  if(done<labels.length&&tries++<30)setTimeout(apply,200);"
@@ -686,8 +692,9 @@ def _build_dashboard(container) -> None:
             "  tabMq.addEventListener('change',()=>{"
             "    document.querySelectorAll('.main-tabs .q-tab .q-tab__label')"
             "      .forEach((label,i)=>{"
-            "        if(label.dataset.full)"
-            "          label.textContent=tabMq.matches?shortNames[i]:label.dataset.full;"
+            "        if(!window.__tgsTabFullNames[i])return;"
+            "        label.textContent=tabMq.matches"
+            "          ?shortNames[i]:window.__tgsTabFullNames[i];"
             "      });"
             "  });"
             "}})();"
@@ -715,7 +722,10 @@ def _build_dashboard(container) -> None:
             "    document.getElementById('tgs-lp-box').textContent=text;"
             "  };"
             "  document.addEventListener('click',(e)=>{"
-            "    const el=e.target&&e.target.closest?e.target.closest('[data-full]'):null;"
+            # 只匹配卡片字段的值节点（.tgs-field-v），避免把其他带 data-full
+            # 的元素（例如将来新增的组件）误当成可展开字段而弹出蒙层
+            "    const el=e.target&&e.target.closest"
+            "      ?e.target.closest('.tgs-field-v[data-full]'):null;"
             "    if(!el)return;"
             "    e.preventDefault();show(el);"
             "  });"

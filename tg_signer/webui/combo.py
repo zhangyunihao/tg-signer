@@ -1976,6 +1976,14 @@ class ComboTaskBlock:
         outcome, record = await stop_with_feedback(
             lambda: self.runner._stop_run(run_id)
         )
+        # _stop_run 在线程里执行、不碰界面；停止结果落地（刷新主控台表格与
+        # 状态、提示）必须回到事件循环里做，否则拿不到 slot 上下文
+        apply_result = getattr(self.runner, "_apply_stop_result", None)
+        if apply_result is not None:
+            try:
+                apply_result(run_id, outcome, record)
+            except Exception:
+                logger.debug("组合任务停止结果刷新失败", exc_info=True)
         if outcome == "stopped":
             self._finalize_snapshot(run_id)
         self._live_ids.discard(run_id)

@@ -2151,9 +2151,15 @@ class TaskRunnerBlock:
         self.dialog.open()
         ui.notify("已复制任务参数，可调整后点击「执行」", type="positive")
 
-    def _stop_run(self, record_id: str) -> None:
-        """同步停止（组合任务等既有调用方使用），阻塞当前线程直至进程退出。"""
-        return self._apply_stop_result(record_id, *stop_run_core(record_id))
+    def _stop_run(self, record_id: str) -> tuple[str, Optional[dict]]:
+        """同步停止（组合任务等既有调用方使用），阻塞当前线程直至进程退出。
+
+        本方法通常经 ``asyncio.to_thread`` 在后台线程执行，只做停止与落盘，
+        不触碰界面：后台线程没有 NiceGUI 的 slot 上下文，调用 ``ui.notify``
+        会抛 RuntimeError 并吞掉停止结果。界面刷新与提示由调用方在事件循环
+        中通过 ``_apply_stop_result`` 完成。
+        """
+        return stop_run_core(record_id)
 
     def _apply_stop_result(self, record_id: str, outcome: str, record) -> tuple:
         """停止结果落地：刷新表格/状态并提示（须在事件循环线程调用）。"""
