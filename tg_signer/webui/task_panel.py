@@ -2076,7 +2076,7 @@ class TaskRunnerBlock:
                                 f"（{note}）" if note and status != "进行中" else ""
                             )
                             ui.label(
-                                f"{mark} {d.get('account', '')} → {d.get('chat', '')}："
+                                f"{d.get('account', '')} · {d.get('chat', '')}："
                                 f"{status}{note_text}"
                             ).classes(f"text-sm py-0.5 tgs-detail-line {color}").style(
                                 "white-space: pre-wrap; overflow-wrap: anywhere;"
