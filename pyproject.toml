@@ -39,7 +39,7 @@ speedup = [
     "tgcrypto"
 ]
 gui = [
-    "nicegui"
+    "nicegui>=3.13"
 ]
 yaml = [
     "pyyaml"

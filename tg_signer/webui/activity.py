@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Awaitable
 from typing import Optional
@@ -12,6 +13,12 @@ from typing import Optional
 from nicegui import background_tasks, ui
 
 logger = logging.getLogger(__name__)
+
+# background_tasks.create 的 context 参数是 nicegui 3.18 才新增的；
+# 3.13 没有该参数，传了会直接 TypeError 导致页面构建失败。
+_CREATE_SUPPORTS_CONTEXT = (
+    "context" in inspect.signature(background_tasks.create).parameters
+)
 
 # key: client.id, value: {"hidden": bool, "tab": str}
 _STATE: dict[str, dict] = {}
@@ -68,9 +75,10 @@ def is_client_alive(client) -> bool:
     """会话是否仍然存在：只有被 NiceGUI 删除后才应停止轮询。
 
     短暂的 socket 断连（has_socket_connection=False）期间会话仍然存在，
-    3 秒重连窗口内页面和元素树都会保留，轮询应继续等待重连而非永久退出。
+    服务端保留 client 的重连窗口内页面和元素树都会保留，轮询应继续等待
+    重连而非永久退出。
     """
-    return not client.is_deleted
+    return not getattr(client, "is_deleted", False)
 
 
 def should_poll(client, tab: Optional[str] = None) -> bool:
@@ -81,7 +89,7 @@ def should_poll(client, tab: Optional[str] = None) -> bool:
     没有状态记录的页面（如独立进度页）返回 True 保持原行为；
     会话已被删除时返回 False。
     """
-    if client.is_deleted:
+    if getattr(client, "is_deleted", False):
         return False
     entry = _STATE.get(client.id)
     if entry is None:
@@ -101,16 +109,19 @@ def poll_delay(base: float, failures: int, max_delay: float = 30.0) -> float:
 def create_poll_task(awaitable: Awaitable, *, name: str, client) -> asyncio.Task:
     """创建带异常兜底的轮询后台任务。
 
-    用 NiceGUI 的 background_tasks.create（保留强引用、并在 client 上下文中运行），
-    同时在模块内按 client+name 再持有一次引用；任务因非取消异常结束时
-    用 logger.exception 记录，避免"轮询静默死亡"而日志里查不到原因。
+    用 NiceGUI 的 background_tasks.create（保留强引用），同时在模块内按
+    client+name 再持有一次引用；任务因非取消异常结束时用 logger.exception
+    记录，避免"轮询静默死亡"而日志里查不到原因。
+
+    nicegui 3.13 的 create 没有 context 参数：此时靠 asyncio 在创建任务时
+    复制当前上下文（调用点本身处于页面/事件上下文）实现等价效果。
     """
     key = f"{getattr(client, 'id', '')}:{name}"
+    create_kwargs: dict = {"name": name, "handle_exceptions": False}
+    if _CREATE_SUPPORTS_CONTEXT:
+        create_kwargs["context"] = client
     task = background_tasks.create(
-        _run_poll(awaitable, name=name, client=client),
-        name=name,
-        handle_exceptions=False,
-        context=client,
+        _run_poll(awaitable, name=name, client=client), **create_kwargs
     )
     _POLL_TASKS[key] = task
 

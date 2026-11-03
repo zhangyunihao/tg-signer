@@ -70,6 +70,11 @@ def install_exception_notifier() -> None:
     client = ui.context.client
     if client.id in _INSTALLED:
         return
+    # ui.on_exception 在部分 NiceGUI 版本不存在：此时保持框架默认日志，
+    # 仅跳过自定义弹窗，不能让页面构建失败。
+    if not hasattr(ui, "on_exception"):
+        logger.warning("当前 NiceGUI 不支持 ui.on_exception，异常仅记录日志")
+        return
     _INSTALLED.add(client.id)
     client.on_delete(lambda: _INSTALLED.discard(client.id))
 
