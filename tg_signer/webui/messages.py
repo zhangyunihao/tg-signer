@@ -54,6 +54,7 @@ from tg_signer.webui.giveaway import (
     retry_speak_alert,
     speak_retry_log_key,
 )
+from tg_signer.webui.theme import MOBILE_DESIGN_CSS
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,9 @@ ALL_ACCOUNTS = ""
 
 # 消息类型过滤下拉的「全部」哨兵值
 ALL_TYPES = ""
+
+# 消息中心首屏渲染条数：其余按「加载更多」分批追加，控制 DOM 规模
+MESSAGE_PAGE_SIZE = 40
 
 # 消息中心独立页面路由（右上角铃铛在新标签页打开）
 MESSAGES_PAGE_PATH = "/messages"
@@ -147,12 +151,23 @@ def _time_sort_value(m: dict) -> int:
     return ((month * 100 + day) * 100 + hour) * 10000 + minute * 100 + second
 
 
+def message_keys(m: dict) -> List[str]:
+    """返回单条消息包含的全部消息键（合并消息对应多条原始提醒）。"""
+    keys = m.get("keys")
+    return list(keys) if keys else [m["key"]]
+
+
+def is_message_unread(m: dict, read_keys: Set[str]) -> bool:
+    """合并消息里只要还有任一原始提醒未读，整条消息即视为未读。"""
+    return any(key not in read_keys for key in message_keys(m))
+
+
 def message_sort_key(
     m: dict, read_keys: Set[str], pin_keys: Set[str] = frozenset()
 ) -> tuple:
     """排序规则：置顶最优先；其次未读优先于已读，未读内部中奖最优先；同组内新消息在前。"""
     pinned = m["key"] in pin_keys
-    unread = m["key"] not in read_keys
+    unread = is_message_unread(m, read_keys)
     return (
         0 if pinned else 1,
         0 if unread else 1,
@@ -161,11 +176,12 @@ def message_sort_key(
     )
 
 
-def collect_messages(workdir, read_keys: Set[str] | None = None) -> List[dict]:
+def collect_messages(workdir) -> List[dict]:
     """汇总全部消息：中奖、加入失败、频道已满与未完成发言任务（排序见 message_sort_key）。
 
-    传入 read_keys 时，同一账号 + 同一频道的未读「发言数未达标」消息会合并为一条：
-    新提醒只把抽奖标题追加到已有消息，不再单独产生新消息。
+    同一账号 + 同一频道的「发言数未达标」消息合并为一条（不区分已读状态）：新提醒
+    只把抽奖标题追加到已有消息，不再单独产生新消息。合并消息记录全部原始消息键
+    （keys），点击一次即可把整条合并消息里的提醒全部标为已读。
     """
     wd = Path(workdir)
     messages: List[dict] = []
@@ -248,20 +264,23 @@ def collect_messages(workdir, read_keys: Set[str] | None = None) -> List[dict]:
             }
         )
     # 3) 报名成功后仍未达标的发言数任务（还需发言 N 条）
-    # 同账号 + 同频道的未读消息只保留一条，其余提醒把抽奖标题追加进去
-    unread_speech: dict[tuple[str, str], dict] = {}
+    # 同账号 + 同频道的提醒全部合并为一条（不区分已读状态），其余提醒把抽奖标题
+    # 追加到已有消息；合并消息记录全部原始键，点击一次即全部标记已读
+    speech: dict[tuple[str, str], dict] = {}
     for a in load_speech_alerts(wd):
         acct = str(a.get("account") or "")
         bot = str(a.get("bot") or "")
         group = str(a.get("group") or "")
         time_str = str(a.get("time") or "")
         key = f"speech_required|{acct}|{bot}|{group}|{a.get('required')}|{time_str}"
-        existing = unread_speech.get((acct, group))
-        if read_keys is not None and key not in read_keys and existing is not None:
+        existing = speech.get((acct, group))
+        if existing is not None:
             existing["text"] += "；" + format_speech_merge_note(a)
+            existing["keys"].append(key)
             continue
         message = {
             "key": key,
+            "keys": [key],
             "tag": "发言数未达标",
             "color": "blue",
             "account": acct,
@@ -270,8 +289,7 @@ def collect_messages(workdir, read_keys: Set[str] | None = None) -> List[dict]:
             "text": format_speech_alert(a),
         }
         messages.append(message)
-        if read_keys is not None and key not in read_keys:
-            unread_speech[(acct, group)] = message
+        speech[(acct, group)] = message
     # 4) 置顶抽奖帖点击「参与抽奖」被弹窗拦下：发言数不够，参与失败
     for a in load_speech_insufficient_alerts(wd):
         acct = str(a.get("account") or "")
@@ -302,8 +320,8 @@ def message_center_button() -> Callable[[], None]:
 
     def refresh_badge() -> None:
         read_keys = load_read_keys(state.workdir)
-        messages = collect_messages(state.workdir, read_keys)
-        unread = [m for m in messages if m["key"] not in read_keys]
+        messages = collect_messages(state.workdir)
+        unread = [m for m in messages if is_message_unread(m, read_keys)]
         count = len(unread)
         has_unread_win = any(m["tag"] == "中奖" for m in unread)
         badge.set_text(str(count))
@@ -345,12 +363,12 @@ def _filter_options(read_keys: Set[str]) -> dict:
     """
     accounts: Set[str] = set()
     unread_counts: dict[str, int] = {}
-    for m in collect_messages(state.workdir, read_keys):
+    for m in collect_messages(state.workdir):
         acct = str(m.get("account") or "")
         if not acct:
             continue
         accounts.add(acct)
-        if m["key"] not in read_keys:
+        if is_message_unread(m, read_keys):
             unread_counts[acct] = unread_counts.get(acct, 0) + 1
     ordered = sorted(accounts, key=lambda a: (0 if unread_counts.get(a) else 1, a))
     return {
@@ -386,10 +404,13 @@ def _build_center_page() -> None:
     install_activity_tracking()
     read_keys: Set[str] = load_read_keys(state.workdir)
     last_fp = {"value": ""}
+    # 列表分页：默认只渲染首屏 40 条，其余「加载更多」按需追加，
+    # 避免数百条消息一次性生成上万个 DOM 节点、拖慢首帧与手机滚动
+    shown = {"n": MESSAGE_PAGE_SIZE}
 
     def visible_messages() -> List[dict]:
         """按当前用户/类型过滤条件取可见消息（未排序）。"""
-        messages = collect_messages(state.workdir, read_keys)
+        messages = collect_messages(state.workdir)
         sel = str(filter_sel.value or "")
         if sel:
             messages = [m for m in messages if m.get("account") == sel]
@@ -398,27 +419,30 @@ def _build_center_page() -> None:
             messages = [m for m in messages if m.get("tag") == type_sel_value]
         return messages
 
-    def mark_one(key: str) -> None:
-        if key in read_keys:
+    def mark_one(m: dict) -> None:
+        keys = message_keys(m)
+        if all(key in read_keys for key in keys):
             return
-        read_keys.add(key)
+        read_keys.update(keys)
         save_read_keys(state.workdir, read_keys)
         render_list()
         refresh_unread_badge()
 
-    def toggle_read(key: str) -> None:
-        """点击圆点切换已读/未读（已读消息可再次标为未读）。"""
-        if key in read_keys:
-            read_keys.discard(key)
+    def toggle_read(m: dict) -> None:
+        """点击圆点切换已读/未读（已读消息可再次标为未读，合并消息整体切换）。"""
+        keys = message_keys(m)
+        if any(key not in read_keys for key in keys):
+            read_keys.update(keys)
         else:
-            read_keys.add(key)
+            for key in keys:
+                read_keys.discard(key)
         save_read_keys(state.workdir, read_keys)
         render_list()
         refresh_unread_badge()
 
     def mark_all_read() -> None:
         for m in visible_messages():
-            read_keys.add(m["key"])
+            read_keys.update(message_keys(m))
         save_read_keys(state.workdir, read_keys)
         render_list()
         refresh_unread_badge()
@@ -426,10 +450,12 @@ def _build_center_page() -> None:
     def _on_filter_change(_e) -> None:
         # 持久化过滤选择：刷新页面、重开标签页后仍保留（clearable 清空存为「全部」）
         app.storage.user[FILTER_STORAGE_KEY] = str(filter_sel.value or "")
+        shown["n"] = MESSAGE_PAGE_SIZE
         render_list()
 
     def _on_type_filter_change(_e) -> None:
         app.storage.user[TYPE_FILTER_STORAGE_KEY] = str(type_sel.value or "")
+        shown["n"] = MESSAGE_PAGE_SIZE
         render_list()
 
     def toggle_pin(key: str) -> None:
@@ -482,6 +508,10 @@ def _build_center_page() -> None:
         else:
             ui.notify(f"重发完成：{ok_count} 条口令全部发送成功", type="positive")
 
+    def show_more() -> None:
+        shown["n"] += MESSAGE_PAGE_SIZE
+        render_list()
+
     def render_list() -> None:
         list_container.clear()
         messages = visible_messages()
@@ -492,25 +522,25 @@ def _build_center_page() -> None:
         messages.sort(key=lambda m: message_sort_key(m, read_keys, pin_keys))
         with list_container:
             if not messages:
-                ui.label("暂无消息").classes("text-sm text-gray-400")
+                ui.label("暂无消息").classes("text-sm text-gray-400 tgs-empty")
                 return
-            for m in messages:
-                unread = m["key"] not in read_keys
+            for m in messages[: shown["n"]]:
+                unread = is_message_unread(m, read_keys)
                 pinned = m["key"] in pin_keys
 
-                def _on_row_click(*_args, _key: str = m["key"]) -> None:
-                    mark_one(_key)
+                def _on_row_click(*_args, _msg: dict = m) -> None:
+                    mark_one(_msg)
 
                 def _on_pin_click(*_args, _key: str = m["key"]) -> None:
                     toggle_pin(_key)
 
-                def _on_dot_click(*_args, _key: str = m["key"]) -> None:
-                    toggle_read(_key)
+                def _on_dot_click(*_args, _msg: dict = m) -> None:
+                    toggle_read(_msg)
 
                 with (
                     ui.row()
                     .classes(
-                        "w-full items-start gap-2 p-2 rounded cursor-pointer "
+                        "w-full items-start gap-2 p-2 rounded cursor-pointer tgs-msg-row "
                         + ("bg-blue-50" if unread else "")
                     )
                     .on("click", _on_row_click)
@@ -562,6 +592,12 @@ def _build_center_page() -> None:
                     ).on("click.stop", _on_pin_click).tooltip(
                         "取消置顶" if pinned else "置顶"
                     )
+            remaining = len(messages) - shown["n"]
+            if remaining > 0:
+                # 只追加一页，未展开部分不进入 DOM；过滤/刷新仍保留当前展开页数
+                ui.button(f"加载更多（剩余 {remaining} 条）", on_click=show_more).props(
+                    "flat dense full-width"
+                ).classes("text-sm")
 
     def refresh_all() -> None:
         # 重建过滤选项（未读账号置前并刷新未读数标注），选中项失效时回落「全部用户」
@@ -584,8 +620,8 @@ def _build_center_page() -> None:
     def refresh_unread_badge() -> None:
         count = sum(
             1
-            for m in collect_messages(state.workdir, read_keys)
-            if m["key"] not in read_keys
+            for m in collect_messages(state.workdir)
+            if is_message_unread(m, read_keys)
         )
         unread_badge.set_text(str(count))
         unread_badge.set_visibility(count > 0)
@@ -595,8 +631,14 @@ def _build_center_page() -> None:
         pin_keys = load_pin_keys(state.workdir)
         return json.dumps(
             [
-                [m["key"], m.get("text"), m["key"] in read_keys, m["key"] in pin_keys]
-                for m in collect_messages(state.workdir, read_keys)
+                [
+                    m["key"],
+                    m.get("text"),
+                    m.get("keys"),
+                    is_message_unread(m, read_keys),
+                    m["key"] in pin_keys,
+                ]
+                for m in collect_messages(state.workdir)
             ]
         )
 
@@ -625,26 +667,33 @@ def _build_center_page() -> None:
         retry_log_dialog.open()
 
     with ui.column().classes("w-full gap-3"):
-        with ui.row().classes("w-full items-center gap-2 no-wrap"):
+        with ui.row().classes("w-full items-center gap-2 no-wrap tgs-page-head"):
             ui.button(icon="arrow_back").props("flat round dense").on_click(
                 lambda: ui.navigate.to("/", new_tab=False)
             )
             ui.label("消息中心").classes("text-xl font-semibold")
             unread_badge = ui.badge("0").props("color=red").classes("text-[10px]")
             ui.space()
-            # 重发口令：与右侧单条重试同数据源，仅存在口令提醒时显示
-            retry_all_btn = ui.button("重发口令", on_click=retry_all_speak).props(
-                "outline dense color=primary"
-            )
-            ui.button("全部已读", on_click=mark_all_read).props("outline dense")
-            ui.button(icon="refresh").props("flat round dense").on_click(refresh_all)
-        ui.label(
-            "汇总抽奖中奖提醒、监控对象加入失败提醒与抽奖过程中未完成的发言任务"
-            "（口令发送失败/发言数未达标，显示还需发言条数），点击消息标记为已读，"
-            "「发言任务」右侧的刷新按钮可重试发送口令，重试过的消息旁的文档按钮"
-            "可查看重试日志（刷新后仍保留），顶部「重发口令」可批量重发全部，"
-            "点击右侧图钉可置顶/取消置顶（置顶消息始终排在最前）。"
-        ).classes("text-xs text-gray-500")
+            with ui.row().classes("items-center gap-1 no-wrap tgs-page-actions"):
+                # 重发口令：与右侧单条重试同数据源，仅存在口令提醒时显示
+                retry_all_btn = ui.button("重发口令", on_click=retry_all_speak).props(
+                    "outline dense color=primary"
+                )
+                ui.button("全部已读", on_click=mark_all_read).props("outline dense")
+                ui.button(icon="refresh").props("flat round dense").on_click(
+                    refresh_all
+                )
+        ui.label("中奖、加入失败与待补发言提醒；点消息标为已读。").classes(
+            "text-sm text-gray-500"
+        )
+        with ui.expansion("操作说明", icon="help_outline").classes("w-full"):
+            ui.label(
+                "汇总抽奖中奖提醒、监控对象加入失败提醒与抽奖过程中未完成的发言任务"
+                "（口令发送失败/发言数未达标，显示还需发言条数）。点击消息标记为已读；"
+                "「发言任务」右侧的刷新按钮可重试发送口令；重试过的消息旁的文档按钮"
+                "可查看重试日志（刷新后仍保留）；顶部「重发口令」可批量重发全部；"
+                "点击右侧图钉可置顶/取消置顶（置顶消息始终排在最前）。"
+            ).classes("text-xs text-gray-500")
         # 恢复上次选择的过滤用户/消息类型（刷新页面、重开标签页后仍保留）
         options = _filter_options(read_keys)
         saved = str(app.storage.user.get(FILTER_STORAGE_KEY) or "")
@@ -709,6 +758,7 @@ def messages_page() -> None:
     ui.dark_mode(False)
     ui.page_title("消息中心 - TG Signer")
     ui.add_head_html(_PAGE_HEAD_STYLE)
+    ui.add_head_html(MOBILE_DESIGN_CSS)
 
     root = ui.column().classes("w-full gap-3")
 

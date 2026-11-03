@@ -350,8 +350,8 @@ def channel_stats_block(workdir) -> None:
         chart_box.clear()
         with chart_box:
             if not rows:
-                ui.label("暂无可统计的数据，点击「更新统计」开始扫描").classes(
-                    "text-sm text-gray-400"
+                ui.label("暂无可统计的数据，点「更新统计」开始扫描").classes(
+                    "text-sm text-gray-400 tgs-empty"
                 )
                 return
             ui.echart(_chart_options(rows)).classes("w-full").style("height: 340px")
@@ -456,10 +456,9 @@ def channel_stats_block(workdir) -> None:
             running["flag"] = False
             update_btn.enable()
 
-    ui.label(
-        "统计每个账号已加入的频道与超级群组数量（计入 500/1000 上限，"
-        "基础群与私聊不计入）。仅读取对话列表，不会加入或退出任何频道。"
-    ).classes("text-xs text-gray-500")
+    ui.label("统计已加入的频道/超级群组，仅读取，不加入或退出。").classes(
+        "text-xs text-gray-500"
+    )
 
     with ui.row().classes("w-full items-end gap-2 flex-wrap"):
         account_sel = (

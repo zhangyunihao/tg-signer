@@ -8,6 +8,10 @@ TaskRunnerBlock 的 _launch（task_type="组合任务"），历史统一记录�
 import functools
 import json
 import logging
+import os
+import subprocess
+import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from html import escape
@@ -24,6 +28,8 @@ from tg_signer.webui.auto_leave import (
     load_leave_tasks,
 )
 from tg_signer.webui.common import (
+    SOURCE_ROOT,
+    _assign_to_job,
     add_dialog_close_button,
     attach_select_all,
     format_duration,
@@ -51,6 +57,7 @@ from tg_signer.webui.giveaway import (
     load_giveaway_timeout_min,
     load_task_store,
 )
+from tg_signer.webui.theme import MOBILE_DESIGN_CSS
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +180,544 @@ class _SharedRunner:
         from tg_signer.webui.task_panel import stop_run_core
 
         return stop_run_core(record_id)
+
+
+# ---- 失败子任务重试：进度页直接重跑失败项，不重跑已成功项、不新增历史记录 ----
+# 重试任务按「原记录 id」注册在进程级注册表中，页面刷新/重建后仍能看到
+# 排队与重试中状态；服务重启后注册表丢失，但快照中的失败项仍可再次重试。
+COMBO_RETRY_QUEUED = "排队中"
+COMBO_RETRY_RUNNING = "重试中…"
+_RETRY_NOTE_MAX = 180
+_retry_lock = threading.RLock()
+_retry_jobs: dict[str, dict] = {}
+
+
+def _combo_run_active(record_id: str) -> bool:
+    """该记录是否仍有组合任务进程在本服务内运行。"""
+    from tg_signer.webui.task_panel import TaskRunnerBlock
+
+    return record_id in TaskRunnerBlock.runs
+
+
+def _safe_notify(client, message: str, type_: str = "info") -> None:
+    """后台线程通知页面；页面已关闭或断连时静默跳过，不影响重试流程。"""
+    if client is None:
+        return
+    try:
+        if not getattr(client, "has_socket_connection", True):
+            return
+        with client:
+            ui.notify(message, type=type_)
+    except Exception:
+        logger.debug("发送失败项重试通知失败", exc_info=True)
+
+
+def _combo_account_available(account: str) -> bool:
+    """账号是否仍可用（会话文件存在；环境变量注入的账号不做文件校验）。"""
+    if not account:
+        return False
+    if os.environ.get("TG_ACCOUNT") == account:
+        return True
+    try:
+        return (Path(".") / f"{account}.session").is_file()
+    except OSError:
+        return False
+
+
+def combo_failed_units(
+    details: list[dict], combo_subs: list[dict]
+) -> list[tuple[str, str]]:
+    """从明细中取出仍失败的「子任务标签 × 账号」，按首次出现顺序去重。"""
+    label_set = {f"{s.get('type')} · {s.get('task')}" for s in combo_subs if s}
+    units: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for d in details or []:
+        if str(d.get("status") or "") != "失败":
+            continue
+        label = str(d.get("chat") or "")
+        account = str(d.get("account") or "")
+        if not account or label not in label_set:
+            continue
+        key = (label, account)
+        if key in seen:
+            continue
+        seen.add(key)
+        units.append(key)
+    return units
+
+
+def combo_apply_retry_results(
+    details: list[dict], updates: dict[tuple[str, str], tuple[str, str]]
+) -> int:
+    """把重试结果写回原明细：只改仍为「失败」的匹配行，成功行不受影响。"""
+    changed = 0
+    for (label, account), (status, note) in updates.items():
+        for row in details or []:
+            if (
+                str(row.get("chat") or "") == label
+                and str(row.get("account") or "") == account
+                and str(row.get("status") or "") == "失败"
+            ):
+                row["status"] = status
+                row["note"] = note
+                changed += 1
+                break
+    return changed
+
+
+def combo_refresh_record_status(record: dict) -> None:
+    """失败项全部重试成功后，把记录状态从「失败」校正为「已完成」。"""
+    if str(record.get("status") or "") != "失败":
+        return
+    details = record.get("details") or []
+    if any(str(d.get("status") or "") == "失败" for d in details):
+        return
+    record["status"] = "已完成"
+    result = str(record.get("result") or "").strip()
+    suffix = "失败项重试后全部成功"
+    if suffix not in result:
+        record["result"] = f"{result}，{suffix}" if result else suffix
+
+
+def combo_failure_reason(lines: list[str]) -> str:
+    """从重试进程输出中提取失败原因（优先错误关键词，否则取最后一行）。"""
+    cleaned = [
+        str(line).strip()
+        for line in lines
+        if str(line).strip() and not str(line).lstrip().startswith(">>>")
+    ]
+    keywords = (
+        "error",
+        "exception",
+        "traceback",
+        "timeout",
+        "failed",
+        "失败",
+        "错误",
+        "异常",
+        "超时",
+        "未授权",
+        "无法",
+        "flood",
+    )
+    for line in reversed(cleaned):
+        lower = line.lower()
+        if any(word in lower for word in keywords):
+            return line[:_RETRY_NOTE_MAX]
+    return cleaned[-1][:_RETRY_NOTE_MAX] if cleaned else ""
+
+
+def combo_retry_signature(record_id: str) -> tuple:
+    """当前重试状态指纹，供进度页轮询判断是否需要重绘。"""
+    with _retry_lock:
+        job = _retry_jobs.get(record_id)
+        if not job:
+            return ()
+        return tuple(
+            sorted(
+                (label, account, str(unit.get("state") or ""))
+                for (label, account), unit in job["units"].items()
+                if str(unit.get("state") or "")
+                in (COMBO_RETRY_QUEUED, COMBO_RETRY_RUNNING)
+            )
+        )
+
+
+def combo_retry_unit_state(record_id: str, label: str, account: str) -> str:
+    """某失败项的重试状态；不在重试队列时返回空串（可显示「重试」按钮）。"""
+    with _retry_lock:
+        job = _retry_jobs.get(record_id)
+        if not job:
+            return ""
+        unit = job["units"].get((label, account))
+        state = str((unit or {}).get("state") or "")
+        return state if state in (COMBO_RETRY_QUEUED, COMBO_RETRY_RUNNING) else ""
+
+
+def combo_retry_active_count(record_id: str) -> int:
+    with _retry_lock:
+        job = _retry_jobs.get(record_id)
+        if not job:
+            return 0
+        return sum(
+            1
+            for unit in job["units"].values()
+            if str(unit.get("state") or "") in (COMBO_RETRY_QUEUED, COMBO_RETRY_RUNNING)
+        )
+
+
+def _build_retry_sub(sub: dict, account: str, workdir) -> dict | None:
+    """复用组合任务原有的子任务 spec 构建逻辑；配置已删除时返回 None。"""
+    from tg_signer.webui.task_panel import build_combo_sub_spec
+
+    try:
+        return build_combo_sub_spec(account, sub, workdir)
+    except Exception:
+        logger.debug("构建失败项重试子任务失败: %s", sub, exc_info=True)
+        return None
+
+
+def _merge_retry_updates(
+    record_id: str, updates: dict[tuple[str, str], tuple[str, str]]
+) -> bool:
+    """把重试结果回写到运行中明细、任务历史与进度快照（加锁，幂等）。
+
+    返回是否至少完成一次写回；异常只记日志，由调用方给出可见提示。
+    """
+    if not updates:
+        return True
+    try:
+        with _retry_lock:
+            from tg_signer.webui.task_history import (
+                load_task_history,
+                update_task_history,
+            )
+            from tg_signer.webui.task_panel import TaskRunnerBlock
+
+            run = TaskRunnerBlock.runs.get(record_id)
+            if run is not None:
+                combo_apply_retry_results(run.get("details") or [], updates)
+            items = load_task_history()
+            rec = next((r for r in items if str(r.get("id") or "") == record_id), None)
+            if rec is not None:
+                combo_apply_retry_results(rec.get("details") or [], updates)
+                combo_refresh_record_status(rec)
+                update_task_history(rec)
+            store = load_combo_progress(state.workdir)
+            snap = store.get(record_id)
+            if snap is not None:
+                combo_apply_retry_results(snap.get("details") or [], updates)
+                snap_rec = snap.get("record") or {}
+                if rec is not None:
+                    snap_rec["status"] = rec.get("status")
+                    snap_rec["result"] = rec.get("result")
+                    snap["record"] = snap_rec
+                snap["updated_at"] = time.time()
+                save_combo_progress(store, state.workdir)
+            job = _retry_jobs.get(record_id)
+            if job is not None:
+                for key in updates:
+                    job["units"].pop(key, None)
+                    job["spawned"].pop(key, None)
+        return True
+    except Exception:
+        logger.exception("回写失败项重试结果失败: %s", record_id)
+        return False
+
+
+def _run_account_retry(
+    record_id: str,
+    task_name: str,
+    account: str,
+    items: list[tuple[tuple[str, str], dict]],
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """单账号重试进程：只执行该账号仍失败的子任务，返回逐项结果。"""
+    updates: dict[tuple[str, str], tuple[str, str]] = {}
+    spec_subs = [built for _, built in items]
+    payload = {"subs": spec_subs}
+    cmd = [
+        sys.executable,
+        "-m",
+        "tg_signer.combo_runner",
+        json.dumps(payload, ensure_ascii=False),
+    ]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SOURCE_ROOT)
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+        )
+        _assign_to_job(proc)
+    except Exception as exc:
+        logger.exception("启动失败项重试进程失败: %s", account)
+        reason = f"重试启动失败：{exc}"[:_RETRY_NOTE_MAX]
+        return {key: ("失败", reason) for key, _ in items}
+
+    from tg_signer.webui.task_panel import TaskRunnerBlock
+
+    prefix = f"[{task_name}:{account}] "
+    pos = 0
+    current_key: tuple[str, str] | None = None
+    reasons: list[str] = []
+    try:
+        for line in proc.stdout:
+            TaskRunnerBlock._append_output_line(prefix + line.rstrip("\r\n"))
+            stripped = line.lstrip()
+            if stripped.startswith(">>> 子任务开始"):
+                # 标记行顺序与 spec_subs 一致，用下标映射避免标签格式差异
+                current_key = items[pos][0] if pos < len(items) else None
+                pos += 1
+                reasons = []
+            elif stripped.startswith(">>> 子任务结束"):
+                tail = stripped.rsplit("退出码", 1)[-1].strip()
+                code_ok = tail.isdigit() and int(tail) == 0
+                key = current_key
+                if key is not None:
+                    if code_ok:
+                        updates[key] = ("成功", "重试成功")
+                    else:
+                        reason = combo_failure_reason(reasons) or (
+                            f"退出码 {tail}" if tail else "进程退出码非 0"
+                        )
+                        updates[key] = ("失败", f"重试失败：{reason}")
+                current_key = None
+            elif current_key is not None:
+                reasons.append(line.strip())
+        proc.wait()
+    except Exception as exc:
+        logger.exception("读取失败项重试进程输出失败: %s", account)
+        reason = f"重试异常：{exc}"[:_RETRY_NOTE_MAX]
+        for key, _ in items:
+            updates.setdefault(key, ("失败", reason))
+    finally:
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except OSError:
+            logger.debug("关闭重试进程输出失败", exc_info=True)
+    for key, _ in items:
+        if key not in updates:
+            code = proc.returncode
+            updates[key] = ("失败", f"重试进程提前退出（返回码 {code}）")
+    return updates
+
+
+def _run_retry_batch(
+    record_id: str,
+    task_name: str,
+    groups: dict[str, list[tuple[tuple[str, str], dict]]],
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """多账号并发执行重试子进程，汇总所有失败项的结果。"""
+    results: dict[tuple[str, str], tuple[str, str]] = {}
+    results_lock = threading.Lock()
+    threads: list[threading.Thread] = []
+
+    def _worker(account: str, items) -> None:
+        try:
+            update = _run_account_retry(record_id, task_name, account, items)
+        except Exception as exc:
+            logger.exception("重试账号 %s 失败", account)
+            reason = f"重试异常：{exc}"[:_RETRY_NOTE_MAX]
+            update = dict.fromkeys((key for key, _ in items), ("失败", reason))
+        with results_lock:
+            results.update(update)
+
+    for account, items in groups.items():
+        thread = threading.Thread(
+            target=_worker,
+            args=(account, items),
+            daemon=True,
+            name=f"combo-retry-{account}",
+        )
+        thread.start()
+        threads.append(thread)
+    for thread in threads:
+        thread.join()
+    return results
+
+
+def _retry_worker(record_id: str) -> None:
+    """重试任务后台线程：原组合任务结束后按批次执行失败项并回写结果。"""
+    try:
+        waited = False
+        while _combo_run_active(record_id):
+            waited = True
+            time.sleep(2)
+        # 原任务刚结束：等轮询收尾把终态明细写入任务历史，避免覆盖回写结果
+        if waited:
+            time.sleep(2)
+        while True:
+            with _retry_lock:
+                job = _retry_jobs.get(record_id)
+                if job is None:
+                    return
+                if not job["pending"]:
+                    _retry_jobs.pop(record_id, None)
+                    return
+                keys = list(job["pending"])
+                job["pending"] = []
+                task_name = str(job.get("task_name") or "")
+                client = job.get("client")
+                groups: dict[str, list[tuple[tuple[str, str], dict]]] = {}
+                for key in keys:
+                    built = job["spawned"].get(key)
+                    unit = job["units"].get(key)
+                    if built is None or unit is None:
+                        continue
+                    unit["state"] = COMBO_RETRY_RUNNING
+                    groups.setdefault(str(unit.get("account") or ""), []).append(
+                        (key, built)
+                    )
+                groups.pop("", None)
+            if not groups:
+                continue
+            updates = _run_retry_batch(record_id, task_name, groups)
+            merged = _merge_retry_updates(record_id, updates)
+            ok = sum(1 for status, _ in updates.values() if status == "成功")
+            bad = len(updates) - ok
+            msg = f"失败项重试完成：成功 {ok}，失败 {bad}"
+            if not merged:
+                msg += "（结果写回失败，请刷新页面后重试）"
+            if bad:
+                first_reason = next(
+                    (
+                        note
+                        for status, note in updates.values()
+                        if status == "失败" and note
+                    ),
+                    "",
+                )
+                if first_reason:
+                    msg += f"；失败原因：{first_reason[:120]}"
+            _safe_notify(client, msg, type_="positive" if not bad else "warning")
+    except Exception as exc:
+        logger.exception("失败项重试线程异常: %s", record_id)
+        with _retry_lock:
+            job = _retry_jobs.pop(record_id, None)
+            client = (job or {}).get("client")
+            keys = list((job or {}).get("units") or {})
+        reason = f"重试异常：{exc}"[:_RETRY_NOTE_MAX]
+        _merge_retry_updates(record_id, dict.fromkeys(keys, ("失败", reason)))
+        _safe_notify(client, f"失败项重试异常：{exc}", type_="negative")
+
+
+def request_combo_retry(
+    view,
+    run: dict,
+    combo_subs: list[dict],
+    units: list[tuple[str, str]],
+    client=None,
+) -> int:
+    """提交失败项重试，返回实际排入的失败项数量。
+
+    只接受仍处于「失败」的项；原组合任务还在运行（或刚启动）时先排队，
+    待进程结束后自动执行，避免与运行中的任务并发写同一会话与状态。
+    """
+    record = run.get("record") or {}
+    record_id = str(record.get("id") or "")
+    if not record_id:
+        _safe_notify(client, "该任务缺少记录 ID，无法重试", "warning")
+        return 0
+    from tg_signer.webui.task_history import load_task_history
+
+    items = load_task_history()
+    rec = next((r for r in items if str(r.get("id") or "") == record_id), None)
+    if rec is None:
+        _safe_notify(
+            client,
+            "任务记录已被清理，无法重试；请重新运行该组合任务",
+            "warning",
+        )
+        return 0
+    if str(rec.get("status") or "") == "运行中" and not _combo_run_active(record_id):
+        _safe_notify(
+            client,
+            "任务仍标记为运行中，但当前服务没有对应进程（可能启动于上次"
+            "服务运行期间），无法安全重试",
+            "warning",
+        )
+        return 0
+    if not combo_subs:
+        _safe_notify(
+            client,
+            "缺少这次执行的子任务配置（可能服务重启或快照被清理），无法重试",
+            "warning",
+        )
+        return 0
+    details = (
+        run.get("details")
+        if _combo_run_active(record_id)
+        else (rec.get("details") or run.get("details") or [])
+    )
+    failed_keys = set(combo_failed_units(details or [], combo_subs))
+    sub_by_label = {f"{s.get('type')} · {s.get('task')}": s for s in combo_subs if s}
+    accepted: list[tuple[tuple[str, str], str, dict]] = []
+    skipped: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for label, account in units:
+        key = (label, account)
+        if key in seen or key not in failed_keys:
+            continue
+        seen.add(key)
+        sub = sub_by_label.get(label)
+        if sub is None:
+            skipped.append(f"{label}（子任务配置已失效）")
+            continue
+        if not _combo_account_available(account):
+            skipped.append(f"{account}（会话文件不存在，可能已删除或未登录）")
+            continue
+        built = _build_retry_sub(sub, account, view.workdir)
+        if not built:
+            skipped.append(f"{label}（任务配置已删除或无法构建）")
+            continue
+        accepted.append((key, account, built))
+    if not accepted:
+        msg = "没有可重试的失败项"
+        if skipped:
+            msg += "：" + "；".join(skipped[:3])
+        _safe_notify(client, msg, "warning")
+        return 0
+    duplicate_only = False
+    with _retry_lock:
+        job = _retry_jobs.get(record_id)
+        if job is not None:
+            accepted = [a for a in accepted if a[0] not in job["units"]]
+            duplicate_only = not accepted
+        if not duplicate_only:
+            if job is None:
+                job = {
+                    "record_id": record_id,
+                    "task_name": str(rec.get("task_name") or ""),
+                    "units": {},
+                    "spawned": {},
+                    "pending": [],
+                    "thread": None,
+                    "client": client,
+                }
+                _retry_jobs[record_id] = job
+            else:
+                job["client"] = client or job.get("client")
+            for key, account, built in accepted:
+                job["units"][key] = {
+                    "state": COMBO_RETRY_QUEUED,
+                    "account": account,
+                }
+                job["spawned"][key] = built
+                job["pending"].append(key)
+            thread = job.get("thread")
+            if thread is None or not thread.is_alive():
+                thread = threading.Thread(
+                    target=_retry_worker,
+                    args=(record_id,),
+                    daemon=True,
+                    name=f"combo-retry-{record_id}",
+                )
+                job["thread"] = thread
+                thread.start()
+    if duplicate_only:
+        _safe_notify(
+            client,
+            "这些失败项正在重试或排队中，请勿重复点击",
+            "warning",
+        )
+        return 0
+    count = len(accepted)
+    active = _combo_run_active(record_id)
+    if active:
+        msg = f"已加入重试队列（{count} 项）；原组合任务仍在运行，结束后自动开始重试"
+    else:
+        msg = f"已提交 {count} 项失败项重试"
+    if skipped:
+        msg += "；已跳过：" + "；".join(skipped[:2])
+    _safe_notify(client, msg, "warning" if skipped else "positive")
+    return count
 
 
 # 签到动作代码 -> 描述（见 tg_signer.config.SupportAction）
@@ -503,11 +1048,9 @@ class ComboTaskBlock:
         self._editing_name: str | None = None  # 非 None 表示正在编辑该组合
 
         ui.label("组合任务").classes("text-lg font-semibold")
-        ui.label(
-            "点击「新增任务」选择组合任务模板和账号执行（账号可留空，"
-            "留空时各子任务使用其绑定的账号；可设置开始时间延迟启动）；"
-            "模板的创建与编辑在右上角「任务组合配置」。"
-        ).classes("text-sm text-gray-500")
+        ui.label("选择模板与账号执行；模板在右上角维护。").classes(
+            "text-sm text-gray-500 tgs-tab-intro"
+        )
 
         with ui.row().classes("w-full gap-2 items-center no-wrap"):
             ui.button(
@@ -756,8 +1299,8 @@ class ComboTaskBlock:
 
         with self.history_container:
             if not records:
-                ui.label("暂无历史任务，点击「新增任务」启动组合任务").classes(
-                    "text-sm text-gray-400"
+                ui.label("暂无历史任务，点「新增任务」启动。").classes(
+                    "text-sm text-gray-400 tgs-empty"
                 )
             for i, rec in enumerate(page_records):
                 rid = str(rec.get("id") or "")
@@ -1098,11 +1641,35 @@ class ComboTaskBlock:
                     ui.badge(f"已退频道 {left_n} 个").props("color=orange outline")
                 if joined_n and "抽奖" in sub_types:
                     ui.badge(f"已参与抽奖 {joined_n} 个").props("color=orange outline")
+            # 失败项重试：只重跑仍失败的「子任务 × 账号」，不重跑已成功项
+            record_id = str(rec.get("id") or "")
+            failed_units = combo_failed_units(run.get("details") or [], combo_subs)
+            if record_id and failed_units:
+                active = combo_retry_active_count(record_id)
+                with ui.row().classes("w-full items-center gap-2 flex-wrap mt-1"):
+                    if active:
+                        ui.button(f"重试进行中（{active} 项）").props(
+                            "flat dense color=info disable"
+                        )
+                    else:
+                        holder: dict = {}
+                        retry_all_btn = ui.button(
+                            f"重试全部失败项（{len(failed_units)}）",
+                            on_click=lambda h=holder: self._retry_and_lock_button(
+                                h,
+                                run,
+                                combo_subs,
+                                failed_units,
+                                f"重试进行中（{len(failed_units)} 项）",
+                            ),
+                        ).props("flat dense color=primary")
+                        # 点击回调执行时 holder 已就绪，用于立即禁用按钮
+                        holder["btn"] = retry_all_btn
             # 账号执行进度：每个账号一行，展示当前步骤、完成数与进度条
             ui.label("账号执行进度").classes("text-sm font-semibold text-gray-800 mt-2")
             entries = self._account_progress(run, combo_subs)
             if not entries:
-                ui.label("暂无账号执行记录").classes("text-xs text-gray-400")
+                ui.label("暂无账号执行记录").classes("text-xs text-gray-400 tgs-empty")
             else:
                 with ui.column().classes("w-full gap-1"):
                     for entry in entries:
@@ -1212,6 +1779,8 @@ class ComboTaskBlock:
             if not accounts:
                 ui.label("未绑定账号").classes("text-xs text-gray-400")
                 return
+            record_id = str((run.get("record") or {}).get("id") or "")
+            combo_subs = run.get("combo_subs") or []
             with ui.column().classes("w-full gap-0 mt-1"):
                 for acc in accounts:
                     acc_status = self._acc_sub_status(run, acc, label)
@@ -1226,12 +1795,42 @@ class ComboTaskBlock:
                         ),
                         "",
                     )
-                    with ui.row().classes("w-full items-center gap-1 tgs-prog-acc-row"):
+                    row_class = "w-full items-center gap-1 tgs-prog-acc-row"
+                    if acc_status == "失败":
+                        row_class += " flex-wrap"
+                    with ui.row().classes(row_class):
                         ui.icon("person").classes("text-xs text-gray-400")
                         ui.label(acc).classes("text-xs text-gray-800")
                         if note:
                             ui.label(note).classes("text-xs font-medium text-gray-500")
                         ui.space()
+                        if acc_status == "失败" and record_id:
+                            retry_state = combo_retry_unit_state(record_id, label, acc)
+                            if retry_state:
+                                ui.button(retry_state).props(
+                                    "flat dense color=info disable"
+                                ).classes("tgs-retry-btn")
+                            else:
+                                holder: dict = {}
+                                retry_btn = (
+                                    ui.button(
+                                        "重试",
+                                        on_click=lambda h=holder,
+                                        r=run,
+                                        s=combo_subs,
+                                        a=acc,
+                                        lb=label: self._retry_and_lock_button(
+                                            h,
+                                            r,
+                                            s,
+                                            [(lb, a)],
+                                            COMBO_RETRY_QUEUED,
+                                        ),
+                                    )
+                                    .props("flat dense color=primary")
+                                    .classes("tgs-retry-btn")
+                                )
+                                holder["btn"] = retry_btn
                         ui.badge(acc_status).props(f"color={acc_color} outline")
 
     def _open_leave_detail(self, sub: dict) -> None:
@@ -1241,6 +1840,42 @@ class ComboTaskBlock:
             ui.notify("请在任务进度页查看退频道明细", type="warning")
             return
         opener(sub)
+
+    def _request_retry(
+        self, run: dict, combo_subs: list[dict], units: list[tuple[str, str]]
+    ) -> int:
+        """按钮入口：任何异常都转成提示，不影响进度页轮询与页面本身。"""
+        try:
+            try:
+                client = ui.context.client
+            except Exception:
+                client = None
+            return request_combo_retry(self, run, combo_subs, units, client=client)
+        except Exception as exc:
+            logger.exception("提交失败项重试失败")
+            ui.notify(f"提交重试失败：{exc}", type="negative")
+            return 0
+
+    def _retry_and_lock_button(
+        self,
+        holder: dict,
+        run: dict,
+        combo_subs: list[dict],
+        units: list[tuple[str, str]],
+        queued_text: str,
+    ) -> None:
+        """点击后立即把按钮切成排队/禁用态，避免轮询前连点产生重复请求。"""
+        count = self._request_retry(run, combo_subs, units)
+        if not count:
+            return
+        btn = holder.get("btn")
+        if btn is None:
+            return
+        try:
+            btn.set_text(queued_text)
+            btn.set_enabled(False)
+        except Exception:
+            logger.debug("更新重试按钮状态失败", exc_info=True)
 
     def _tick(self) -> None:
         """每 2 秒轮询：落盘进度快照；历史状态或运行中任务进度变化时刷新列表。"""
@@ -1273,8 +1908,8 @@ class ComboTaskBlock:
             logger.debug("读取任务历史失败", exc_info=True)
         with self.template_container:
             if not items:
-                ui.label("还没有组合任务模板，点击「新增组合任务模板」创建").classes(
-                    "text-sm text-gray-400"
+                ui.label("暂无模板，点「新增组合任务模板」创建。").classes(
+                    "text-sm text-gray-400 tgs-empty"
                 )
             # 抽奖子任务行展示「是否重复参与」：读一次任务库避免逐卡片重复读盘
             try:
@@ -1578,9 +2213,9 @@ class ComboTaskBlock:
         with ui.dialog() as self.combo_dialog, ui.card().classes("w-full max-w-2xl"):
             add_dialog_close_button(self.combo_dialog)
             self.combo_title = ui.label("新增组合任务").classes("text-lg font-semibold")
-            ui.label(
-                "把多个已有任务按顺序组合；执行时各子任务使用其绑定的账号，账号之间并行。"
-            ).classes("text-xs text-gray-500")
+            ui.label("已有任务按顺序组合，账号之间并行。").classes(
+                "text-xs text-gray-500"
+            )
             self.combo_name_input = ui.input(label="组合名称").classes("w-full")
             ui.label("子任务（按添加顺序执行，可用箭头调整）").classes(
                 "text-sm text-gray-600"
@@ -1730,10 +2365,9 @@ class ComboTaskBlock:
         ):
             add_dialog_close_button(self.config_dialog)
             ui.label("任务组合配置").classes("text-lg font-semibold")
-            ui.label(
-                "把多个已有任务按顺序组合成模板；在「新增任务」中选择模板执行，"
-                "执行时各子任务使用其绑定的账号，账号之间并行。"
-            ).classes("text-xs text-gray-500")
+            ui.label("把已有任务按顺序组合，执行时按绑定账号并行。").classes(
+                "text-xs text-gray-500"
+            )
             with ui.row().classes("w-full gap-2"):
                 ui.button(
                     "新增组合任务模板",
@@ -1786,10 +2420,9 @@ class ComboTaskBlock:
                 .props("clearable")
             )
             attach_select_all(self.new_task_accounts)
-            ui.label(
-                "留空：各子任务使用其绑定的账号执行（账号之间并行启动）。"
-                "选择账号后：所有子任务仅用所选账号执行。"
-            ).classes("text-xs text-gray-500")
+            ui.label("留空用各子任务绑定账号；选定则仅用该账号。").classes(
+                "text-xs text-gray-500"
+            )
             # 用单行输入替代 ui.time 时钟弹层：弹层占满弹窗、手机上尤其笨重，
             # 这里只需 HH:MM，输入框更简洁，格式由启动时校验兜底
             self.new_task_start_time = (
@@ -1800,11 +2433,9 @@ class ComboTaskBlock:
                 .classes("w-56")
                 .props("clearable")
             )
-            ui.label(
-                "所选时间已过则从明天该时间开始。"
-                "开始时间到达后先检测 TG 网络，不通则按下方间隔重试，"
-                "次数用尽仍不通则放弃本次任务。"
-            ).classes("text-xs text-gray-500")
+            ui.label("时间已过则从明天开始；网络不通按间隔重试。").classes(
+                "text-xs text-gray-500"
+            )
             with ui.row().classes("w-full gap-2 no-wrap"):
                 self.new_task_retry_interval = ui.number(
                     label="网络不通重试间隔（分钟）",
@@ -1992,10 +2623,9 @@ class ComboTaskBlock:
                         "text-xs text-gray-600"
                     )
                 if status == "运行中":
-                    ui.label(
-                        "未找到本服务的运行记录（可能启动于上次服务运行期间），"
-                        "仅展示历史信息。"
-                    ).classes("text-xs text-gray-400")
+                    ui.label("仅历史信息（服务重启前的运行记录）。").classes(
+                        "text-xs text-gray-400"
+                    )
                 else:
                     ui.label("任务已结束，无实时进度数据。").classes(
                         "text-xs text-gray-400"
@@ -2148,7 +2778,7 @@ def _build_progress_page(record_id: str) -> None:
     if record is None:
         with content:
             ui.label("未找到该组合任务记录（可能已被清理）").classes(
-                "text-sm text-gray-500"
+                "text-sm text-gray-500 tgs-empty"
             )
         return
 
@@ -2207,8 +2837,7 @@ def _build_progress_page(record_id: str) -> None:
             ui.notify(f"已停止: {stopped['task_name']}", type="positive")
         elif outcome == "orphan":
             ui.notify(
-                "该任务启动于上次服务运行期间，已无法远程停止；"
-                "如进程仍在后台运行，请在系统任务管理器中结束对应 Python 进程",
+                "启动于上次服务期间，需在系统任务管理器结束进程",
                 type="warning",
             )
         render_content()
@@ -2248,7 +2877,7 @@ def _build_progress_page(record_id: str) -> None:
         skipped = leave_state["skipped"]
         with body:
             if not rows:
-                ui.label("暂无待确认的频道").classes("text-sm text-gray-400")
+                ui.label("暂无待确认的频道").classes("text-sm text-gray-400 tgs-empty")
                 return
             for row in rows:
                 key = str(row.get("key") or "")
@@ -2289,7 +2918,7 @@ def _build_progress_page(record_id: str) -> None:
             return
         if view.runner.runs.get(record_id) is not None:
             ui.notify(
-                "组合任务运行中，请等任务结束后再手动退出，避免同一账号会话冲突",
+                "组合任务运行中，请等任务结束后再手动退出，避免会话冲突",
                 type="warning",
             )
             return
@@ -2368,9 +2997,9 @@ def _build_progress_page(record_id: str) -> None:
     ):
         add_dialog_close_button(leave_detail_dialog)
         leave_refs["title"] = ui.label("退频道明细").classes("text-lg font-semibold")
-        ui.label(
-            "勾选表示跳过该频道；未勾选的频道点「确定退出」后立即退出（不可撤销）。"
-        ).classes("text-xs text-gray-500")
+        ui.label("勾选=跳过；未勾选的确定后立即退出，不可撤销。").classes(
+            "text-xs text-gray-500"
+        )
         with ui.row().classes("w-full items-center gap-2 flex-wrap"):
             ui.button("全选跳过", on_click=lambda: _leave_select_all(True)).props(
                 "flat dense"
@@ -2412,6 +3041,7 @@ def _build_progress_page(record_id: str) -> None:
                     int((p.get("stats") or {}).get("joined_total") or 0)
                     for p in run.get("procs") or []
                 ),
+                combo_retry_signature(record_id),
             )
         fresh = next(
             (
@@ -2428,6 +3058,16 @@ def _build_progress_page(record_id: str) -> None:
             len((fresh or {}).get("details") or []),
             bool(snap),
             len(snap.get("logs") or []),
+            tuple(
+                (
+                    str(d.get("chat") or ""),
+                    str(d.get("account") or ""),
+                    str(d.get("status") or ""),
+                    str(d.get("note") or ""),
+                )
+                for d in (fresh or {}).get("details") or []
+            ),
+            combo_retry_signature(record_id),
         )
 
     def update_elapsed() -> None:
@@ -2491,6 +3131,7 @@ def combo_progress_page(record_id: str = "") -> None:
     ui.dark_mode(False)
     ui.page_title("任务进度 - TG Signer")
     ui.add_head_html(_PROGRESS_PAGE_STYLE)
+    ui.add_head_html(MOBILE_DESIGN_CSS)
     root = ui.column().classes("w-full gap-3")
 
     def render_page() -> None:

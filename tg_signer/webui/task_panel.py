@@ -423,9 +423,9 @@ class TaskRunnerBlock:
 
     def __init__(self) -> None:
         ui.label("签到").classes("text-lg font-semibold")
-        ui.label(
-            "点击「新增任务」在弹窗中选择任务类型、任务与账号；组合任务的创建与执行在独立的「组合任务」tab；历史列表可「复制」任意历史任务的参数快速新建，运行中的任务可停止。"
-        ).classes("text-sm text-gray-500")
+        ui.label("选择任务类型、任务与账号启动；历史可复制参数。").classes(
+            "text-sm text-gray-500 tgs-tab-intro"
+        )
 
         with ui.row().classes("gap-2 items-center flex-wrap"):
             ui.button(
@@ -447,9 +447,9 @@ class TaskRunnerBlock:
         with ui.row().classes("w-full items-center justify-between"):
             ui.label("任务历史").classes("text-md font-semibold")
             ui.button("清空历史", on_click=self.clear_history).props("outline dense")
-        ui.label(
-            "记录通过本页面手动执行过的任务（含类型、账号、状态与结果），保存在工作目录下。"
-        ).classes("text-sm text-gray-500")
+        ui.label("记录本页手动执行的任务。").classes(
+            "text-sm text-gray-500 tgs-tab-intro"
+        )
         self.history_summary = ui.label("").classes("text-sm text-gray-600")
         self.history_table = (
             ui.table(
@@ -630,9 +630,9 @@ class TaskRunnerBlock:
                     "flat dense"
                 )
             self.binding_row.set_visibility(False)
-            ui.label(
-                "账号来自 *.session 文件；多选时每个账号各启动一个进程。首次执行后账号与任务绑定，后续执行无需再选。"
-            ).classes("text-xs text-gray-500")
+            ui.label("账号来自 .session；多选时每账号一个进程。").classes(
+                "text-xs text-gray-500"
+            )
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=self.dialog.close).props("outline")
                 ui.button("执行", color="primary", on_click=self.start_task)
@@ -848,7 +848,7 @@ class TaskRunnerBlock:
         with self.history_cards:
             shown = self.history_rows[: self._cards_limit]
             if not shown:
-                ui.label("暂无记录").classes("text-sm text-gray-400")
+                ui.label("暂无记录").classes("text-sm text-gray-400 tgs-empty")
             for idx, row in enumerate(shown, 1):
                 with ui.card().classes("w-full mobile-list-card border"):
                     with ui.row().classes(
@@ -1874,10 +1874,9 @@ class TaskRunnerBlock:
                 f" · 进行中 {counts['进行中']} · 中断 {counts['中断']}"
             ).classes("text-sm text-gray-600")
             if can_rerun:
-                ui.label(
-                    "勾选失败的频道后点「重试签到」，只对这些频道重新执行签到；"
-                    "若失败原因是账号已不在群里，可先点「重新加入」再加入后再重试。"
-                ).classes("text-xs text-gray-500")
+                ui.label("仅重试失败频道；不在群可先重新加入。").classes(
+                    "text-xs text-gray-500"
+                )
             # 分账号失败统计：点击可直接筛选该账号
             if acc_stats:
                 with ui.row().classes("w-full gap-1 flex-wrap items-center"):
@@ -2155,8 +2154,7 @@ class TaskRunnerBlock:
             self._refresh_history_table()
             self._update_status()
             ui.notify(
-                "该任务启动于上次服务运行期间，已无法远程停止；"
-                "如进程仍在后台运行，请在系统任务管理器中结束对应 Python 进程",
+                "启动于上次服务期间，需在系统任务管理器结束进程",
                 type="warning",
             )
             return outcome, record

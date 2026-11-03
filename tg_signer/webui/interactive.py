@@ -107,8 +107,8 @@ class InteractiveSignerConfig:
         self.chats_container.clear()
         with self.chats_container:
             if not self.chats:
-                ui.label("暂无任务，请点击右上角添加").classes(
-                    "text-gray-500 italic w-full text-center py-4"
+                ui.label("暂无任务，点右上角添加。").classes(
+                    "text-gray-500 w-full text-center tgs-empty"
                 )
                 return
 
@@ -254,7 +254,9 @@ class InteractiveSignerConfig:
                 actions_container.clear()
                 with actions_container:
                     if not d_actions:
-                        ui.label("暂无动作").classes("text-gray-500 italic text-sm")
+                        ui.label("暂无动作").classes(
+                            "text-gray-500 italic text-sm tgs-empty"
+                        )
                     for i, action in enumerate(d_actions):
                         with ui.row().classes(
                             "w-full items-center justify-between bg-white p-2 rounded shadow-sm"

@@ -74,6 +74,7 @@ from tg_signer.webui.sign import (
     user_info_block,
 )
 from tg_signer.webui.stop_all import stop_all_tasks
+from tg_signer.webui.theme import MOBILE_DESIGN_CSS
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,7 @@ def log_block(card: Optional[ui.card] = None) -> Callable[[], None]:
     """日志查看卡片；传入外部弹窗卡片（card）时提供全屏显示切换。"""
     with ui.card().classes("w-full shadow-sm tgs-log-card"):
         ui.label("日志查看").classes("text-md font-semibold")
-        ui.label("查看最新日志行，可自定义文件路径和行数。").classes(
+        ui.label("查看最新日志，可自定义文件与行数。").classes(
             "text-sm text-gray-500 mb-1"
         )
 
@@ -342,9 +343,7 @@ def _build_dashboard(container) -> None:
             _users_built = True
             with users_card:
                 ui.label("用户信息").classes("text-lg font-semibold")
-                ui.label("查看当前已登录账户信息 (users/*/me.json)。").classes(
-                    "text-gray-600"
-                )
+                ui.label("当前已登录账号与限流状态。").classes("text-sm text-gray-500")
                 users_refresh = user_info_block()
                 refreshers.append(users_refresh)
                 # 块本身只创建空容器并返回 refresh，需立即调用一次填充内容
@@ -411,10 +410,9 @@ def _build_dashboard(container) -> None:
                 # 中奖消息转发目标（全局设置，对所有抽奖任务生效）：
                 # 多选，选项 = 收藏夹 + 各账号最近会话中的群组/频道
                 ui.label("中奖消息转发目标").classes("text-lg font-semibold mt-2")
-                ui.label(
-                    "抽奖引擎识别到中奖消息后，用各账号把中奖原消息转发到这里"
-                    "（可多选，需为该账号已加入的群组/频道），修改后新启动的任务生效。"
-                ).classes("text-xs text-gray-500")
+                ui.label("转发到账号已加入的群组/频道，新启动任务生效。").classes(
+                    "text-xs text-gray-500"
+                )
                 for tid in current_targets:
                     if tid not in target_options:
                         target_options[tid] = tid
@@ -431,11 +429,9 @@ def _build_dashboard(container) -> None:
                 )
                 # 中奖回扫条数：首次记录某 bot 时的初始基线，之后增量扫描
                 ui.label("中奖回扫条数").classes("text-lg font-semibold mt-2")
-                ui.label(
-                    "首次记录某个 bot 时回扫其私聊最近多少条消息找中奖通知"
-                    "（默认 50）；之后按水位线增量扫描，只处理新消息，"
-                    "该值不再参与日常回扫。"
-                ).classes("text-xs text-gray-500")
+                ui.label("首次回扫条数（默认 50），之后按新消息增量扫描。").classes(
+                    "text-xs text-gray-500"
+                )
                 sweep_input = ui.number(
                     label="回扫条数",
                     value=sweep_limit,
@@ -445,10 +441,9 @@ def _build_dashboard(container) -> None:
                 ).classes("w-full")
                 # 中奖扫描额外机器人（全局）：除抽奖任务扫到的 bot 外也回扫这些 bot
                 ui.label("中奖扫描额外机器人").classes("text-lg font-semibold mt-2")
-                ui.label(
-                    "中奖扫描除了回扫抽奖任务扫到的机器人，还额外回扫这里填写的"
-                    "机器人私聊中奖通知（逗号分隔，可带 @，如 @yujie_lottery_bot）。"
-                ).classes("text-xs text-gray-500")
+                ui.label("额外回扫的机器人，逗号分隔，可带 @。").classes(
+                    "text-xs text-gray-500"
+                )
                 extra_bots_input = ui.input(
                     label="额外机器人（逗号分隔）",
                     value="，".join(extra_bots),
@@ -456,11 +451,9 @@ def _build_dashboard(container) -> None:
                 ).classes("w-full")
                 # 抽奖任务超时（全局）：单独运行与组合子任务共用
                 ui.label("抽奖任务超时（分钟）").classes("text-lg font-semibold mt-2")
-                ui.label(
-                    "抽奖任务运行达到该时长后自动停止"
-                    "（单独运行的抽奖任务与组合任务中的抽奖子任务共用，"
-                    "0=不限，默认 10）。"
-                ).classes("text-xs text-gray-500")
+                ui.label("到时自动停止；0=不限，默认 10 分钟。").classes(
+                    "text-xs text-gray-500"
+                )
                 timeout_input = ui.number(
                     label="超时（分钟，0=不限）",
                     value=timeout_min,
@@ -470,11 +463,9 @@ def _build_dashboard(container) -> None:
                 ).classes("w-full")
                 # 单频道扫描上限（全局）：关键词未命中时也按该条数截断
                 ui.label("单频道扫描上限（条）").classes("text-lg font-semibold mt-2")
-                ui.label(
-                    "每个频道/群组每轮最多回溯多少条历史消息"
-                    "（关键词未命中时同样生效，达到上限会写入消息中心提醒，"
-                    "默认 500）。"
-                ).classes("text-xs text-gray-500")
+                ui.label("每轮最多回溯条数，默认 500。").classes(
+                    "text-xs text-gray-500"
+                )
                 scan_cap_input = ui.number(
                     label="扫描上限（条）",
                     value=scan_cap,
@@ -486,11 +477,9 @@ def _build_dashboard(container) -> None:
                 ui.label("全局调用上限与同时扫描账号数").classes(
                     "text-lg font-semibold mt-2"
                 )
-                ui.label(
-                    "按「所有同时运行的抽奖任务 + 全部账号合计」生效（同目录任务共用"
-                    "一个限速队列），用于规避 429 Transport flood（按出口 IP 计数，"
-                    "账号越多越需要压低合计速率）；0=不限，默认 8 次/秒、4 个账号。"
-                ).classes("text-xs text-gray-500")
+                ui.label("合计限速，用于规避 429；0=不限，默认 8/秒、4 账号。").classes(
+                    "text-xs text-gray-500"
+                )
                 global_qps_input = ui.number(
                     label="全局调用上限（次/秒，0=不限）",
                     value=global_qps,
@@ -507,15 +496,36 @@ def _build_dashboard(container) -> None:
                 ).classes("w-full")
                 # 抽奖贴跳过关键字（全局）：扫描时命中的抽奖帖不参与
                 ui.label("抽奖贴跳过关键字").classes("text-lg font-semibold mt-2")
-                ui.label(
-                    "抽奖任务扫描到的帖子包含其中任一字符串时直接跳过、不参与该抽奖"
-                    "（逗号分隔，留空则不过滤）。"
-                ).classes("text-xs text-gray-500")
+                ui.label("命中任一关键字即跳过，留空不过滤。").classes(
+                    "text-xs text-gray-500"
+                )
                 skip_kw_input = ui.input(
                     label="跳过关键字（逗号分隔）",
                     value="，".join(skip_keywords),
                     placeholder="如：嫩妹币，仅限新用户",
                 ).classes("w-full")
+
+                # 参数细节统一收进折叠区：首屏只保留「做什么 + 关键限制」，
+                # 技术含义与风险说明仍可展开查看，不改变任何保存逻辑
+                with ui.expansion("参数说明与风险", icon="help_outline").classes(
+                    "w-full"
+                ):
+                    ui.label(
+                        "转发目标：各账号把中奖原消息转发到所选目标，目标需为该账号"
+                        "已加入的群组/频道；修改后对新启动的任务生效。\n"
+                        "回扫条数：首次记录某个 bot 时回扫最近 50 条；之后按水位线"
+                        "增量扫描，该值不再参与日常回扫。\n"
+                        "额外机器人：除抽奖任务扫到的 bot 外，也回扫这里填写的机器人"
+                        "私聊中奖通知（逗号分隔，可带 @）。\n"
+                        "超时：单独运行的抽奖任务与组合任务中的抽奖子任务共用；"
+                        "0=不限。\n"
+                        "扫描上限：每轮每频道最多回溯条数；达到上限会写入消息中心提醒。\n"
+                        "全局调用：按所有同时运行的抽奖任务与全部账号合计生效，同目录"
+                        "任务共用一个限速队列；用于规避 429 Transport flood（按出口 IP"
+                        "计数），0=不限。\n"
+                        "跳过关键字：扫描到的帖子包含任一字符串时直接跳过、不参与"
+                        "（逗号分隔，留空不过滤）。"
+                    ).classes("text-xs text-gray-500").style("white-space: pre-line")
 
                 async def apply_settings() -> None:
                     # 先切换工作目录并刷新界面，再在后台线程落盘各项设置
@@ -581,17 +591,19 @@ def _build_dashboard(container) -> None:
                 type="positive",
             )
 
-        with ui.row().classes("w-full items-center justify-between gap-2 no-wrap"):
+        with ui.row().classes(
+            "w-full items-center justify-between gap-2 no-wrap tgs-header-row"
+        ):
             with (
                 ui.tabs()
                 .classes("flex-1 min-w-0 main-tabs")
                 .props("align=left") as tabs
             ):
-                tab_run = ui.tab("run", "签到")
-                tab_combo = ui.tab("combo", "组合任务")
-                tab_random = ui.tab("random", "随机发言")
-                tab_leave = ui.tab("leave", "批量退频道")
-                tab_giveaway = ui.tab("giveaway", "自动抽奖")
+                tab_run = ui.tab("run", "签到", icon="task_alt")
+                tab_combo = ui.tab("combo", "组合任务", icon="account_tree")
+                tab_random = ui.tab("random", "随机发言", icon="chat")
+                tab_leave = ui.tab("leave", "批量退频道", icon="logout")
+                tab_giveaway = ui.tab("giveaway", "自动抽奖", icon="casino")
 
             # 版本号 + 消息中心 + 菜单按钮，与主标签栏同行（下拉项在下方绑定）
             with ui.row().classes("items-center gap-0 no-wrap tgs-header-actions"):
@@ -761,24 +773,14 @@ def _build_dashboard(container) -> None:
 
         def _build_random_panel() -> None:
             with panel_random:
-                ui.label(
-                    "多账号随机发言：选择账号与目标群组，按固定间隔从内置语库随机发送消息。"
-                ).classes("text-gray-600 tgs-tab-intro")
                 refreshers.append(random_chat_block(state.workdir))
 
         def _build_leave_panel() -> None:
             with panel_leave:
-                ui.label(
-                    "批量退出长期不更新的频道：扫描账号对话，预览确认后并发批量退出。"
-                ).classes("text-gray-600 tgs-tab-intro")
                 refreshers.append(auto_leave_block(state.workdir))
 
         def _build_giveaway_panel() -> None:
             with panel_giveaway:
-                ui.label(
-                    "自动参与频道抽奖：监听 t.me 抽奖机器人链接（?start= 参数），"
-                    "实时新帖与手动扫描两种方式触发，支持多账号与指定频道列表。"
-                ).classes("text-gray-600 tgs-tab-intro")
                 refreshers.append(giveaway_block(state.workdir))
 
         def _ensure_configs() -> None:
@@ -789,9 +791,7 @@ def _build_dashboard(container) -> None:
             _configs_built = True
             with configs_card:
                 ui.label("签到配置管理").classes("text-lg font-semibold")
-                ui.label("管理 signer 的配置文件，支持查看、编辑和删除。").classes(
-                    "text-gray-600"
-                )
+                ui.label("查看、编辑或删除签到配置。").classes("text-sm text-gray-500")
 
                 # ---- 配置导入导出（用于备份或迁移到其他设备） ----
                 async def export_configs() -> None:
@@ -843,13 +843,18 @@ def _build_dashboard(container) -> None:
                 ):
                     add_dialog_close_button(import_dlg)
                     ui.label("导入备份").classes("text-lg font-semibold")
-                    ui.label(
-                        "选择此前「导出全部配置」生成的备份文件（.zip 或 .json）。"
-                        "同名配置会被覆盖，账户状态同步恢复；"
-                        "ZIP 还会还原最近聊天缓存和批量退频道排除关键字配置。"
-                        "任务历史不随备份迁移；备份不含 session 登录凭据，"
-                        "迁移账号需另行复制 .session 文件。"
-                    ).classes("text-sm text-gray-600")
+                    ui.label("覆盖同名配置，不含登录凭据。").classes(
+                        "text-sm text-gray-600"
+                    )
+                    with ui.expansion("备份包含什么", icon="help_outline").classes(
+                        "w-full"
+                    ):
+                        ui.label(
+                            "支持此前「导出全部配置」生成的 .zip 或 .json。同名配置会被"
+                            "覆盖，账户状态同步恢复；ZIP 还会还原最近聊天缓存和批量退频道"
+                            "排除关键字配置。任务历史不随备份迁移；备份不含 session 登录"
+                            "凭据，迁移账号需另行复制 .session 文件。"
+                        ).classes("text-xs text-gray-500")
                     ui.upload(
                         label="选择备份文件",
                         on_upload=on_import_file,
@@ -1309,6 +1314,8 @@ def build_ui(auth_code: str = None) -> None:
         </style>
         """
     )
+    # 设计语言单独成文件，消息中心 / 组合进度等独立页面复用同一份
+    ui.add_head_html(MOBILE_DESIGN_CSS)
     ui.page_title("TG Signer Web 控制台")
     root = ui.column().classes("w-full gap-3")
     # 页面初始化即检测科学上网连通性（后台执行不阻塞首屏，失败弹持久报错）
@@ -1418,7 +1425,8 @@ def main(host: str = None, port: int = None, storage_secret: str = None) -> None
         flush_task_history()
 
     # GZip 压缩：NiceGUI 静态资源约 6MB（Vue/Quasar/字体等），gzip 后约 1.5MB，
-    # 显著降低手机等弱网环境的首次加载耗时
+    # 显著降低手机等弱网环境的首次加载耗时。
+    # ui.run 默认还会再加一层 GZip，这里显式关闭，避免重复中间件与重复 Vary 头
     from starlette.middleware.gzip import GZipMiddleware
 
     app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -1431,6 +1439,7 @@ def main(host: str = None, port: int = None, storage_secret: str = None) -> None
         host=host,
         port=port,
         show=False,
+        gzip_middleware_factory=None,
         storage_secret=storage_secret or _load_or_create_storage_secret(),
         # 会话 cookie 持久化 30 天（与过期会话清理策略一致），浏览器重开/服务重启后仍能记住上次选中的 tab
         session_middleware_kwargs={"max_age": 30 * 86400},

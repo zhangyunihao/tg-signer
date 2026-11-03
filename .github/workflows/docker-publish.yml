@@ -1,9 +1,15 @@
 name: Publish Docker Image
 
+# 只响应严格的 vX.Y.Z tag（历史无 v 前缀的 1.0.x tag 不再触发）。
+# latest / latest-webui 只在同时满足以下条件时更新：
+#   1) tag 是当前最高的稳定版本；
+#   2) tag 指向的提交在默认分支上。
+# 这样重推旧 tag 或推送维护分支 tag 都不会把 latest 指偏。
+
 on:
   push:
     tags:
-      - '*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
       ref:
@@ -40,6 +46,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -61,11 +69,41 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PUSH_TAG_NAME: ${{ github.ref_name }}
           MANUAL_IMAGE_TAG: ${{ inputs.image_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
+          set -euo pipefail
+
           if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             ref_name="${MANUAL_IMAGE_TAG}"
+            publish_latest=false
           else
             ref_name="${PUSH_TAG_NAME}"
+            if [[ ! "${ref_name}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Unsupported release tag: ${ref_name}" >&2
+              exit 1
+            fi
+
+            version="${ref_name#v}"
+            publish_latest=false
+
+            on_default_branch=false
+            if git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${DEFAULT_BRANCH}"; then
+              on_default_branch=true
+            fi
+
+            highest_version="$(
+              git tag --list 'v*' \
+                | sed 's/^v//' \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V \
+                | tail -n 1
+            )"
+
+            if [[ "${version}" == "${highest_version}" && "${on_default_branch}" == "true" ]]; then
+              publish_latest=true
+            fi
+
+            echo "release=${version} highest=${highest_version} on_default_branch=${on_default_branch} publish_latest=${publish_latest}"
           fi
 
           image="${REGISTRY}/${IMAGE_NAME}"
@@ -77,9 +115,10 @@ jobs:
 
           {
             echo "version_tag=${ref_name}${{ matrix.tag_suffix }}"
+            echo "publish_latest=${publish_latest}"
             echo "tags<<EOF"
             echo "${image}:${ref_name}${{ matrix.tag_suffix }}"
-            if [[ "${EVENT_NAME}" == "push" ]]; then
+            if [[ "${publish_latest}" == "true" ]]; then
               echo "${image}:${{ matrix.latest_tag }}"
             fi
             echo "EOF"

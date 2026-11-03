@@ -1,31 +1,171 @@
 name: Publish Python Package
 
+# 发布链路只响应严格的 vX.Y.Z tag：
+#   validate（tag 与包版本一致）-> test（复用 test.yml 的 lint + pytest）
+#   -> build（干净目录构建，只把本次 dist 作为 artifact）
+#   -> publish（PyPI Trusted Publishing / OIDC，不再使用长期 token）
+#
+# 版本唯一来源：tg_signer/__init__.py 的 __version__（pyproject.toml 为 dynamic version）。
+# 回退到 API token 的步骤见 docs/release.md「回退方案」。
+
 on:
   push:
     tags:
-      - '*'
+      # GitHub 的 tag filter 只支持 glob，这里限制为 v + 三段数字。
+      # job 内还会用严格正则 ^vX.Y.Z$ 二次校验；其他形态的 tag 不会触发本 workflow。
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
 
 jobs:
-  publish:
+  validate:
+    name: Validate tag and version
     runs-on: ubuntu-latest
-
+    outputs:
+      version: ${{ steps.check.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install build dependencies
-        run: python -m pip install --upgrade pip setuptools wheel build twine
-
-      - name: Build the package
-        run: python -m build
-
-      - name: Publish to PyPI
+      - name: Check tag equals package __version__
+        id: check
+        shell: bash
         env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
-        run: python -m twine upload dist/*
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import ast
+          import os
+          import re
+          from pathlib import Path
+
+          tag = os.environ["REF_NAME"]
+          match = re.fullmatch(r"v(\d+\.\d+\.\d+)", tag)
+          if not match:
+              raise SystemExit(f"拒绝发布：ref {tag!r} 不是严格的 vX.Y.Z tag")
+          tag_version = match.group(1)
+
+          tree = ast.parse(Path("tg_signer/__init__.py").read_text(encoding="utf-8"))
+          version = None
+          for node in tree.body:
+              if isinstance(node, ast.Assign):
+                  for target in node.targets:
+                      if isinstance(target, ast.Name) and target.id == "__version__":
+                          version = ast.literal_eval(node.value)
+
+          if version is None:
+              raise SystemExit("tg_signer/__init__.py 中找不到 __version__")
+
+          print(f"tag version     = {tag_version}")
+          print(f"package version = {version}")
+          if tag_version != version:
+              raise SystemExit(
+                  f"版本不一致：tag {tag} -> {tag_version}，"
+                  f"tg_signer/__init__.py __version__ = {version}"
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"version={version}\n")
+          PY
+
+  test:
+    name: Lint and test
+    needs: validate
+    # 复用 test.yml，避免 publish 与 push/PR 各维护一套 lint/test 步骤。
+    # tag push 不会命中 test.yml 的 branches 触发器，因此这里只会跑一次。
+    uses: ./.github/workflows/test.yml
+
+  build:
+    name: Build distributions
+    needs: [validate, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Build only this version
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf dist build
+          python -m build --outdir dist
+          python -m twine check dist/*
+          test -n "$(find dist -maxdepth 1 -type f -name "*${VERSION}*" -print -quit)"
+          ls -l dist
+
+      - name: Upload current run dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to PyPI
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/tg-signer-plus
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download current run dist
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Verify downloaded artifacts
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -n "$(find dist -maxdepth 1 -type f -name "*${VERSION}*" -print -quit)"
+          ls -l dist
+
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          print-hash: true
+
+# -----------------------------------------------------------------------------
+# 回退方案（仅当 PyPI Trusted Publishing 不可用时）：
+# 1. 在 GitHub 仓库或 environment pypi 中创建 secret PYPI_API_TOKEN
+#    （PyPI 项目级 token，不要用账号级 token；建议只授予该项目）。
+# 2. 删除上面的 pypa/gh-action-pypi-publish 步骤，替换为：
+#      - name: Publish to PyPI (token fallback)
+#        env:
+#          TWINE_USERNAME: __token__
+#          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+#        run: python -m pip install twine && python -m twine upload --skip-existing dist/*
+# 3. 回退时可去掉 id-token: write；environment: pypi 下的 secret 必须在该 environment 中创建。
+# 详细迁移/回退步骤见 docs/release.md。
+# -----------------------------------------------------------------------------

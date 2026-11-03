@@ -1587,7 +1587,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 if capture_engine_stats(_n):
                     _persist()
                 try:
-                    eng.stop()
+                    await asyncio.to_thread(eng.stop)
                 except Exception:
                     logger.debug("任务运行超时自动停止失败", exc_info=True)
                 # 定时器在后台任务里触发，ui.context 无槽栈，需显式进入 client
@@ -1756,7 +1756,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             # 停止前先把当前统计落盘，避免明细只存在于内存
             if capture_engine_stats(name):
                 _persist()
-            engine.stop()
+            # 停止内部会 terminate 子进程并最多等待 5 秒（失败再 kill 等 5 秒），
+            # 必须放线程执行，否则事件循环卡住期间所有面板轮询与 websocket 都停摆
+            await asyncio.to_thread(engine.stop)
         else:
             set_status(False)
 
@@ -2003,8 +2005,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         card_sweep_texts.clear()
         with task_list_container:
             if not tasks:
-                ui.label("暂无任务，请点击「添加任务」创建。").classes(
-                    "text-sm text-gray-400"
+                ui.label("暂无任务，点击「添加任务」创建。").classes(
+                    "text-sm text-gray-400 tgs-empty"
                 )
                 return
             columns = [
@@ -2441,12 +2443,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 _GLOBAL_STATUS_CBS[engine_key(name)] = set_status
 
     ui.label("自动抽奖").classes("text-lg font-semibold")
-    ui.label(
-        "监控指定频道/群组消息中的 t.me 抽奖机器人链接（?start= 参数），自动点击参与；"
-        "任务启动时可自动扫描历史消息（至参与上限或连续 5 条已开奖为止）。"
-        "同一抽奖链接每个账号只参与一次，"
-        "记录持久化在工作目录，重启不重复参与。"
-    ).classes("text-sm text-gray-500")
+    ui.label("监控频道抽奖链接并自动参与，支持多账号。").classes(
+        "text-sm text-gray-500 tgs-tab-intro"
+    )
 
     # —— 清除所有已参与抽奖记录 ——
     def open_clear_records_dlg() -> None:
@@ -2456,11 +2455,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         # 参与记录由子进程写入，这里每次重新读盘，避免页面持有过期快照
         total = GiveawayState(workdir).count()
         clear_count_label.text = (
-            f"当前共 {total} 条已参与记录（覆盖所有账号）。"
-            "清除后，相同抽奖链接对所有账号都视为未参与，下次扫描将重新参与；"
-            "中奖消息去重记录与各账号 × bot 的回扫进度（水位线）保留，"
-            "已提醒过的旧中奖消息不会被重复推送。"
-            "此操作不可恢复，确定清除？"
+            f"共 {total} 条已参与记录；清除后相同链接可再次参与，且不可恢复。"
         )
         clear_records_dlg.open()
 
@@ -2479,6 +2474,11 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         add_dialog_close_button(clear_records_dlg)
         ui.label("清除所有已参与抽奖记录").classes("text-lg font-semibold")
         clear_count_label = ui.label("").classes("text-sm text-gray-700")
+        with ui.expansion("清除范围", icon="help_outline").classes("w-full"):
+            ui.label(
+                "覆盖所有账号。中奖消息去重记录与各账号 × bot 的回扫进度（水位线）"
+                "保留，已提醒过的旧中奖消息不会被重复推送。"
+            ).classes("text-xs text-gray-500")
         with ui.row().classes("w-full justify-end"):
             ui.button("取消", on_click=clear_records_dlg.close).props("flat")
             ui.button("确认清除", color="negative", on_click=do_clear_records)
@@ -2491,8 +2491,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 icon="delete_sweep",
                 on_click=open_clear_records_dlg,
             ).props("outline color=negative").tooltip(
-                "删除所有账号的已参与抽奖记录（保留中奖消息去重与回扫进度），"
-                "清除后相同链接可再次参与"
+                "删除已参与记录，相同链接可再次参与"
             )
             ui.button("添加任务", icon="add", on_click=open_add_dialog).props("outline")
     task_list_container = ui.column().classes("w-full gap-2")
@@ -2662,7 +2661,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         detail_list.clear()
         with detail_list:
             if not by_acct:
-                ui.label("暂无参与记录").classes("text-sm text-gray-400")
+                ui.label("暂无参与记录").classes("text-sm text-gray-400 tgs-empty")
             else:
                 for acct in sorted(by_acct, key=lambda a: by_acct[a], reverse=True):
                     with ui.column().classes("w-full gap-0.5"):
@@ -2885,16 +2884,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     max=600,
                     format="%d",
                 ).classes("w-48")
-            ui.label(
-                "加入/解析节奏与滚动配额用于规避 Telegram 限流"
-                "（FLOOD_WAIT 短暂停、PEER_FLOOD 会数小时到数天无法加群）；"
-                "间隔在上下限之间随机取值，配额按账号统计且跨任务重启累计，"
-                "0 表示不限制。"
-            ).classes("text-xs text-gray-500")
+            ui.label("间隔过小会增加限流等待；0=不限制。").classes(
+                "text-xs text-gray-500"
+            )
 
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
             win_switch = ui.switch(
-                "中奖识别（检测到中奖消息自动提醒；转发目标、抽奖贴跳过关键字在右上角菜单「设置」）",
+                "中奖识别（私聊命中自动提醒）",
                 value=True,
             )
 
@@ -2970,21 +2966,25 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         _apply_rescue_visibility()
         _apply_source_visibility()
 
-        ui.label(
-            "提示：参与 = 以账号身份向抽奖机器人发送 /start（等同手动点开链接）；"
-            "机器人若弹出「确认参与」类按钮会自动点击；开启自动加入后，"
-            "机器人回复消息中出现的频道/群组链接会被逐一加入（激进模式，可能误加）。"
-            "「百宝箱扫描」类型直接扫描该 bot 私聊里的「您已获得抽奖资格（已达标）」"
-            "消息并点击「点击参与抽奖」，无需监控频道、也不会自动加群。"
-            "「中奖扫描」类型只回扫该 bot 私聊里的中奖通知并提醒，不参与抽奖、不加群；"
-            "机器人用户名留空时回扫全部已知机器人（即抽奖任务参与过的 bot）。"
-            "补漏扫描会按设定间隔重拉各频道最近若干条消息，"
-            "捞回此前因网络异常/中断漏掉的抽奖帖，连续多轮拉取失败会自动暂停一段时间。"
-            "中奖识别会在 bot 私聊出现中奖消息时转发提醒并写入消息中心，"
-            "转发目标与微信推送（Server酱）在右上角消息中心统一设置，"
-            "任务启动与每轮补漏时也会回扫各 bot 私聊，补捡停机期间的中奖通知。"
-            "请确保账号已加入所监控的频道。"
-        ).classes("text-xs text-amber-600")
+        ui.label("参与需账号已加入频道；自动加入为激进模式，可能误加。").classes(
+            "text-xs text-amber-600"
+        )
+        with ui.expansion("参与规则与风险", icon="help_outline").classes("w-full"):
+            ui.label(
+                "参与 = 以账号身份向抽奖机器人发送 /start（等同手动点开链接）；"
+                "机器人若弹出「确认参与」类按钮会自动点击；开启自动加入后，机器人"
+                "回复消息中出现的频道/群组链接会被逐一加入（激进模式，可能误加）。\n"
+                "「百宝箱扫描」直接扫描该 bot 私聊里的「您已获得抽奖资格（已达标）」"
+                "消息并点击「点击参与抽奖」，无需监控频道、也不会自动加群。\n"
+                "「中奖扫描」只回扫该 bot 私聊里的中奖通知并提醒，不参与抽奖、不加群；"
+                "机器人用户名留空时回扫全部已知机器人（即抽奖任务参与过的 bot）。\n"
+                "补漏扫描按设定间隔重拉各频道最近若干条消息，捞回因网络异常/中断漏掉"
+                "的抽奖帖；连续多轮失败会自动暂停一段时间。\n"
+                "中奖识别会在 bot 私聊出现中奖消息时转发提醒并写入消息中心；转发目标"
+                "与微信推送（Server酱）在右上角消息中心统一设置，任务启动与每轮补漏时"
+                "也会回扫各 bot 私聊，补捡停机期间的中奖通知。\n"
+                "请确保账号已加入所监控的频道。"
+            ).classes("text-xs text-gray-500").style("white-space: pre-line")
         with ui.row().classes("w-full justify-end tgs-dialog-footer"):
             ui.button("取消", on_click=add_dlg.close).props("flat")
             add_dlg_submit = ui.button(

@@ -1053,8 +1053,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         table_ref["table"] = None
         with task_list_container:
             if not tasks:
-                ui.label("暂无任务，请点击「添加任务」创建。").classes(
-                    "text-sm text-gray-400"
+                ui.label("暂无任务，点击「添加任务」创建。").classes(
+                    "text-sm text-gray-400 tgs-empty"
                 )
                 return
             columns = [
@@ -1345,12 +1345,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 _GLOBAL_STATUS_CBS[engine_key(name)] = set_status
 
     ui.label("随机发言").classes("text-lg font-semibold")
-    ui.label(
-        f"由所选账号发送消息到目标群组，发送内容默认从内置 {len(PHRASES)} 条语库中随机抽取，"
-        "也可在添加任务时配置该任务专属语库（每行一条）。发送后可在指定秒数自动删除"
-        "（删除延迟填 0 或留空则不删除）。支持添加多个任务并行运行；设置重复次数后"
-        "会循环执行，每轮结束断开所有账号，等待间隔期间不占用数据库。"
-    ).classes("text-sm text-gray-500")
+    ui.label("向目标群随机发送语库消息，可延时删除、多任务并行。").classes(
+        "text-sm text-gray-500 tgs-tab-intro"
+    )
 
     # —— 任务列表（置顶） ——
     with ui.row().classes("w-full items-center justify-between"):
@@ -1564,10 +1561,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 max=10080,
                 format="%d",
             ).classes("w-40")
-            ui.label(
-                "重复执行：首次执行完成并断开所有账号后，等待设定的间隔（分钟）"
-                "再执行下一轮，等待期间不占用 session 数据库（可被其他任务使用）。"
-            ).classes("text-xs text-gray-500 flex-1 min-w-[240px]")
+            ui.label("首次完成并断开账号后等待，再执行下一轮。").classes(
+                "text-xs text-gray-500 flex-1 min-w-[240px]"
+            )
 
         phrases_input = (
             ui.textarea(
@@ -1578,9 +1574,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             .props("outlined autogrow")
         )
 
-        ui.label(
-            "提示：发送过于频繁可能触发 Telegram 风控，建议间隔不小于 5 秒；同一账号不能同时用于多个运行中的任务。"
-        ).classes("text-xs text-amber-600")
+        ui.label("间隔建议 ≥5 秒；同一账号不可并行运行。").classes(
+            "text-xs text-amber-600"
+        )
         with ui.row().classes("w-full justify-end tgs-dialog-footer"):
             ui.button("取消", on_click=add_dlg.close).props("flat")
             ui.button("确定添加", color="primary", on_click=on_add_task)

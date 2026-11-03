@@ -1076,7 +1076,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             with body:
                 if not rows:
                     detail_refs["shown"] = 0
-                    ui.label("暂无待确认的频道").classes("text-sm text-gray-400")
+                    ui.label("暂无待确认的频道").classes(
+                        "text-sm text-gray-400 tgs-empty"
+                    )
                     return
                 with ui.row().classes("w-full items-center gap-2 flex-wrap"):
                     ui.button(
@@ -1145,7 +1147,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             shown = rows[: cards_limit["n"]]
             if not shown:
                 ui.label("暂无执行记录，点击「新建任务」开始").classes(
-                    "text-sm text-gray-400"
+                    "text-sm text-gray-400 tgs-empty"
                 )
             for row in shown:
                 with ui.card().classes("w-full mobile-list-card border"):
@@ -1264,20 +1266,17 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             delete_task(str(row["id"]))
 
     ui.label("批量退频道").classes("text-lg font-semibold")
-    ui.label(
-        "扫描所选账号超过指定天数没有新消息的频道（可选包含群组）并批量退出；"
-        "不更新天数阈值支持小数（如 0.5），填 0 表示扫描全部频道/群组，此时不允许自动退出。"
-        "开启「自动退出未命中关键字」后，未命中保护关键字的频道自动退出；"
-        "命中关键字的频道在「明细」中展示，需手动勾选退出。自己是创建者的对话永远不会被退出。"
-    ).classes("text-sm text-gray-500")
+    ui.label("扫描并退出长期无更新的频道/群组。").classes(
+        "text-sm text-gray-500 tgs-tab-intro"
+    )
 
     with ui.row().classes("w-full items-center"):
         ui.button("新建任务", on_click=lambda: open_create_dialog()).props(
             "color=primary"
         )
-        ui.label(
-            "每次执行都会在列表新增一条记录，可复制配置再次执行；点击「明细」查看命中的频道"
-        ).classes("text-xs text-gray-500 ml-auto")
+        ui.label("每次执行新增一条记录，可复制再次执行。").classes(
+            "text-xs text-gray-500 ml-auto"
+        )
         settings_btn = (
             ui.button(_settings_btn_text(), on_click=lambda: open_settings_dialog())
             .props("flat dense color=primary")
@@ -1408,23 +1407,21 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 label="扫描范围",
             ).classes("w-40")
             sp = ui.checkbox("跳过置顶", value=True)
-        ui.label(
-            "不更新天数阈值支持小数（如 0.5 天）；填 0 表示扫描全部频道/群组，"
-            "此时不允许勾选自动退出"
-        ).classes("text-xs text-gray-500")
+        ui.label("0 = 扫描全部；天数可填小数（如 0.5）。").classes(
+            "text-xs text-gray-500"
+        )
         kw_input = ui.input(
             "保护关键字（逗号分隔）", value=",".join(load_default_keywords(workdir))
         ).classes("w-full")
         ik_input = ui.input(
             "包含关键字（逗号分隔，任一命中即算，留空不限制）", value=""
         ).classes("w-full")
-        ui.label(
-            "多个关键字为或关系：标题命中任一关键字即算；"
-            "填写后仅命中的频道/群组会进入扫描结果（再按保护关键字区分自动退出与手动确认）"
-        ).classes("text-xs text-gray-500")
-        ui.label(
-            "未命中关键字的频道将在启动后自动退出；命中关键字的频道仅展示，需手动勾选退出"
-        ).classes("text-xs text-gray-500")
+        ui.label("多个关键字为或关系，仅命中项进入结果。").classes(
+            "text-xs text-gray-500"
+        )
+        ui.label("未命中自动退出；命中项需手动勾选退出。").classes(
+            "text-xs text-gray-500"
+        )
         auto_cb = ui.checkbox("自动退出未命中关键字的频道")
 
         def _sync_auto_cb() -> None:
@@ -1453,10 +1450,14 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     ):
         add_dialog_close_button(detail_dialog)
         detail_title = ui.label("任务明细").classes("text-lg font-semibold")
-        ui.label(
-            "未命中保护关键字的对话已默认勾选，命中关键字的保持不勾；"
-            "核对后点「退出所选」立即退出（无需二次确认）。明细已持久化，任务完成后重新打开仍可见。"
-        ).classes("text-xs text-gray-500")
+        ui.label("默认勾选未命中项；点「退出所选」立即执行。").classes(
+            "text-xs text-gray-500"
+        )
+        with ui.expansion("退出规则", icon="help_outline").classes("w-full"):
+            ui.label(
+                "命中保护关键字的保持不勾；退出无需二次确认，不可撤销。"
+                "明细已持久化，任务完成后重新打开仍可见。自己是创建者的对话不会被退出。"
+            ).classes("text-xs text-gray-500")
         detail_body = ui.column().classes("w-full gap-2")
 
     with ui.dialog() as delete_dialog, ui.card():
@@ -1500,19 +1501,17 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     ):
         add_dialog_close_button(settings_dialog)
         ui.label("退频道设置").classes("text-lg font-semibold")
-        ui.label(
-            "默认保护关键字：新建任务与自动任务（含频道已满、组合任务）的保护字初始值，"
-            "标题命中即不自动退出；留空则使用内置默认。"
-        ).classes("text-xs text-gray-500")
+        ui.label("新建/自动任务的初始保护字；留空用内置默认。").classes(
+            "text-xs text-gray-500"
+        )
         default_kw_input = (
             ui.textarea("默认保护关键字（逗号分隔）", value="")
             .classes("w-full")
             .props("outlined autogrow")
         )
-        ui.label(
-            "扫描跳过：标题命中任一名称/关键字的频道、群组在扫描时直接跳过"
-            "（不展示、不自动退出）；对所有退频道任务（含自动/组合）生效。"
-        ).classes("text-xs text-gray-500 mt-2")
+        ui.label("命中即跳过（不展示、不退出），对所有任务生效。").classes(
+            "text-xs text-gray-500 mt-2"
+        )
         skip_input = (
             ui.textarea("跳过的频道/群组名称", value="")
             .classes("w-full")

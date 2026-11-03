@@ -333,9 +333,7 @@ def user_info_block() -> Callable[[], None]:
         ).classes("w-full")
         add_status = ui.label("").classes("text-sm text-gray-500")
         # 密码提示常驻显示（放在 step2 外，打开弹窗即可见）
-        ui.label(
-            "提示：若账户开启了两步验证，登录时会提示需要密码，届时密码输入框才会出现"
-        ).classes("text-xs text-gray-400")
+        ui.label("两步验证时才会出现密码框。").classes("text-xs text-gray-400")
 
         with ui.column().classes("w-full") as step2:
             step2.visible = False
@@ -571,8 +569,7 @@ def user_info_block() -> Callable[[], None]:
                                 "text-lg font-semibold"
                             )
                             ui.label(
-                                "将删除该账户的 .session / .session_string 文件，不可恢复！"
-                                "删除前请先停止使用该账户的任务。"
+                                "删除 session 文件，不可恢复；先停止任务。"
                             ).classes("text-sm text-red-600")
                             with ui.row().classes("w-full justify-end"):
                                 ui.button("取消", on_click=dlg.close).props("flat")
@@ -614,8 +611,7 @@ def user_info_block() -> Callable[[], None]:
                                 "text-lg font-semibold"
                             )
                             ui.label(
-                                "将重命名 .session / .session_string 文件，"
-                                "并同步更新顺序与停用记录。重命名前请先停止使用该账户的任务。"
+                                "重命名 session 并同步停用记录；先停止任务。"
                             ).classes("text-sm text-gray-500")
                             new_name = ui.input("新账户名", value=name).classes(
                                 "w-full"
@@ -731,8 +727,7 @@ def user_info_block() -> Callable[[], None]:
                                             n, e.value
                                         ),
                                     ).props("dense").tooltip(
-                                        "双向账号无法接收陌生人主动私聊，"
-                                        "遇「发言数大于 N 条」类抽奖自动跳过"
+                                        "双向账号无法接收陌生人私聊，此类抽奖会跳过"
                                     )
                                 info = identities.get(name)
                                 if info:
@@ -768,9 +763,9 @@ def user_info_block() -> Callable[[], None]:
                                     full_cls
                                 )
                                 full_labels[name].set_visibility(bool(full_text))
-                ui.label(
-                    "停用的账户不会出现在签到/随机发言/批量退频道的账号下拉列表中"
-                ).classes("text-xs text-gray-500")
+                ui.label("停用后不出现在各任务的账号下拉中。").classes(
+                    "text-xs text-gray-500"
+                )
 
             # —— 用户信息 ——
             entries = load_user_infos(state.workdir)
