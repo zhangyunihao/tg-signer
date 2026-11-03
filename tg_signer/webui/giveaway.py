@@ -34,7 +34,12 @@ from tg_signer.giveaway_parsing import DEFAULT_KEYWORDS
 from tg_signer.giveaway_state import GiveawayState
 from tg_signer.locks import file_lock
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.activity import should_poll
+from tg_signer.webui.activity import (
+    create_poll_task,
+    is_client_alive,
+    poll_delay,
+    should_poll,
+)
 from tg_signer.webui.auto_leave import create_auto_leave_task, run_auto_leave_task
 from tg_signer.webui.common import (
     add_dialog_close_button,
@@ -2581,49 +2586,53 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     client = ui.context.client
 
     async def _poll_loop() -> None:
+        failures = 0
         while True:
-            await asyncio.sleep(2.0)
-            if not client.has_socket_connection:
+            await asyncio.sleep(poll_delay(2.0, failures))
+            if not is_client_alive(client):
                 return
-            if not should_poll(client, "giveaway"):
-                # 页面不可见/不在该 tab 时跳过刷新，仅推进日志游标（保留最近 200 行）
-                _seen["n"] = max(_seen["n"], len(log_buf) - 200)
-                continue
-            table = table_ref["table"]
-            if table is not None:
-                try:
-                    changed = False
-                    for r in table.rows:
-                        n = str(r.get("name") or "")
-                        if n in tasks:
-                            new_status = _status_text(n)
-                            if r.get("status") != new_status:
-                                r["status"] = new_status
-                                changed = True
-                            new_joined = f"{joined_count(n)} 个"
-                            if r.get("joined") != new_joined:
-                                r["joined"] = new_joined
-                                changed = True
-                            cfg_now = tasks[n]
-                            start_ts = cfg_now.get("_start_ts")
-                            if start_ts and task_running(n):
-                                dur = format_duration(time.time() - start_ts)
-                                if r.get("duration") != dur:
-                                    r["duration"] = dur
-                                    changed = True
-                            # 移动端卡片：运行中每秒刷新耗时，结束后显示持久化时长
-                            _update_card_time(n, _card_time_text(n, task_running(n)))
-                    if changed:
-                        table.update()
-                except Exception:
-                    logger.debug("轮询刷新任务表格 UI 失败", exc_info=True)
-            if _seen["n"] > len(log_buf):
-                _seen["n"] = len(log_buf)
-            new_lines = log_buf[_seen["n"] :]
-            if not new_lines:
-                continue
-            _seen["n"] = len(log_buf)
+            failures = 0
             try:
+                if not should_poll(client, "giveaway"):
+                    # 页面不可见/不在该 tab 时跳过刷新，仅推进日志游标（保留最近 200 行）
+                    _seen["n"] = max(_seen["n"], len(log_buf) - 200)
+                    continue
+                table = table_ref["table"]
+                if table is not None:
+                    try:
+                        changed = False
+                        for r in table.rows:
+                            n = str(r.get("name") or "")
+                            if n in tasks:
+                                new_status = _status_text(n)
+                                if r.get("status") != new_status:
+                                    r["status"] = new_status
+                                    changed = True
+                                new_joined = f"{joined_count(n)} 个"
+                                if r.get("joined") != new_joined:
+                                    r["joined"] = new_joined
+                                    changed = True
+                                cfg_now = tasks[n]
+                                start_ts = cfg_now.get("_start_ts")
+                                if start_ts and task_running(n):
+                                    dur = format_duration(time.time() - start_ts)
+                                    if r.get("duration") != dur:
+                                        r["duration"] = dur
+                                        changed = True
+                                # 移动端卡片：运行中每秒刷新耗时，结束后显示持久化时长
+                                _update_card_time(
+                                    n, _card_time_text(n, task_running(n))
+                                )
+                        if changed:
+                            table.update()
+                    except Exception:
+                        logger.debug("轮询刷新任务表格 UI 失败", exc_info=True)
+                if _seen["n"] > len(log_buf):
+                    _seen["n"] = len(log_buf)
+                new_lines = log_buf[_seen["n"] :]
+                if not new_lines:
+                    continue
+                _seen["n"] = len(log_buf)
                 with client:
                     for line in new_lines:
                         try:
@@ -2631,9 +2640,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         except Exception:
                             logger.debug("推送新日志到界面日志区失败", exc_info=True)
             except Exception:
-                return
+                failures += 1
+                logger.exception("抽奖面板轮询刷新失败（连续 %s 次）", failures)
 
-    asyncio.create_task(_poll_loop())
+    create_poll_task(_poll_loop(), name="giveaway-poll", client=client)
 
     # —— 参与明细弹窗：按用户显示本次/上次新参加的抽奖数 ——
     with ui.dialog() as detail_dlg, ui.card().classes("w-full max-w-md"):

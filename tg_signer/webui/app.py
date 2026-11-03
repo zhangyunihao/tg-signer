@@ -64,6 +64,11 @@ from tg_signer.webui.giveaway import (
     save_win_forward_targets,
     save_win_sweep_limit,
 )
+from tg_signer.webui.health import (
+    install_exception_notifier,
+    page_error_page,
+    show_panel_error,
+)
 from tg_signer.webui.messages import message_center_button
 from tg_signer.webui.random_chat import random_chat_block
 from tg_signer.webui.sign import (
@@ -292,14 +297,20 @@ def _apply_paths(workdir_input, on_refresh: Callable[[], None]) -> None:
 
 
 def _build_dashboard(container) -> None:
+    # 页面回调异常统一走轻量弹窗（5 秒去重），避免只留在服务端日志里
+    install_exception_notifier()
     # 跟踪浏览器会话的可见性与当前 tab，供各面板轮询门控使用
     install_activity_tracking()
     with container:
         refreshers: list[Callable[[], None]] = []
 
         def refresh_all() -> None:
+            # 单个刷新器失败不应影响其余面板的首屏渲染
             for refresh in refreshers:
-                refresh()
+                try:
+                    refresh()
+                except Exception:
+                    logger.exception("界面刷新失败: %r", refresh)
 
         # ---- 预创建"数据查看"对话框（内容首次打开时才构建，减少首屏负载） ----
         with (
@@ -599,11 +610,11 @@ def _build_dashboard(container) -> None:
                 .classes("flex-1 min-w-0 main-tabs")
                 .props("align=left") as tabs
             ):
-                tab_run = ui.tab("run", "签到", icon="task_alt")
-                tab_combo = ui.tab("combo", "组合任务", icon="account_tree")
-                tab_random = ui.tab("random", "随机发言", icon="chat")
-                tab_leave = ui.tab("leave", "批量退频道", icon="logout")
-                tab_giveaway = ui.tab("giveaway", "自动抽奖", icon="casino")
+                tab_run = ui.tab("run", "签到")
+                tab_combo = ui.tab("combo", "组合任务")
+                tab_random = ui.tab("random", "随机发言")
+                tab_leave = ui.tab("leave", "批量退频道")
+                tab_giveaway = ui.tab("giveaway", "自动抽奖")
 
             # 版本号 + 消息中心 + 菜单按钮，与主标签栏同行（下拉项在下方绑定）
             with ui.row().classes("items-center gap-0 no-wrap tgs-header-actions"):
@@ -878,17 +889,48 @@ def _build_dashboard(container) -> None:
             "leave": _build_leave_panel,
             "giveaway": _build_giveaway_panel,
         }
+        _panel_panels = {
+            "run": panel_run,
+            "combo": panel_combo,
+            "random": panel_random,
+            "leave": panel_leave,
+            "giveaway": panel_giveaway,
+        }
+        _panel_titles = {
+            "run": "签到",
+            "combo": "组合任务",
+            "random": "随机发言",
+            "leave": "批量退频道",
+            "giveaway": "自动抽奖",
+        }
         _panel_built: set = set()
 
         def _ensure_panel(name: str) -> None:
-            """首次激活 tab 时构建对应面板（幂等）。"""
+            """首次激活 tab 时构建对应面板（幂等）。
+
+            构建失败时回滚已创建的元素与刷新器，只在该面板内显示
+            「加载失败 / 重试」，其它面板与首屏渲染不受影响。
+            """
             if name in _panel_built:
                 return
             builder = _panel_builders.get(name)
             if builder is None:
                 return
+            refresh_mark = len(refreshers)
+            panel = _panel_panels[name]
+            # 首次构建前面板为空；失败后再次进入（tab 切换/重试）时先清掉失败占位
+            panel.clear()
+            try:
+                builder()
+            except Exception:
+                logger.exception("面板 %s 构建失败", name)
+                del refreshers[refresh_mark:]
+                panel.clear()
+                show_panel_error(
+                    panel, _panel_titles[name], lambda: _ensure_panel(name)
+                )
+                return
             _panel_built.add(name)
-            builder()
 
         # 默认 tab（run/签到）立即构建，保证首屏可用
         _ensure_panel("run")
@@ -1233,14 +1275,14 @@ def build_ui(auth_code: str = None) -> None:
                 .tgs-header-version { display: none; }
                 .tgs-header-actions .q-btn { padding: 4px; }
                 .main-tabs { overflow: hidden; }
-                .main-tabs .q-tab { padding-left: 5px; padding-right: 5px; }
+                .main-tabs .q-tab { padding-left: 0; padding-right: 0; }
                 /* tab 文字用两字短名（data-short 由页面脚本写入 label 上）：
                    原全名字号置 0 隐藏，::before 显示短名，五个 tab 一屏放下；
-                   360px 窄屏下 15px 会挤压出横向滚动，缩到 14px 保证全部可见 */
+                   去图标后按纯文字均分，360px 下 13px 保证「退频道」不溢出 */
                 .main-tabs .q-tab .q-tab__label { font-size: 0; }
                 .main-tabs .q-tab .q-tab__label::before {
                     content: attr(data-short);
-                    font-size: 14px;
+                    font-size: 13px;
                     letter-spacing: normal;
                 }
                 /* 弹窗：利用几乎全部宽度，高度限制在可视区内（dvh 适配地址栏伸缩），
@@ -1424,6 +1466,9 @@ def main(host: str = None, port: int = None, storage_secret: str = None) -> None
         # 任务历史为防抖写盘，退出前强制落盘，避免最后一条记录丢失
         flush_task_history()
 
+    # 页面构建失败时展示可读错误页 + 「重新加载」按钮，替换 NiceGUI 默认 500
+    app.on_page_exception(page_error_page)
+
     # GZip 压缩：NiceGUI 静态资源约 6MB（Vue/Quasar/字体等），gzip 后约 1.5MB，
     # 显著降低手机等弱网环境的首次加载耗时。
     # ui.run 默认还会再加一层 GZip，这里显式关闭，避免重复中间件与重复 Vary 头
@@ -1440,6 +1485,11 @@ def main(host: str = None, port: int = None, storage_secret: str = None) -> None
         port=port,
         show=False,
         gzip_middleware_factory=None,
+        # 断线后服务端保留 client 的窗口从默认 3 秒放宽到 5 秒：
+        # 心跳仍为 ping_interval=max(0.8*reconnect_timeout, 4)=4 秒、
+        # ping_timeout=max(0.4*reconnect_timeout, 2)=2 秒，未改变检测灵敏度，
+        # 仅让弱网/短暂切后台的浏览器多一点重连时间，避免整页重建。
+        reconnect_timeout=5.0,
         storage_secret=storage_secret or _load_or_create_storage_secret(),
         # 会话 cookie 持久化 30 天（与过期会话清理策略一致），浏览器重开/服务重启后仍能记住上次选中的 tab
         session_middleware_kwargs={"max_age": 30 * 86400},

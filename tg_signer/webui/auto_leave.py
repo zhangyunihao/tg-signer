@@ -23,7 +23,12 @@ from pyrogram.errors import FloodWait, RPCError
 from tg_signer.core import get_client, safe_disconnect, timeout_aiter
 from tg_signer.giveaway_state import record_account_limit
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.activity import should_poll
+from tg_signer.webui.activity import (
+    create_poll_task,
+    is_client_alive,
+    poll_delay,
+    should_poll,
+)
 from tg_signer.webui.channel_stats import refresh_stats_for_accounts
 from tg_signer.webui.common import (
     add_dialog_close_button,
@@ -1591,25 +1596,27 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     poll_client = ui.context.client
 
     async def _poll_external_tasks() -> None:
+        failures = 0
         while True:
-            await asyncio.sleep(3)
-            # 客户端断开后退出循环：should_poll 在状态记录被清理后返回 True，
-            # 否则会持续向已删除的 client 渲染列表（服务端日志出现
-            # "Client has been deleted but is still being used"）
-            if not poll_client.has_socket_connection:
+            await asyncio.sleep(poll_delay(3.0, failures))
+            # 仅在会话被删除时退出：短暂断连会保留页面，重连后应继续同步；
+            # 若用连接状态判断退出，断连即永久停止轮询。
+            if not is_client_alive(poll_client):
                 return
-            # 页面不可见或不在该 tab 时跳过磁盘检查，切回后自动恢复
-            if not should_poll(poll_client, "leave"):
-                continue
+            failures = 0
             try:
+                # 页面不可见或不在该 tab 时跳过磁盘检查，切回后自动恢复
+                if not should_poll(poll_client, "leave"):
+                    continue
                 mtime = tasks_mtime_ns(workdir)
                 if mtime == last_mtime["v"]:
                     continue
                 last_mtime["v"] = mtime
                 _sync_from_disk()
             except Exception:
-                logger.debug("同步退频道任务列表失败", exc_info=True)
+                failures += 1
+                logger.exception("同步退频道任务列表失败（连续 %s 次）", failures)
 
-    asyncio.create_task(_poll_external_tasks())
+    create_poll_task(_poll_external_tasks(), name="leave-poll", client=poll_client)
 
     return refresh

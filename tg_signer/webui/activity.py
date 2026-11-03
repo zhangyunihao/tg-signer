@@ -4,14 +4,21 @@
 未激活时跳过刷新，减少空转唤醒、websocket 流量与服务端负载。
 """
 
+import asyncio
+import logging
+from collections.abc import Awaitable
 from typing import Optional
 
-from nicegui import ui
+from nicegui import background_tasks, ui
+
+logger = logging.getLogger(__name__)
 
 # key: client.id, value: {"hidden": bool, "tab": str}
 _STATE: dict[str, dict] = {}
 # 已安装可见性监听的 client.id：主控台与页内对话框可能重复调用，只安装一次
 _INSTALLED: set[str] = set()
+# 后台轮询任务引用（key: f"{client.id}:{name}"），done 时清理
+_POLL_TASKS: dict[str, asyncio.Task] = {}
 
 
 def _entry(client) -> dict:
@@ -57,13 +64,24 @@ def set_active_tab(name: str, client=None) -> None:
     _entry(client)["tab"] = str(name or "")
 
 
-def should_poll(client, tab: Optional[str] = None) -> bool:
-    """轮询循环是否应继续刷新：页面可见，且（可选）所在 tab 处于激活状态。
+def is_client_alive(client) -> bool:
+    """会话是否仍然存在：只有被 NiceGUI 删除后才应停止轮询。
 
-    未安装活跃度跟踪的页面（如独立进度页）没有状态记录，返回 True 保持原行为；
-    但已删除或已断连的 client 无论有无记录都不再轮询。
+    短暂的 socket 断连（has_socket_connection=False）期间会话仍然存在，
+    3 秒重连窗口内页面和元素树都会保留，轮询应继续等待重连而非永久退出。
     """
-    if client.is_deleted or not client.has_socket_connection:
+    return not client.is_deleted
+
+
+def should_poll(client, tab: Optional[str] = None) -> bool:
+    """轮询是否应当刷新 UI：页面可见，且（可选）所在 tab 处于激活状态。
+
+    只描述可见性/激活状态，不承载连接状态：短暂断连时仍返回 True，
+    轮询可继续推进游标、同步后台数据，重连后直接补渲染。
+    没有状态记录的页面（如独立进度页）返回 True 保持原行为；
+    会话已被删除时返回 False。
+    """
+    if client.is_deleted:
         return False
     entry = _STATE.get(client.id)
     if entry is None:
@@ -71,3 +89,46 @@ def should_poll(client, tab: Optional[str] = None) -> bool:
     if entry["hidden"]:
         return False
     return tab is None or entry["tab"] == tab
+
+
+def poll_delay(base: float, failures: int, max_delay: float = 30.0) -> float:
+    """连续失败时的指数退避秒数；failures 为 0 时返回 base。"""
+    if failures <= 0:
+        return base
+    return min(base * (2 ** min(failures, 6)), max_delay)
+
+
+def create_poll_task(awaitable: Awaitable, *, name: str, client) -> asyncio.Task:
+    """创建带异常兜底的轮询后台任务。
+
+    用 NiceGUI 的 background_tasks.create（保留强引用、并在 client 上下文中运行），
+    同时在模块内按 client+name 再持有一次引用；任务因非取消异常结束时
+    用 logger.exception 记录，避免"轮询静默死亡"而日志里查不到原因。
+    """
+    key = f"{getattr(client, 'id', '')}:{name}"
+    task = background_tasks.create(
+        _run_poll(awaitable, name=name, client=client),
+        name=name,
+        handle_exceptions=False,
+        context=client,
+    )
+    _POLL_TASKS[key] = task
+
+    def _on_done(finished: asyncio.Task) -> None:
+        _POLL_TASKS.pop(key, None)
+        if not finished.cancelled():
+            finished.exception()  # 取回异常；具体日志已在 _run_poll 中输出
+
+    task.add_done_callback(_on_done)
+    return task
+
+
+async def _run_poll(awaitable: Awaitable, *, name: str, client) -> None:
+    try:
+        await awaitable
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "后台轮询任务 %s 异常退出（client=%s）", name, getattr(client, "id", "?")
+        )

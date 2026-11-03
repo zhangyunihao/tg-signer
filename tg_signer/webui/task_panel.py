@@ -17,7 +17,12 @@ from typing import Dict, Optional
 
 from nicegui import ui
 
-from tg_signer.webui.activity import should_poll
+from tg_signer.webui.activity import (
+    create_poll_task,
+    is_client_alive,
+    poll_delay,
+    should_poll,
+)
 from tg_signer.webui.auto_leave import _scan_types_of as _leave_scan_types
 from tg_signer.webui.auto_leave import load_config as _load_leave_config
 from tg_signer.webui.auto_leave import load_default_keywords as _load_leave_keywords
@@ -588,12 +593,14 @@ class TaskRunnerBlock:
         self._last_render_seq: Optional[int] = None
         self._last_clear_seq: int = 0
 
-        # 轮询改用独立 asyncio 循环而非 ui.timer：页面重建（root.clear）会删除
-        # timer 的父 slot，ui.timer 内部访问已删 slot 会抛 RuntimeError 并可能
-        # 终止服务进程；asyncio 循环配合断连退出检查更健壮。
+        # 轮询改用独立后台任务而非 ui.timer：页面重建（root.clear）会删除
+        # timer 的父 slot，ui.timer 内部访问已删 slot 会抛 RuntimeError；
+        # create_poll_task 持有引用并记录异常，仅在会话被删除时退出。
         self._poll_enabled = False
         self._poll_client = ui.context.client
-        self._poll_task = asyncio.create_task(self._poll_forever())
+        self._poll_task = create_poll_task(
+            self._poll_forever(), name="run-poll", client=self._poll_client
+        )
 
         # ---- 新增任务弹窗 ----
         with ui.dialog() as self.dialog, ui.card().classes("w-full max-w-2xl"):
@@ -2301,24 +2308,28 @@ class TaskRunnerBlock:
             self._poll_enabled = False
 
     async def _poll_forever(self) -> None:
-        """替代 ui.timer 的轮询循环：断连自动退出，UI 更新包裹在 client 上下文。"""
+        """替代 ui.timer 的轮询循环：仅在会话被删除时退出，短暂断连继续等待重连。"""
+        failures = 0
         while True:
-            await asyncio.sleep(0.5)
-            if not self._poll_client.has_socket_connection:
+            await asyncio.sleep(poll_delay(0.5, failures))
+            if not is_client_alive(self._poll_client):
                 return
-            if not self._poll_enabled:
-                continue
-            # 先收集输出（与当前 tab / 页面可见性无关），保证组合任务在其他 tab
-            # 运行、页面切后台时进度页与进度快照仍有日志可读
-            TaskRunnerBlock.drain_output()
-            # 页面不可见或已切到其他 tab 时跳过刷新，切回后自动恢复
-            if not should_poll(self._poll_client, "run"):
-                continue
+            # 本轮从正常状态开始；若下方抛异常再由 except 递增失败计数
+            failures = 0
             try:
+                if not self._poll_enabled:
+                    continue
+                # 先收集输出（与当前 tab / 页面可见性无关），保证组合任务在其他 tab
+                # 运行、页面切后台时进度页与进度快照仍有日志可读
+                TaskRunnerBlock.drain_output()
+                # 页面不可见或已切到其他 tab 时跳过刷新，切回后自动恢复
+                if not should_poll(self._poll_client, "run"):
+                    continue
                 with self._poll_client:
                     self._poll_output()
             except Exception:
-                logger.debug("轮询读取子任务输出失败", exc_info=True)
+                failures += 1
+                logger.exception("任务面板轮询刷新失败（连续 %s 次）", failures)
 
     def clear_log(self) -> None:
         TaskRunnerBlock.output_lines.clear()

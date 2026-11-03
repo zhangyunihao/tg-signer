@@ -19,7 +19,12 @@ from nicegui import ui
 from tg_signer.core import get_client, safe_disconnect
 from tg_signer.phrases import PHRASES, parse_custom_phrases, phrase_pool_label
 from tg_signer.utils import atomic_write_json, atomic_write_text
-from tg_signer.webui.activity import should_poll
+from tg_signer.webui.activity import (
+    create_poll_task,
+    is_client_alive,
+    poll_delay,
+    should_poll,
+)
 from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
@@ -1420,44 +1425,46 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
     client = ui.context.client
 
     async def _poll_loop() -> None:
+        failures = 0
         while True:
-            await asyncio.sleep(2.0)
-            if not client.has_socket_connection:
+            await asyncio.sleep(poll_delay(2.0, failures))
+            if not is_client_alive(client):
                 return
-            if not should_poll(client, "random"):
-                # 页面不可见/不在该 tab 时跳过刷新，仅推进日志游标（保留最近 200 行）
-                _seen["n"] = max(_seen["n"], len(log_buf) - 200)
-                continue
-            # 刷新运行中任务的进度状态列（如 "运行中 (18/100)"）与实时执行时长
-            table = table_ref["table"]
-            if table is not None:
-                try:
-                    changed = False
-                    for r in table.rows:
-                        n = str(r.get("name") or "")
-                        if n in tasks:
-                            new_status = _status_text(n)
-                            if r.get("status") != new_status:
-                                r["status"] = new_status
-                                changed = True
-                            cfg_now = tasks[n]
-                            start_ts = cfg_now.get("_start_ts")
-                            if start_ts and task_running(n):
-                                dur = format_duration(time.time() - start_ts)
-                                if r.get("duration") != dur:
-                                    r["duration"] = dur
-                                    changed = True
-                    if changed:
-                        table.update()
-                except Exception:
-                    logger.debug("轮询刷新任务表格 UI 失败", exc_info=True)
-            if _seen["n"] > len(log_buf):
-                _seen["n"] = len(log_buf)
-            new_lines = log_buf[_seen["n"] :]
-            if not new_lines:
-                continue
-            _seen["n"] = len(log_buf)
+            failures = 0
             try:
+                if not should_poll(client, "random"):
+                    # 页面不可见/不在该 tab 时跳过刷新，仅推进日志游标（保留最近 200 行）
+                    _seen["n"] = max(_seen["n"], len(log_buf) - 200)
+                    continue
+                # 刷新运行中任务的进度状态列（如 "运行中 (18/100)"）与实时执行时长
+                table = table_ref["table"]
+                if table is not None:
+                    try:
+                        changed = False
+                        for r in table.rows:
+                            n = str(r.get("name") or "")
+                            if n in tasks:
+                                new_status = _status_text(n)
+                                if r.get("status") != new_status:
+                                    r["status"] = new_status
+                                    changed = True
+                                cfg_now = tasks[n]
+                                start_ts = cfg_now.get("_start_ts")
+                                if start_ts and task_running(n):
+                                    dur = format_duration(time.time() - start_ts)
+                                    if r.get("duration") != dur:
+                                        r["duration"] = dur
+                                        changed = True
+                        if changed:
+                            table.update()
+                    except Exception:
+                        logger.debug("轮询刷新任务表格 UI 失败", exc_info=True)
+                if _seen["n"] > len(log_buf):
+                    _seen["n"] = len(log_buf)
+                new_lines = log_buf[_seen["n"] :]
+                if not new_lines:
+                    continue
+                _seen["n"] = len(log_buf)
                 with client:
                     for line in new_lines:
                         try:
@@ -1465,9 +1472,10 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                         except Exception:
                             logger.debug("推送新日志到界面日志区失败", exc_info=True)
             except Exception:
-                return
+                failures += 1
+                logger.exception("随机聊天面板轮询刷新失败（连续 %s 次）", failures)
 
-    asyncio.create_task(_poll_loop())
+    create_poll_task(_poll_loop(), name="random-chat-poll", client=client)
 
     # —— 添加任务弹窗 ——
     with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl tgs-dialog-card"):

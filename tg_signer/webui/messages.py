@@ -28,7 +28,13 @@ from typing import Callable, List, Set
 from nicegui import app, ui
 
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.activity import install_activity_tracking, should_poll
+from tg_signer.webui.activity import (
+    create_poll_task,
+    install_activity_tracking,
+    is_client_alive,
+    poll_delay,
+    should_poll,
+)
 from tg_signer.webui.common import add_dialog_close_button, state
 from tg_signer.webui.components import LOG_AREA_CLASS
 from tg_signer.webui.giveaway import (
@@ -340,19 +346,22 @@ def message_center_button() -> Callable[[], None]:
     refresh_badge()
 
     async def _poll() -> None:
+        failures = 0
         while True:
-            await asyncio.sleep(10)
-            if not client.has_socket_connection:
+            await asyncio.sleep(poll_delay(10.0, failures))
+            if not is_client_alive(client):
                 return
-            # 铃铛在所有 tab 可见，只需页面可见；页面隐藏时跳过汇总
-            if not should_poll(client):
-                continue
+            failures = 0
             try:
+                # 铃铛在所有 tab 可见，只需页面可见；页面隐藏时跳过汇总
+                if not should_poll(client):
+                    continue
                 refresh_badge()
             except Exception:
-                logger.debug("轮询刷新消息未读徽标失败", exc_info=True)
+                failures += 1
+                logger.exception("轮询刷新消息未读徽标失败（连续 %s 次）", failures)
 
-    asyncio.create_task(_poll())
+    create_poll_task(_poll(), name="messages-badge-poll", client=client)
     return refresh_badge
 
 
@@ -727,22 +736,25 @@ def _build_center_page() -> None:
     client = ui.context.client
 
     async def _poll() -> None:
+        failures = 0
         while True:
-            await asyncio.sleep(10)
-            if not client.has_socket_connection:
+            await asyncio.sleep(poll_delay(10.0, failures))
+            if not is_client_alive(client):
                 return
-            # 页面隐藏（手机锁屏/切后台）时跳过汇总，切回后自动恢复
-            if not should_poll(client):
-                continue
+            failures = 0
             try:
+                # 页面隐藏（手机锁屏/切后台）时跳过汇总，切回后自动恢复
+                if not should_poll(client):
+                    continue
                 fp = _fingerprint()
                 if fp != last_fp["value"]:
                     last_fp["value"] = fp
                     refresh_all()
             except Exception:
-                logger.debug("轮询刷新消息中心列表失败", exc_info=True)
+                failures += 1
+                logger.exception("轮询刷新消息中心列表失败（连续 %s 次）", failures)
 
-    asyncio.create_task(_poll())
+    create_poll_task(_poll(), name="messages-page-poll", client=client)
 
 
 @ui.page(MESSAGES_PAGE_PATH)

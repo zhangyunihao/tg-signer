@@ -56,17 +56,21 @@ MOBILE_DESIGN_CSS = """
         padding-bottom: calc(0.75rem + env(safe-area-inset-bottom)) !important;
         gap: 0.75rem !important;
     }
-    /* 顶部导航：图标 + 两字短标，吸顶并带毛玻璃，滚动时长页面仍可切 tab */
+    /* 顶部导航：纯文字短标签，吸顶并带毛玻璃，滚动时长页面仍可切 tab */
     .tgs-header-row {
         position: sticky;
         top: 0;
         z-index: 100;
         margin: -0.75rem -0.75rem 0;
         padding: 0.5rem 0.75rem;
+        /* 右侧收紧到 8px，给 tab 栏多让出 4px（360px 下每个约 44.8px） */
+        padding-right: 0.5rem;
         background: rgba(246, 248, 252, 0.88);
         backdrop-filter: blur(12px);
         -webkit-backdrop-filter: blur(12px);
         border-bottom: 1px solid rgba(227, 232, 240, 0.7);
+        /* 去图标后把 tab 栏与右侧按钮的间距压到 2px，5 个 tab 各约 44px 宽 */
+        gap: 0.125rem !important;
     }
     .main-tabs {
         background: var(--tgs-surface);
@@ -77,21 +81,23 @@ MOBILE_DESIGN_CSS = """
         min-height: 58px;
     }
     .main-tabs .q-tabs__content { width: 100%; }
+    /* 去图标后 5 个短标签均分整行：等宽 flex + 居中，360px 不挤不滚 */
     .main-tabs .q-tab {
         flex: 1 1 0;
         min-width: 0;
-        flex-direction: column;
         min-height: 52px !important;
-        padding: 2px !important;
+        padding: 0 !important;
         border-radius: 0.8125rem;
-        gap: 1px;
+        justify-content: center;
         transition: background-color 0.18s ease;
     }
-    .main-tabs .q-tab__icon { font-size: 1.125rem; margin: 0; }
-    .main-tabs .q-tab .q-tab__label::before { font-size: 0.71875rem; font-weight: 600; }
+    .main-tabs .q-tab__content { justify-content: center; min-width: 0; }
+    /* 标签字号由 ≤640px 样式段里的 ::before 统一控制（data-short 短名） */
+    .main-tabs .q-tab__label { color: var(--tgs-text-2); }
+    .main-tabs .q-tab__label::before { font-weight: 600; }
     .main-tabs .q-tab--active { background: var(--tgs-brand-soft); }
-    .main-tabs .q-tab--active .q-tab__label::before,
-    .main-tabs .q-tab--active .q-tab__icon { color: var(--tgs-brand-strong) !important; }
+    .main-tabs .q-tab--active .q-tab__label,
+    .main-tabs .q-tab--active .q-tab__label::before { color: var(--tgs-brand-strong) !important; }
     .main-tabs .q-tab__indicator { display: none; }
     .tgs-header-actions .q-btn { padding: 0 !important; }
     /* 卡片：统一 16px 圆角、细描边、轻投影 */
