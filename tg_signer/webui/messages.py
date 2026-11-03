@@ -695,14 +695,6 @@ def _build_center_page() -> None:
         ui.label("中奖、加入失败与待补发言提醒；点消息标为已读。").classes(
             "text-sm text-gray-500"
         )
-        with ui.expansion("操作说明", icon="help_outline").classes("w-full"):
-            ui.label(
-                "汇总抽奖中奖提醒、监控对象加入失败提醒与抽奖过程中未完成的发言任务"
-                "（口令发送失败/发言数未达标，显示还需发言条数）。点击消息标记为已读；"
-                "「发言任务」右侧的刷新按钮可重试发送口令；重试过的消息旁的文档按钮"
-                "可查看重试日志（刷新后仍保留）；顶部「重发口令」可批量重发全部；"
-                "点击右侧图钉可置顶/取消置顶（置顶消息始终排在最前）。"
-            ).classes("text-xs text-gray-500")
         # 恢复上次选择的过滤用户/消息类型（刷新页面、重开标签页后仍保留）
         options = _filter_options(read_keys)
         saved = str(app.storage.user.get(FILTER_STORAGE_KEY) or "")

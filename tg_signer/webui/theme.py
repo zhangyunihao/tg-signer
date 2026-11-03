@@ -62,6 +62,11 @@ MOBILE_DESIGN_CSS = """
         top: 0;
         z-index: 100;
         margin: -0.75rem -0.75rem 0;
+        /* .nicegui-content 是 align-items: flex-start 的 flex 列，w-full 的
+           width:100% 只等于内容盒 336px，负右外边距不会把盒子撑到视口右边，
+           导致右侧比视口少 24px（12px 内边距 + 12px 负边距）。补回 2 个
+           0.75rem 让吸顶栏铺满视口，铃铛/菜单贴右，tab 栏多出 24px。 */
+        width: calc(100% + 1.5rem) !important;
         padding: 0.5rem 0.75rem;
         /* 右侧收紧到 8px，给 tab 栏多让出 4px（360px 下每个约 44.8px） */
         padding-right: 0.5rem;
@@ -411,6 +416,10 @@ MOBILE_DESIGN_CSS = """
         top: 0;
         z-index: 100;
         margin: -0.75rem -0.75rem 0;
+        /* 同 .tgs-header-row：flex 列 + w-full 下负右边距不生效，页头右缘
+           会比视口少 24px（边框线与按钮都缩进，和下方卡片右缘对不齐），
+           补回 2 个 0.75rem 让页头铺满视口、按钮与卡片右缘对齐。 */
+        width: calc(100% + 1.5rem) !important;
         padding: 0.5rem 0.75rem;
         background: rgba(246, 248, 252, 0.9);
         backdrop-filter: blur(12px);
