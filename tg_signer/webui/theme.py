@@ -102,13 +102,7 @@ MOBILE_DESIGN_CSS = """
     .main-tabs .q-tab--active { background: var(--tgs-brand-soft); }
     .main-tabs .q-tab--active .q-tab__label { color: var(--tgs-brand-strong) !important; }
     .main-tabs .q-tab__indicator { display: none; }
-    /* 铃铛/菜单收窄到 2rem 宽（高度仍保留 44px 便于点击），给 tab 栏多让出 24px */
-    .tgs-header-actions .q-btn {
-        padding: 0 !important;
-        width: 2rem;
-        min-width: 2rem !important;
-        min-height: 2.75rem !important;
-    }
+    .tgs-header-actions .q-btn { padding: 0 !important; }
     /* 卡片：统一 16px 圆角、细描边、轻投影 */
     .nicegui-content .q-card,
     .q-dialog .q-card {
@@ -353,18 +347,7 @@ MOBILE_DESIGN_CSS = """
     .q-dialog .q-card > * { flex-shrink: 0; }
     .q-dialog .q-card .q-expansion-item__container,
     .q-dialog .q-card .q-expansion-item .q-item { flex-shrink: 0; }
-    /* 顶部拖拽把手（纯装饰，提示可下拉关闭） */
-    .q-dialog .q-card::before {
-        content: "";
-        position: absolute;
-        top: 6px;
-        left: 50%;
-        width: 34px;
-        height: 4px;
-        border-radius: 999px;
-        background: var(--tgs-line-strong);
-        transform: translateX(-50%);
-    }
+    /* 底部抽屉不再绘制装饰性把手：卡片不可拖拽/不可展开，把手会造成误导 */
     .q-dialog .q-card.tgs-dialog-card { padding-bottom: 0 !important; }
     /* 全屏日志弹窗保持铺满视口，不被普通弹窗的宽度/内边距覆盖 */
     .q-dialog .q-card.tgs-log-fullscreen {
