@@ -390,7 +390,7 @@ class TaskRunnerBlock:
     # 服务进程级共享：所有浏览器标签页看到并管理同一批运行中的任务，
     # 服务重启后也据此把上次未结束的常驻任务自动恢复
     runs: dict[str, dict] = {}
-    MAX_OUTPUT_LINES = 500  # 共享输出缓冲上限，防止长时间运行内存无限增长
+    MAX_OUTPUT_LINES = 1000  # 共享输出缓冲上限，防止长时间运行内存无限增长
     MAX_RENDER_LINES = 200  # 日志区最多渲染的行数
     output_lines: deque[str] = deque(maxlen=MAX_OUTPUT_LINES)
     _line_seq: int = 0  # 累计追加行数（单调递增），用于各标签页增量渲染
@@ -2082,6 +2082,8 @@ class TaskRunnerBlock:
                                 "white-space: pre-wrap; overflow-wrap: anywhere;"
                             )
                 list_container.update()
+                # 重绘后同步底部勾选计数与按钮可用状态（全选/清空/筛选都会走到这里）
+                refresh_selection()
 
             render()
             refresh_selection()

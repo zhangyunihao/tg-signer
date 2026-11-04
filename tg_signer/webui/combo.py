@@ -99,6 +99,8 @@ def save_composite_tasks(items: list[dict], workdir: Path | str | None = None) -
 COMPOSITE_PROGRESS_FILE = "webui_combo_progress.json"
 COMBO_PROGRESS_LIMIT = 30
 COMBO_PROGRESS_LOG_LINES = 200
+# 「一键复制」上限：运行中直接读共享输出缓冲，可比页面展示多取一些行
+COMBO_COPY_LOG_LINES = 1000
 
 
 def _composite_progress_path(workdir: Path | str | None = None) -> Path:
@@ -2005,13 +2007,15 @@ class ComboTaskBlock:
             "result": str(rec.get("result") or ""),
         }
 
-    def _combo_log_lines(self, task_name: str) -> list[str]:
-        """本组合任务的运行日志（共享输出缓冲按任务名前缀过滤）。"""
+    def _combo_log_lines(
+        self, task_name: str, limit: int = COMBO_PROGRESS_LOG_LINES
+    ) -> list[str]:
+        """本组合任务的运行日志（共享输出缓冲按任务名前缀过滤，最多 limit 行）。"""
         if not task_name:
             return []
         prefix = f"[{task_name}:"
         lines = [line for line in self.runner.output_lines if line.startswith(prefix)]
-        return lines[-COMBO_PROGRESS_LOG_LINES:]
+        return lines[-limit:]
 
     def _build_snapshot(self, run: dict) -> dict:
         rec = run.get("record") or {}
@@ -2797,9 +2801,19 @@ def _build_progress_page(record_id: str) -> None:
     # 运行日志区常驻页面：轮询只就地更新文本，不随进度卡片重建，
     # 这样移动端阅读日志时滚动条不会被重置回顶部。
     log_state: dict = {"lines": [], "body": None}
+
+    def copy_log() -> None:
+        """复制日志：运行中最多取 COMBO_COPY_LOG_LINES 行，结束后用已加载的快照日志。"""
+        run = view.runner.runs.get(record_id)
+        if run is None:
+            copy_log_lines(log_state["lines"])
+            return
+        name = str((run.get("record") or {}).get("task_name") or "")
+        copy_log_lines(view._combo_log_lines(name, COMBO_COPY_LOG_LINES))
+
     log_toolbar(
         "运行日志",
-        on_copy=lambda: copy_log_lines(log_state["lines"]),
+        on_copy=copy_log,
         on_fullscreen=lambda: fullscreen.toggle(),
         title_classes="text-xs font-semibold text-gray-600",
         row_classes="w-full items-center justify-between mt-1",
