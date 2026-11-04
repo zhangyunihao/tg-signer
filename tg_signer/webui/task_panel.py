@@ -36,6 +36,7 @@ from tg_signer.webui.common import (
     attach_select_all,
     build_debug_report,
     copy_text_to_clipboard,
+    list_field_summary,
     mobile_card_fields,
     mobile_card_result,
     notify_error,
@@ -427,23 +428,24 @@ class TaskRunnerBlock:
         return list(cls.output_lines)[-n:]
 
     def __init__(self) -> None:
-        ui.label("签到").classes("text-lg font-semibold")
         ui.label("选择任务类型、任务与账号启动；历史可复制参数。").classes(
             "text-sm text-gray-500 tgs-tab-intro"
         )
 
-        with ui.row().classes("gap-2 items-center flex-wrap"):
+        # 顶部操作行与其它 tab 统一：主操作在左，次要操作在右，整行两端对齐
+        with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
             ui.button(
                 "新增任务", icon="add", color="primary", on_click=self.open_dialog
             )
-            ui.button("清空输出", on_click=self.clear_log).props("outline")
-            ui.button(
-                "复制调试日志",
-                icon="bug_report",
-                on_click=self.copy_debug_log,
-            ).props("outline").tooltip(
-                "复制环境信息+运行输出+任务历史+日志文件，粘贴到电脑排查复现"
-            )
+            with ui.row().classes("gap-2 items-center flex-wrap"):
+                ui.button("清空输出", on_click=self.clear_log).props("outline")
+                ui.button(
+                    "复制调试日志",
+                    icon="bug_report",
+                    on_click=self.copy_debug_log,
+                ).props("outline").tooltip(
+                    "复制环境信息+运行输出+任务历史+日志文件，粘贴到电脑排查复现"
+                )
 
         self.status_label = ui.label("空闲").classes("text-sm text-gray-500")
 
@@ -869,11 +871,12 @@ class TaskRunnerBlock:
                         ui.badge(status).props(
                             f"color={self._status_color(status)}"
                         ).classes("shrink-0").props(f'data-runstatus="{rid}"')
+                    acc_summary, acc_full = list_field_summary(row.get("accounts"))
                     mobile_card_fields(
                         [
                             ("类型", row.get("type")),
                             ("执行时长", row.get("duration")),
-                            ("账号", row.get("accounts"), True),
+                            ("账号", acc_summary, True, True, acc_full),
                             ("执行时间", row.get("time"), True),
                         ]
                     )

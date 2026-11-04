@@ -35,6 +35,7 @@ from tg_signer.webui.common import (
     attach_select_all,
     copy_text_to_clipboard,
     format_duration,
+    list_field_summary,
     mobile_card_fields,
     mobile_card_result,
     with_select_all,
@@ -1200,7 +1201,13 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     )
                     mobile_card_fields(
                         [
-                            ("账号", row["accounts_text"], True),
+                            (
+                                "账号",
+                                row["accounts_summary"],
+                                True,
+                                True,
+                                row["accounts_text"],
+                            ),
                             ("执行时间", time_text, True),
                         ]
                     )
@@ -1246,6 +1253,12 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 task_states[task["id"]] = _default_state(task)
             st = task_states[task["id"]]
             account_names = [str(a) for a in (task.get("accounts") or [])]
+            # 移动端卡片单行省略：数量 + 前 3 项缩略，悬停/点击看全部
+            acc_summary, acc_full = (
+                list_field_summary(account_names)
+                if account_names
+                else ("未选择", "未选择")
+            )
             rows.append(
                 {
                     "id": task["id"],
@@ -1257,12 +1270,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                         else (str(task.get("duration") or "") or "—")
                     ),
                     "accounts": "、".join(account_names) or "未选择",
-                    # 移动端卡片先显示账号数，再列出账号
-                    "accounts_text": (
-                        f"{len(account_names)} 个：{'、'.join(account_names)}"
-                        if account_names
-                        else "未选择"
-                    ),
+                    "accounts_summary": acc_summary,
+                    "accounts_text": acc_full,
                     "status": _short_status(st),
                     "result": str(st.get("status") or "—"),
                     "running": bool(st.get("running")),
@@ -1294,17 +1303,14 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         if row and row.get("id"):
             delete_task(str(row["id"]))
 
-    ui.label("批量退频道").classes("text-lg font-semibold")
     ui.label("扫描并退出长期无更新的频道/群组。").classes(
         "text-sm text-gray-500 tgs-tab-intro"
     )
 
-    with ui.row().classes("w-full items-center"):
+    # 顶部操作行与其它 tab 统一：主操作在左，次要操作在右，整行两端对齐
+    with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
         ui.button("新建任务", on_click=lambda: open_create_dialog()).props(
             "color=primary"
-        )
-        ui.label("每次执行新增一条记录，可复制再次执行。").classes(
-            "text-xs text-gray-500 ml-auto"
         )
         settings_btn = (
             ui.button(_settings_btn_text(), on_click=lambda: open_settings_dialog())

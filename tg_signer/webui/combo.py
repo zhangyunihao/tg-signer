@@ -33,6 +33,7 @@ from tg_signer.webui.common import (
     add_dialog_close_button,
     attach_select_all,
     format_duration,
+    list_field_summary,
     mobile_card_fields,
     mobile_card_result,
     state,
@@ -1049,19 +1050,18 @@ class ComboTaskBlock:
         self.workdir = workdir
         self._editing_name: str | None = None  # 非 None 表示正在编辑该组合
 
-        ui.label("组合任务").classes("text-lg font-semibold")
         ui.label("选择模板与账号执行；模板在右上角维护。").classes(
             "text-sm text-gray-500 tgs-tab-intro"
         )
 
-        with ui.row().classes("w-full gap-2 items-center no-wrap"):
+        # 顶部操作行与其它 tab 统一：主操作在左，次要操作在右，整行两端对齐
+        with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
             ui.button(
                 "新增任务",
                 icon="add",
                 color="primary",
                 on_click=lambda: self.open_new_task_dialog(),
             )
-            ui.space()
             ui.button(
                 "任务组合配置",
                 icon="settings",
@@ -1325,10 +1325,11 @@ class ComboTaskBlock:
                         if duration and duration != "—"
                         else start_text
                     )
+                    acc_summary, acc_full = list_field_summary(rec.get("accounts"))
                     mobile_card_fields(
                         [
                             ("开始时间", time_text, True),
-                            ("账号", rec.get("accounts"), True),
+                            ("账号", acc_summary, True, True, acc_full),
                         ]
                     )
                     # 运行中任务：卡片上直接显示进度条 + 状态徽章

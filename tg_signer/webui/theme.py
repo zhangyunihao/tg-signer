@@ -286,10 +286,10 @@ MOBILE_DESIGN_CSS = """
     .q-badge.bg-amber { background: var(--tgs-warning) !important; }
     .q-badge.bg-grey-6,
     .q-badge.bg-grey-7 { background: #64748b !important; }
-    /* 列表卡片：统一内边距、描边与字段排布 */
+    /* 列表卡片：统一内边距、描边与字段排布（移动端尽量紧凑） */
     .mobile-list-card {
-        padding: 0.75rem 0.875rem !important;
-        gap: 0.375rem;
+        padding: 0.625rem 0.75rem !important;
+        gap: 0.25rem;
         border: 1px solid var(--tgs-line);
         border-radius: 0.875rem !important;
         box-shadow: var(--tgs-shadow-1) !important;
@@ -297,10 +297,12 @@ MOBILE_DESIGN_CSS = """
     }
     /* 卡片按钮行：不换行、按钮等分整行，6 个按钮（含置顶图钉）在 360px 同处一行 */
     .mobile-card-actions {
-        margin-top: 0.5rem !important;
+        margin-top: 0.375rem !important;
         gap: 0.125rem !important;
         flex-wrap: nowrap !important;
     }
+    /* 卡片列表与上方页头的间距收一档，页面更紧凑 */
+    .tgs-mobile-cards { margin-top: 0 !important; }
     .mobile-card-actions .q-btn {
         min-height: 44px !important;
         min-width: 0 !important;

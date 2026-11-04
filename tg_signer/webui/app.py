@@ -1321,14 +1321,14 @@ def build_ui(auth_code: str = None) -> None:
                     overflow-wrap: anywhere;
                 }
                 .tgs-field-pre { white-space: pre-line; }
-                /* 账号/监控对象等长列表：原先单行省略会吞掉关键信息，改为换行
-                   完整展示（overflow-wrap 允许超长账号/频道名在任意位置断行） */
+                /* 账号/监控对象等长列表：单行省略，超出行宽以省略号收尾，
+                   悬停 title、点击弹层查看完整内容（文本本身已带「N 个：」数量） */
                 .tgs-field-one { align-items: center; }
                 .tgs-field-one .tgs-field-v {
-                    white-space: normal;
-                    overflow: visible;
-                    text-overflow: clip;
-                    overflow-wrap: anywhere;
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    cursor: pointer;
                 }
                 .mobile-card-actions { margin-top: 2px; }
                 /* 顶部主标签：恢复旧版密度，单行满宽贴顶。

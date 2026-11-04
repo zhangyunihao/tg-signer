@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import platform
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -147,12 +148,40 @@ def add_dialog_close_button(dlg: ui.dialog) -> None:
             ).classes("dialog-close-fab")
 
 
+# 多值字段（账号/频道列表）按字符串切分时的分隔符
+_LIST_SPLIT_RE = re.compile(r"[、,，;；\n]+")
+
+
+def list_field_summary(value, limit: int = 3) -> tuple[str, str]:
+    """账号/频道等多值字段的卡片展示：返回 (缩略文本, 完整文本)。
+
+    列表按项处理，字符串按 、/,/，/;/；/换行 切分，空值返回「—」。
+    多于 1 项时带数量前缀「N 个：」；超过 limit 项时缩略为前 limit 项 + …，
+    完整文本始终列出全部项，供悬停 title 与点击弹层展示。
+    """
+    if isinstance(value, (list, tuple, set)):
+        items = [str(v).strip() for v in value]
+    elif value is None:
+        items = []
+    else:
+        items = [p.strip() for p in _LIST_SPLIT_RE.split(str(value))]
+    items = [i for i in items if i]
+    if not items:
+        return "—", "—"
+    if len(items) == 1:
+        return items[0], items[0]
+    full = f"{len(items)} 个：" + "、".join(items)
+    if len(items) <= limit:
+        return full, full
+    return f"{len(items)} 个：" + "、".join(items[:limit]) + "…", full
+
+
 def mobile_card_fields(fields: list[tuple]) -> None:
     """移动端卡片字段网格：两列排布，标签定宽浅灰、内容深灰自动换行。
 
     每项为 (标签, 内容, 是否整行, 是否单行省略, 点击展开的完整内容)；
     内容按纯文本转义，None/空串显示为「—」。单行省略用于账号/监控对象
-    等长列表，点击时弹出完整内容。
+    等长列表：超出行宽以省略号收尾，悬停 title、点击弹层看完整内容。
     """
     from html import escape
 
@@ -167,7 +196,10 @@ def mobile_card_fields(fields: list[tuple]) -> None:
         if one_line:
             cls += " tgs-field-one"
             long_text = text if len(item) <= 4 or item[4] is None else str(item[4])
-            attrs = f' data-full="{escape(long_text, quote=True)}"'
+            attrs = (
+                f' data-full="{escape(long_text, quote=True)}"'
+                f' title="{escape(long_text, quote=True)}"'
+            )
         cells.append(
             f'<div class="{cls}">'
             f'<span class="tgs-field-k">{escape(str(label))}</span>'

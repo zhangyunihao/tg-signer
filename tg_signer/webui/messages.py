@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import re
+from html import escape
 from pathlib import Path
 from typing import Callable, List, Set
 
@@ -39,6 +40,7 @@ from tg_signer.webui.common import add_dialog_close_button, state
 from tg_signer.webui.components import LOG_AREA_CLASS
 from tg_signer.webui.giveaway import (
     channel_title_map,
+    extract_win_prize,
     format_channels_full_alert,
     format_join_alert,
     format_scan_cap_alert,
@@ -209,6 +211,23 @@ def message_sort_key(
     )
 
 
+# 消息正文里需要加重展示的群组引用（如「群组「某交流群」还需发言 3 条」）
+_GROUP_REF_RE = re.compile(r"群组「[^」]*」")
+
+
+def message_html(m: dict) -> str:
+    """消息正文转为带加重片段的 HTML：所有消息加重群组引用，中奖消息加重奖品行。
+
+    文本先整体转义再包 <b>：正文来自 bot 消息与异常信息，不可信；
+    顶部通知/推送仍走 format_* 的纯文本，不带 HTML 标记。
+    """
+    text = escape(str(m.get("text") or ""))
+    prize = escape(str(m.get("prize") or ""))
+    if prize and prize in text:
+        text = text.replace(prize, f"<b>{prize}</b>", 1)
+    return _GROUP_REF_RE.sub(lambda match: f"<b>{match.group(0)}</b>", text)
+
+
 def collect_messages(workdir) -> List[dict]:
     """汇总全部消息：中奖、加入失败、频道已满与未完成发言任务（排序见 message_sort_key）。
 
@@ -231,6 +250,8 @@ def collect_messages(workdir) -> List[dict]:
                 "account": acct,
                 "time": time_str,
                 "text": format_win_alert(a),
+                # 奖品行原样取出（含「中奖奖品：」前缀），渲染时加重展示
+                "prize": extract_win_prize(str(a.get("text") or "")),
             }
         )
     # 1) 抽奖任务：监控对象加入失败（文件内已按最新在前排序）
@@ -591,7 +612,8 @@ def _build_center_page() -> None:
                 ui.badge(m["tag"]).props(f"outline dense color={m['color']}").classes(
                     "shrink-0"
                 )
-                ui.label(m["text"]).classes(
+                # 加重片段（群组/奖品）需按 HTML 渲染；ui.html 默认走 DOMPurify 消毒
+                ui.html(message_html(m)).classes(
                     "tgs-msg-text text-sm flex-1 min-w-0 "
                     + ("text-gray-900" if unread else "text-gray-500")
                 )

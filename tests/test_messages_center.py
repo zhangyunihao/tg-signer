@@ -4,6 +4,7 @@ from tg_signer.webui import giveaway
 from tg_signer.webui.messages import (
     collect_messages,
     is_message_unread,
+    message_html,
     message_keys,
 )
 
@@ -62,3 +63,53 @@ def test_speech_alerts_in_different_groups_stay_separate(tmp_path):
     msgs = _speech_messages(tmp_path)
     assert len(msgs) == 2
     assert all(len(message_keys(m)) == 1 for m in msgs)
+
+
+def test_group_reference_bolded_in_message_html(tmp_path):
+    """所有消息渲染 HTML 时，群组引用整体加重展示。"""
+    giveaway.save_speech_alerts(tmp_path, [_speech_alert("抽奖A", 3, "11-02 03:03:28")])
+
+    (msg,) = _speech_messages(tmp_path)
+    html = message_html(msg)
+    assert "<b>群组「上海艺术展览会交流群」</b>" in html
+    # 通知/推送用的纯文本正文不含任何 HTML 标记
+    assert "<b>" not in msg["text"]
+
+
+def test_win_prize_bolded_in_message_html(tmp_path):
+    """中奖消息渲染 HTML 时，奖品行加重展示，其余正文原样保留。"""
+    giveaway.save_win_alerts(
+        tmp_path,
+        [
+            {
+                "account": "alice",
+                "bot": "giveaway_bot",
+                "text": "💐 中奖提醒 💐\n恭喜您中奖了！\n中奖奖品：18.8\n防伪编号：H123",
+                "time": "11-04 10:00:00",
+            }
+        ],
+    )
+
+    (msg,) = [m for m in collect_messages(tmp_path) if m["tag"] == "中奖"]
+    assert "<b>中奖奖品：18.8</b>" in message_html(msg)
+    assert "防伪编号：H123" in msg["text"]
+    assert "<b>" not in msg["text"]
+
+
+def test_message_html_escapes_untrusted_text(tmp_path):
+    """正文来自 bot 消息/异常信息：HTML 必须先转义，不允许注入标签。"""
+    giveaway.save_speech_alerts(
+        tmp_path,
+        [
+            {
+                **_speech_alert("抽奖A", 3, "11-02 03:03:28"),
+                "group": "<img src=x>",
+            }
+        ],
+    )
+
+    (msg,) = _speech_messages(tmp_path)
+    html = message_html(msg)
+    assert "<img" not in html
+    assert "&lt;img src=x&gt;" in html
+    assert "<b>群组「&lt;img src=x&gt;」</b>" in html

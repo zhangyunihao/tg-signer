@@ -30,6 +30,7 @@ from tg_signer.webui.common import (
     attach_select_all,
     copy_text_to_clipboard,
     format_duration,
+    list_field_summary,
     mobile_card_fields,
     with_select_all,
 )
@@ -1288,10 +1289,13 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                                 f"color={'info' if running else 'grey-6'}"
                             )
                             card_badges[n] = badge
+                        acc_summary, acc_full = list_field_summary(row["accounts"])
+                        # 群组是单个标题（可能含逗号），按单项处理避免误切分
+                        chat_summary, chat_full = list_field_summary([row["chat"]])
                         mobile_card_fields(
                             [
-                                ("账号", row["accounts"], True),
-                                ("群组", row["chat"], True),
+                                ("账号", acc_summary, True, True, acc_full),
+                                ("群组", chat_summary, True, True, chat_full),
                                 ("间隔", row["interval"]),
                                 ("删除延迟", row["delete_after"]),
                                 ("账号条数", row["total"]),
@@ -1349,17 +1353,16 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 tasks[name]["_set_status"] = set_status
                 _GLOBAL_STATUS_CBS[engine_key(name)] = set_status
 
-    ui.label("随机发言").classes("text-lg font-semibold")
     ui.label("向目标群随机发送语库消息，可延时删除、多任务并行。").classes(
         "text-sm text-gray-500 tgs-tab-intro"
     )
 
-    # —— 任务列表（置顶） ——
-    with ui.row().classes("w-full items-center justify-between"):
-        ui.label("任务列表").classes("font-semibold")
+    # —— 任务列表（置顶）：操作行与其它 tab 统一，主操作在左、整行两端对齐 ——
+    with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
         ui.button("添加任务", icon="add", on_click=lambda: add_dlg.open()).props(
             "outline"
         )
+    ui.label("任务列表").classes("font-semibold")
     task_list_container = ui.column().classes("w-full gap-2")
     # 移动端卡片列表的展开状态（render_tasks 每次全量重建）
     mobile_state = {"show_all": False}

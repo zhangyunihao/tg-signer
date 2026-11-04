@@ -527,6 +527,17 @@ def save_win_alerts(workdir, alerts: List[dict]) -> None:
     _WIN_ALERTS.save(workdir, alerts)
 
 
+# 中奖消息中的奖品行（如「中奖奖品：18.8」，与识别过滤共用同一套措辞）：
+# 消息中心渲染时据此把奖品加重展示（format_win_alert 仍是纯文本，通知/推送不带标记）
+WIN_PRIZE_RE = re.compile(r"(?:中奖奖品|中得奖品|获得奖品)[：:][^\n]*")
+
+
+def extract_win_prize(raw: str) -> str:
+    """从中奖原消息文本中取出奖品行（含「中奖奖品：」前缀）；无奖品行返回空串。"""
+    match = WIN_PRIZE_RE.search(raw or "")
+    return match.group(0).strip() if match else ""
+
+
 def format_win_alert(a: dict) -> str:
     text = str(a.get("text") or "").replace("\n", " ")
     return f"账号 {a.get('account')} 中奖（@{a.get('bot')}）：{text}（{a.get('time')}）"
@@ -2119,14 +2130,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                         "source_type": source_type,
                         "task_type": giveaway_type_label(cfg),
                         "accounts": ", ".join(cfg["accounts"]),
-                        # 移动端卡片改为完整展示并自动换行（原先前 2 项 + 省略号
-                        # 会把账号/频道名截断，手机上看不到关键信息）
-                        "accounts_summary": _list_text(cfg["accounts"]),
+                        # 移动端卡片单行省略：显示数量 + 前 3 项，悬停/点击看全部
+                        "accounts_summary": _list_text(cfg["accounts"], 3),
                         "accounts_full": _list_text(cfg["accounts"]),
                         "chats": f"{len(chat_names)} 个："
                         + "、".join(chat_names[:3])
                         + ("…" if len(chat_names) > 3 else ""),
-                        "chats_summary": _list_text(chat_names),
+                        "chats_summary": _list_text(chat_names, 3),
                         "chats_full": _list_text(chat_names),
                         "keywords": "、".join(cfg.get("keywords") or []) or "全部链接",
                         "ignore_hist": (
@@ -2448,7 +2458,6 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 tasks[name]["_set_status"] = set_status
                 _GLOBAL_STATUS_CBS[engine_key(name)] = set_status
 
-    ui.label("自动抽奖").classes("text-lg font-semibold")
     ui.label("监控频道抽奖链接并自动参与，支持多账号。").classes(
         "text-sm text-gray-500 tgs-tab-intro"
     )
@@ -2489,17 +2498,15 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             ui.button("取消", on_click=clear_records_dlg.close).props("flat")
             ui.button("确认清除", color="negative", on_click=do_clear_records)
 
-    with ui.row().classes("w-full items-center justify-between"):
-        ui.label("任务列表").classes("font-semibold")
-        with ui.row().classes("gap-2 items-center"):
-            ui.button(
-                "清除参与记录",
-                icon="delete_sweep",
-                on_click=open_clear_records_dlg,
-            ).props("outline color=negative").tooltip(
-                "删除已参与记录，相同链接可再次参与"
-            )
-            ui.button("添加任务", icon="add", on_click=open_add_dialog).props("outline")
+    # 顶部操作行与其它 tab 统一：主操作在左，次要操作在右，整行两端对齐
+    with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
+        ui.button("添加任务", icon="add", on_click=open_add_dialog).props("outline")
+        ui.button(
+            "清除参与记录",
+            icon="delete_sweep",
+            on_click=open_clear_records_dlg,
+        ).props("outline color=negative").tooltip("删除已参与记录，相同链接可再次参与")
+    ui.label("任务列表").classes("font-semibold")
     task_list_container = ui.column().classes("w-full gap-2")
     mobile_state = {"limit": 5}
 
