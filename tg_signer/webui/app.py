@@ -78,7 +78,7 @@ from tg_signer.webui.sign import (
     flush_task_history,
     user_info_block,
 )
-from tg_signer.webui.stop_all import stop_all_tasks
+from tg_signer.webui.stop_all import running_tabs, stop_all_tasks
 from tg_signer.webui.theme import MOBILE_DESIGN_CSS
 
 logger = logging.getLogger(__name__)
@@ -981,6 +981,36 @@ def _build_dashboard(container) -> None:
 
         refresh_all()
 
+        # 有任务正在执行的 tab 突出展示：运行状态登记在各面板模块里，
+        # 这里按固定周期汇总后同步到主标签（不依赖面板是否构建、当前停在哪个 tab）
+        _tab_elements = {
+            "run": tab_run,
+            "combo": tab_combo,
+            "random": tab_random,
+            "leave": tab_leave,
+            "giveaway": tab_giveaway,
+        }
+        _tab_running_seen: dict = {}
+
+        def _sync_running_tabs() -> None:
+            try:
+                running = running_tabs(state.workdir)
+            except Exception:
+                logger.exception("统计运行中的任务失败，跳过本轮 tab 高亮同步")
+                return
+            for name, tab in _tab_elements.items():
+                want = name in running
+                if _tab_running_seen.get(name) == want:
+                    continue  # 状态未变化不动元素，避免每轮无效 update
+                _tab_running_seen[name] = want
+                if want:
+                    tab.classes(add="tgs-tab-running")
+                else:
+                    tab.classes(remove="tgs-tab-running")
+
+        ui.timer(2.0, _sync_running_tabs)
+        _sync_running_tabs()
+
 
 def _resolve_auth_code(explicit: Optional[str]) -> str:
     """解析 WebUI 访问授权码：显式参数优先，其次 TG_SIGNER_GUI_AUTHCODE 环境变量，空白视为未配置。"""
@@ -1195,6 +1225,20 @@ def build_ui(auth_code: str = None) -> None:
             .tgs-dialog-flex .q-tab-panels {
                 flex: 1 1 auto;
                 min-height: 0;
+            }
+            /* 五个 tab 顶部操作行共用：统一上下留白，保证各页按钮区域高度一致 */
+            .tgs-tab-actions {
+                margin-top: 4px;
+                margin-bottom: 8px;
+            }
+            /* 该 tab 有任务正在执行：主色加粗 + 底部高亮条。
+               与选中态的胶囊底色区分，即使没停在这个 tab 也能一眼看出 */
+            .main-tabs .q-tab.tgs-tab-running {
+                box-shadow: inset 0 -3px 0 0 var(--tgs-brand-strong);
+            }
+            .main-tabs .q-tab.tgs-tab-running .q-tab__label {
+                color: var(--tgs-brand-strong) !important;
+                font-weight: 700;
             }
             /* 桌面端（>640px）：所有列表最右的「操作」列固定在右侧（粘性列），
                横向滚动时始终可见。移动端表格整体隐藏改用卡片列表，无需生效；

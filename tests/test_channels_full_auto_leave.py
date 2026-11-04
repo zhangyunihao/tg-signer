@@ -1,6 +1,7 @@
 """账号频道/群组已满（CHANNELS_TOO_MUCH）→ 消息提醒 + 自动退频道的回归测试。"""
 
 import asyncio
+import json
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -169,6 +170,16 @@ def test_days_threshold_supports_fractional_values(tmp_path, monkeypatch):
     assert auto_leave._to_days(None, 7) == 7
     assert auto_leave._fmt_days(1.5) == "1.5"
     assert auto_leave._fmt_days(2.0) == "2"
+
+
+def test_legacy_config_zero_days_migrates_without_becoming_default(tmp_path):
+    # 旧配置里的 0（扫描全部）迁移成任务后必须仍是 0，不能被 `or 7` 兜底成 7
+    (tmp_path / auto_leave.CONFIG_NAME).write_text(
+        json.dumps({"accounts": ["alice"], "days": 0}), encoding="utf-8"
+    )
+    tasks = auto_leave.load_leave_tasks(tmp_path)
+    assert len(tasks) == 1
+    assert tasks[0]["days"] == 0
 
 
 def test_as_utc_handles_pyrogram_message_dates():

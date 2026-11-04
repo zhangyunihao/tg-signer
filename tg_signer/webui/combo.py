@@ -1055,7 +1055,9 @@ class ComboTaskBlock:
         )
 
         # 顶部操作行与其它 tab 统一：主操作在左，次要操作在右，整行两端对齐
-        with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
+        with ui.row().classes(
+            "w-full items-center justify-between gap-2 flex-wrap tgs-tab-actions"
+        ):
             ui.button(
                 "新增任务",
                 icon="add",
@@ -1068,7 +1070,6 @@ class ComboTaskBlock:
                 on_click=lambda: self.open_config_dialog(),
             ).props("outline")
 
-        ui.label("历史任务").classes("text-md font-semibold")
         # 桌面端表格（<=640px 隐藏，改用下方卡片列表），操作列：进度/停止/复制
         self.history_table = (
             ui.table(

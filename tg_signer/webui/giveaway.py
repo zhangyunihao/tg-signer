@@ -1309,6 +1309,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 # 上次执行的开始时间与时长（运行结束或停止时写入时长）
                 "last_start_time": str(cfg.get("last_start_time") or ""),
                 "last_duration": str(cfg.get("last_duration") or ""),
+                # 上次运行结果：已完成（自然跑完）/ 已停止（手动或超时停止）
+                "last_outcome": str(cfg.get("last_outcome") or ""),
                 # 上次运行新参与抽奖总数与各账号分布
                 "last_joined": int(cfg.get("last_joined") or 0),
                 "last_joined_by_account": {
@@ -1435,10 +1437,22 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         engine = get_engine(name)
         return engine is not None and engine.running
 
+    def _ended_status(cfg: Optional[dict]) -> str:
+        """未结束态文案：从未启动过=未运行，跑过的按结果展示（已完成/已停止）。"""
+        if not cfg or not str(cfg.get("last_start_time") or ""):
+            return "未运行"
+        return str(cfg.get("last_outcome") or "已完成")
+
+    def _badge_color(running: bool, text: str) -> str:
+        """状态徽标配色：运行中=蓝，已完成=绿，其余（未运行/已停止）=灰。"""
+        if running:
+            return "info"
+        return "positive" if text.startswith("已完成") else "grey-6"
+
     def _status_text(name: str) -> str:
         engine = get_engine(name)
         if engine is None or not engine.running:
-            return "未运行"
+            return _ended_status(tasks.get(name))
         return engine.progress_text() or "运行中"
 
     def _sweep_text(name: str) -> str:
@@ -1600,6 +1614,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 return
             eng = get_engine(_n)
             if eng is not None and eng.running:
+                # 超时自动停止：标记停止原因，结束回调据此显示「已停止」而非「已完成」
+                cfg_late["_stop_requested"] = True
                 if capture_engine_stats(_n):
                     _persist()
                 try:
@@ -1682,6 +1698,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     cfg_done["last_duration"] = format_duration(
                         time.time() - cfg_done["_start_ts"]
                     )
+                # 手动/超时停止=已停止，自然跑完=已完成；结束前清掉停止标记
+                cfg_done["last_outcome"] = (
+                    "已停止" if cfg_done.pop("_stop_requested", None) else "已完成"
+                )
                 capture_engine_stats(_n)
                 _persist()
                 # 结束分隔线：与启动线配对，标明这一段是第几次运行
@@ -1753,6 +1773,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
             cfg["last_duration"] = ""
             cfg["_start_ts"] = start_ts
+            cfg.pop("last_outcome", None)  # 重新跑：清掉上一轮的结束结果
             # 启动分隔线：子进程冷启动要数百毫秒，先落线再接它的首批日志
             cfg["run_count"] = run_no
             log(f"════ 第 {run_no} 次启动 ════")
@@ -1769,6 +1790,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     async def stop_task(name: str, set_status: Callable[[bool], None]) -> None:
         engine = get_engine(name)
         if engine is not None and engine.running:
+            # 标记停止原因，结束回调据此写入「已停止」而不是「已完成」
+            cfg = tasks.get(name)
+            if cfg is not None:
+                cfg["_stop_requested"] = True
             # 停止前先把当前统计落盘，避免明细只存在于内存
             if capture_engine_stats(name):
                 _persist()
@@ -1907,6 +1932,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 "run_count",
                 "last_start_time",
                 "last_duration",
+                "last_outcome",
                 "last_joined",
                 "last_joined_by_account",
                 "last_joined_by_account_chat",
@@ -2181,7 +2207,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             table.add_slot(
                 "body-cell-status",
                 '<q-td :props="props">'
-                f"<q-badge :color=\"({running_expr}) ? 'info' : 'grey-6'\">"
+                f"<q-badge :color=\"({running_expr}) ? 'info' : "
+                "(props.row.status.startsWith('已完成') ? 'positive' : 'grey-6')\">"
                 "{{ props.row.status }}</q-badge></q-td>",
             )
             table.add_slot(
@@ -2212,7 +2239,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 def _set(running: bool) -> None:
                     text = "运行中（已参与0）" if running else "未运行"
                     if not running:
-                        text = "未运行"
+                        text = _ended_status(tasks.get(n))
                     else:
                         engine = get_engine(n)
                         # 刚启动时子进程尚未回报进度，回退「运行中」避免状态为空
@@ -2240,7 +2267,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     badge = card_badges.get(str(n))
                     if badge is not None:
                         try:
-                            badge.props(f"color={'info' if running else 'grey-6'}")
+                            badge.props(f"color={_badge_color(running, text)}")
                             # 状态徽标拼接回扫进度：回扫时显示「状态 · 回扫进度」
                             badge.text = f"{text} · {sweep}" if sweep else text
                             badge.update()
@@ -2330,7 +2357,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             with mobile_cards:
                 for row in shown_rows:
                     n = str(row["name"])
-                    running = row["status"] != "未运行"
+                    running = task_running(n)
                     set_status = make_set_status(n)
                     time_text = _card_time_text(n, running)
                     with ui.card().classes("w-full mobile-list-card border"):
@@ -2352,7 +2379,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                                 else row["status"]
                             )
                             badge = ui.badge(badge_text).props(
-                                f"color={'info' if running else 'grey-6'}"
+                                f"color={_badge_color(running, row['status'])}"
                             )
                             card_badges[n] = badge
                         card_fields = [
@@ -2499,14 +2526,15 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             ui.button("确认清除", color="negative", on_click=do_clear_records)
 
     # 顶部操作行与其它 tab 统一：主操作在左，次要操作在右，整行两端对齐
-    with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
-        ui.button("添加任务", icon="add", on_click=open_add_dialog).props("outline")
+    with ui.row().classes(
+        "w-full items-center justify-between gap-2 flex-wrap tgs-tab-actions"
+    ):
+        ui.button("添加任务", icon="add", on_click=open_add_dialog)
         ui.button(
             "清除参与记录",
             icon="delete_sweep",
             on_click=open_clear_records_dlg,
         ).props("outline color=negative").tooltip("删除已参与记录，相同链接可再次参与")
-    ui.label("任务列表").classes("font-semibold")
     task_list_container = ui.column().classes("w-full gap-2")
     mobile_state = {"limit": 5}
 

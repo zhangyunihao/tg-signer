@@ -827,6 +827,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 # 上次执行的开始时间与时长（运行结束或停止时写入时长）
                 "last_start_time": str(cfg.get("last_start_time") or ""),
                 "last_duration": str(cfg.get("last_duration") or ""),
+                # 上次运行结果：已完成（自然跑完）/ 已停止（手动或超时停止）
+                "last_outcome": str(cfg.get("last_outcome") or ""),
             }
         store["tasks"] = clean
         save_task_store(workdir, store)
@@ -895,10 +897,22 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         engine = get_engine(name)
         return engine is not None and engine.running
 
+    def _ended_status(cfg: dict | None) -> str:
+        """未结束态文案：从未启动过=未运行，跑过的按结果展示（已完成/已停止）。"""
+        if not cfg or not str(cfg.get("last_start_time") or ""):
+            return "未运行"
+        return str(cfg.get("last_outcome") or "已完成")
+
+    def _badge_color(running: bool, text: str) -> str:
+        """状态徽标配色：运行中=蓝，已完成=绿，其余（未运行/已停止）=灰。"""
+        if running:
+            return "info"
+        return "positive" if text.startswith("已完成") else "grey-6"
+
     def _status_text(name: str) -> str:
         engine = get_engine(name)
         if engine is None or not engine.running:
-            return "未运行"
+            return _ended_status(tasks.get(name))
         return engine.progress_text() or "运行中"
 
     def remove_task(name: str) -> None:
@@ -951,11 +965,16 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                 return
 
         def _on_finish(_n: str = name) -> None:
-            # 运行结束/停止：按启动时间计算执行时长并持久化
+            # 运行结束/停止：按启动时间计算执行时长并持久化，
+            # 同时记录结束结果（自然跑完=已完成，手动/超时停止=已停止）
             cfg_done = tasks.get(_n)
-            if cfg_done is not None and cfg_done.get("_start_ts"):
-                cfg_done["last_duration"] = format_duration(
-                    time.time() - cfg_done["_start_ts"]
+            if cfg_done is not None and cfg_done.get("last_start_time"):
+                if cfg_done.get("_start_ts"):
+                    cfg_done["last_duration"] = format_duration(
+                        time.time() - cfg_done["_start_ts"]
+                    )
+                cfg_done["last_outcome"] = (
+                    "已停止" if cfg_done.pop("_stop_requested", None) else "已完成"
                 )
                 _persist()
             cb = _GLOBAL_STATUS_CBS.get(engine_key(_n)) or tasks.get(_n, {}).get(
@@ -985,6 +1004,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
             cfg["last_duration"] = ""
             cfg["_start_ts"] = start_ts
+            cfg.pop("last_outcome", None)  # 重新跑：清掉上一轮的结束结果
             _persist()
             set_status(True)
             ui.notify(f"任务 #{name} 已启动", type="positive")
@@ -994,7 +1014,11 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
     async def stop_task(name: str, set_status: Callable[[bool], None]) -> None:
         engine = get_engine(name)
         if engine is not None and engine.running:
-            # 停止后由状态定时器显示「停止中」，收尾完成经 on_finish 回调置为未运行
+            # 标记停止原因，结束回调据此写入「已停止」而不是「已完成」；
+            # 停止后由状态定时器显示「停止中」，收尾完成经 on_finish 回调置为结束结果
+            cfg = tasks.get(name)
+            if cfg is not None:
+                cfg["_stop_requested"] = True
             await engine.stop()
         else:
             set_status(False)
@@ -1182,14 +1206,15 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             table_ref["table"] = table
             # 移动端卡片上的状态徽章（按任务名），状态回调同时更新表格行与卡片徽章
             card_badges: dict[str, ui.badge] = {}
-            # 状态列渲染为彩色徽章：运行中=蓝、未运行=灰（状态文本可能带进度，用 startsWith 匹配）
+            # 状态列渲染为彩色徽章：运行中=蓝、已完成=绿、其余=灰（状态文本可能带进度，用 startsWith 匹配）
             table.add_slot(
                 "body-cell-status",
                 '<q-td :props="props">'
-                "<q-badge :color=\"props.row.status.startsWith('运行中') ? 'info' : 'grey-6'\">"
+                "<q-badge :color=\"props.row.status.startsWith('运行中') ? 'info' : "
+                "(props.row.status.startsWith('已完成') ? 'positive' : 'grey-6')\">"
                 "{{ props.row.status }}</q-badge></q-td>",
             )
-            # 操作列：未运行显示「启动」，运行中显示「停止」，另附「复制」「删除」
+            # 操作列：结束态显示「启动」，运行中显示「停止」，另附「复制」「删除」
             table.add_slot(
                 "body-cell-actions",
                 '<q-td :props="props" class="col-actions">'
@@ -1206,8 +1231,8 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
 
             def make_set_status(n: str) -> Callable[[bool], None]:
                 def _set(running: bool) -> None:
-                    text = "运行中" if running else "未运行"
                     cfg_now = tasks.get(n) or {}
+                    text = "运行中" if running else _ended_status(cfg_now)
                     start_ts = cfg_now.get("_start_ts")
                     dur = (
                         format_duration(time.time() - start_ts)
@@ -1226,7 +1251,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                     badge = card_badges.get(str(n))
                     if badge is not None:
                         try:
-                            badge.props(f"color={'info' if running else 'grey-6'}")
+                            badge.props(f"color={_badge_color(running, text)}")
                             badge.text = text
                             badge.update()
                         except Exception:
@@ -1286,7 +1311,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
                         ):
                             ui.label(f"任务 #{n}").classes("text-base font-semibold")
                             badge = ui.badge(row["status"]).props(
-                                f"color={'info' if running else 'grey-6'}"
+                                f"color={_badge_color(running, row['status'])}"
                             )
                             card_badges[n] = badge
                         acc_summary, acc_full = list_field_summary(row["accounts"])
@@ -1358,11 +1383,10 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
     )
 
     # —— 任务列表（置顶）：操作行与其它 tab 统一，主操作在左、整行两端对齐 ——
-    with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
-        ui.button("添加任务", icon="add", on_click=lambda: add_dlg.open()).props(
-            "outline"
-        )
-    ui.label("任务列表").classes("font-semibold")
+    with ui.row().classes(
+        "w-full items-center justify-between gap-2 flex-wrap tgs-tab-actions"
+    ):
+        ui.button("添加任务", icon="add", on_click=lambda: add_dlg.open())
     task_list_container = ui.column().classes("w-full gap-2")
     # 移动端卡片列表的展开状态（render_tasks 每次全量重建）
     mobile_state = {"show_all": False}

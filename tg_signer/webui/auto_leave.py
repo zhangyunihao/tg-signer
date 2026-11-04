@@ -232,7 +232,8 @@ def load_leave_tasks(workdir) -> List[Dict]:
                 "id": f"leave_{datetime.now():%Y%m%d%H%M%S}",
                 "name": "默认退频道任务",
                 "accounts": list(cfg.get("accounts") or []),
-                "days": float(cfg.get("days") or 7),
+                # 注意不能用 `days or 7`：0 表示扫描全部，会被误转成 7
+                "days": _to_days(cfg.get("days"), 7),
                 "scan_types": _scan_types_of(cfg),
                 "skip_pinned": bool(cfg.get("skip_pinned", True)),
                 "keywords": load_default_keywords(workdir),
@@ -822,6 +823,15 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         st = task_states.get(task_id)
         if st:
             st["stop"] = True
+        # 后台自动任务（抽奖触发）不在本页运行，按任务 id 前缀统一触发停止开关
+        prefix = f"{wd_key}|{task_id}|"
+        for key, stop in list(_ACTIVE_STOPS.items()):
+            if not key.startswith(prefix):
+                continue
+            try:
+                stop()
+            except Exception:
+                logger.debug("停止退频道任务失败", exc_info=True)
 
     async def leave_selected(task_id: str) -> None:
         task = find_task(task_id)
@@ -894,7 +904,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         st = task_states.get(task_id)
         if not task:
             return
-        if st and st["running"]:
+        if st and _is_running_now(st):
             ui.notify("任务运行中，请先停止再删除", type="warning")
             return
         # 填充页面级持久确认弹窗（不在事件槽位里动态创建弹窗）
@@ -946,6 +956,10 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             return
         scope = str(scope_sel.value or "both")
         d = days_input.value
+        if d is None:
+            # 留空不再静默回落到默认 7 天（否则会误按 7 天扫描/自动退出）
+            ui.notify("请填写不更新天数阈值（0 表示扫描全部）", type="warning")
+            return
         days = _to_days(d, 7)
         task = {
             "id": f"leave_{datetime.now():%Y%m%d%H%M%S%f}",
@@ -968,9 +982,14 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         # 每次执行都是一条新记录，创建后立即启动
         await run_task(task["id"])
 
+    def _is_running_now(st: Dict) -> bool:
+        """运行中判定：本页发起的任务看内存状态，后台自动任务看落盘状态。"""
+        full = str(st.get("status") or "")
+        return bool(st.get("running")) or full in _AUTO_TASK_ACTIVE_STATUSES
+
     def _short_status(st: Dict) -> str:
         full = str(st.get("status") or "—")
-        if st.get("running") or full in _AUTO_TASK_ACTIVE_STATUSES:
+        if _is_running_now(st):
             return "运行中"
         if full.startswith("完成") or full.startswith("退出完成"):
             return "已完成"
@@ -1232,6 +1251,11 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                                 "停止",
                                 on_click=lambda r=row: stop_task(str(r["id"])),
                             ).props("flat dense color=negative")
+                        else:
+                            ui.button(
+                                "启动",
+                                on_click=lambda r=row: run_task(str(r["id"])),
+                            ).props("flat dense color=primary")
                         ui.button(
                             "删除", on_click=lambda r=row: delete_task(str(r["id"]))
                         ).props("flat dense color=negative")
@@ -1274,7 +1298,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                     "accounts_text": acc_full,
                     "status": _short_status(st),
                     "result": str(st.get("status") or "—"),
-                    "running": bool(st.get("running")),
+                    "running": _is_running_now(st),
                     # 频道已满自动触发的任务，卡片/表格上标记「自动」
                     "auto": task.get("trigger") == "channels_full",
                 }
@@ -1293,6 +1317,11 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         if row and row.get("id"):
             open_detail_dialog(str(row["id"]))
 
+    async def _on_leave_start(e) -> None:
+        row = _event_row(e)
+        if row and row.get("id"):
+            await run_task(str(row["id"]))
+
     def _on_leave_stop(e) -> None:
         row = _event_row(e)
         if row and row.get("id"):
@@ -1308,13 +1337,13 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     )
 
     # 顶部操作行与其它 tab 统一：主操作在左，次要操作在右，整行两端对齐
-    with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
-        ui.button("新建任务", on_click=lambda: open_create_dialog()).props(
-            "color=primary"
-        )
+    with ui.row().classes(
+        "w-full items-center justify-between gap-2 flex-wrap tgs-tab-actions"
+    ):
+        ui.button("新建任务", icon="add", on_click=lambda: open_create_dialog())
         settings_btn = (
             ui.button(_settings_btn_text(), on_click=lambda: open_settings_dialog())
-            .props("flat dense color=primary")
+            .props("outline")
             .tooltip("页面级设置：默认保护关键字与扫描跳过")
         )
 
@@ -1394,7 +1423,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         '<div class="ellipsis" style="max-width: 180px;" :title="props.row.accounts">'
         "{{ props.row.accounts }}</div></q-td>",
     )
-    # 操作列：复制 / 明细（命中频道）/ 停止（运行中）/ 删除
+    # 操作列：复制 / 明细（命中频道）/ 启动（未运行）/ 停止（运行中）/ 删除
     leave_table.add_slot(
         "body-cell-actions",
         '<q-td :props="props" class="col-actions">'
@@ -1402,6 +1431,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         'label="复制" @click="$parent.$emit(\'leaveDup\', props.row)" />'
         '<q-btn flat dense color="grey-8" '
         'label="明细" @click="$parent.$emit(\'leaveDetail\', props.row)" />'
+        '<q-btn v-if="!props.row.running" flat dense color="primary" '
+        'label="启动" @click="$parent.$emit(\'leaveStart\', props.row)" />'
         '<q-btn v-if="props.row.running" flat dense color="negative" '
         'label="停止" @click="$parent.$emit(\'leaveStop\', props.row)" />'
         '<q-btn flat dense color="negative" '
@@ -1410,6 +1441,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     )
     leave_table.on("leaveDup", _on_leave_dup)
     leave_table.on("leaveDetail", _on_leave_detail)
+    leave_table.on("leaveStart", _on_leave_start)
     leave_table.on("leaveStop", _on_leave_stop)
     leave_table.on("leaveDel", _on_leave_del)
     # 移动端（<=640px）用纵向卡片列表替代横滑宽表，桌面端隐藏

@@ -433,7 +433,9 @@ class TaskRunnerBlock:
         )
 
         # 顶部操作行与其它 tab 统一：主操作在左，次要操作在右，整行两端对齐
-        with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
+        with ui.row().classes(
+            "w-full items-center justify-between gap-2 flex-wrap tgs-tab-actions"
+        ):
             ui.button(
                 "新增任务", icon="add", color="primary", on_click=self.open_dialog
             )
@@ -451,12 +453,8 @@ class TaskRunnerBlock:
 
         # ---- 任务历史 ----
         ui.separator().classes("my-2")
-        with ui.row().classes("w-full items-center justify-between"):
-            ui.label("任务历史").classes("text-md font-semibold")
+        with ui.row().classes("w-full items-center justify-end"):
             ui.button("清空历史", on_click=self.clear_history).props("outline dense")
-        ui.label("记录本页手动执行的任务。").classes(
-            "text-sm text-gray-500 tgs-tab-intro"
-        )
         self.history_summary = ui.label("").classes("text-sm text-gray-600")
         self.history_table = (
             ui.table(
