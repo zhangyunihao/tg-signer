@@ -1,14 +1,25 @@
-"""WebUI 全站共用样式：移动端设计语言（色彩 / 字号 / 间距 / 圆角 / 组件形态）。
+"""WebUI 全站共用样式：移动端（<=640px）与桌面端（>640px）两套设计语言。
 
 主控台与消息中心、组合进度等独立页面都引入同一份 CSS，保证同类元素形态一致；
-所有规则限定在 <=640px 媒体查询内，桌面端（>640px）不受影响。
+移动端 44px 触控与底部抽屉、桌面端 36px 控件与居中限宽内容列互不影响。
 """
+
+import re as _re
+
+
+def _compact(css: str) -> str:
+    """去掉注释与多余空白：CSS 内联在每个页面 <head>，压缩后不增加 HTML 体积。"""
+    css = _re.sub(r"/\*.*?\*/", "", css, flags=_re.S)
+    css = _re.sub(r"\s+", " ", css)
+    css = _re.sub(r"\s*([{}:;,>])\s*", r"\1", css)
+    return css.strip()
+
 
 MOBILE_DESIGN_CSS = """
 <style>
 @media (max-width: 640px) {
     /* ============ 移动端设计语言：统一令牌 / 度量 / 组件形态 ============
-       色彩：品牌主色沿用 #1976d2（白底对比 4.60:1），辅助文字与语义色
+       色彩：品牌主色沿用 #1976d2（白底对比 4.63:1），辅助文字与语义色
        均达到 WCAG AA（正文 >=4.5:1，见报告中的实测值）。
        字号：全部用 rem，跟随系统字号缩放；正文 14px，辅助 13px，
        说明 12px，输入框 16px（避免 iOS 聚焦放大）。
@@ -35,6 +46,7 @@ MOBILE_DESIGN_CSS = """
         --tgs-radius-lg: 1rem;
         --tgs-radius-md: 0.75rem;
         --tgs-radius-sm: 0.5rem;
+        --tgs-radius-pill: 999px;
         --tgs-gap: 0.75rem;
         --tgs-fs-title: 1.125rem;
         --tgs-fs-heading: 1rem;
@@ -519,6 +531,58 @@ MOBILE_DESIGN_CSS = """
     .q-dialog .q-card,
     .tgs-log-area,
     .q-table__middle { scrollbar-width: thin; }
+    /* 页面承载面：主控台 tab 面板统一成一张带描边与轻投影的白色卡片。
+       原来面板是无圆角的整块白底，和内部列表卡片形成「白底套白卡」的
+       两层同色块；加描边/圆角/阴影后承载面与内容卡片层次可辨。 */
+    .nicegui-content .q-tab-panels { background: transparent !important; }
+    .nicegui-content .q-tab-panel {
+        background: var(--tgs-surface);
+        border: 1px solid var(--tgs-line);
+        border-radius: var(--tgs-radius-lg);
+        box-shadow: var(--tgs-shadow-1);
+        padding: 0.75rem !important;
+    }
+    /* 消息中心分区标题：小号灰标签 + 自动延伸的分割线，未读/已读一眼分区 */
+    .nicegui-content .tgs-msg-section {
+        display: flex !important;
+        align-items: center;
+        gap: 0.5rem;
+        margin-top: 0.25rem;
+        /* 加 .nicegui-content 前缀压过 .text-sm，否则分区标题会跟正文同号 */
+        font-size: var(--tgs-fs-cap) !important;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: var(--tgs-text-3) !important;
+    }
+    .tgs-msg-section::after {
+        content: "";
+        flex: 1 1 auto;
+        height: 1px;
+        background: var(--tgs-line);
+    }
+    /* 独立页页头：标题行下方一条分割线，和卡片区拉开 */
+    .tgs-page-head {
+        padding-bottom: 0.5rem;
+        border-bottom: 1px solid var(--tgs-line);
+    }
+    /* 整页级空态（组合进度记录不存在）比行内空态高，避免一屏只有一小条 */
+    .tgs-empty-page { min-height: 180px; }
+    /* 网络自检提示条：保留全部提示文字，只收字号与内边距，少占一屏 */
+    .tgs-net-banner { padding: 0.5rem 0.75rem !important; }
+    .tgs-net-banner .text-sm {
+        font-size: var(--tgs-fs-aux) !important;
+        line-height: 1.5;
+    }
+    /* 设置/新增弹窗底栏在滚动内容里吸底，操作按钮始终可见 */
+    .tgs-dialog-footer { background: var(--tgs-surface); }
+    /* 登录/鉴权页：标题与说明居中，和居中的验证卡片形成同一轴线 */
+    .tgs-auth-title,
+    .tgs-auth-sub {
+        width: 100%;
+        text-align: center;
+    }
+    .tgs-auth-title { margin-top: 1.5rem; }
+    .tgs-auth-card { padding: 1.25rem !important; gap: 0.75rem !important; }
     :focus-visible {
         outline: 2px solid rgba(25, 118, 210, 0.45);
         outline-offset: 2px;
@@ -539,5 +603,403 @@ MOBILE_DESIGN_CSS = """
         }
     }
 }
+
+/* ============================================================================
+   桌面端（>640px）设计语言。
+   移动端那套 44px 触控、底部抽屉、单列卡片不复用；这里按鼠标/键盘场景给出
+   更紧凑的 36px 控件、40px 表头、居中最大 1200px 的内容列与 560px 起宽的
+   弹窗，避免 1280 下卡片被拉满整屏、弹窗缩在角落显得空旷。
+   ============================================================================ */
+@media (min-width: 641px) {
+    :root {
+        --tgs-brand: #1976d2;
+        --tgs-brand-strong: #1565c0;
+        --tgs-brand-soft: #e9f1fd;
+        --tgs-surface: #ffffff;
+        --tgs-surface-soft: #f7f9fc;
+        --tgs-line: #e3e8f0;
+        --tgs-line-strong: #d3dae6;
+        --tgs-text: #111827;
+        --tgs-text-2: #3f4a5a;
+        --tgs-text-3: #5b6675;
+        --tgs-success: #15803d;
+        --tgs-warning: #b45309;
+        --tgs-danger: #b42318;
+        --tgs-radius-lg: 1rem;
+        --tgs-radius-md: 0.75rem;
+        --tgs-radius-sm: 0.5rem;
+        --tgs-radius-pill: 999px;
+        --tgs-shadow-1: 0 1px 2px rgba(16, 24, 40, 0.06);
+        --tgs-shadow-2: 0 10px 28px rgba(16, 24, 40, 0.12);
+    }
+    body {
+        background: #f3f5f9 !important;
+        color: var(--tgs-text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+            "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+        -webkit-font-smoothing: antialiased;
+    }
+    .nicegui-content {
+        padding: 1.25rem 1.5rem 2rem !important;
+        gap: 1rem !important;
+    }
+    /* 内容列居中限宽：1280 下两侧留白，宽屏也不会把表格/卡片拉成一条 */
+    .nicegui-content > .nicegui-column {
+        width: 100%;
+        max-width: 1200px;
+        margin: 0 auto;
+    }
+    /* ---- 顶部导航 ---- */
+    .tgs-header-row {
+        min-height: 56px;
+        padding-bottom: 0.25rem;
+        border-bottom: 1px solid var(--tgs-line);
+    }
+    .main-tabs { min-height: 48px; }
+    .main-tabs .q-tab {
+        min-height: 44px;
+        padding: 0 0.875rem;
+        border-radius: 0.5rem;
+        transition: background-color 0.16s ease;
+    }
+    .main-tabs .q-tab:hover { background: rgba(25, 118, 210, 0.06); }
+    .main-tabs .q-tab--active { background: var(--tgs-brand-soft); }
+    .main-tabs .q-tab--active .q-tab__label {
+        color: var(--tgs-brand-strong) !important;
+        font-weight: 600;
+    }
+    .main-tabs .q-tab__label { font-size: 0.875rem; }
+    .main-tabs .q-tab__indicator { display: none; }
+    .tgs-header-actions .q-btn {
+        min-width: 40px;
+        min-height: 40px;
+        padding: 0;
+    }
+    /* 版本号做成中性胶囊标签，与图标按钮同级但更弱 */
+    .tgs-header-version {
+        padding: 0.125rem 0.5rem;
+        border: 1px solid var(--tgs-line);
+        border-radius: var(--tgs-radius-pill);
+        background: var(--tgs-surface-soft);
+        font-size: 0.6875rem;
+        color: var(--tgs-text-3);
+    }
+    /* ---- 页面承载面与卡片 ---- */
+    .nicegui-content .q-tab-panels { background: transparent !important; }
+    .nicegui-content .q-tab-panel {
+        background: var(--tgs-surface);
+        border: 1px solid var(--tgs-line);
+        border-radius: var(--tgs-radius-lg);
+        box-shadow: var(--tgs-shadow-1);
+        padding: 1.25rem !important;
+    }
+    .nicegui-content .q-card {
+        border: 1px solid var(--tgs-line);
+        border-radius: var(--tgs-radius-md) !important;
+        box-shadow: var(--tgs-shadow-1) !important;
+    }
+    /* ---- 字号阶梯：页面标题 24 / 区块 18 / 卡片标题 16 / 正文 14 / 辅助 12 ---- */
+    .nicegui-content .text-xl {
+        font-size: 1.5rem !important;
+        font-weight: 650;
+        letter-spacing: -0.015em;
+    }
+    .nicegui-content .text-lg {
+        font-size: 1.125rem !important;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+    }
+    .nicegui-content .text-md { font-size: 1rem !important; font-weight: 600; }
+    .nicegui-content .text-sm,
+    .q-dialog .text-sm { font-size: 0.875rem !important; line-height: 1.55; }
+    .nicegui-content .text-xs,
+    .q-dialog .text-xs { font-size: 0.75rem !important; line-height: 1.5; }
+    .text-gray-400 { color: #6b7688 !important; }
+    .text-gray-500 { color: var(--tgs-text-3) !important; }
+    .text-gray-600 { color: var(--tgs-text-2) !important; }
+    .text-gray-700 { color: #2f3947 !important; }
+    .text-amber-600,
+    .text-orange-600,
+    .text-orange-500 { color: var(--tgs-warning) !important; }
+    .text-positive { color: var(--tgs-success) !important; }
+    .text-negative { color: var(--tgs-danger) !important; }
+    /* ---- 按钮：主/次/危险三级靠填充/描边/红色文字区分，高度 36 ---- */
+    .q-btn {
+        min-height: 36px;
+        border-radius: var(--tgs-radius-sm) !important;
+        font-size: 0.8125rem;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        transition: background-color 0.16s ease, box-shadow 0.16s ease;
+    }
+    .q-btn--dense { min-height: 32px; }
+    .q-btn--round {
+        min-width: 40px;
+        min-height: 40px;
+    }
+    .q-btn--outline {
+        background: var(--tgs-surface) !important;
+        border-color: var(--tgs-line-strong) !important;
+    }
+    .q-btn--outline:hover { background: var(--tgs-surface-soft) !important; }
+    .q-btn:active { transform: none; }
+    /* 分段控件：浅底轨道 + 等分内嵌选中块，和移动端同一形态、更矮一档 */
+    .q-btn-toggle {
+        gap: 2px;
+        padding: 3px;
+        background: var(--tgs-surface-soft);
+        border: 1px solid var(--tgs-line);
+        border-radius: var(--tgs-radius-sm) !important;
+        box-shadow: none !important;
+    }
+    .q-btn-toggle > .q-btn {
+        min-width: 0 !important;
+        min-height: 34px !important;
+        padding: 0 0.5rem !important;
+        border-radius: calc(var(--tgs-radius-sm) - 2px) !important;
+        background: transparent !important;
+        color: var(--tgs-text-2) !important;
+    }
+    .q-btn-toggle > .q-btn:before { border: 0 !important; }
+    .q-btn-toggle > .q-btn.bg-primary {
+        background: var(--tgs-brand) !important;
+        color: #ffffff !important;
+    }
+    /* ---- 表单 ---- */
+    .q-field--outlined .q-field__control {
+        min-height: 40px;
+        border-radius: var(--tgs-radius-sm);
+    }
+    .q-field--standard .q-field__control { min-height: 40px; }
+    .q-field__label { font-size: 0.75rem; }
+    .q-field__bottom { font-size: 0.75rem; color: var(--tgs-text-3); }
+    .q-field__native,
+    .q-field__input { font-size: 0.875rem; }
+    .q-toggle__label,
+    .q-checkbox__label,
+    .q-radio__label { font-size: 0.875rem; }
+    /* ---- 表格：表头浅底 40、正文 48，数字列等宽对齐由页面 td 的 font-mono 保持 ---- */
+    .q-table th {
+        height: 40px;
+        padding: 0 0.75rem;
+        background: var(--tgs-surface-soft);
+        border-bottom: 1px solid var(--tgs-line) !important;
+        color: var(--tgs-text-3);
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+    }
+    .q-table th:first-child,
+    .q-table td:first-child { padding-left: 1rem; }
+    .q-table th:last-child,
+    .q-table td:last-child { padding-right: 1rem; }
+    .q-table td {
+        height: auto;
+        min-height: 48px;
+        padding: 0.5rem 0.75rem;
+        border-bottom: 1px solid var(--tgs-line);
+        font-size: 0.875rem;
+        /* 账号/频道等长文本换行显示，不再被列宽截断 */
+        white-space: normal;
+        overflow-wrap: anywhere;
+        vertical-align: middle;
+    }
+    .q-table td:nth-child(2) {
+        /* 第二列通常是短标签（任务类型/频道类型），不参与换行，避免被拆成三行 */
+        white-space: nowrap;
+    }
+    .q-table tbody tr { transition: background-color 0.12s ease; }
+    .q-table tbody tr:hover { background: var(--tgs-surface-soft); }
+    .q-table__bottom {
+        padding: 0.5rem 1rem;
+        border-top: 1px solid var(--tgs-line);
+        color: var(--tgs-text-3);
+        font-size: 0.75rem;
+    }
+    /* ---- 弹窗：560px 起宽，标题/分区/正文拉开层级，右上关闭按钮对齐 ---- */
+    .q-dialog__backdrop { background: rgba(15, 23, 42, 0.38) !important; }
+    .q-dialog__inner { padding: 1.5rem !important; }
+    .q-dialog__inner > .q-card {
+        /* 只兜底最小宽度：各弹窗自带的 max-w-lg/xl/2xl/3xl/4xl 仍决定上限，
+           小弹窗（420/520/560）不会缩成一条，配置管理这类宽弹窗保持原宽 */
+        min-width: 560px;
+        max-height: 86vh;
+        padding: 1.5rem !important;
+        gap: 1rem !important;
+        border-radius: var(--tgs-radius-lg) !important;
+        box-shadow: 0 24px 48px rgba(16, 24, 40, 0.18) !important;
+        overflow-y: auto;
+    }
+    .q-dialog .text-lg { font-size: 1.125rem !important; font-weight: 650; }
+    /* 弹窗内的分区标题比弹窗标题小一档（统一带 mt-2） */
+    .q-dialog .text-lg.mt-2 {
+        margin-top: 0.5rem !important;
+        font-size: 0.9375rem !important;
+        color: var(--tgs-text);
+    }
+    .dialog-close-fab {
+        top: 12px !important;
+        right: 12px !important;
+        min-width: 36px !important;
+        min-height: 36px !important;
+        /* 桌面弹窗关闭键不用移动端那块灰底，hover 时才出现底色，减少视觉噪声 */
+        background: transparent !important;
+        color: var(--tgs-text-3) !important;
+    }
+    .dialog-close-fab:hover { background: var(--tgs-surface-soft) !important; }
+    /* 桌面长弹窗（设置/新增）底栏吸底：滚动时主操作始终可见。
+       bottom/-margin 各下移 1.5rem，让底栏一直盖到卡片下沿，
+       否则滚动内容会从卡片底部内边距那一条缝里露出来。 */
+    .tgs-dialog-footer {
+        position: sticky;
+        bottom: -1.5rem;
+        z-index: 2;
+        width: calc(100% + 3rem);
+        margin: 0 -1.5rem -1.5rem;
+        padding: 0.75rem 1.5rem;
+        background: var(--tgs-surface);
+        border-top: 1px solid var(--tgs-line);
+    }
+    /* 全屏日志弹窗在桌面保持 84vh，不铺满整屏 */
+    .q-dialog .q-card.tgs-log-fullscreen {
+        width: min(960px, 92vw) !important;
+        max-width: 92vw !important;
+        height: 84vh !important;
+        max-height: 84vh !important;
+        padding: 1rem !important;
+    }
+    /* ---- 菜单 ---- */
+    .q-menu {
+        min-width: 200px;
+        border-radius: var(--tgs-radius-md);
+        box-shadow: var(--tgs-shadow-2);
+        overflow: hidden;
+    }
+    .q-menu .q-item {
+        min-height: 44px;
+        padding: 0 1rem;
+    }
+    .q-menu .q-item__label { font-size: 0.875rem; }
+    /* ---- 空态 / 提示条 / 日志 ---- */
+    .tgs-empty {
+        display: flex !important;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        min-height: 96px;
+        padding: 1.5rem 1rem;
+        border: 1px dashed var(--tgs-line-strong);
+        border-radius: var(--tgs-radius-md);
+        background: var(--tgs-surface-soft);
+        color: var(--tgs-text-3) !important;
+        font-size: 0.875rem !important;
+        text-align: center;
+    }
+    .tgs-log-area,
+    .tgs-log-pre {
+        border-color: var(--tgs-line);
+        border-radius: var(--tgs-radius-md);
+        background: var(--tgs-surface-soft);
+    }
+    .q-spinner { color: var(--tgs-brand); }
+    .q-separator { background: var(--tgs-line) !important; }
+    /* 提示条：主控台把 bottom 列表移到页头下方，桌面页头 56px 后再留 12px */
+    .q-notifications__list--bottom { top: 88px !important; }
+    .q-notification {
+        border-radius: var(--tgs-radius-sm) !important;
+        box-shadow: var(--tgs-shadow-2) !important;
+        font-size: 0.8125rem !important;
+    }
+    /* ---- 独立页面：消息中心 / 组合进度 ---- */
+    .tgs-page-head {
+        padding-bottom: 0.5rem;
+        border-bottom: 1px solid var(--tgs-line);
+        margin-bottom: 0.25rem;
+    }
+    .tgs-page-head > .text-xl { font-size: 1.375rem !important; }
+    /* 消息中心/日志筛选在桌面加宽到 256px，避免 192px 小框孤零零贴在左侧 */
+    .nicegui-content .w-48 { width: 16rem !important; }
+    /* 登录/鉴权页：整体居中并在首屏偏上位置，卡片加大内边距 */
+    .tgs-auth-title,
+    .tgs-auth-sub {
+        width: 100%;
+        text-align: center;
+    }
+    .tgs-auth-title {
+        margin-top: 8vh;
+        font-size: 1.75rem !important;
+        letter-spacing: -0.02em;
+    }
+    .tgs-auth-card {
+        padding: 1.75rem !important;
+        gap: 0.75rem !important;
+        box-shadow: 0 16px 40px rgba(16, 24, 40, 0.1) !important;
+    }
+    .tgs-msg-row {
+        padding: 0.75rem 1rem !important;
+        background: var(--tgs-surface);
+        border: 1px solid var(--tgs-line);
+        border-radius: var(--tgs-radius-md);
+        box-shadow: var(--tgs-shadow-1);
+        transition: background-color 0.12s ease;
+    }
+    .tgs-msg-row:hover { background: var(--tgs-surface-soft); }
+    .tgs-msg-row.bg-blue-50 {
+        background: #f2f7ff !important;
+        border-color: #d6e4fb;
+    }
+    .nicegui-content .tgs-msg-section {
+        display: flex !important;
+        align-items: center;
+        gap: 0.5rem;
+        margin-top: 0.5rem;
+        font-size: 0.75rem !important;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: var(--tgs-text-3) !important;
+    }
+    .tgs-msg-section::after {
+        content: "";
+        flex: 1 1 auto;
+        height: 1px;
+        background: var(--tgs-line);
+    }
+    /* 进度页参数行：标签定宽、数值左对齐到同一栅格 */
+    .tgs-prog-param-label {
+        flex: 0 0 96px;
+        color: var(--tgs-text-3);
+        font-size: 0.8125rem;
+    }
+    .tgs-prog-param-value { font-size: 0.875rem; color: var(--tgs-text); }
+    .tgs-prog-head-row { padding-bottom: 0.5rem; border-bottom: 1px solid var(--tgs-line); }
+    @media (prefers-reduced-motion: reduce) {
+        * {
+            transition: none !important;
+            animation-duration: 0.01ms !important;
+        }
+    }
+}
+/* 签到「实时输出」为空时的占位提示：纯 CSS 伪元素，不新增 DOM 节点 */
+.sign-log-area .nicegui-column:empty::before {
+    content: "暂无输出，开始任务后会显示实时日志";
+    display: block;
+    padding: 0.25rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+        "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    color: #5b6675;
+}
+/* 空日志时收紧日志区高度并让占位垂直居中，避免一整块空白 */
+.sign-log-area:not(.tgs-log-fullscreen):has(.nicegui-column:empty) {
+    height: 96px !important;
+    max-height: 96px !important;
+}
+.sign-log-area .nicegui-column:empty {
+    height: 100%;
+    justify-content: center;
+}
 </style>
 """
+
+MOBILE_DESIGN_CSS = _compact(MOBILE_DESIGN_CSS)

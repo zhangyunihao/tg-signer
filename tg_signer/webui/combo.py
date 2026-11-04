@@ -2796,7 +2796,7 @@ def _build_progress_page(record_id: str) -> None:
     if record is None:
         with content:
             ui.label("未找到该组合任务记录（可能已被清理）").classes(
-                "text-sm text-gray-500 tgs-empty"
+                "text-sm text-gray-500 tgs-empty tgs-empty-page"
             )
         return
 

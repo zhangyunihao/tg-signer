@@ -650,7 +650,9 @@ def _build_center_page() -> None:
                 ui.label("暂无消息").classes("text-sm text-gray-400 tgs-empty")
                 return
             if unread_shown:
-                ui.label(f"未读 {unread_total}").classes("text-sm text-gray-400 px-1")
+                ui.label(f"未读 {unread_total}").classes(
+                    "text-sm text-gray-400 px-1 tgs-msg-section"
+                )
                 for m in unread_shown:
                     render_row(m, True)
                 hidden = unread_total - len(unread_shown)
@@ -660,7 +662,7 @@ def _build_center_page() -> None:
                     )
             if read_shown:
                 ui.label(f"已读 {read_total}").classes(
-                    "text-sm text-gray-400 px-1 pt-2"
+                    "text-sm text-gray-400 px-1 pt-2 tgs-msg-section"
                 )
                 for m in read_shown:
                     render_row(m, False)

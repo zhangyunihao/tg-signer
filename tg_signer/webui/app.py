@@ -1071,13 +1071,13 @@ async def _probe_telegram_connectivity(slot: ui.element) -> None:
 def _auth_gate(container, auth_code: str, on_success: Callable[[], None]) -> None:
     with container:
         ui.label("TG Signer Web 控制台").classes(
-            "text-2xl font-semibold tracking-wide mb-2"
+            "text-2xl font-semibold tracking-wide mb-2 tgs-auth-title"
         )
         ui.label("已启用访问控制，请输入 Auth Code 继续使用 Web 控制台。").classes(
-            "text-gray-600"
+            "text-gray-600 tgs-auth-sub"
         )
         with ui.column().classes("w-full items-center"):
-            with ui.card().classes("w-full max-w-xl shadow-md"):
+            with ui.card().classes("w-full max-w-xl shadow-md tgs-auth-card"):
                 ui.label("Auth Code 验证").classes("text-lg font-semibold")
                 ui.label("检测到auth_code环境变量已配置，首次访问需验证。").classes(
                     "text-sm text-gray-500"
