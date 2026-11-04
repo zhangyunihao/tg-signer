@@ -20,6 +20,11 @@ spec 可带可选的 ``start_at``（``YYYY-MM-DD HH:MM:SS``）：进程先等待
 时间，再探测 TG 网络；不通则按 ``network_retry_seconds``（默认 1800 秒）
 间隔重试，最多 ``network_max_retries`` 次（默认 3 次），仍不通则退出码 3
 （视为本次组合任务失败）。
+
+运行中若连续 ``NETWORK_FAIL_THRESHOLD``（默认 2）个子任务因网络异常以
+退出码 4 失败，同样视为整轮网络故障：先按 ``network_retry_seconds``
+（缺省 300 秒、最多 ``network_max_retries`` 次、缺省 3 次）等待网络恢复；
+仍不通则剩余子任务标记为跳过（补打开始/结束行、退出码 4）并整体退出码 3。
 """
 
 import json
@@ -29,11 +34,20 @@ import sys
 import time
 from datetime import datetime
 
+from tg_signer import NET_UNFINISHED_EXIT_CODE
+
 # 开始时间到达后若 TG 网络不通：默认每 30 分钟重试一次，最多重试 3 次；
 # 可通过 spec 的 network_retry_seconds / network_max_retries 覆盖
 NETWORK_RETRY_INTERVAL = 30 * 60
 NETWORK_MAX_RETRIES = 3
 NETWORK_PROBE_TIMEOUT = 8.0
+# 运行中：连续该次数的子任务因网络失败（退出码 4）即视为整轮网络故障，
+# 先探测/等待网络恢复再继续，避免断网期间把剩余子任务全部跑空
+NETWORK_FAIL_THRESHOLD = 2
+# 运行中网络不通时的退避间隔与最大重试次数（区别于开跑前的 30 分钟重试）；
+# 同样可被 spec 的 network_retry_seconds / network_max_retries 覆盖
+NETWORK_BACKOFF_INTERVAL = 5 * 60
+NETWORK_BACKOFF_MAX_RETRIES = 3
 # 等待开始时间期间输出剩余时间的间隔（秒）
 _WAIT_LOG_INTERVAL = 600
 
@@ -53,16 +67,23 @@ def _parse_start_at(value) -> datetime | None:
     return None
 
 
-def _parse_retry_settings(spec: dict) -> tuple[int, int]:
-    """读取网络重试间隔（秒）与次数；缺失或非法时用默认值，负值归零。"""
+def _parse_retry_settings(
+    spec: dict,
+    default_interval: int = NETWORK_RETRY_INTERVAL,
+    default_retries: int = NETWORK_MAX_RETRIES,
+) -> tuple[int, int]:
+    """读取网络重试间隔（秒）与次数；缺失或非法时用默认值，负值归零。
+
+    默认值可传入（运行中网络退避用更短的间隔），spec 显式配置始终优先。
+    """
     try:
         interval = int(spec.get("network_retry_seconds"))
     except (TypeError, ValueError):
-        interval = NETWORK_RETRY_INTERVAL
+        interval = default_interval
     try:
         retries = int(spec.get("network_max_retries"))
     except (TypeError, ValueError):
-        retries = NETWORK_MAX_RETRIES
+        retries = default_retries
     return max(1, interval), max(0, retries)
 
 
@@ -154,6 +175,22 @@ def _run_with_timeout(cmd: list[str], timeout: int | None) -> int:
         return 124
 
 
+def _sub_label(sub: dict) -> str:
+    """子任务展示标签：优先 label，退回拼接后的 args。"""
+    return str(sub.get("label") or " ".join(sub.get("args") or []))
+
+
+def _print_skipped_subs(subs: list[dict], start_index: int, total: int) -> None:
+    """为未执行的子任务补打「开始/结束」标记行，保证 WebUI 明细不残留「进行中」。"""
+    for j in range(start_index, total + 1):
+        print(f">>> 子任务开始 [{j}/{total}]: {_sub_label(subs[j - 1])}", flush=True)
+        print("    网络不可用，跳过该子任务", flush=True)
+        print(
+            f">>> 子任务结束 [{j}/{total}] 退出码 {NET_UNFINISHED_EXIT_CODE}",
+            flush=True,
+        )
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("缺少组合任务参数", flush=True)
@@ -176,8 +213,27 @@ def main() -> None:
     subs = spec.get("subs") or []
     total = len(subs)
     codes: list[int] = []
+    net_fail_streak = 0
     for i, sub in enumerate(subs, 1):
-        label = str(sub.get("label") or " ".join(sub.get("args") or []))
+        # 连续网络失败子任务达到阈值：视为整轮网络故障，先探测/等待网络恢复；
+        # 仍不通则中止剩余子任务（补打开始/结束标记行后按网络失败退出）
+        if net_fail_streak >= NETWORK_FAIL_THRESHOLD:
+            interval, retries = _parse_retry_settings(
+                spec, NETWORK_BACKOFF_INTERVAL, NETWORK_BACKOFF_MAX_RETRIES
+            )
+            print(
+                f">>> 连续 {net_fail_streak} 个子任务因网络失败，等待网络恢复"
+                f"（{_fmt_interval(interval)}，最多 {retries} 次探测）",
+                flush=True,
+            )
+            if not _wait_for_network(interval, retries):
+                print(
+                    f">>> 网络仍不可用，跳过剩余 {total - i + 1} 个子任务", flush=True
+                )
+                _print_skipped_subs(subs, i, total)
+                raise SystemExit(3)
+            net_fail_streak = 0
+        label = _sub_label(sub)
         print(f">>> 子任务开始 [{i}/{total}]: {label}", flush=True)
         if sub.get("module"):
             cmd = [
@@ -201,6 +257,8 @@ def main() -> None:
             print(f"    子任务超时限制：{timeout} 秒", flush=True)
         code = _run_with_timeout(cmd, timeout)
         codes.append(code)
+        # 网络失败子任务（退出码 4）连击计数：达到阈值即触发整轮网络退避
+        net_fail_streak = net_fail_streak + 1 if code == NET_UNFINISHED_EXIT_CODE else 0
         if code == 124:
             print(f">>> 子任务超时 [{i}/{total}] 已达 {timeout} 秒强制退出", flush=True)
         # 多账号错峰延迟只对首个子任务生效，避免后续串行子任务重复等待

@@ -26,13 +26,14 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from tg_signer import NET_UNFINISHED_EXIT_CODE
 from tg_signer.giveaway_core import GiveawayEngine
 from tg_signer.giveaway_state import GiveawayState
 from tg_signer.logger import make_task_logger
 
-# 网络异常导致本轮扫描未完成时的退出码：组合任务按「退出码非 0 即失败」
-# 展示进度，若不区分，网络超时导致的空扫描会被当成成功子任务
-NET_UNFINISHED_EXIT_CODE = 4
+# 网络异常导致本轮扫描未完成时的退出码（来自 tg_signer 包根）：组合任务按
+# 「退出码非 0 即失败」展示进度，若不区分，网络超时导致的空扫描会被当成成功子任务；
+# 退频道子任务与组合任务的网络退避共用同一语义
 
 
 def engine_kwargs_from_spec(spec: dict) -> Dict[str, Any]:

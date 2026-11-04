@@ -592,7 +592,7 @@ def _build_center_page() -> None:
                     "shrink-0"
                 )
                 ui.label(m["text"]).classes(
-                    "text-sm flex-1 min-w-0 "
+                    "tgs-msg-text text-sm flex-1 min-w-0 "
                     + ("text-gray-900" if unread else "text-gray-500")
                 )
                 if m.get("retry"):

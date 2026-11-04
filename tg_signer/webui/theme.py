@@ -499,6 +499,20 @@ MOBILE_DESIGN_CSS = """
         background: #eef5ff !important;
         border-color: #cfe1fa;
     }
+    /* 消息行改为两行布局：窄屏下圆点、类型标签、操作按钮与正文挤在同一行，
+       正文只剩不足卡片 1/3 宽度被压成竖排窄列。第一行放圆点/标签/操作按钮
+       （标签用 auto 右边距把按钮推到行尾），正文挪到第二行整行展示。 */
+    .tgs-msg-row { flex-wrap: wrap; align-items: center; row-gap: 0.375rem; }
+    .tgs-msg-row > .q-badge { margin-right: auto; }
+    .tgs-msg-row .tgs-msg-text {
+        order: 9;
+        flex: 1 0 100%;
+        min-width: 0;
+        font-size: var(--tgs-fs-body);
+        line-height: 1.6;
+        /* 长用户名/链接/无空格串允许任意位置断行，不产生横向滚动 */
+        overflow-wrap: anywhere;
+    }
     /* 长列表滚动更顺滑，滚动条收窄 */
     .q-dialog .q-card,
     .tgs-log-area,

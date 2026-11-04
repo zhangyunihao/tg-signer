@@ -54,6 +54,19 @@ logger = logging.getLogger(__name__)
 # 单次网络调用超时（秒）：手机代理不稳定场景，超时明确失败而非永久挂起
 _NET_CALL_TIMEOUT = 90
 
+
+class ScanNetworkError(RuntimeError):
+    """扫描阶段的网络类失败（批量退频道据此按失败结束，触发组合任务网络退避）。"""
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    """是否网络类失败（超时/连接断开/代理僵死），与抽奖引擎判定口径一致。"""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+        return True
+    msg = str(exc)
+    return "网络异常" in msg or ("网络请求" in msg and "超时" in msg)
+
+
 CONFIG_NAME = "auto_leave_config.json"
 LEAVE_TASKS_FILE = "webui_leave_tasks.json"
 
@@ -422,6 +435,7 @@ async def scan_stale_chats(
     log: Callable[[str], None] = None,
     skip_keywords: List[str] | None = None,
     workdir=None,
+    raise_on_net_error: bool = False,
 ) -> List[Dict]:
     """扫描单个账号，返回超过 days 天不更新的对话列表（只读，不做任何退出）
 
@@ -429,6 +443,8 @@ async def scan_stale_chats(
     days: 不更新天数阈值（支持小数，如 0.5），0 表示不按天数过滤（扫描全部符合条件的对话）
     skip_keywords: 页面级跳过关键字，标题命中即直接跳过（不进入结果）
     workdir: 状态库目录（限流同步到账户页展示），不传则不记录
+    raise_on_net_error: 扫描因网络异常中断时抛 ScanNetworkError（组合任务用，
+        避免把网络失败的空扫描当成「没有需要退出的对话」成功结束）
     """
     scan_types = str(scan_types or "both")
     want_channel = scan_types in ("channel", "both")
@@ -437,6 +453,7 @@ async def scan_stale_chats(
     skip_keywords = [str(kw).strip() for kw in (skip_keywords or []) if str(kw).strip()]
     found: List[Dict] = []
     client = None
+    net_error: BaseException | None = None
     try:
         client = get_client(account, workdir=str(session_dir))
         ok = await asyncio.wait_for(client.connect(), 30)
@@ -492,7 +509,8 @@ async def scan_stale_chats(
             f"超过 {_fmt_days(days)} 天未更新" if days > 0 else "全部（未按天数过滤）"
         )
         log(f"[{account}] 扫描完成，共 {scanned} 个对话，{len(found)} 个{stale_desc}")
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as exc:
+        net_error = exc
         log(f"[{account}] 连接超时（30s），跳过")
     except FloodWait as exc:
         wait = min(int(getattr(exc, "value", 0) or 60), 120)
@@ -501,10 +519,16 @@ async def scan_stale_chats(
         )
         log(f"[{account}] 扫描触发限流（{wait}s）: {exc}")
     except Exception as exc:
+        if _is_network_error(exc):
+            net_error = exc
         log(f"[{account}] 扫描失败: {exc}")
     finally:
         if client is not None:
             await safe_disconnect(client)
+    if raise_on_net_error and net_error is not None:
+        raise ScanNetworkError(
+            f"网络异常导致扫描未完成（账号：{account}）: {net_error}"
+        ) from net_error
     return found
 
 

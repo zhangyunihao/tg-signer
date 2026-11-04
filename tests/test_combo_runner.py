@@ -281,3 +281,98 @@ def test_combo_runner_module_sub(monkeypatch):
     cmd = calls[0]
     assert cmd[1:3] == ["-m", "tg_signer.giveaway_runner"]
     assert json.loads(cmd[3])["account"] == "a"
+
+
+def _net_fail_spec(count: int) -> str:
+    subs = [{"label": f"抽奖 · {i}", "args": [f"sub{i}"]} for i in range(1, count + 1)]
+    return json.dumps({"subs": subs}, ensure_ascii=False)
+
+
+def test_combo_runner_single_network_fail_does_not_backoff(monkeypatch):
+    """单次网络失败（退出码 4）不触发网络等待，后续子任务照常执行。"""
+    codes = iter([4, 0])
+    runs, waits = [], []
+    monkeypatch.setattr(
+        combo_runner,
+        "_run_with_timeout",
+        lambda cmd, timeout=None: runs.append(cmd[-1]) or next(codes),
+    )
+    monkeypatch.setattr(
+        combo_runner,
+        "_wait_for_network",
+        lambda interval, retries: waits.append((interval, retries)) or True,
+    )
+    monkeypatch.setattr(combo_runner.sys, "argv", ["combo_runner", _net_fail_spec(2)])
+    with pytest.raises(SystemExit) as exc:
+        combo_runner.main()
+    # 任一子任务非 0 整体失败，但网络等待不应被触发
+    assert exc.value.code == 1
+    assert runs == ["sub1", "sub2"]
+    assert waits == []
+
+
+def test_combo_runner_consecutive_network_fails_waits_then_continues(monkeypatch):
+    """连续 2 个网络失败子任务后先等网络恢复，恢复后继续执行剩余子任务。"""
+    codes = iter([4, 4, 0])
+    runs, waits = [], []
+    monkeypatch.setattr(
+        combo_runner,
+        "_run_with_timeout",
+        lambda cmd, timeout=None: runs.append(cmd[-1]) or next(codes),
+    )
+    monkeypatch.setattr(
+        combo_runner,
+        "_wait_for_network",
+        lambda interval, retries: waits.append((interval, retries)) or True,
+    )
+    monkeypatch.setattr(combo_runner.sys, "argv", ["combo_runner", _net_fail_spec(3)])
+    with pytest.raises(SystemExit) as exc:
+        combo_runner.main()
+    assert exc.value.code == 1
+    assert runs == ["sub1", "sub2", "sub3"]
+    # 运行中退避用更短的默认间隔，而不是开跑前的 30 分钟
+    assert waits == [
+        (
+            combo_runner.NETWORK_BACKOFF_INTERVAL,
+            combo_runner.NETWORK_BACKOFF_MAX_RETRIES,
+        )
+    ]
+
+
+def test_combo_runner_network_gives_up_skips_remaining(monkeypatch, capsys):
+    """网络持续不通时中止：剩余子任务补打开始/结束标记行并整体退出码 3。"""
+    runs, waits = [], []
+    monkeypatch.setattr(
+        combo_runner,
+        "_run_with_timeout",
+        lambda cmd, timeout=None: runs.append(cmd[-1]) or 4,
+    )
+    monkeypatch.setattr(
+        combo_runner,
+        "_wait_for_network",
+        lambda interval, retries: waits.append((interval, retries)) or False,
+    )
+    monkeypatch.setattr(combo_runner.sys, "argv", ["combo_runner", _net_fail_spec(4)])
+    with pytest.raises(SystemExit) as exc:
+        combo_runner.main()
+    assert exc.value.code == 3
+    # 前两个子任务真跑过，达到阈值后不再启动新进程
+    assert runs == ["sub1", "sub2"]
+    assert len(waits) == 1
+    out = capsys.readouterr().out
+    # 未执行的子任务补打标记行，WebUI 明细不会残留「进行中」
+    for i in (3, 4):
+        assert f">>> 子任务开始 [{i}/4]: 抽奖 · {i}" in out
+        assert f">>> 子任务结束 [{i}/4] 退出码 4" in out
+    assert "网络不可用，跳过该子任务" in out
+
+
+def test_net_unfinished_exit_code_is_shared():
+    """组合/抽奖/退频道子任务共用同一个「网络未完成」退出码定义。"""
+    from tg_signer import NET_UNFINISHED_EXIT_CODE as shared
+    from tg_signer import leave_runner
+    from tg_signer.giveaway_runner import NET_UNFINISHED_EXIT_CODE as gcode
+
+    assert combo_runner.NET_UNFINISHED_EXIT_CODE == shared
+    assert leave_runner.NET_UNFINISHED_EXIT_CODE == shared
+    assert gcode == shared

@@ -32,9 +32,11 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
+from tg_signer import NET_UNFINISHED_EXIT_CODE
 from tg_signer.core import get_client, safe_disconnect
 from tg_signer.logger import make_task_logger
 from tg_signer.webui.auto_leave import (
+    ScanNetworkError,
     _scan_types_of,
     _to_days,
     leave_one,
@@ -68,16 +70,24 @@ async def run_leave(spec: dict) -> int:
     session_dir = Path(str(spec.get("session_dir") or "."))
     # 状态库目录：限流同步到 WebUI 账户页展示（旧 spec 无此字段时不记录）
     workdir = str(spec["workdir"]) if spec.get("workdir") else None
-    rows = await scan_stale_chats(
-        account,
-        session_dir,
-        days,
-        _scan_types_of(spec),
-        bool(spec.get("skip_pinned", True)),
-        log,
-        skip_keywords=load_skip_keywords(session_dir),
-        workdir=workdir,
-    )
+    try:
+        rows = await scan_stale_chats(
+            account,
+            session_dir,
+            days,
+            _scan_types_of(spec),
+            bool(spec.get("skip_pinned", True)),
+            log,
+            skip_keywords=load_skip_keywords(session_dir),
+            workdir=workdir,
+            raise_on_net_error=True,
+        )
+    except ScanNetworkError as exc:
+        # 网络异常导致扫描未完成：不能当成「没有需要退出的对话」成功结束，
+        # 按网络失败退出码返回，组合任务据此触发整轮网络退避
+        log(f"[{account}] {exc}")
+        log(f"[{account}] 网络异常导致扫描未完成，子任务按失败结束")
+        return NET_UNFINISHED_EXIT_CODE
     inc_kws = [str(k) for k in (spec.get("include_keywords") or []) if k]
     if inc_kws:
         before = len(rows)
