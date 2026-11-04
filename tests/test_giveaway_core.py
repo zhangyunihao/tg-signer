@@ -1931,6 +1931,74 @@ def test_click_confirm_resends_duplicate_same_param_start(tmp_path, monkeypatch)
     assert not any("跳过重复 start" in line for line in logs)
 
 
+class _EntryCardThenCallbackClient(_CallbackClient):
+    """入口卡片只带 URL 按钮；重发 start 后 bot 才发带 callback 的报名卡片。"""
+
+    def __init__(self, bot_users=None):
+        super().__init__(bot_users)
+        self.callback_card = None
+
+    async def start_bot(self, username, param):
+        self.started.append((username, param))
+        if self.callback_card is not None:
+            self.history.insert(0, self.callback_card)
+        return None
+
+    async def request_callback_answer(self, chat_id, message_id, callback_data):
+        await super().request_callback_answer(chat_id, message_id, callback_data)
+        # 报名成功后 bot 会再发一条成功消息，核对时最新一条即报名凭据
+        self.history.insert(
+            0,
+            _msg(
+                id=message_id + 1,
+                text="您已成功报名抽奖（未达标α） 您还需完成激活任务才能抽奖！",
+            ),
+        )
+
+
+def test_click_confirm_clicks_callback_card_after_entry_url_restart(
+    tmp_path, monkeypatch
+):
+    """入口卡片只有 URL 按钮时，重发 start 后必须补点新卡片里的
+    「立刻参加抽奖」callback。
+
+    @lotterybestbot 的真实失败链路：点「👉 点击参与抽奖」只是重发 start，
+    bot 又回一张同样的入口卡片；真正的报名按钮在随后带 callback 的卡片里。
+    旧流程重发 start 后直接核对，读到入口卡片就判失败，永远点不到报名按钮。
+    """
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = _EntryCardThenCallbackClient(bot_users={"LotteryBestBot"})
+    entry = _msg(
+        id=1,
+        text="🎰 榜一大哥JH赞助出击红包🧧 📮 参与条件： 🌏️ 归属地 上海,江苏,浙江",
+        buttons=[
+            [_btn("👉 点击参与抽奖", url="https://t.me/LotteryBestBot?start=jh1")]
+        ],
+    )
+    client.callback_card = _msg(
+        id=2,
+        text="🎰 榜一大哥JH赞助出击红包🧧 点击下方按钮立刻报名",
+        buttons=[[_btn("立刻参加抽奖", callback_data="join:jh1")]],
+    )
+    completed, reason = asyncio.run(
+        engine._click_confirm("acc", client, "LotteryBestBot", entry, "jh1")
+    )
+    assert (completed, reason) == (True, "")
+    assert client.started == [("LotteryBestBot", "jh1")]
+    assert client.callback_clicks == [("LotteryBestBot", 2, "join:jh1")]
+    assert any("立刻参加抽奖" in line for line in logs)
+
+
 def test_click_confirm_join_paused_reports_incomplete(tmp_path, monkeypatch):
     """账号加入被 FLOOD_WAIT 暂停期间，bot 要求加入频道才能参与：
 
@@ -2558,7 +2626,8 @@ def test_ended_reply_breaks_bot_after_three_strikes(tmp_path, monkeypatch):
 
 def test_click_confirm_poll_ended_checks_newest_only(tmp_path, monkeypatch):
     """confirm_wait 轮询期间仅核对最新一条消息：会话中历史遗留的旧
-    「已结束」回复不误杀本次参与；最新回复命中「已结束」时终止并计数。"""
+    「已结束」回复不误杀本次参与；最新回复命中「已结束」时终止跟进，
+    按 ended 原因返回（熔断计数由上层 _handle_start_ended 统一完成）。"""
     import asyncio
 
     import tg_signer.giveaway_core as gc
@@ -2591,19 +2660,19 @@ def test_click_confirm_poll_ended_checks_newest_only(tmp_path, monkeypatch):
     assert not any("回复抽奖已结束" in line for line in logs)
     assert engine._ended_counts == {}
 
-    # 最新回复即「已结束」：终止跟进并累计熔断计数
+    # 最新回复即「已结束」：终止跟进，按 ended 原因返回（不能记已参与）
     client2 = _CallbackClient(bot_users={"Lottery8Bot"})
     client2.history = [stale_ended]
     logs2: list = []
     engine.log = logs2.append
-    asyncio.run(
+    completed, reason = asyncio.run(
         engine._click_confirm(
             "acc", client2, "Lottery8Bot", _msg(text="/start", id=3), "r1"
         )
     )
+    assert (completed, reason) == (False, gc.CONFIRM_REASON_ENDED)
     assert client2.callback_clicks == []
     assert any("回复抽奖已结束" in line for line in logs2)
-    assert engine._ended_counts == {"acc|lottery8bot": 1}
 
 
 def test_engine_join_invite_request_sent_is_pending_not_joined(tmp_path):

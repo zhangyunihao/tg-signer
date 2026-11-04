@@ -142,6 +142,52 @@ def test_handle_start_reply_ended_popup_records_ended_note(tmp_path, monkeypatch
     assert events and all(e["ok"] is False for e in events)
 
 
+def test_handle_start_reply_poll_ended_not_recorded_as_participated(
+    tmp_path, monkeypatch
+):
+    """轮询期间 bot 最新回复「已结束」：按终态处理（note=ended、归还名额），
+    不能记 [已参与]（此前 _click_confirm 返回 True，被上层记成假成功）。"""
+    state = GiveawayState(tmp_path)
+    engine = GiveawayEngine(state=state)
+    engine.confirm_wait = 1
+    logs: list[str] = []
+    engine.log = logs.append
+    events: list[dict] = []
+    engine.on_event = events.append
+
+    async def fake_sleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", fake_sleep)
+
+    class _EndedClient:
+        async def get_chat_history(self, username, limit):
+            yield _Msg("该抽奖活动已结束")
+
+    engine.joined = 1  # 参与前已预留的名额
+    asyncio.run(
+        engine._handle_start_reply(
+            "u1",
+            _EndedClient(),
+            "Lottery8Bot",
+            "P1",
+            "频道A",
+            "标题",
+            True,
+            _Msg("请点击按钮参与抽奖"),
+            None,
+        )
+    )
+
+    record = state.record("u1", "Lottery8Bot", "P1")
+    assert record is not None and record["note"] == "ended"
+    assert engine.joined == 0
+    assert engine._ended_counts == {"u1|lottery8bot": 1}
+    assert not any("[已参与]" in line for line in logs)
+    assert any("[已结束]" in line for line in logs)
+    assert events and all(e["ok"] is False for e in events)
+
+
 def test_source_btn_popup_participate_failed_not_recorded():
     """「您的发言数:0 反馈数:0 参与失败」弹窗：不记成功，计失败并归还名额。"""
     engine = _engine()

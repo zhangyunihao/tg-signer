@@ -4690,18 +4690,20 @@ class GiveawayEngine:
         返回（是否完成，未完成原因）：completed=False 表示 bot 要求加入频道
         但本次未生效（加入被暂停、点击超时、点击后仍要求先加入等），原因
         字符串用于把上层 [未参与] 日志与真实故障对齐；completed=True 时
-        原因为空（含已结束终态）。
+        原因为空。bot 回复/弹窗报「已结束」属终态，返回
+        (False, CONFIRM_REASON_ENDED) 交给上层按已结束处理——此前这里返回
+        True，会被 _handle_start_reply 记成 [已参与]（假成功）。
         """
         ended, candidates = self._initial_confirm_candidates(
             account, username, start_msg, source_message
         )
         if ended:
-            return True, ""
+            return False, CONFIRM_REASON_ENDED
         if self.confirm_wait > 0:
             if await self._poll_confirm_candidates(
                 account, client, username, candidates
             ):
-                return True, ""
+                return False, CONFIRM_REASON_ENDED
         # 「防脚本验证」（如 @dbchoujiang123_bot）：按正文顺序点击 emoji 按钮
         # 完成人机校验，再刷新候选，让后续加入/确认流程看到验证后的消息
         await self._refresh_candidates_after_verification(
@@ -4779,7 +4781,8 @@ class GiveawayEngine:
             # bot 直接回复「已结束」（活动提前结束）＝终态，立即返回，
             # 不轮询、不加入、不重发 start
             if reply_says_ended(start_msg):
-                self._note_ended(account, username)
+                # 熔断计数统一在 _handle_start_ended 里做，这里只负责识别终态，
+                # 避免同一事件被计两次（3 次熔断会因此提前到 2 次触发）
                 self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
                 return True, candidates
         # 原始抽奖帖参与条件中的频道（如「加入：xx 频道」）与 bot 回复一并进行提取，
@@ -4808,10 +4811,15 @@ class GiveawayEngine:
             # 仅核对最新一条（get_chat_history 按新到旧返回）：
             # 会话里历史遗留的旧「已结束」回复不应误杀本次参与
             if fresh and reply_says_ended(fresh[0]):
-                self._note_ended(account, username)
+                # 同上：终态计数由 _handle_start_ended 统一处理
                 self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
                 return True
-            if any(self._find_confirm_button(m) is not None for m in candidates):
+            # 只有出现 callback 报名按钮才提前结束轮询：入口卡片的 URL
+            # 按钮只等于「再发一次 start」，bot 常在 /start 后先回入口卡片、
+            # 稍后才发带「立刻参加抽奖」callback 的卡片（@lotterybestbot
+            # 即如此）。看到 URL 按钮就 break 会让后续流程一直点入口，
+            # 真正的报名按钮永远进不了候选（日志表现：反复「仍是入口卡片」）
+            if any(self._find_callback_confirm_button(m) for m in candidates):
                 break
             # 防脚本验证/算术验证消息没有确认按钮：提前结束轮询交给验证处理
             if any(is_emoji_verify_message(m) for m in candidates) or any(
@@ -5056,22 +5064,92 @@ class GiveawayEngine:
         candidates: List[Any],
         param: str = "",
     ) -> Tuple[bool, str]:
-        """找到并处理第一个确认按钮；返回（参与是否真正完成，未完成原因）。"""
+        """找到并处理确认按钮；返回（参与是否真正完成，未完成原因）。
+
+        优先在所有候选消息里找 callback 报名按钮（「立刻参加抽奖」），
+        全部候选都没有 callback 时才退回 URL 入口按钮（「👉 点击参与抽奖」）。
+        按候选顺序遇到第一个按钮就点，会先点入口卡片的 URL 按钮 → bot 又回
+        一张同样的入口卡片，真正的报名按钮永远点不到（@lotterybestbot 的
+        真实失败链路：20:09:23 点入口 → 20:09:29 仍是入口卡片）。
+        """
         if self._flood_paused(account, username):
             return True, ""  # 该 bot 已被限流，暂停期内不再发起任何 start/点击
         if self._click_failed_paused(account, username):
             # 按钮刚点击失败（超时/网络异常），冷却期内不重复点击
             return False, "确认按钮点击失败后的冷却期内，跳过本次点击"
+        url_fallback: Optional[Tuple[Any, Any]] = None
         for message in candidates:
             btn = self._find_confirm_button(message)
             if btn is None:
                 continue
-            stop, completed, reason = await self._try_confirm_button(
-                account, client, username, message, btn, candidates, param
+            if getattr(btn, "callback_data", None):
+                stop, completed, reason = await self._try_confirm_button(
+                    account, client, username, message, btn, candidates, param
+                )
+                if stop:
+                    return completed, reason
+                continue
+            if url_fallback is None:
+                url_fallback = (message, btn)
+        if url_fallback is not None:
+            _, completed, reason = await self._try_confirm_button(
+                account,
+                client,
+                username,
+                url_fallback[0],
+                url_fallback[1],
+                candidates,
+                param,
             )
-            if stop:
-                return completed, reason
+            return completed, reason
         return True, ""
+
+    async def _click_callback_after_restart(
+        self,
+        account: str,
+        client: Any,
+        username: str,
+        candidates: List[Any],
+        param: str = "",
+    ) -> Optional[Tuple[bool, bool, str]]:
+        """重发 start 后，从 bot 新回复里找 callback 报名按钮并点击一次。
+
+        @lotterybestbot 这类 bot 的入口卡片只有「👉 点击参与抽奖」URL 按钮，
+        真正的报名按钮「立刻参加抽奖」在随后的新卡片里。旧流程重发 start 后
+        直接核对，读到入口卡片就判「仍是参与入口卡片」，永远点不到报名按钮。
+        返回 None 表示新回复里没有 callback 按钮，交给通用核对兜底。
+        """
+        checked_ids = {getattr(m, "id", None) for m in candidates if m is not None}
+        # 等待轮数按 confirm_wait 换算，但最多 3 轮（≤4.5 秒）：
+        # 真正的报名卡片紧跟 start 回复，等太久只会拖慢整轮扫描
+        rounds = min(3, max(1, int(round(self.confirm_wait / 1.5))))
+        for _ in range(rounds):
+            await asyncio.sleep(1.5)
+            fresh: List[Any] = []
+            try:
+                async for recent in client.get_chat_history(username, limit=4):
+                    fresh.append(recent)
+                    await self._check_win_message(account, client, username, recent)
+            except Exception:
+                logger.debug("重发 start 后拉取 bot 回复失败", exc_info=True)
+                continue
+            candidates.extend(fresh)
+            if fresh and reply_says_ended(fresh[0]):
+                self.log(f"[{account}] @{username} 回复抽奖已结束，跳过后续跟进")
+                return True, False, CONFIRM_REASON_ENDED
+            for message in sorted(
+                fresh, key=lambda m: getattr(m, "id", 0) or 0, reverse=True
+            ):
+                if getattr(message, "id", None) in checked_ids:
+                    continue
+                checked_ids.add(getattr(message, "id", None))
+                btn = self._find_callback_confirm_button(message)
+                if btn is None:
+                    continue
+                return await self._try_confirm_button(
+                    account, client, username, message, btn, candidates, param
+                )
+        return None
 
     async def _try_confirm_button(
         self,
@@ -5135,6 +5213,11 @@ class GiveawayEngine:
                 self.log(
                     f"已点击 @{username} 的参与按钮「{btn.text}」（按链接参数重新参与）"
                 )
+                follow = await self._click_callback_after_restart(
+                    account, client, username, candidates, param
+                )
+                if follow is not None:
+                    return follow
                 completed = await self._verify_after_click(
                     account, client, username, candidates, param=param
                 )
@@ -5150,6 +5233,11 @@ class GiveawayEngine:
             if plain_same_bot:
                 await self._start_bot(client, account, username, "")
                 self.log(f"已点击 @{username} 的参与按钮「{btn.text}」（重发 start）")
+                follow = await self._click_callback_after_restart(
+                    account, client, username, candidates, param
+                )
+                if follow is not None:
+                    return follow
                 completed = await self._verify_after_click(
                     account, client, username, candidates, param=param
                 )
@@ -5527,3 +5615,10 @@ class GiveawayEngine:
             if getattr(btn, "callback_data", None):
                 return btn
         return matched[0] if matched else None
+
+    def _find_callback_confirm_button(self, message: Any) -> Optional[Any]:
+        """只返回 callback 型确认按钮；URL 入口按钮不算真正的报名动作。"""
+        btn = self._find_confirm_button(message)
+        if btn is not None and getattr(btn, "callback_data", None):
+            return btn
+        return None
