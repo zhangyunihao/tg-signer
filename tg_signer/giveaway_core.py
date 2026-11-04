@@ -113,6 +113,15 @@ ENTRY_CARD_FAIL_LIMIT = 3
 ENTRY_CARD_COOLDOWN = 1800
 
 
+# 入口卡片 bot 级熔断：同一（账号, bot）对多个**不同抽奖**都只回入口卡片
+# （如 @jdcj555_bot 每条抽奖都回同一张卡片），说明该 bot 的报名入口整体
+# 不可用或需要未暴露的前置条件；逐条抽奖重试只会白烧点击、放大风控。
+# 按不同 start 参数计数（同一抽奖重复失败只算一次），达到上限后本轮跳过
+# 该 bot；任一抽奖参与成功即清零。
+ENTRY_CARD_BOT_FAIL_LIMIT = 3
+ENTRY_CARD_BOT_COOLDOWN = 1800
+
+
 # 审批制私有群提交加入申请后、审批通过前的重试冷却（秒）：期间不重复
 # 提交加入申请，也不把「申请已提交」当作已加入去发 start/点按钮
 JOIN_PENDING_RETRY = 1800
@@ -792,6 +801,10 @@ class GiveawayEngine:
         # 不同抽奖互不影响
         self._entry_card_fails: Dict[str, int] = {}
         self._entry_card_until: Dict[str, float] = {}
+        # 入口卡片 bot 级熔断：{account|bot_lower: 仅回入口卡片的不同抽奖参数}
+        # 与冷却恢复时刻
+        self._entry_card_bot_params: Dict[str, set] = {}
+        self._entry_card_bot_until: Dict[str, float] = {}
         # 「已结束」回复熔断：{account|bot_lower: 次数}；达到上限加入 _ended_bots
         self._ended_counts: Dict[str, int] = {}
         self._ended_bots: set = set()
@@ -1051,6 +1064,8 @@ class GiveawayEngine:
         self._click_failed_until.clear()
         self._entry_card_fails.clear()
         self._entry_card_until.clear()
+        self._entry_card_bot_params.clear()
+        self._entry_card_bot_until.clear()
         self._ended_counts.clear()
         self._ended_bots.clear()
         self._seen_msgs.clear()
@@ -2706,6 +2721,10 @@ class GiveawayEngine:
             # 该抽奖已连续多次停在入口卡片（参与条件疑似永久不满足），
             # 冷却期内不再发 start，避免每轮白烧一次点击
             return False
+        if self._entry_card_bot_paused(account, username):
+            # 该 bot 多个不同抽奖都只回入口卡片（报名入口整体不可用），
+            # 冷却期内跳过该 bot 的所有抽奖
+            return False
         if self._flood_key(account, username) in self._ended_bots:
             return False  # 已结束回复熔断的 bot，静默跳过
         return True
@@ -2801,6 +2820,19 @@ class GiveawayEngine:
         """
         msg = str(exc).upper()
         return "CHANNEL_PRIVATE" in msg or "CHANNEL_INVALID" in msg
+
+    @staticmethod
+    def _is_guard_bot_join_error(exc: Exception) -> bool:
+        """加入是否被「守卫机器人网页确认」拦截（kurigram 层不匹配 bug）。
+
+        kurigram 2.2.26 的 ChatJoinResult._parse 仍读 result.webview，而生成
+        类型 ChatInviteJoinResultWebView 的字段是 bot_id/query_id/users，于是
+        抛 ``'ChatInviteJoinResultWebView' object has no attribute 'webview'``。
+        语义上该群/频道必须经守卫机器人 Web App 确认，纯 MTProto 无法自动
+        加入，重试也不会成功；单独识别可避免误报成普通「加入失败」。
+        """
+        text = str(exc)
+        return "ChatInviteJoinResultWebView" in text and "webview" in text
 
     @staticmethod
     def _is_network_timeout(exc: Exception) -> bool:
@@ -3102,12 +3134,57 @@ class GiveawayEngine:
                 "点击后仍为参与入口卡片（参与条件疑似永久不满足），"
                 f"冷却 {ENTRY_CARD_COOLDOWN // 60} 分钟内不再尝试该抽奖"
             )
+        self._note_entry_card_bot_fail(account, username, param)
+
+    def _entry_card_bot_key(self, account: str, username: str) -> str:
+        """入口卡片 bot 级熔断键：账号 + bot（不区分抽奖参数）。"""
+        return self._flood_key(account, username)
+
+    def _entry_card_bot_paused(self, account: str, username: str) -> bool:
+        """bot 级入口卡片熔断冷却是否生效（到期自动解除并清空计数）。"""
+        key = self._entry_card_bot_key(account, username)
+        until = self._entry_card_bot_until.get(key)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            self._entry_card_bot_until.pop(key, None)
+            self._entry_card_bot_params.pop(key, None)
+            return False
+        return True
+
+    def _note_entry_card_bot_fail(
+        self, account: str, username: str, param: str
+    ) -> None:
+        """记录该 bot 有一个不同抽奖只回入口卡片。
+
+        按**不同 start 参数**计数：同一抽奖反复失败只算一次（那由参数级
+        熔断负责）；多个不同抽奖都失败说明该 bot 整体不可用（如
+        @jdcj555_bot 对每条抽奖都回同一张入口卡片），达到上限后本轮
+        跳过该 bot，避免逐条白烧点击。
+        """
+        key = self._entry_card_bot_key(account, username)
+        if key in self._entry_card_bot_until:
+            return  # 已在冷却中
+        params = self._entry_card_bot_params.setdefault(key, set())
+        params.add(param)
+        fails = len(params)
+        if fails >= ENTRY_CARD_BOT_FAIL_LIMIT:
+            self._entry_card_bot_until[key] = time.monotonic() + ENTRY_CARD_BOT_COOLDOWN
+            self.log(
+                f"[{account}] @{username} 已有 {fails} 个不同抽奖点击后仍只回"
+                "参与入口卡片（该 bot 报名入口疑似整体不可用），"
+                f"本轮跳过该 bot（冷却 {ENTRY_CARD_BOT_COOLDOWN // 60} 分钟）"
+            )
 
     def _reset_entry_card_fails(self, account: str, username: str, param: str) -> None:
         """参与成功后清零入口卡片失败计数与冷却（重复参与重新计算）。"""
         key = self._entry_card_key(account, username, param)
         self._entry_card_fails.pop(key, None)
         self._entry_card_until.pop(key, None)
+        # 任一抽奖真正参与成功即证明该 bot 报名入口可用，清掉 bot 级计数
+        bot_key = self._entry_card_bot_key(account, username)
+        self._entry_card_bot_params.pop(bot_key, None)
+        self._entry_card_bot_until.pop(bot_key, None)
 
     def _log_transport_flood_429(self, account: str) -> None:
         """记录每次 429 的账号与时刻，并区分「单账号过密」和「多账号同时被风控」。
@@ -3364,6 +3441,10 @@ class GiveawayEngine:
         if self._entry_card_paused(account, username, param):
             # 该抽奖已连续多次停在入口卡片（参与条件疑似永久不满足），
             # 冷却期内不再发 start，避免每轮白烧一次 start
+            return False
+        if self._entry_card_bot_paused(account, username):
+            # 该 bot 多个不同抽奖都只回入口卡片（报名入口整体不可用），
+            # 冷却期内跳过该 bot 的所有抽奖
             return False
         return True
 
@@ -3860,6 +3941,15 @@ class GiveawayEngine:
                     "本轮跳过该目标，稍后重试"
                 )
                 return False, True
+            elif self._is_guard_bot_join_error(exc):
+                # 需守卫机器人网页确认才能加入：本工具无法完成该流程，
+                # 本任务内直接跳过，免得每轮都记一条误导性的「加入失败」
+                self._mark_unreachable(account, target)
+                self.log(
+                    f"[{account}] {target} 需守卫机器人网页确认才能加入，"
+                    "无法自动加入，本任务内跳过"
+                )
+                return False, False
             elif self._is_unreachable_target_error(exc):
                 # 私密/已失效群组：加入永远失败，本任务内直接跳过
                 self._mark_unreachable(account, target)
@@ -5259,6 +5349,25 @@ class GiveawayEngine:
             if not text:
                 return True
             flat = " ".join(str(text).split())[:40]
+            if is_emoji_verify_message(msg) or is_math_verify_message(msg):
+                # bot 在点击后才要求人机校验（防脚本 emoji / 算术）：这不是
+                # 报名确认。先完成校验，再等 bot 给出明确的成功回复；没有
+                # 明确确认就不能记「已参与」——否则持久化后下一轮扫描永久
+                # 跳过，而实际只停在验证入口（真实日志出现过这种假成功）
+                self.log(f"@{username} 点击后要求人机校验，本次报名尚未确认：{flat}")
+                handled = await self._handle_math_verification(
+                    account, client, username, [msg], param
+                )
+                if not handled:
+                    handled = await self._handle_emoji_verification(
+                        account, client, username, [msg]
+                    )
+                if handled and await self._wait_signup_success(
+                    account, client, username
+                ):
+                    return True
+                self.log(f"@{username} 人机校验后仍未收到报名成功回复，稍后重试")
+                return False
             if "已参加" in text or reply_says_signup_success(msg):
                 # 「已参加…」或「已成功报名抽奖（未达标）/已获得抽奖资格」
                 # 均为参与成功（未达标仅剩发言数等激活任务，标记为完成）

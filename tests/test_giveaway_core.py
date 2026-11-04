@@ -6135,3 +6135,100 @@ def test_message_filter_skips_username_and_score_conditions(tmp_path):
     score_msg = _msg(text="🎰 测试抽奖\n🎯 参与（100 分）")
     assert engine._message_filtered_out("acc", score_msg, "抽奖帖", True, True) is True
     assert any("需消耗积分" in line for line in logs)
+
+
+def test_verify_after_click_emoji_verification_is_not_success(tmp_path, monkeypatch):
+    """点击后 bot 回「防脚本验证」→ 不是报名确认，不能记已参与。
+
+    真实日志：@dbchoujiang123_bot 点击后回复「🤖 防脚本验证 请按顺序点击…」，
+    旧逻辑落进兜底 return True，直接持久化「已参与」，下一轮永久跳过该抽奖，
+    而实际只停在验证入口。
+    """
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    client = FakeClient(bot_users={"dbchoujiang123_bot"})
+    client.history = [
+        _msg(text="🤖 防脚本验证 请按顺序点击：【🍉、🚀、🐷】 点错会冷却 30 秒。")
+    ]
+
+    completed = asyncio.run(
+        engine._verify_after_click("acc", client, "dbchoujiang123_bot", [])
+    )
+
+    assert completed is False
+    assert any("人机校验" in line for line in logs)
+    assert not any("参与成功" in line for line in logs)
+
+
+def test_join_guard_bot_webview_error_marks_target_unreachable(tmp_path):
+    """守卫机器人网页确认拦截（kurigram 层 bug）→ 记不可达并跳过，不再重试。"""
+    import asyncio
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    class GuardBotClient(FakeClient):
+        async def join_chat(self, target):
+            raise RuntimeError(
+                "'ChatInviteJoinResultWebView' object has no attribute 'webview'"
+            )
+
+    client = GuardBotClient()
+    joined, blocked = asyncio.run(
+        engine._join_single_target("acc", client, "GZFYJT", "@dbchoujiang123_bot")
+    )
+
+    assert (joined, blocked) == (False, False)
+    assert engine._target_unreachable("acc", "GZFYJT") is True
+    assert any("需守卫机器人网页确认" in line for line in logs)
+    assert not any("加入 GZFYJT 失败" in line for line in logs)
+
+
+def test_entry_card_bot_level_breaker_counts_distinct_params(tmp_path):
+    """同一 bot 多个不同抽奖都只回入口卡片 → bot 级熔断，跳过该 bot 全部抽奖。
+
+    真实日志：@jdcj555_bot 在小琳琳/乐乐/潼潼等多个抽奖上都只回入口卡片，
+    参数级熔断按抽奖分开计数永远不触发，逐条点击只会白烧请求。
+    """
+    import time
+
+    import tg_signer.giveaway_core as gc
+
+    engine, _state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+
+    # 同一抽奖反复失败只算一次，不触发 bot 级熔断
+    for _ in range(gc.ENTRY_CARD_BOT_FAIL_LIMIT + 1):
+        engine._note_entry_card_fail("acc", "jdcj555_bot", "p1")
+    assert engine._entry_card_bot_paused("acc", "jdcj555_bot") is False
+    assert engine._link_is_actionable("acc", "jdcj555_bot", "p2") is True
+
+    for param in ("p2", "p3"):
+        engine._note_entry_card_fail("acc", "jdcj555_bot", param)
+    assert engine._entry_card_bot_paused("acc", "jdcj555_bot") is True
+    assert engine._link_is_actionable("acc", "jdcj555_bot", "p4") is False
+    assert any("跳过该 bot" in line for line in logs)
+
+    # 冷却到期自动解除并清空计数
+    key = engine._entry_card_bot_key("acc", "jdcj555_bot")
+    engine._entry_card_bot_until[key] = time.monotonic() - 1
+    assert engine._entry_card_bot_paused("acc", "jdcj555_bot") is False
+
+    # 任一抽奖真正参与成功 → 清零 bot 级计数
+    engine._note_entry_card_fail("acc", "jdcj555_bot", "p1")
+    engine._record_participate_success(
+        "acc", "jdcj555_bot", "p1", "频道A", "标题", False
+    )
+    assert engine._entry_card_bot_params.get(key) is None
+    assert engine._entry_card_bot_paused("acc", "jdcj555_bot") is False
