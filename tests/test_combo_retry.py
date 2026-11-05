@@ -16,9 +16,11 @@ LABEL_B = "自动化 · B"
 def _clean_retry_jobs():
     with combo._retry_lock:
         combo._retry_jobs.clear()
+        combo._retry_logs.clear()
     yield
     with combo._retry_lock:
         combo._retry_jobs.clear()
+        combo._retry_logs.clear()
 
 
 def _detail(label, account, status, note=""):
@@ -91,6 +93,36 @@ def test_failure_reason_prefers_error_line():
     assert "TimeoutError" in combo.combo_failure_reason(lines)
     assert combo.combo_failure_reason(["最后一行"]) == "最后一行"
     assert combo.combo_failure_reason([]) == ""
+
+
+def test_retry_logs_are_kept_per_record_after_job_ends():
+    rid_a, rid_b = "rid-a", "rid-b"
+    combo._append_retry_log(rid_a, "[任务:alice] 重试开始")
+    combo._append_retry_log(rid_b, "[任务:bob] 重试开始")
+    combo._append_retry_log(rid_a, "[任务:alice] 重试完成")
+    # 任务结束后重试任务注册表被清空，日志仍可按记录读到
+    with combo._retry_lock:
+        combo._retry_jobs.clear()
+    assert combo.combo_retry_log_lines(rid_a) == [
+        "[任务:alice] 重试开始",
+        "[任务:alice] 重试完成",
+    ]
+    assert combo.combo_retry_log_lines(rid_b) == ["[任务:bob] 重试开始"]
+    assert combo.combo_retry_log_lines("missing") == []
+
+
+def test_retry_logs_truncate_and_evict_oldest_record():
+    rid = "rid-truncate"
+    for i in range(combo._RETRY_LOG_LINES + 10):
+        combo._append_retry_log(rid, f"line {i}")
+    lines = combo.combo_retry_log_lines(rid, limit=combo._RETRY_LOG_LINES)
+    assert len(lines) == combo._RETRY_LOG_LINES
+    assert lines[-1] == f"line {combo._RETRY_LOG_LINES + 9}"
+
+    for i in range(combo._RETRY_LOG_RECORDS):
+        combo._append_retry_log(f"rid-{i}", "x")
+    # 超出记录上限时淘汰最久未更新的记录
+    assert combo.combo_retry_log_lines(rid) == []
 
 
 def test_retry_state_registry_reports_queue_and_running():

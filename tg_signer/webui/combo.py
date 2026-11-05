@@ -202,8 +202,38 @@ class _SharedRunner:
 COMBO_RETRY_QUEUED = "排队中"
 COMBO_RETRY_RUNNING = "重试中…"
 _RETRY_NOTE_MAX = 180
+# 失败项重试的输出日志：任务结束后共享缓冲可能被清理或服务重启，
+# 单独按记录缓存一份，进度页在任务结束后仍能继续展示重试日志。
+_RETRY_LOG_LINES = 400
+_RETRY_LOG_RECORDS = 30
 _retry_lock = threading.RLock()
 _retry_jobs: dict[str, dict] = {}
+_retry_logs: dict[str, list[str]] = {}
+
+
+def _append_retry_log(record_id: str, line: str) -> None:
+    """追加一条重试日志（带任务名前缀，与共享缓冲中的格式一致）。"""
+    if not record_id:
+        return
+    with _retry_lock:
+        logs = _retry_logs.pop(record_id, None)
+        if logs is None:
+            while len(_retry_logs) >= _RETRY_LOG_RECORDS:
+                _retry_logs.pop(next(iter(_retry_logs)), None)
+            logs = []
+        # 重新插入，保证超出上限时淘汰的是最久未更新的记录
+        _retry_logs[record_id] = logs
+        logs.append(line)
+        if len(logs) > _RETRY_LOG_LINES:
+            del logs[: len(logs) - _RETRY_LOG_LINES]
+
+
+def combo_retry_log_lines(
+    record_id: str, limit: int = COMBO_PROGRESS_LOG_LINES
+) -> list[str]:
+    """该记录失败项重试产生的日志（最近的 limit 行）。"""
+    with _retry_lock:
+        return list(_retry_logs.get(record_id) or [])[-limit:]
 
 
 def _combo_run_active(record_id: str) -> bool:
@@ -462,7 +492,9 @@ def _run_account_retry(
     reasons: list[str] = []
     try:
         for line in proc.stdout:
-            TaskRunnerBlock._append_output_line(prefix + line.rstrip("\r\n"))
+            text = prefix + line.rstrip("\r\n")
+            TaskRunnerBlock._append_output_line(text)
+            _append_retry_log(record_id, text)
             stripped = line.lstrip()
             if stripped.startswith(">>> 子任务开始"):
                 # 标记行顺序与 spec_subs 一致，用下标映射避免标签格式差异
@@ -1060,6 +1092,9 @@ class ComboTaskBlock:
         self.runner = runner  # TaskRunnerBlock 实例：复用 _launch/_stop_run/账号发现
         self.workdir = workdir
         self._editing_name: str | None = None  # 非 None 表示正在编辑该组合
+        # 连点保护：保存/启动只处理第一次点击，弹窗重新打开时复位
+        self._combo_saving = False
+        self._new_task_starting = False
 
         ui.label("选择模板与账号执行；模板在右上角维护。").classes(
             "text-sm text-gray-500 tgs-tab-intro"
@@ -1193,6 +1228,8 @@ class ComboTaskBlock:
         view._live_ids = set()
         view._live_names = {}
         view._snap_sigs = {}
+        view._combo_saving = False
+        view._new_task_starting = False
         return view
 
     # ---- 数据 ----
@@ -2263,11 +2300,16 @@ class ComboTaskBlock:
                 ).props("outline dense")
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=self.combo_dialog.close).props("outline")
-                ui.button("保存", color="primary", on_click=self._save_combo)
+                self.combo_save_btn = ui.button(
+                    "保存", color="primary", on_click=self._save_combo
+                )
 
     def open_combo_dialog(self, combo: dict | None = None) -> None:
         """打开创建（combo=None）或编辑（传入已有组合）弹窗。"""
         self._editing_name = str(combo.get("name")) if combo else None
+        # 连点保护复位：每次打开弹窗都允许提交一次
+        self._combo_saving = False
+        self.combo_save_btn.enable()
         self.combo_title.text = (
             f"编辑组合任务: {self._editing_name}" if combo else "新增组合任务"
         )
@@ -2355,13 +2397,24 @@ class ComboTaskBlock:
             self._render_combo_sub_rows()
 
     def _save_combo(self) -> None:
+        """保存弹窗内容：连点两次只处理第一次。"""
+        if self._combo_saving:
+            return
+        self._combo_saving = True
+        self.combo_save_btn.disable()
+        if not self._save_combo_now():
+            self._combo_saving = False
+            self.combo_save_btn.enable()
+
+    def _save_combo_now(self) -> bool:
+        """真正保存；返回 True 表示已保存并关闭弹窗。"""
         name = (self.combo_name_input.value or "").strip()
         if not name:
             ui.notify("请填写组合名称", type="warning")
-            return
+            return False
         if not self._combo_subs:
             ui.notify("请至少添加一个子任务", type="warning")
-            return
+            return False
         subs = [{"type": it["type"], "task": it.get("task")} for it in self._combo_subs]
         missing = [i + 1 for i, s in enumerate(subs) if not s["task"]]
         if missing:
@@ -2369,7 +2422,7 @@ class ComboTaskBlock:
                 f"第 {', '.join(map(str, missing))} 个子任务尚未选择任务",
                 type="warning",
             )
-            return
+            return False
         items = self._load()
         updated = any(c.get("name") == name for c in items)
         items = [c for c in items if c.get("name") != name]
@@ -2388,6 +2441,7 @@ class ComboTaskBlock:
             f"（{len(subs)} 个子任务）",
             type="positive",
         )
+        return True
 
     # ---- 模板配置弹窗（右上角入口） ----
 
@@ -2488,7 +2542,9 @@ class ComboTaskBlock:
                 ).classes("flex-1")
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("取消", on_click=self.new_task_dialog.close).props("outline")
-                ui.button("启动", color="primary", on_click=self._start_new_task)
+                self.new_task_start_btn = ui.button(
+                    "启动", color="primary", on_click=self._start_new_task
+                )
 
     def _render_new_task_subs(self) -> None:
         """按当前所选模板重建子任务勾选列表（默认全部勾选）。"""
@@ -2546,21 +2602,35 @@ class ComboTaskBlock:
         self.new_task_start_time.set_value("")
         self.new_task_retry_interval.set_value(30)
         self.new_task_retry_times.set_value(3)
+        # 连点保护复位：每次打开弹窗都允许启动一次
+        self._new_task_starting = False
+        self.new_task_start_btn.enable()
         self.new_task_dialog.open()
         if template:
             ui.notify("已复制任务参数，可调整后点击「启动」", type="positive")
 
     def _start_new_task(self) -> None:
+        """启动组合任务：连点两次只启动一次，避免重复下发。"""
+        if self._new_task_starting:
+            return
+        self._new_task_starting = True
+        self.new_task_start_btn.disable()
+        if not self._start_new_task_now():
+            self._new_task_starting = False
+            self.new_task_start_btn.enable()
+
+    def _start_new_task_now(self) -> bool:
+        """真正启动；返回 True 表示已成功下发并关闭弹窗。"""
         name = self.new_task_template.value
         if not name:
             ui.notify("请选择组合任务模板", type="warning")
-            return
+            return False
         sub_indexes = None
         if self._new_task_checks:
             sub_indexes = [i for i, cb in self._new_task_checks.items() if cb.value]
             if not sub_indexes:
                 ui.notify("请至少勾选一个子任务", type="warning")
-                return
+                return False
         # 开始时间（可选）：HH:MM；已过则顺延到明天，避免误以为会立即执行
         raw_time = str(self.new_task_start_time.value or "").strip()
         start_at = None
@@ -2572,7 +2642,7 @@ class ComboTaskBlock:
                 )
             except ValueError:
                 ui.notify("开始时间格式无效，请按 HH:MM 输入", type="warning")
-                return
+                return False
             if target <= datetime.now():
                 target += timedelta(days=1)
             start_at = f"{target:%Y-%m-%d %H:%M:%S}"
@@ -2581,10 +2651,10 @@ class ComboTaskBlock:
             retry_times = int(self.new_task_retry_times.value)
         except (TypeError, ValueError):
             ui.notify("重试间隔和次数需为整数", type="warning")
-            return
+            return False
         if retry_minutes < 1 or retry_times < 0:
             ui.notify("重试间隔需不小于 1 分钟，重试次数不能为负", type="warning")
-            return
+            return False
         accounts = [a for a in (self.new_task_accounts.value or []) if a]
         if self.runner._launch(
             "组合任务",
@@ -2597,6 +2667,8 @@ class ComboTaskBlock:
         ):
             self.new_task_dialog.close()
             self._render_history()
+            return True
+        return False
 
     # ---- 进度独立页面：展示运行中/已结束任务的内容 ----
 
@@ -2857,19 +2929,32 @@ def _build_progress_page(record_id: str) -> None:
     log_exit = exit_fullscreen_button(lambda: fullscreen.toggle())
     fullscreen = LogFullscreen(log_box, log_exit)
 
+    def snapshot_log_lines() -> list[str]:
+        """已结束任务的快照日志；只读一次快照文件，重试日志另行拼接。"""
+        cached = log_state.get("snap_logs")
+        if cached is None:
+            snap = load_combo_progress(view.workdir).get(record_id) or {}
+            cached = [str(x) for x in (snap.get("logs") or [])][
+                -COMBO_PROGRESS_LOG_LINES:
+            ]
+            log_state["snap_logs"] = cached
+        return cached
+
     def update_log() -> None:
-        """就地更新日志文本；内容未变时不触发 DOM 更新。"""
+        """就地更新日志文本；内容未变时不触发 DOM 更新。
+
+        运行中直接读共享输出缓冲（失败项重试的行也写在其中）；任务结束后
+        缓冲会随其他任务增长被淘汰，改用快照日志 + 本记录的重试日志缓存，
+        否则点了「重试」后日志区会一直停留在结束时的快照内容。
+        """
         run = view.runner.runs.get(record_id)
         if run is not None:
             name = str((run.get("record") or {}).get("task_name") or "")
             lines = view._combo_log_lines(name)
-        elif log_state["body"] is None:
-            snap = load_combo_progress(view.workdir).get(record_id) or {}
-            lines = [str(x) for x in (snap.get("logs") or [])]
-            lines = lines[-COMBO_PROGRESS_LOG_LINES:]
         else:
-            # 已结束任务的快照日志不再变化，无需每 2 秒重读快照文件
-            return
+            lines = (snapshot_log_lines() + combo_retry_log_lines(record_id))[
+                -COMBO_PROGRESS_LOG_LINES:
+            ]
         body = "\n".join(escape(line) for line in lines)
         log_state["lines"] = lines
         if body == log_state["body"]:

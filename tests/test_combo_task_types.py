@@ -823,6 +823,116 @@ def test_combo_giveaway_events_reach_message_center(tmp_path):
     assert not events.exists()  # 事件文件读取完即清理
 
 
+def test_combo_start_ignores_double_click(tmp_path, monkeypatch):
+    """「启动」连点两次只下发一次任务，弹窗重开后才允许再次启动。"""
+    from tg_signer.webui import combo as combo_mod
+
+    view = combo_mod.ComboTaskBlock.headless(tmp_path)
+    notices: list[str] = []
+    monkeypatch.setattr(combo_mod.ui, "notify", lambda m, **k: notices.append(str(m)))
+
+    class _Btn:
+        disabled = False
+
+        def disable(self):
+            self.disabled = True
+
+        def enable(self):
+            self.disabled = False
+
+    class _Val:
+        def __init__(self, value):
+            self.value = value
+
+    launched: list[str] = []
+    view.new_task_start_btn = _Btn()
+    view.new_task_dialog = type("D", (), {"close": lambda s: None})()
+    view.new_task_template = _Val("tpl")
+    view._new_task_checks = {}
+    view.new_task_start_time = _Val("")
+    view.new_task_accounts = _Val([])
+    view.new_task_retry_interval = _Val(30)
+    view.new_task_retry_times = _Val(3)
+    view._render_history = lambda: None
+    view.runner = type(
+        "R",
+        (),
+        {"_launch": staticmethod(lambda *a, **k: launched.append(a[1]) or True)},
+    )()
+
+    view._start_new_task()
+    view._start_new_task()  # 第二次点击：弹窗尚未重新打开
+
+    assert launched == ["tpl"]
+    assert view.new_task_start_btn.disabled is True
+
+    # 弹窗重新打开后复位，允许再次启动
+    view.new_task_dialog = type("D", (), {"close": lambda s: None})()
+    view.new_task_start_btn.enable()
+    view._new_task_starting = False
+    view._start_new_task()
+    assert launched == ["tpl", "tpl"]
+
+
+def test_combo_start_reenables_on_validation_failure(tmp_path, monkeypatch):
+    """校验未通过（如未选模板）时恢复按钮，不能把入口锁死。"""
+    from tg_signer.webui import combo as combo_mod
+
+    view = combo_mod.ComboTaskBlock.headless(tmp_path)
+    monkeypatch.setattr(combo_mod.ui, "notify", lambda m, **k: None)
+
+    class _Btn:
+        disabled = False
+
+        def disable(self):
+            self.disabled = True
+
+        def enable(self):
+            self.disabled = False
+
+    view.new_task_start_btn = _Btn()
+    view.new_task_template = type("V", (), {"value": ""})()
+
+    view._start_new_task()
+
+    assert view._new_task_starting is False
+    assert view.new_task_start_btn.disabled is False
+
+
+def test_combo_save_ignores_double_click(tmp_path, monkeypatch):
+    """「保存」连点两次只写入一次模板，避免重复提示。"""
+    from tg_signer.webui import combo as combo_mod
+
+    view = combo_mod.ComboTaskBlock.headless(tmp_path)
+    notices: list[str] = []
+    monkeypatch.setattr(combo_mod.ui, "notify", lambda m, **k: notices.append(str(m)))
+
+    class _Btn:
+        disabled = False
+
+        def disable(self):
+            self.disabled = True
+
+        def enable(self):
+            self.disabled = False
+
+    saves: list[list[dict]] = []
+    view.combo_save_btn = _Btn()
+    view.combo_dialog = type("D", (), {"close": lambda s: None})()
+    view.combo_name_input = type("V", (), {"value": " 测试组合 "})()
+    view._combo_subs = [{"type": "抽奖", "task": "t1"}]
+    view._render_template_list = lambda: None
+    view._save = saves.append
+
+    view._save_combo()
+    view._save_combo()  # 第二次点击：弹窗已关闭、未重开
+
+    assert len(saves) == 1
+    assert saves[0][0]["name"] == "测试组合"
+    assert len(notices) == 1
+    assert view.combo_save_btn.disabled is True
+
+
 def test_giveaway_sub_note_shows_type_chats_and_repeat(tmp_path):
     """启动弹窗勾选列表：抽奖子任务展示子类型、监控对象、是否允许重复参与。"""
     from tg_signer.webui.combo import _giveaway_sub_note
