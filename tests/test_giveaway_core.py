@@ -4854,6 +4854,74 @@ def test_check_win_message_ignores_non_win_and_disabled(tmp_path):
     assert client.forwarded == []
 
 
+def test_check_win_message_forward_falls_back_to_other_account(tmp_path):
+    """检测账号转发失败时换其他在线账号转发：成功则不记失败、不进重试队列。"""
+    import asyncio
+
+    class _FailingClient(FakeClient):
+        async def forward_messages(self, chat_id, from_chat_id, message_ids):
+            raise RuntimeError("[400 CHAT_WRITE_FORBIDDEN] I cannot send messages")
+
+    engine, _state = _engine(tmp_path)
+    events: list = []
+    logs: list = []
+    engine.on_event = events.append
+    engine.log = logs.append
+    bad = _FailingClient(bot_users={"LotteryBestBot"})
+    good = FakeClient(bot_users={"LotteryBestBot"})
+    engine._clients = {"acc": bad, "acc2": good}
+
+    asyncio.run(
+        engine._check_win_message(
+            "acc", bad, "LotteryBestBot", _msg(text=WIN_SAMPLE, id=21)
+        )
+    )
+    assert bad.forwarded == []
+    assert good.forwarded == [("me", -1001234567890, (21,))]
+    assert len(events) == 1
+    # 代转发成功 → 事件不带失败原因，也没有待重试登记
+    assert "fwd_failures" not in events[0]
+    assert engine._win_fwd_retries == []
+    assert any("代 acc 转发" in line for line in logs)
+
+
+def test_check_win_message_forward_failure_reported_and_retried(tmp_path):
+    """全部账号转发失败：原因写进 win 事件 + 登记重试；下一轮回扫重试一次。"""
+    import asyncio
+
+    class _FailingClient(FakeClient):
+        async def forward_messages(self, chat_id, from_chat_id, message_ids):
+            raise RuntimeError("[400 CHAT_WRITE_FORBIDDEN] bot was blocked")
+
+    engine, _state = _engine(tmp_path)
+    events: list = []
+    logs: list = []
+    engine.on_event = events.append
+    engine.log = logs.append
+    bad = _FailingClient(bot_users={"LotteryBestBot"})
+    engine._clients = {"acc": bad}
+
+    asyncio.run(
+        engine._check_win_message(
+            "acc", bad, "LotteryBestBot", _msg(text=WIN_SAMPLE, id=31)
+        )
+    )
+    assert bad.forwarded == []
+    assert len(events) == 1
+    assert any("CHAT_WRITE_FORBIDDEN" in x for x in events[0].get("fwd_failures", []))
+    assert len(engine._win_fwd_retries) == 1
+    assert engine._win_fwd_retries[0]["targets"] == ["me"]
+    assert any("转发到 收藏夹 失败" in line for line in logs)
+
+    # 下一轮回扫：换可用账号重试成功，队列清空
+    good = FakeClient(bot_users={"LotteryBestBot"})
+    engine._clients = {"acc2": good}
+    asyncio.run(engine._sweep_all_accounts())
+    assert good.forwarded == [("me", -1001234567890, (31,))]
+    assert engine._win_fwd_retries == []
+    assert any("重试成功" in line for line in logs)
+
+
 def test_sweep_bot_wins_scans_known_bots_only(tmp_path):
     """启动回扫：只扫状态里交互过的 bot；扫到中奖消息即转发+发事件。"""
     import asyncio

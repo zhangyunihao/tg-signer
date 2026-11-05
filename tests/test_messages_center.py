@@ -96,6 +96,58 @@ def test_win_prize_bolded_in_message_html(tmp_path):
     assert "<b>" not in msg["text"]
 
 
+def test_win_alert_shows_forward_failures(tmp_path):
+    """中奖提醒展示转发失败原因；旧提醒（无该字段）展示保持原样。"""
+    giveaway.save_win_alerts(
+        tmp_path,
+        [
+            {
+                "account": "8",
+                "bot": "LotteryBestBot",
+                "text": "恭喜您中奖了",
+                "time": "11-05 03:47:00",
+                "fwd_failures": ["-1004324986564：CHAT_WRITE_FORBIDDEN"],
+            },
+            {
+                "account": "alice",
+                "bot": "giveaway_bot",
+                "text": "恭喜您中奖了",
+                "time": "11-04 10:00:00",
+            },
+        ],
+    )
+
+    msgs = [m for m in collect_messages(tmp_path) if m["tag"] == "中奖"]
+    assert len(msgs) == 2
+    texts = [m["text"] for m in msgs]
+    assert any(
+        "转发失败：-1004324986564：CHAT_WRITE_FORBIDDEN" in text for text in texts
+    )
+    # 无 fwd_failures 字段的旧提醒不出现「转发失败」
+    assert any("转发失败" not in text for text in texts)
+
+
+def test_win_event_records_forward_failures(tmp_path):
+    """win 事件里的 fwd_failures 落盘到提醒并出现在格式化文案中。"""
+    giveaway._handle_win_event(
+        None,
+        tmp_path,
+        {
+            "type": "win",
+            "account": "8",
+            "bot": "LotteryBestBot",
+            "text": "恭喜您中奖了",
+            "fwd_failures": ["-1004324986564：CHAT_WRITE_FORBIDDEN"],
+        },
+    )
+    alerts = giveaway.load_win_alerts(tmp_path)
+    assert alerts[0]["fwd_failures"] == ["-1004324986564：CHAT_WRITE_FORBIDDEN"]
+    assert (
+        "转发失败：-1004324986564：CHAT_WRITE_FORBIDDEN"
+        in giveaway.format_win_alert(alerts[0])
+    )
+
+
 def test_message_html_escapes_untrusted_text(tmp_path):
     """正文来自 bot 消息/异常信息：HTML 必须先转义，不允许注入标签。"""
     giveaway.save_speech_alerts(

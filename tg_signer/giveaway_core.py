@@ -860,6 +860,9 @@ class GiveawayEngine:
         self.post_skip_keywords: Tuple[str, ...] = ()
         # 已处理的中奖消息：{account|bot|msg_id}，进程内去重（跨重启靠状态文件）
         self._win_handled: set = set()
+        # 中奖消息转发失败待重试的目标：[{account, bot, chat_id, mid, targets,
+        # client}]，下一轮回扫开始时重试一次（避免一次性抖动漏转发）
+        self._win_fwd_retries: List[dict] = []
         # 标记为「双向」的账户集合：发言数要求类抽奖自动跳过
         self.two_way_accounts: set = set()
         self.chats: List = []
@@ -1011,6 +1014,7 @@ class GiveawayEngine:
             str(k).strip() for k in (post_skip_keywords or ()) if str(k).strip()
         )
         self._win_handled.clear()
+        self._win_fwd_retries.clear()
         # 口令错峰排期按运行周期重置，避免上一轮残留的等待时刻拖慢本次启动
         self._password_gate_until.clear()
         # 双向账户集合：发言数要求类抽奖自动跳过
@@ -2161,16 +2165,32 @@ class GiveawayEngine:
         self.log(f"[{account}] 检测到中奖消息（@{bot_username}）：{summary}")
         # 转发原消息到各转发目标（默认收藏夹），单个失败不阻断其余目标与提醒
         chat_id = getattr(getattr(message, "chat", None), "id", None) or bot_username
+        failures: List[Dict[str, str]] = []
         if mid is not None:
-            await self._forward_win_message(account, client, chat_id, mid)
-        self._emit(
-            {
-                "type": "win",
-                "account": account,
-                "bot": bot_username,
-                "text": text[:300],
-            }
-        )
+            failures = await self._forward_win_message(account, client, chat_id, mid)
+        payload = {
+            "type": "win",
+            "account": account,
+            "bot": bot_username,
+            "text": text[:300],
+        }
+        if failures:
+            # 转发失败原因随事件带出，消息中心直接展示（而不是只写日志）
+            payload["fwd_failures"] = [
+                f"{f['name']}：{f['error']}"[:200] for f in failures[:5]
+            ]
+            # 失败目标登记待重试：下一轮回扫开始时重试一次，避免一次性抖动漏转发
+            self._win_fwd_retries.append(
+                {
+                    "account": account,
+                    "bot": bot_username,
+                    "chat_id": chat_id,
+                    "mid": mid,
+                    "targets": [f["target"] for f in failures],
+                    "client": client,
+                }
+            )
+        self._emit(payload)
 
     def _mark_win_handled(
         self, account: str, bot_username: str, mid: Optional[int], text: str
@@ -2198,26 +2218,91 @@ class GiveawayEngine:
         return True
 
     async def _forward_win_message(
-        self, account: str, client: Any, chat_id: Any, mid: int
-    ) -> None:
-        """转发中奖原消息到各转发目标（默认收藏夹），单个失败不阻断其余。"""
-        for target in self.win_forward_targets:
+        self,
+        account: str,
+        client: Any,
+        chat_id: Any,
+        mid: int,
+        targets: Optional[List[Any]] = None,
+    ) -> List[Dict[str, str]]:
+        """转发中奖原消息到各转发目标（默认收藏夹），单个失败不阻断其余。
+
+        单个目标失败时先换其他在线账号重试（见 _forward_win_to_target）；
+        返回仍失败的目标清单 [{"target", "name", "error"}]，由调用方写进
+        win 事件供消息中心展示，并登记到下一轮回扫重试一次。
+        """
+        failures: List[Dict[str, str]] = []
+        for target in self.win_forward_targets if targets is None else targets:
+            name = "收藏夹" if target == "me" else str(target)
+            error = await self._forward_win_to_target(
+                account, client, chat_id, mid, target, name
+            )
+            if error:
+                failures.append({"target": target, "name": name, "error": error})
+        return failures
+
+    async def _forward_win_to_target(
+        self,
+        account: str,
+        client: Any,
+        chat_id: Any,
+        mid: int,
+        target: Any,
+        name: str,
+    ) -> str:
+        """向单个目标转发中奖原消息：成功返回空串，否则返回失败原因。
+
+        检测账号失败时依次换其他在线账号转发（多账号任务里单账号无权限/
+        网络抖动不致漏通知），全部账号都失败才记为失败。
+        """
+        candidates: List[Tuple[str, Any]] = [(account, client)]
+        candidates.extend(
+            (acc, cl) for acc, cl in list(self._clients.items()) if cl is not client
+        )
+        last_error = ""
+        for acc, cl in candidates:
             try:
-                await client.forward_messages(
+                await cl.forward_messages(
                     chat_id=target,
                     from_chat_id=chat_id,
                     message_ids=[mid],
                 )
-                self.log(
-                    f"[{account}] 中奖消息已转发到 "
-                    f"{'收藏夹' if target == 'me' else target}"
-                )
             except Exception as exc:
-                self.log(
-                    f"[{account}] 中奖消息转发到 "
-                    f"{'收藏夹' if target == 'me' else target} 失败: {exc}"
-                )
+                last_error = str(exc) or type(exc).__name__
+                self.log(f"[{acc}] 中奖消息转发到 {name} 失败: {exc}")
                 logger.debug("中奖消息转发失败", exc_info=True)
+                continue
+            self.log(
+                f"[{acc}] 中奖消息已转发到 {name}"
+                + ("" if acc == account else f"（代 {account} 转发）")
+            )
+            return ""
+        return last_error or "无可用账号"
+
+    async def _retry_win_forward_failures(self) -> None:
+        """回扫开始时对上一轮转发失败的目标重试一次，避免一次性抖动漏通知。
+
+        每条中奖消息只重试一次：仍失败则保留消息中心已展示的失败原因，
+        不再无限重试。
+        """
+        pending, self._win_fwd_retries = self._win_fwd_retries, []
+        for item in pending:
+            client = self._clients.get(item["account"]) or item["client"]
+            failures = await self._forward_win_message(
+                item["account"],
+                client,
+                item["chat_id"],
+                item["mid"],
+                targets=item["targets"],
+            )
+            if not failures:
+                self.log(f"[{item['account']}] 中奖消息转发重试成功（@{item['bot']}）")
+            else:
+                detail = "；".join(f"{f['name']}：{f['error']}" for f in failures)
+                self.log(
+                    f"[{item['account']}] 中奖消息转发重试仍失败"
+                    f"（@{item['bot']}）：{detail}"[:500]
+                )
 
     def _win_sweep_bots(self, account: str) -> List[str]:
         """该账号本轮待回扫的 bot 列表（机器人任务只回扫目标 bot）。
@@ -2279,6 +2364,8 @@ class GiveawayEngine:
         """全部已连接账号并行回扫中奖消息，并单独维护该轮进度。"""
         if not self.win_detect or self._state is None:
             return
+        # 先把上一轮转发失败的目标重试一次（避免一次性抖动漏通知）
+        await self._retry_win_forward_failures()
         pairs = [
             (account, client, self._win_sweep_bots(account))
             for account, client in list(self._clients.items())

@@ -1729,7 +1729,8 @@ class TaskRunnerBlock:
             labels[token] = f"{name}({chat_id})" if name else chat_id
         return labels
 
-    def _format_progress(self, run: dict) -> str:
+    @staticmethod
+    def _format_progress(run: dict) -> str:
         """根据各账号进程的日志统计生成进度文本。"""
         total = run.get("total_chats") or 0
         started = failed = completed = 0
@@ -2189,18 +2190,44 @@ class TaskRunnerBlock:
             f"el => {{ el.textContent = '{safe_dur}'; }});"
         )
 
-    def _finalize_run(self, record_id: str) -> None:
-        run = self.runs.pop(record_id, None)
+    @classmethod
+    def finalize_finished_runs(cls, *, combo_only: bool = False) -> list[str]:
+        """收尾所有子进程已结束的运行，返回本次写入终态的记录 id。
+
+        与 tab / 页面可见性无关：任务在「组合任务」tab 或独立进度页结束时
+        也要能落终态，否则运行记录会一直停在「运行中」，进度页的失败项
+        重试（排队等待原运行结束）会永远等不到开始。
+        combo_only=True 供组合任务侧调用，只收尾组合任务记录。
+        """
+        done: list[str] = []
+        for run_id, run in list(cls.runs.items()):
+            if combo_only and "组合" not in str(
+                (run.get("record") or {}).get("task_type") or ""
+            ):
+                continue
+            procs = run.get("procs") or []
+            if not all(i["proc"].poll() is not None for i in procs):
+                continue
+            if any(i["reader"].is_alive() for i in procs):
+                continue
+            if cls._finalize_run_data(run_id):
+                done.append(run_id)
+        return done
+
+    @classmethod
+    def _finalize_run_data(cls, record_id: str) -> bool:
+        """数据层收尾：把终态写入任务历史；不刷新界面，供任意轮询侧调用。"""
+        run = cls.runs.pop(record_id, None)
         if run is None:
-            return  # 已被其他浏览器标签页的轮询收尾
+            return False  # 已被其他浏览器标签页的轮询收尾
         rcs = ", ".join(str(i["proc"].returncode) for i in run["procs"])
         ok = all(i["proc"].returncode == 0 for i in run["procs"])
         close_pending_details(run, "自动")
         record = run["record"]
         record["status"] = "已完成" if ok else "失败"
         record["details"] = list(run["details"])
-        record["duration"] = self._format_duration_ts(run["start_ts"])
-        progress = self._format_progress(run)
+        record["duration"] = cls._format_duration_ts(run["start_ts"])
+        progress = cls._format_progress(run)
         parts = []
         if progress:
             parts.append(progress)
@@ -2208,7 +2235,11 @@ class TaskRunnerBlock:
         parts.append(f"耗时 {record['duration']}")
         record["result"] = "，".join(parts)
         update_task_history(record)
-        self._refresh_history_table()
+        return True
+
+    def _finalize_run(self, record_id: str) -> None:
+        if self._finalize_run_data(record_id):
+            self._refresh_history_table()
 
     @staticmethod
     def _format_duration_ts(start_ts: float) -> str:
@@ -2309,11 +2340,18 @@ class TaskRunnerBlock:
             # 本轮从正常状态开始；若下方抛异常再由 except 递增失败计数
             failures = 0
             try:
-                if not self._poll_enabled:
-                    continue
                 # 先收集输出（与当前 tab / 页面可见性无关），保证组合任务在其他 tab
                 # 运行、页面切后台时进度页与进度快照仍有日志可读
                 TaskRunnerBlock.drain_output()
+                # 运行收尾同样与 tab / 可见性无关：任务在「组合任务」tab 或独立
+                # 进度页结束时也要落终态，否则记录永远停在「运行中」，进度页的
+                # 失败项重试队列（等原运行结束）会一直排队不开始
+                if TaskRunnerBlock.finalize_finished_runs():
+                    with self._poll_client:
+                        self._refresh_history_table()
+                        self._update_status()
+                if not self._poll_enabled:
+                    continue
                 # 页面不可见或已切到其他 tab 时跳过刷新，切回后自动恢复
                 if not should_poll(self._poll_client, "run"):
                     continue

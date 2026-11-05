@@ -617,6 +617,160 @@ def test_drain_output_collects_logs_without_dashboard_polling():
         TaskRunnerBlock._line_seq = saved_seq
 
 
+def _combo_run(record_id="rid", *, task_type="组合任务 · demo", alive=False):
+    """构造一个已结束（或仍在运行）的组合任务运行 dict，供收尾逻辑测试。"""
+
+    class _Proc:
+        returncode = None if alive else 1
+
+        def poll(self):
+            return None if alive else 1
+
+    class _Reader:
+        def is_alive(self):
+            return alive
+
+    return {
+        "record": {
+            "id": record_id,
+            "task_name": "demo",
+            "task_type": task_type,
+            "accounts": "alice",
+            "start_time": "11-05 10:00:00",
+        },
+        "start_ts": 1000.0,
+        "total_chats": 1,
+        "details": [{"chat": "抽奖 · 1", "account": "alice", "status": "失败"}],
+        "procs": [
+            {
+                "proc": _Proc(),
+                "reader": _Reader(),
+                "stats": {"started": 1, "failed": 1, "current_pos": None},
+            }
+        ],
+    }
+
+
+def test_finalize_finished_runs_writes_terminal_state(monkeypatch):
+    """运行收尾与 tab / 页面可见性解耦：不经过任何界面轮询也要把终态写入历史。
+
+    否则任务在「组合任务」tab 或独立进度页结束时会一直停在「运行中」，
+    进度页的失败项重试（排队等待原运行结束）永远等不到开始。
+    """
+    saved_runs = dict(TaskRunnerBlock.runs)
+    written: list[dict] = []
+    try:
+        TaskRunnerBlock.runs.clear()
+        TaskRunnerBlock.runs["rid"] = _combo_run()
+        monkeypatch.setattr(sign_mod, "update_task_history", written.append)
+
+        done = TaskRunnerBlock.finalize_finished_runs(combo_only=True)
+
+        assert done == ["rid"]
+        assert "rid" not in TaskRunnerBlock.runs
+        assert written and written[0]["id"] == "rid"
+        assert written[0]["status"] == "失败"  # 返回码 1 → 失败
+    finally:
+        TaskRunnerBlock.runs.clear()
+        TaskRunnerBlock.runs.update(saved_runs)
+
+
+def test_finalize_finished_runs_skips_live_run(monkeypatch):
+    """进程还在跑（或输出线程未结束）时不得提前收尾。"""
+    saved_runs = dict(TaskRunnerBlock.runs)
+    written: list[dict] = []
+    try:
+        TaskRunnerBlock.runs.clear()
+        TaskRunnerBlock.runs["rid"] = _combo_run(alive=True)
+        monkeypatch.setattr(sign_mod, "update_task_history", written.append)
+
+        assert TaskRunnerBlock.finalize_finished_runs() == []
+        assert "rid" in TaskRunnerBlock.runs
+        assert not written
+    finally:
+        TaskRunnerBlock.runs.clear()
+        TaskRunnerBlock.runs.update(saved_runs)
+
+
+def test_finalize_finished_runs_combo_only_skips_sign_run(monkeypatch):
+    """组合任务侧只收尾组合记录，避免签到任务的主控台表格行漏掉刷新。"""
+    saved_runs = dict(TaskRunnerBlock.runs)
+    written: list[dict] = []
+    try:
+        TaskRunnerBlock.runs.clear()
+        TaskRunnerBlock.runs["rid"] = _combo_run(task_type="签到 (run-once)")
+        monkeypatch.setattr(sign_mod, "update_task_history", written.append)
+
+        assert TaskRunnerBlock.finalize_finished_runs(combo_only=True) == []
+        assert "rid" in TaskRunnerBlock.runs
+        assert TaskRunnerBlock.finalize_finished_runs() == ["rid"]
+        assert "rid" not in TaskRunnerBlock.runs
+    finally:
+        TaskRunnerBlock.runs.clear()
+        TaskRunnerBlock.runs.update(saved_runs)
+
+
+def test_progress_page_sync_finalizes_finished_run(tmp_path, monkeypatch):
+    """独立进度页不依赖主控台轮询：_sync_progress_snapshots 里就要收尾，
+    否则进度页永远显示「运行中」，点重试只会一直排队不执行。"""
+    from tg_signer.webui.combo import ComboTaskBlock
+
+    saved_runs = dict(TaskRunnerBlock.runs)
+    written: list[dict] = []
+    try:
+        TaskRunnerBlock.runs.clear()
+        TaskRunnerBlock.runs["rid"] = _combo_run()
+        monkeypatch.setattr(sign_mod, "update_task_history", written.append)
+        view = ComboTaskBlock.headless(tmp_path)
+
+        view._sync_progress_snapshots()
+
+        assert "rid" not in TaskRunnerBlock.runs
+        assert written and written[0]["id"] == "rid"
+    finally:
+        TaskRunnerBlock.runs.clear()
+        TaskRunnerBlock.runs.update(saved_runs)
+
+
+def test_poll_forever_finalizes_when_on_other_tab(monkeypatch):
+    """主控台轮询在「非签到 tab」跳过界面刷新，但已结束的运行仍要收尾。"""
+    import asyncio
+
+    saved_runs = dict(TaskRunnerBlock.runs)
+    written: list[dict] = []
+    try:
+        TaskRunnerBlock.runs.clear()
+        TaskRunnerBlock.runs["rid"] = _combo_run()
+        panel = TaskRunnerBlock.__new__(TaskRunnerBlock)
+
+        class _Ctx:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        refreshed: list[str] = []
+        panel._poll_client = _Ctx()
+        panel._poll_enabled = True
+        panel._refresh_history_table = lambda: refreshed.append("table")
+        panel._update_status = lambda: refreshed.append("status")
+        monkeypatch.setattr(sign_mod, "update_task_history", written.append)
+        monkeypatch.setattr(sign_mod, "should_poll", lambda *a, **k: False)
+        monkeypatch.setattr(sign_mod, "poll_delay", lambda *a, **k: 0)
+        alive = iter([True, False])
+        monkeypatch.setattr(sign_mod, "is_client_alive", lambda c: next(alive))
+
+        asyncio.run(panel._poll_forever())
+
+        assert "rid" not in TaskRunnerBlock.runs
+        assert written and written[0]["id"] == "rid"
+        assert refreshed == ["table", "status"]
+    finally:
+        TaskRunnerBlock.runs.clear()
+        TaskRunnerBlock.runs.update(saved_runs)
+
+
 def test_combo_giveaway_events_reach_message_center(tmp_path):
     """组合任务抽奖子进程的 speech_required 事件要进入消息中心提醒。"""
 

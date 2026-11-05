@@ -179,6 +179,17 @@ class _SharedRunner:
         TaskRunnerBlock.drain_output()
 
     @staticmethod
+    def finalize_finished_runs(*, combo_only: bool = False) -> list[str]:
+        """收尾子进程已结束的运行：进度页不依赖主控台轮询也能落终态。
+
+        主控台轮询在页面切走 / 客户端断开后停止，任务在这里结束时由本页
+        收尾，否则进度页一直显示「运行中」，失败项重试会一直排队等待。
+        """
+        from tg_signer.webui.task_panel import TaskRunnerBlock
+
+        return TaskRunnerBlock.finalize_finished_runs(combo_only=combo_only)
+
+    @staticmethod
     def _stop_run(record_id: str):
         from tg_signer.webui.task_panel import stop_run_core
 
@@ -2090,6 +2101,14 @@ class ComboTaskBlock:
         # 组合任务通常在「组合任务」tab 启动，签到页的日志轮询不会运行；
         # 这里主动收集子进程输出，进度页与快照才有日志可读
         self.runner.drain_output()
+        # 运行收尾同样与 tab / 页面可见性无关：任务在本页结束时也要先落终态，
+        # 否则运行记录永远停在「运行中」，失败项重试队列会一直排队不开始
+        finalize = getattr(self.runner, "finalize_finished_runs", None)
+        if finalize is not None:
+            try:
+                finalize(combo_only=True)
+            except Exception:
+                logger.debug("组合任务终态收尾失败", exc_info=True)
         live: dict[str, dict] = {}
         for rid, run in list(self.runner.runs.items()):
             rec = run.get("record") or {}

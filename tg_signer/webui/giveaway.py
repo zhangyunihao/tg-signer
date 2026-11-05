@@ -575,7 +575,11 @@ def extract_win_prize(raw: str) -> str:
 
 def format_win_alert(a: dict) -> str:
     text = str(a.get("text") or "").replace("\n", " ")
-    return f"账号 {a.get('account')} 中奖（@{a.get('bot')}）：{text}（{a.get('time')}）"
+    line = f"账号 {a.get('account')} 中奖（@{a.get('bot')}）：{text}（{a.get('time')}）"
+    failures = [str(x).strip() for x in (a.get("fwd_failures") or []) if str(x).strip()]
+    if failures:
+        line += "；转发失败：" + "；".join(failures)
+    return line
 
 
 def load_channels_full_alerts(workdir) -> List[dict]:
@@ -713,6 +717,10 @@ def _handle_win_event(client, workdir, ev: dict) -> None:
             "account": acct,
             "bot": bot,
             "text": str(ev.get("text") or "")[:300],
+            # 转发失败的目标与原因（引擎在 win 事件里带出），消息中心直接展示
+            "fwd_failures": [
+                str(x)[:200] for x in (ev.get("fwd_failures") or []) if str(x).strip()
+            ][:5],
             "time": _alert_time(),
         },
     )
