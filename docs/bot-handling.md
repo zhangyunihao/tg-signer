@@ -167,6 +167,11 @@ start 后不满足条件时，bot 回复「您需加入指定的群组/频道」
 - 无链接实体、非 t.me 链接（帖子路径/bot 深链）忽略
 - 提取结果与通用提取合并去重后走统一加入流程
 - 清单本身算「加入要求」→ 加入后自动重发 start（该 bot 也在强制重参与名单）
+- 清单只剩名称、**解析不到任何可加入链接**（`has_unactionable_checklist`）
+  且没有可点按钮时，判定「不可操作」：**不记已参与**，该抽奖进入 30 分钟
+  冷却（`CONFIRM_REASON_UNACTIONABLE`，避免每轮重发 start 空转），同时推送
+  消息中心「清单无法解析」提醒（`checklist_unactionable` 事件 →
+  `webui_checklist_unactionable_alerts.json`，按 账号+bot+参数 去重）
 
 ### 3.3 强制重参与
 

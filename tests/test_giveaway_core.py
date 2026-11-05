@@ -3276,6 +3276,85 @@ def test_status_targets_trigger_restart(tmp_path, monkeypatch):
     assert client.started == [("LotteryBestBot", "r1")]
 
 
+def test_has_unactionable_checklist():
+    """清单有❌行但解析不到可加入链接才算「不可操作」。"""
+    from tg_signer.giveaway_parsing import has_unactionable_checklist
+
+    plain = _msg(text="您需加入指定的群组/频道\n🎫 加入-某测试频道D ❌")
+    assert has_unactionable_checklist(plain) is True
+    linked = _status_message(
+        "您需加入指定的群组/频道\n🎫 加入-某测试频道D ❌",
+        {"某测试频道D": "https://t.me/test_channel_d"},
+    )
+    assert has_unactionable_checklist(linked) is False
+    # 已加入（✅）行、发言数子行（不含「加入」）都不算清单行
+    assert has_unactionable_checklist(_msg(text="🎫 加入-某频道D ✅")) is False
+    assert has_unactionable_checklist(_msg(text="🎫 需发言 3 条 ❌")) is False
+
+
+def test_unactionable_checklist_not_participated_and_cooled(tmp_path, monkeypatch):
+    """清单只有名称、解析不到链接：不记参与成功，推送提醒并进入冷却。"""
+    import asyncio
+
+    import tg_signer.giveaway_core as gc
+
+    async def _nosleep(*a, **k):
+        pass
+
+    monkeypatch.setattr(gc.asyncio, "sleep", _nosleep)
+    engine, state = _engine(tmp_path)
+    logs: list = []
+    engine.log = logs.append
+    events: list = []
+    engine.on_event = events.append
+    client = FakeClient(bot_users={"LotteryBestBot"})
+    reply = _msg(text="您需加入指定的群组/频道\n🎰 某频道C\n🎫 加入-某频道D ❌")
+    asyncio.run(
+        engine._handle_start_reply(
+            "acc", client, "LotteryBestBot", "r1", "chan", "抽奖", False, reply, None
+        )
+    )
+    # 不记已参与（否则后续扫描会当成功永久跳过）
+    assert not state.has("acc", "lotterybestbot", "r1")
+    # 推送消息中心事件，并进入该抽奖的冷却
+    assert [e for e in events if e.get("type") == "checklist_unactionable"]
+    assert engine._unactionable_paused("acc", "LotteryBestBot", "r1")
+    assert not engine._can_participate_link("acc", "LotteryBestBot", "r1")
+    assert any("没有可加入链接" in line for line in logs)
+    # 冷却到期自动解除（模拟已过期）
+    key = engine._entry_card_key("acc", "LotteryBestBot", "r1")
+    engine._unactionable_until[key] = gc.time.monotonic() - 1
+    assert not engine._unactionable_paused("acc", "LotteryBestBot", "r1")
+    assert key not in engine._unactionable_until
+
+
+def test_checklist_unactionable_message_center(tmp_path):
+    """新消息类型「清单无法解析」能在消息中心被汇总展示。"""
+    from tg_signer.webui.giveaway import (
+        load_checklist_unactionable_alerts,
+        save_checklist_unactionable_alerts,
+    )
+    from tg_signer.webui.messages import collect_messages
+
+    save_checklist_unactionable_alerts(
+        tmp_path,
+        [
+            {
+                "account": "acc",
+                "bot": "LotteryBestBot",
+                "param": "r1",
+                "channel": "chan",
+                "title": "抽奖",
+                "time": "12:00:00",
+            }
+        ],
+    )
+    msgs = [m for m in collect_messages(tmp_path) if m["tag"] == "清单无法解析"]
+    assert msgs and "没有可加入的链接" in msgs[0]["text"]
+    assert msgs[0]["color"] == "red"
+    assert load_checklist_unactionable_alerts(tmp_path)[0]["bot"] == "LotteryBestBot"
+
+
 def test_lotterybest_restart_reply_participate_button_clicked(tmp_path, monkeypatch):
     """端到端：LotteryBestBot ❌ 清单 → 加入 → 重发 start → 回复带
     「点击参与抽奖」URL 按钮（同 bot participate 链接）→ 应自动点击。"""

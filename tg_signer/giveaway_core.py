@@ -59,6 +59,7 @@ from tg_signer.giveaway_parsing import (
     extract_join_status_targets,
     extract_password_tasks,
     extract_speech_tasks,
+    has_unactionable_checklist,
     is_emoji_verify_message,
     is_math_verify_message,
     math_verify_answer,
@@ -130,6 +131,13 @@ JOIN_PENDING_RETRY = 1800
 # _try_confirm_button 遇到「抽奖已结束」弹窗时返回的未完成原因标记：
 # 上层据此走已结束终态处理（不记参与、不重试），而不是按参与成功记录
 CONFIRM_REASON_ENDED = "__ended__"
+
+
+# _click_confirm 遇到「加入清单只有名称、没有任何可加入链接」时返回的原因：
+# 这类回复无法加入也无法报名，不能记参与成功；上层标记为不可操作并进入
+# 冷却，避免每轮重发 start 空转
+CONFIRM_REASON_UNACTIONABLE = "__unactionable__"
+UNACTIONABLE_COOLDOWN = 1800
 
 
 # —— 加入频道限流保护 ——
@@ -801,6 +809,8 @@ class GiveawayEngine:
         # 不同抽奖互不影响
         self._entry_card_fails: Dict[str, int] = {}
         self._entry_card_until: Dict[str, float] = {}
+        # 清单不可操作（只有名称没有可加入链接）的冷却，键同入口卡片参数级键
+        self._unactionable_until: Dict[str, float] = {}
         # 入口卡片 bot 级熔断：{account|bot_lower: 仅回入口卡片的不同抽奖参数}
         # 与冷却恢复时刻
         self._entry_card_bot_params: Dict[str, set] = {}
@@ -3181,10 +3191,35 @@ class GiveawayEngine:
         key = self._entry_card_key(account, username, param)
         self._entry_card_fails.pop(key, None)
         self._entry_card_until.pop(key, None)
+        # 参与成功说明清单有可操作路径，清掉不可操作冷却
+        self._unactionable_until.pop(key, None)
         # 任一抽奖真正参与成功即证明该 bot 报名入口可用，清掉 bot 级计数
         bot_key = self._entry_card_bot_key(account, username)
         self._entry_card_bot_params.pop(bot_key, None)
         self._entry_card_bot_until.pop(bot_key, None)
+
+    def _unactionable_paused(self, account: str, username: str, param: str) -> bool:
+        """清单不可操作冷却是否生效（到期自动解除）。"""
+        key = self._entry_card_key(account, username, param)
+        until = self._unactionable_until.get(key)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            self._unactionable_until.pop(key, None)
+            return False
+        return True
+
+    def _note_unactionable(self, account: str, username: str, param: str) -> None:
+        """记录一次「清单只有名称、没有可加入链接」，进入冷却避免每轮空转。"""
+        key = self._entry_card_key(account, username, param)
+        if key in self._unactionable_until:
+            return  # 已在冷却中
+        self._unactionable_until[key] = time.monotonic() + UNACTIONABLE_COOLDOWN
+        self.log(
+            f"[{account}] @{username}（{param or '无参数'}）bot 回复的加入清单"
+            f"没有可加入链接，无法加入；冷却 {UNACTIONABLE_COOLDOWN // 60} 分钟内"
+            "不再尝试该抽奖"
+        )
 
     def _log_transport_flood_429(self, account: str) -> None:
         """记录每次 429 的账号与时刻，并区分「单账号过密」和「多账号同时被风控」。
@@ -3446,6 +3481,10 @@ class GiveawayEngine:
             # 该 bot 多个不同抽奖都只回入口卡片（报名入口整体不可用），
             # 冷却期内跳过该 bot 的所有抽奖
             return False
+        if self._unactionable_paused(account, username, param):
+            # bot 的加入清单只有名称、没有可加入链接（无法加入也无法报名），
+            # 冷却期内不重发 start，避免每轮空转
+            return False
         return True
 
     async def _handle_start_reply(
@@ -3475,6 +3514,29 @@ class GiveawayEngine:
                 # 确认按钮弹窗报「已结束」＝终态：按已结束处理，不能记「已参与」
                 self._handle_start_ended(
                     account, username, param, channel, title, reserved
+                )
+                return
+            if fail_reason == CONFIRM_REASON_UNACTIONABLE:
+                # bot 的加入清单只剩名称、没有可加入链接：无法加入也无法报名。
+                # 不记参与成功，进入该抽奖的冷却，并推送消息中心提醒用户手动处理
+                self._note_unactionable(account, username, param)
+                self._emit(
+                    {
+                        "type": "checklist_unactionable",
+                        "account": account,
+                        "bot": username,
+                        "param": param,
+                        "channel": channel,
+                        "title": title,
+                    }
+                )
+                self._handle_join_blocked(
+                    account,
+                    username,
+                    channel,
+                    title,
+                    reserved,
+                    "bot 回复的加入清单没有可加入链接，无法加入",
                 )
                 return
             # 跟进未完成（加入未生效/点击超时/仍要求加入等）：不能记「已参与」，
@@ -5102,6 +5164,14 @@ class GiveawayEngine:
                 param,
             )
             return completed, reason
+        # 没有任何可点按钮时不能直接记成功：若 bot 最新回复是「需加入」清单
+        # 且只剩下名称、解析不到可加入链接，说明无法加入也无法报名，
+        # 按不可操作处理（上层标记未参与 + 冷却 + 推送提醒）
+        for message in candidates:
+            if has_unactionable_checklist(message) and JOIN_REQUIRED_POPUP_RE.search(
+                _message_text(message) or ""
+            ):
+                return False, CONFIRM_REASON_UNACTIONABLE
         return True, ""
 
     async def _click_callback_after_restart(

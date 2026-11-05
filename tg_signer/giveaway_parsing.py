@@ -957,6 +957,26 @@ def extract_join_status_targets(message: Any) -> List[str]:
     return targets
 
 
+def has_unactionable_checklist(message: Any) -> bool:
+    """清单里有「加入-名称 ❌」未加入行，却解析不出任何可加入链接。
+
+    @LotteryBestBot 式回复可能只列频道名称、不暴露 t.me 链接（或链接实体
+    格式异常）。这种情况既无法加入，也不能当作参与成功：调用方应标记为
+    不可操作并进入冷却，避免每轮重复 start 空转。
+    发言数子行（不含「加入」）不算清单行；消息里存在任意可加入目标
+    （隐藏链接/可见链接/按钮）时都不算不可操作。
+    """
+    text = _message_text(message)
+    if not text or "加入" not in text or "❌" not in text:
+        return False
+    if extract_join_status_targets(message) or extract_channel_targets(message):
+        return False
+    return any(
+        "加入" in line and "❌" in line and "✅" not in line
+        for _ls, _le, line in _line_bounds(text)
+    )
+
+
 def _unjoined_row_target(
     text: str, bounds: List[Tuple[int, int, str]], ent: Any
 ) -> Optional[str]:

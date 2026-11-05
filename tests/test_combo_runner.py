@@ -50,7 +50,9 @@ def test_combo_runner_runs_subs_sequentially(monkeypatch):
 
 
 def test_combo_runner_failed_sub_makes_exit_code_1(monkeypatch):
+    """子任务失败但网络探测正常：不退避不补跑，整体按失败退出。"""
     monkeypatch.setattr(combo_runner, "_run_with_timeout", lambda cmd, timeout=None: 1)
+    monkeypatch.setattr(combo_runner, "_check_telegram_network", lambda: (True, "直连"))
     monkeypatch.setattr(
         combo_runner.sys,
         "argv",
@@ -288,14 +290,104 @@ def _net_fail_spec(count: int) -> str:
     return json.dumps({"subs": subs}, ensure_ascii=False)
 
 
-def test_combo_runner_single_network_fail_does_not_backoff(monkeypatch):
-    """单次网络失败（退出码 4）不触发网络等待，后续子任务照常执行。"""
+def test_combo_runner_failed_sub_healthy_network_no_backoff(monkeypatch):
+    """子任务失败但网络探测正常：不算网络故障，不等待不补跑，直接下一条。"""
     codes = iter([4, 0])
     runs, waits = [], []
     monkeypatch.setattr(
         combo_runner,
         "_run_with_timeout",
         lambda cmd, timeout=None: runs.append(cmd[-1]) or next(codes),
+    )
+    monkeypatch.setattr(combo_runner, "_check_telegram_network", lambda: (True, "直连"))
+    monkeypatch.setattr(
+        combo_runner,
+        "_wait_for_network",
+        lambda interval, retries: waits.append((interval, retries)) or True,
+    )
+    monkeypatch.setattr(combo_runner.sys, "argv", ["combo_runner", _net_fail_spec(2)])
+    with pytest.raises(SystemExit) as exc:
+        combo_runner.main()
+    # 任一子任务非 0 整体失败，但网络正常时不触发等待与补跑
+    assert exc.value.code == 1
+    assert runs == ["sub1", "sub2"]
+    assert waits == []
+
+
+def test_combo_runner_net_fail_waits_then_reruns_failed_sub(monkeypatch, capsys):
+    """失败后探测到网络不通：退避恢复后补跑同一条子任务，成功后继续剩余。"""
+    # sub1 首跑失败、补跑成功；sub2/sub3 正常
+    codes = iter([4, 0, 0, 0])
+    runs, waits = [], []
+    monkeypatch.setattr(
+        combo_runner,
+        "_run_with_timeout",
+        lambda cmd, timeout=None: runs.append(cmd[-1]) or next(codes),
+    )
+    # 首次失败后的探测结果：网络不通（补跑成功后不再探测）
+    probes = iter([(False, "直连连接失败")])
+    monkeypatch.setattr(combo_runner, "_check_telegram_network", lambda: next(probes))
+    monkeypatch.setattr(
+        combo_runner,
+        "_wait_for_network",
+        lambda interval, retries: waits.append((interval, retries)) or True,
+    )
+    monkeypatch.setattr(combo_runner.sys, "argv", ["combo_runner", _net_fail_spec(3)])
+    with pytest.raises(SystemExit) as exc:
+        combo_runner.main()
+    assert exc.value.code == 0
+    assert runs == ["sub1", "sub1", "sub2", "sub3"]
+    # 运行中退避用更短的默认间隔，而不是开跑前的 30 分钟
+    assert waits == [
+        (
+            combo_runner.NETWORK_BACKOFF_INTERVAL,
+            combo_runner.NETWORK_BACKOFF_MAX_RETRIES,
+        )
+    ]
+    out = capsys.readouterr().out
+    # 补跑不重复打开始/结束标记行（否则打乱 WebUI 明细与失败项重试的下标映射）
+    assert out.count(">>> 子任务开始 [1/3]") == 1
+    assert out.count(">>> 子任务结束 [1/3]") == 1
+    assert "网络已恢复，补跑该子任务（第 1/2 次）" in out
+
+
+def test_combo_runner_timeout_124_probes_network_then_reruns(monkeypatch):
+    """超时强杀（124）与退出码 4 同样处理：立即探测，网络不通则补跑。"""
+    codes = iter([124, 0])
+    runs, waits = [], []
+    monkeypatch.setattr(
+        combo_runner,
+        "_run_with_timeout",
+        lambda cmd, timeout=None: runs.append(cmd[-1]) or next(codes),
+    )
+    monkeypatch.setattr(
+        combo_runner, "_check_telegram_network", lambda: (False, "直连连接失败")
+    )
+    monkeypatch.setattr(
+        combo_runner,
+        "_wait_for_network",
+        lambda interval, retries: waits.append((interval, retries)) or True,
+    )
+    monkeypatch.setattr(combo_runner.sys, "argv", ["combo_runner", _net_fail_spec(1)])
+    with pytest.raises(SystemExit) as exc:
+        combo_runner.main()
+    assert exc.value.code == 0
+    assert runs == ["sub1", "sub1"]
+    assert len(waits) == 1
+
+
+def test_combo_runner_rerun_limit_gives_up_then_continues(monkeypatch, capsys):
+    """补跑达到上限后放弃该子任务，不再无限重跑，剩余子任务照常执行。"""
+    # sub1 首跑 + NETWORK_SUB_MAX_RETRIES 次补跑均失败；sub2 正常
+    codes = iter([4, 4, 4, 0])
+    runs, waits = [], []
+    monkeypatch.setattr(
+        combo_runner,
+        "_run_with_timeout",
+        lambda cmd, timeout=None: runs.append(cmd[-1]) or next(codes),
+    )
+    monkeypatch.setattr(
+        combo_runner, "_check_telegram_network", lambda: (False, "直连连接失败")
     )
     monkeypatch.setattr(
         combo_runner,
@@ -305,47 +397,23 @@ def test_combo_runner_single_network_fail_does_not_backoff(monkeypatch):
     monkeypatch.setattr(combo_runner.sys, "argv", ["combo_runner", _net_fail_spec(2)])
     with pytest.raises(SystemExit) as exc:
         combo_runner.main()
-    # 任一子任务非 0 整体失败，但网络等待不应被触发
     assert exc.value.code == 1
-    assert runs == ["sub1", "sub2"]
-    assert waits == []
-
-
-def test_combo_runner_consecutive_network_fails_waits_then_continues(monkeypatch):
-    """连续 2 个网络失败子任务后先等网络恢复，恢复后继续执行剩余子任务。"""
-    codes = iter([4, 4, 0])
-    runs, waits = [], []
-    monkeypatch.setattr(
-        combo_runner,
-        "_run_with_timeout",
-        lambda cmd, timeout=None: runs.append(cmd[-1]) or next(codes),
-    )
-    monkeypatch.setattr(
-        combo_runner,
-        "_wait_for_network",
-        lambda interval, retries: waits.append((interval, retries)) or True,
-    )
-    monkeypatch.setattr(combo_runner.sys, "argv", ["combo_runner", _net_fail_spec(3)])
-    with pytest.raises(SystemExit) as exc:
-        combo_runner.main()
-    assert exc.value.code == 1
-    assert runs == ["sub1", "sub2", "sub3"]
-    # 运行中退避用更短的默认间隔，而不是开跑前的 30 分钟
-    assert waits == [
-        (
-            combo_runner.NETWORK_BACKOFF_INTERVAL,
-            combo_runner.NETWORK_BACKOFF_MAX_RETRIES,
-        )
-    ]
+    assert runs == ["sub1", "sub1", "sub1", "sub2"]
+    assert len(waits) == combo_runner.NETWORK_SUB_MAX_RETRIES
+    out = capsys.readouterr().out
+    assert "放弃补跑该子任务" in out
 
 
 def test_combo_runner_network_gives_up_skips_remaining(monkeypatch, capsys):
-    """网络持续不通时中止：剩余子任务补打开始/结束标记行并整体退出码 3。"""
+    """网络持续不通时中止：当前子任务补打结束行、剩余子任务补打开始/结束行。"""
     runs, waits = [], []
     monkeypatch.setattr(
         combo_runner,
         "_run_with_timeout",
         lambda cmd, timeout=None: runs.append(cmd[-1]) or 4,
+    )
+    monkeypatch.setattr(
+        combo_runner, "_check_telegram_network", lambda: (False, "直连连接失败")
     )
     monkeypatch.setattr(
         combo_runner,
@@ -356,12 +424,13 @@ def test_combo_runner_network_gives_up_skips_remaining(monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc:
         combo_runner.main()
     assert exc.value.code == 3
-    # 前两个子任务真跑过，达到阈值后不再启动新进程
-    assert runs == ["sub1", "sub2"]
+    # 第一条子任务失败并探测到网络不通后：退避失败，不再启动任何新进程
+    assert runs == ["sub1"]
     assert len(waits) == 1
     out = capsys.readouterr().out
-    # 未执行的子任务补打标记行，WebUI 明细不会残留「进行中」
-    for i in (3, 4):
+    # 当前子任务补打结束行，未执行的子任务补打标记行，明细不残留「进行中」
+    assert ">>> 子任务结束 [1/4] 退出码 4" in out
+    for i in (2, 3, 4):
         assert f">>> 子任务开始 [{i}/4]: 抽奖 · {i}" in out
         assert f">>> 子任务结束 [{i}/4] 退出码 4" in out
     assert "网络不可用，跳过该子任务" in out

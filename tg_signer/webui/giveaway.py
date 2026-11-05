@@ -28,6 +28,7 @@ from tg_signer.giveaway_core import (
     JOIN_HOURLY_CAP,
     JOIN_PACE_RANGE,
     RESOLVE_PACE_RANGE,
+    UNACTIONABLE_COOLDOWN,
     WIN_SWEEP_LIMIT,
 )
 from tg_signer.giveaway_parsing import DEFAULT_KEYWORDS
@@ -161,6 +162,9 @@ CHANNELS_FULL_ALERTS_MAX = 200
 # 单频道扫描达到上限的提醒（持久化，按账号+频道去重，只保留最新一条）
 SCAN_CAP_ALERTS_FILE = "webui_scan_cap_alerts.json"
 SCAN_CAP_ALERTS_MAX = 200
+# bot 回复的加入频道清单只有名称、没有可加入链接（无法加入也无法报名）的提醒
+CHECKLIST_UNACTIONABLE_ALERTS_FILE = "webui_checklist_unactionable_alerts.json"
+CHECKLIST_UNACTIONABLE_ALERTS_MAX = 200
 # 中奖提醒全局设置（消息中心配置，所有任务共用）：转发目标 + Server酱 SendKey
 WIN_SETTINGS_FILE = "webui_win_settings.json"
 
@@ -230,6 +234,11 @@ _CHANNELS_FULL_ALERTS = _AlertStore(
 )
 _SCAN_CAP_ALERTS = _AlertStore(
     SCAN_CAP_ALERTS_FILE, SCAN_CAP_ALERTS_MAX, "扫描上限提醒"
+)
+_CHECKLIST_UNACTIONABLE_ALERTS = _AlertStore(
+    CHECKLIST_UNACTIONABLE_ALERTS_FILE,
+    CHECKLIST_UNACTIONABLE_ALERTS_MAX,
+    "清单无法解析提醒",
 )
 
 
@@ -519,6 +528,32 @@ def format_speech_merge_note(a: dict) -> str:
     return f"另需完成{title_part}发言（还需 {a.get('required')} 条）"
 
 
+def load_checklist_unactionable_alerts(workdir) -> List[dict]:
+    return _CHECKLIST_UNACTIONABLE_ALERTS.load(workdir)
+
+
+def save_checklist_unactionable_alerts(workdir, alerts: List[dict]) -> None:
+    _CHECKLIST_UNACTIONABLE_ALERTS.save(workdir, alerts)
+
+
+def format_checklist_unactionable_alert(a: dict) -> str:
+    """bot 加入清单只有名称、解析不到可加入链接时的提醒文案。"""
+    title = str(a.get("title") or "").strip()
+    param = str(a.get("param") or "").strip()
+    if title:
+        target = f"抽奖「{title}」"
+    elif param:
+        target = f"抽奖（{param}）"
+    else:
+        target = "抽奖"
+    return (
+        f"账号 {a.get('account')} 参与 @{a.get('bot')} 的{target}失败："
+        "bot 回复的加入频道清单只有名称、没有可加入的链接，无法自动加入；"
+        f"已跳过并冷却 {UNACTIONABLE_COOLDOWN // 60} 分钟，请手动加入后参与"
+        f"（{a.get('time')}）"
+    )
+
+
 def load_win_alerts(workdir) -> List[dict]:
     return _WIN_ALERTS.load(workdir)
 
@@ -606,6 +641,7 @@ SPEECH_ALERT_KEY = ("account", "bot", "group", "required", "title")
 SPEECH_INSUFFICIENT_ALERT_KEY = ("account", "bot", "channel", "title", "detail")
 CHANNELS_FULL_ALERT_KEY = ("account",)
 SCAN_CAP_ALERT_KEY = ("account", "chat")
+CHECKLIST_UNACTIONABLE_ALERT_KEY = ("account", "bot", "param")
 
 # 正在重试口令的账号（session 绝对路径）。同一账号并发重试会各自新建客户端
 # 打开同一个 session 数据库，锁冲突时的同步等待会阻塞 WebUI 事件循环（页面卡住），
@@ -809,8 +845,45 @@ def _handle_speech_insufficient_event(client, workdir, ev: dict) -> None:
     )
 
 
+def _handle_checklist_unactionable_event(client, workdir, ev: dict) -> None:
+    """bot 加入清单只有名称、没有可加入链接：写消息中心并弹顶部提醒。
+
+    同一账号 + bot + 抽奖参数只保留最新一条，避免冷却到期重试时重复刷屏。
+    """
+    acct = str(ev.get("account") or "")
+    if not acct:
+        return
+    bot = str(ev.get("bot") or "")
+    param = str(ev.get("param") or "")
+    alerts = _drop_alert(
+        load_checklist_unactionable_alerts(workdir),
+        CHECKLIST_UNACTIONABLE_ALERT_KEY,
+        f"{acct}|{bot}|{param}",
+    )
+    alerts.insert(
+        0,
+        {
+            "account": acct,
+            "bot": bot,
+            "param": param,
+            "channel": str(ev.get("channel") or ""),
+            "title": str(ev.get("title") or "")[:60],
+            "time": _alert_time(),
+        },
+    )
+    save_checklist_unactionable_alerts(workdir, alerts)
+    _notify_alert(
+        client,
+        format_checklist_unactionable_alert(alerts[0]),
+        "warning",
+        "推送清单无法解析提醒失败",
+    )
+
+
 def handle_giveaway_event(client, workdir, ev: dict) -> None:
-    """引擎事件分发：中奖 / 加入失败或解除 / 口令 / 发言数 / 发言数不够 / 频道已满 / 扫描上限。"""
+    """引擎事件分发：中奖 / 加入失败或解除 / 口令 / 发言数 / 发言数不够 /
+    频道已满 / 扫描上限 / 清单不可解析。
+    """
     etype = ev.get("type")
     if etype == "win":
         _handle_win_event(client, workdir, ev)
@@ -824,6 +897,8 @@ def handle_giveaway_event(client, workdir, ev: dict) -> None:
         _handle_speech_insufficient_event(client, workdir, ev)
     elif etype == "channels_full":
         _handle_channels_full_event(client, workdir, ev)
+    elif etype == "checklist_unactionable":
+        _handle_checklist_unactionable_event(client, workdir, ev)
     elif etype == "scan_cap":
         _handle_scan_cap_event(client, workdir, ev)
 

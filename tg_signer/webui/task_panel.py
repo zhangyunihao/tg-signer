@@ -432,29 +432,15 @@ class TaskRunnerBlock:
             "text-sm text-gray-500 tgs-tab-intro"
         )
 
-        # 顶部操作行与其它 tab 统一：主操作在左，次要操作在右，整行两端对齐
-        with ui.row().classes(
-            "w-full items-center justify-between gap-2 flex-wrap tgs-tab-actions"
-        ):
+        with ui.row().classes("w-full items-center gap-2 flex-wrap tgs-tab-actions"):
             ui.button(
                 "新增任务", icon="add", color="primary", on_click=self.open_dialog
             )
-            with ui.row().classes("gap-2 items-center flex-wrap"):
-                ui.button("清空输出", on_click=self.clear_log).props("outline")
-                ui.button(
-                    "复制调试日志",
-                    icon="bug_report",
-                    on_click=self.copy_debug_log,
-                ).props("outline").tooltip(
-                    "复制环境信息+运行输出+任务历史+日志文件，粘贴到电脑排查复现"
-                )
 
         self.status_label = ui.label("空闲").classes("text-sm text-gray-500")
 
         # ---- 任务历史 ----
         ui.separator().classes("my-2")
-        with ui.row().classes("w-full items-center justify-end"):
-            ui.button("清空历史", on_click=self.clear_history).props("outline dense")
         self.history_summary = ui.label("").classes("text-sm text-gray-600")
         self.history_table = (
             ui.table(

@@ -21,10 +21,16 @@ spec 可带可选的 ``start_at``（``YYYY-MM-DD HH:MM:SS``）：进程先等待
 间隔重试，最多 ``network_max_retries`` 次（默认 3 次），仍不通则退出码 3
 （视为本次组合任务失败）。
 
-运行中若连续 ``NETWORK_FAIL_THRESHOLD``（默认 2）个子任务因网络异常以
-退出码 4 失败，同样视为整轮网络故障：先按 ``network_retry_seconds``
-（缺省 300 秒、最多 ``network_max_retries`` 次、缺省 3 次）等待网络恢复；
-仍不通则剩余子任务标记为跳过（补打开始/结束行、退出码 4）并整体退出码 3。
+运行中任一子任务失败（含超时强杀的退出码 124）后立即探测 TG 网络：
+探测不通视为网络故障，按 ``network_retry_seconds``（缺省 300 秒、最多
+``network_max_retries`` 次、缺省 3 次）等待网络恢复，恢复后补跑该子任务
+（每条最多补跑 ``NETWORK_SUB_MAX_RETRIES`` 次，防止网络抖动下无限重跑）；
+等待恢复失败则当前子任务按实际退出码补打结束行、剩余子任务标记为跳过
+（补打开始/结束行、退出码 4）并整体退出码 3。探测到网络正常时判定为
+子任务自身失败，照常继续下一条。
+
+补跑期间只输出普通日志行，不重复打「>>> 子任务开始/结束」标记行——
+WebUI 明细进度与失败项重试都按标记行做下标映射，重复标记会打乱映射。
 """
 
 import json
@@ -41,9 +47,9 @@ from tg_signer import NET_UNFINISHED_EXIT_CODE
 NETWORK_RETRY_INTERVAL = 30 * 60
 NETWORK_MAX_RETRIES = 3
 NETWORK_PROBE_TIMEOUT = 8.0
-# 运行中：连续该次数的子任务因网络失败（退出码 4）即视为整轮网络故障，
-# 先探测/等待网络恢复再继续，避免断网期间把剩余子任务全部跑空
-NETWORK_FAIL_THRESHOLD = 2
+# 运行中子任务失败后立即探测网络，网络不通则退避等待恢复再补跑该子任务；
+# 每条子任务最多补跑该次数，防止网络抖动下对同一条子任务无限重跑
+NETWORK_SUB_MAX_RETRIES = 2
 # 运行中网络不通时的退避间隔与最大重试次数（区别于开跑前的 30 分钟重试）；
 # 同样可被 spec 的 network_retry_seconds / network_max_retries 覆盖
 NETWORK_BACKOFF_INTERVAL = 5 * 60
@@ -127,7 +133,7 @@ def _fmt_interval(seconds: int) -> str:
 
 
 def _wait_for_network(interval: int, max_retries: int) -> bool:
-    """开始时间到达后确认 TG 网络可用；不通则按 interval 秒重试，最多 max_retries 次。"""
+    """探测 TG 网络是否可用（开跑前与运行中退避共用）；不通则按 interval 秒重试，最多 max_retries 次。"""
     ok, detail = _check_telegram_network()
     retry = 0
     while not ok and retry < max_retries:
@@ -145,7 +151,7 @@ def _wait_for_network(interval: int, max_retries: int) -> bool:
             flush=True,
         )
         return False
-    print(f">>> TG 网络正常（{detail}），开始执行子任务", flush=True)
+    print(f">>> TG 网络正常（{detail}）", flush=True)
     return True
 
 
@@ -191,6 +197,42 @@ def _print_skipped_subs(subs: list[dict], start_index: int, total: int) -> None:
         )
 
 
+def _build_sub_cmd(sub: dict) -> list[str]:
+    """按子任务类型构造子进程命令：module 型走 python -m，其余走 task_runner。"""
+    if sub.get("module"):
+        return [
+            sys.executable,
+            "-m",
+            str(sub["module"]),
+            json.dumps(sub.get("spec") or {}, ensure_ascii=False),
+        ]
+    return [sys.executable, "-m", "tg_signer.task_runner"] + list(sub.get("args") or [])
+
+
+def _sub_timeout(sub: dict) -> int | None:
+    """子任务可选超时（秒）：仅对配置了 timeout 的子任务生效（如自动抽奖）。
+
+    超时强杀并记为失败（退出码 124），后续子任务继续执行；未配置/非法返回 None。
+    """
+    raw = sub.get("timeout")
+    try:
+        timeout = int(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+    return timeout if timeout and timeout > 0 else None
+
+
+def _run_sub(sub: dict, pos: str) -> int:
+    """执行单个子任务并返回退出码；超时强杀返回 124。pos 为 [i/total] 展示串。"""
+    timeout = _sub_timeout(sub)
+    if timeout:
+        print(f"    子任务超时限制：{timeout} 秒", flush=True)
+    code = _run_with_timeout(_build_sub_cmd(sub), timeout)
+    if code == 124:
+        print(f">>> 子任务超时 {pos} 已达 {timeout} 秒强制退出", flush=True)
+    return code
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("缺少组合任务参数", flush=True)
@@ -210,61 +252,59 @@ def main() -> None:
         interval, retries = _parse_retry_settings(spec)
         if not _wait_for_network(interval, retries):
             raise SystemExit(3)
+        print(">>> 开始执行子任务", flush=True)
     subs = spec.get("subs") or []
     total = len(subs)
     codes: list[int] = []
-    net_fail_streak = 0
     for i, sub in enumerate(subs, 1):
-        # 连续网络失败子任务达到阈值：视为整轮网络故障，先探测/等待网络恢复；
-        # 仍不通则中止剩余子任务（补打开始/结束标记行后按网络失败退出）
-        if net_fail_streak >= NETWORK_FAIL_THRESHOLD:
+        pos = f"[{i}/{total}]"
+        label = _sub_label(sub)
+        print(f">>> 子任务开始 {pos}: {label}", flush=True)
+        code = _run_sub(sub, pos)
+        # 任意失败（含 124 超时强杀）立即探测网络：不通视为网络故障，
+        # 退避等待恢复后补跑该子任务；网络正常则判定为子任务自身失败。
+        # 补跑只输出普通日志行、不重复打开始/结束标记行，保证 WebUI 明细
+        # 进度与失败项重试的下标映射不被打乱
+        net_retries = 0
+        while code != 0:
+            ok, detail = _check_telegram_network()
+            if ok:
+                print(
+                    f">>> 网络正常（{detail}），判定为子任务自身失败（退出码 {code}）",
+                    flush=True,
+                )
+                break
+            print(f">>> 子任务 {pos} 失败且网络不可用（{detail}）", flush=True)
+            if net_retries >= NETWORK_SUB_MAX_RETRIES:
+                print(
+                    f">>> 已补跑 {net_retries} 次仍失败，放弃补跑该子任务",
+                    flush=True,
+                )
+                break
             interval, retries = _parse_retry_settings(
                 spec, NETWORK_BACKOFF_INTERVAL, NETWORK_BACKOFF_MAX_RETRIES
             )
             print(
-                f">>> 连续 {net_fail_streak} 个子任务因网络失败，等待网络恢复"
-                f"（{_fmt_interval(interval)}，最多 {retries} 次探测）",
+                f">>> 等待网络恢复（{_fmt_interval(interval)}，最多 {retries} 次探测）",
                 flush=True,
             )
             if not _wait_for_network(interval, retries):
-                print(
-                    f">>> 网络仍不可用，跳过剩余 {total - i + 1} 个子任务", flush=True
-                )
-                _print_skipped_subs(subs, i, total)
+                print(f">>> 子任务结束 {pos} 退出码 {code}", flush=True)
+                print(f">>> 网络仍不可用，跳过剩余 {total - i} 个子任务", flush=True)
+                _print_skipped_subs(subs, i + 1, total)
                 raise SystemExit(3)
-            net_fail_streak = 0
-        label = _sub_label(sub)
-        print(f">>> 子任务开始 [{i}/{total}]: {label}", flush=True)
-        if sub.get("module"):
-            cmd = [
-                sys.executable,
-                "-m",
-                str(sub["module"]),
-                json.dumps(sub.get("spec") or {}, ensure_ascii=False),
-            ]
-        else:
-            cmd = [sys.executable, "-m", "tg_signer.task_runner"] + list(
-                sub.get("args") or []
+            net_retries += 1
+            print(
+                f">>> 网络已恢复，补跑该子任务"
+                f"（第 {net_retries}/{NETWORK_SUB_MAX_RETRIES} 次）",
+                flush=True,
             )
-        # 子任务可选超时（秒）：仅对配置了 timeout 的子任务生效（如自动抽奖），
-        # 超时强杀并记为失败（退出码 124），后续子任务继续执行
-        raw_timeout = sub.get("timeout")
-        try:
-            timeout = int(raw_timeout) if raw_timeout else None
-        except (TypeError, ValueError):
-            timeout = None
-        if timeout and timeout > 0:
-            print(f"    子任务超时限制：{timeout} 秒", flush=True)
-        code = _run_with_timeout(cmd, timeout)
+            code = _run_sub(sub, pos)
         codes.append(code)
-        # 网络失败子任务（退出码 4）连击计数：达到阈值即触发整轮网络退避
-        net_fail_streak = net_fail_streak + 1 if code == NET_UNFINISHED_EXIT_CODE else 0
-        if code == 124:
-            print(f">>> 子任务超时 [{i}/{total}] 已达 {timeout} 秒强制退出", flush=True)
         # 多账号错峰延迟只对首个子任务生效，避免后续串行子任务重复等待
         if i == 1:
             os.environ.pop("TG_SIGNER_START_DELAY", None)
-        print(f">>> 子任务结束 [{i}/{total}] 退出码 {code}", flush=True)
+        print(f">>> 子任务结束 {pos} 退出码 {code}", flush=True)
     raise SystemExit(0 if all(c == 0 for c in codes) else 1)
 
 

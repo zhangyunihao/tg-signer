@@ -10,6 +10,7 @@
 - 报名成功后仍未达标的发言数任务（还需发言 N 条）：webui_speech_alerts.json
 - 置顶抽奖帖点击参与被弹窗拦下（发言数不够）：webui_speech_insufficient_alerts.json
 - 账号频道/群组已满（自动触发退频道任务）：webui_channels_full_alerts.json
+- bot 加入清单只有名称、没有可加入链接（无法自动加入）：webui_checklist_unactionable_alerts.json
 
 主控台右上角铃铛只负责展示未读数徽标，点击在新标签页打开 /messages
 消息中心页面（支持按用户/消息类型过滤、全部已读、消息置顶、10 秒轮询自动刷新）。
@@ -42,6 +43,7 @@ from tg_signer.webui.giveaway import (
     channel_title_map,
     extract_win_prize,
     format_channels_full_alert,
+    format_checklist_unactionable_alert,
     format_join_alert,
     format_scan_cap_alert,
     format_speak_alert,
@@ -50,6 +52,7 @@ from tg_signer.webui.giveaway import (
     format_speech_merge_note,
     format_win_alert,
     load_channels_full_alerts,
+    load_checklist_unactionable_alerts,
     load_join_alerts,
     load_scan_cap_alerts,
     load_speak_alerts,
@@ -359,6 +362,23 @@ def collect_messages(workdir) -> List[dict]:
                 "account": acct,
                 "time": time_str,
                 "text": format_speech_insufficient_alert(a),
+            }
+        )
+    # 5) bot 回复的加入频道清单只有名称、解析不到可加入链接：无法自动加入
+    for a in load_checklist_unactionable_alerts(wd):
+        acct = str(a.get("account") or "")
+        time_str = str(a.get("time") or "")
+        messages.append(
+            {
+                "key": (
+                    f"checklist_unactionable|{acct}|{a.get('bot')}"
+                    f"|{a.get('param')}|{time_str}"
+                ),
+                "tag": "清单无法解析",
+                "color": "red",
+                "account": acct,
+                "time": time_str,
+                "text": format_checklist_unactionable_alert(a),
             }
         )
     return messages
