@@ -4617,7 +4617,7 @@ WIN_SAMPLE = (
 
 def test_win_regex_matches_real_bot_samples():
     """真实 bot 中奖私信样本均命中识别正则；参与类消息不误报。"""
-    from tg_signer.giveaway_parsing import WIN_MESSAGE_RE
+    from tg_signer.giveaway_parsing import WIN_MESSAGE_RE, WIN_PERSONAL_RE
 
     # @LotteryBestBot：标题行 + 正文恭喜 + 防伪编号
     assert WIN_MESSAGE_RE.search(WIN_SAMPLE)
@@ -4636,9 +4636,25 @@ def test_win_regex_matches_real_bot_samples():
         "🔑 校验码：dXFKQFL07KsODbbzJDVQRWxN"
     )
     assert WIN_MESSAGE_RE.search(saber)
+    # @Lottery8Bot：标题「💐💐💐你中奖了💐💐💐」+ 正文「活动中您赢得了奖品:」
+    lottery8 = (
+        "💐💐💐你中奖了💐💐💐\n\n"
+        "🤩恭喜你!John Juarez\n"
+        "『徐汇知禾老师的抽奖活动』活动中您赢得了奖品:\n\n"
+        "🎁 六折通用券\n\n"
+        "在此表示衷心祝贺🎉\n"
+        "备注:抽奖说明:\n"
+        "1.中奖三天内私信老师（有特殊情况提前说明）\n"
+        "2.出击后24小时提交出击报告\n"
+        "中奖联系老师:（附带中奖截图）:\n@ZhiXiaAA00"
+    )
+    assert WIN_MESSAGE_RE.search(lottery8)
+    assert WIN_PERSONAL_RE.search(lottery8)
     # 参与清单/规则说明类消息不误报
     assert not WIN_MESSAGE_RE.search("🎫 加入-某频道 ❌\n└  🔑 发送口令﹝出击宝宝﹞")
     assert not WIN_MESSAGE_RE.search("📜 抽奖说明：中奖者联系老师兑奖")
+    # 规则里的假设句式「如果你中奖了」不误判
+    assert not WIN_MESSAGE_RE.search("📜 抽奖说明：如果你中奖了，请三日内私信老师")
 
 
 def test_check_win_message_skips_draw_announcement(tmp_path):

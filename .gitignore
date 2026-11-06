@@ -113,10 +113,13 @@ logs/*
 # custom
 _test*.py
 _test*.json
+artifacts/
 
 # pyrogram
 *.session
 *.session-journal
+*.session-shm
+*.session-wal
 
 .signer
 *.session_string
