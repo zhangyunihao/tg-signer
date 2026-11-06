@@ -202,6 +202,11 @@ _CLIENT_INSTANCES: dict[str, "Client"] = {}
 _CLIENT_REFS: defaultdict[str, int] = defaultdict(int)
 _CLIENT_ASYNC_LOCKS: dict[str, asyncio.Lock] = {}
 
+# 同账号并发 connect() 的排队锁：Kurigram 未连接时每次 connect 都会各自
+# 打开一次 session 数据库，多个页面/轮询协程同时连接会争抢 sqlite 锁
+# 并报 "database is locked"。
+_CONNECT_ASYNC_LOCKS: dict[str, asyncio.Lock] = {}
+
 # login bootstrap state keyed by account key. This prevents concurrent tasks
 # from repeatedly calling get_me/get_dialogs for the same account.
 _LOGIN_ASYNC_LOCKS: dict[str, asyncio.Lock] = {}
@@ -271,8 +276,9 @@ class ResilientSQLiteStorage(SQLiteStorage):
                 self._discard_conn()
                 delay = delays[attempt]
                 logger.warning(
-                    "session 数据库被其他任务占用（%s），%.0f 秒后重试"
+                    "「%s」session 数据库被其他任务占用（%s），%.0f 秒后重试"
                     f"（第 {attempt + 1}/{len(delays)} 次）",
+                    self.name,
                     exc,
                     delay,
                 )
@@ -338,6 +344,24 @@ class Client(SafeGetForumTopics, BaseClient):
                 session_string=self.session_string,
                 in_memory=True,
             )
+
+    async def connect(self) -> bool:
+        """串行化同一账号的并发连接。
+
+        Kurigram 在未连接时每次 connect() 都会执行一次 storage.open()。
+        多个页面/轮询协程拿到同一个缓存客户端后会并发连接，各自打开一次
+        session 数据库，从而争抢 sqlite 锁并报 "database is locked"。
+        这里按账号排队，已连接时直接视为成功（connect() 在已连接状态下
+        会抛 ConnectionError，上层多把它当作连接失败）。
+        """
+        lock = _CONNECT_ASYNC_LOCKS.get(self.key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _CONNECT_ASYNC_LOCKS[self.key] = lock
+        async with lock:
+            if self.is_connected:
+                return True
+            return await super().connect()
 
     async def _start_with_retry(self) -> None:
         """启动客户端；网络类失败自动重试（手机代理不稳定场景）。"""

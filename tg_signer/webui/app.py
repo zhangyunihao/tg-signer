@@ -12,6 +12,7 @@ from typing import Callable, Optional
 from nicegui import app, run, ui
 
 from tg_signer import __version__
+from tg_signer.logger import configure_logger
 from tg_signer.netcheck import (
     TELEGRAM_DC_HOST,
     TELEGRAM_DC_PORT,
@@ -1594,6 +1595,16 @@ def _install_loop_exception_handler() -> None:
 
 
 def main(host: str = None, port: int = None, storage_secret: str = None) -> None:
+    # WebUI 主进程此前没有配置 logging，告警/异常只走 logging.lastResort：
+    # 没有时间/级别前缀，也不写日志文件（关掉终端即丢失）。这里把
+    # tg_signer.* 模块日志统一到控制台与 logs/tg-signer.log。
+    configure_logger(
+        name="tg_signer",
+        log_level=os.environ.get("TG_SIGNER_LOG_LEVEL", "INFO"),
+        log_dir=LOG_DIR,
+        log_file=DEFAULT_LOG_FILE,
+    )
+
     removed = cleanup_stale_sessions()
     if removed:
         print(
