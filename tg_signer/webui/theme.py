@@ -342,6 +342,14 @@ MOBILE_DESIGN_CSS = """
         font-size: var(--tgs-fs-aux) !important;
         text-align: center;
     }
+    /* 空日志占位：与 .tgs-empty 同一虚线语言，高度由页面 min-height 控制 */
+    .tgs-log-empty {
+        border: 1px dashed var(--tgs-line-strong);
+        border-radius: var(--tgs-radius-md);
+        background: var(--tgs-surface-soft);
+        color: var(--tgs-text-3) !important;
+        text-align: center;
+    }
     .q-spinner { color: var(--tgs-brand); }
     .q-separator { background: var(--tgs-line) !important; }
     /* 折叠说明：承载从页面移出的技术细节/风险提示 */
@@ -895,6 +903,14 @@ MOBILE_DESIGN_CSS = """
         font-size: 0.875rem !important;
         text-align: center;
     }
+    /* 空日志占位：与 .tgs-empty 同一虚线语言，高度由页面 min-height 控制 */
+    .tgs-log-empty {
+        border: 1px dashed var(--tgs-line-strong);
+        border-radius: var(--tgs-radius-md);
+        background: var(--tgs-surface-soft);
+        color: var(--tgs-text-3) !important;
+        text-align: center;
+    }
     .tgs-log-area,
     .tgs-log-pre {
         border-color: var(--tgs-line);
@@ -998,6 +1014,23 @@ MOBILE_DESIGN_CSS = """
 .sign-log-area .nicegui-column:empty {
     height: 100%;
     justify-content: center;
+}
+/* 通用日志区（ui.log）空态：与签到实时输出同一套占位语言，避免整块空白 */
+.tgs-log-area:not(.tgs-page-log-fullscreen):has(.q-scrollarea__content:empty) {
+    height: 120px !important;
+    max-height: 120px !important;
+    border-style: dashed;
+}
+.tgs-log-area .q-scrollarea__content:empty::before {
+    content: "暂无日志，任务开始运行后会显示在这里";
+    display: block;
+    padding: 1.5rem 0.75rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+        "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    color: var(--tgs-text-3);
+    text-align: center;
 }
 </style>
 """

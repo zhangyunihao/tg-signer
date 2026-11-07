@@ -339,7 +339,9 @@ def build_configs_panel(
 
     with ui.row().classes("gap-2 items-center flex-wrap"):
         ui.button("导出全部配置", icon="download", on_click=export_configs)
-        ui.button("导入配置", icon="upload", on_click=lambda: import_dlg.open())
+        ui.button("导入配置", icon="upload", on_click=lambda: import_dlg.open()).props(
+            "outline"
+        )
 
     with (
         ui.dialog() as import_dlg,
@@ -360,8 +362,7 @@ def build_configs_panel(
             on_upload=on_import_file,
             auto_upload=True,
         ).props("accept=.json,.zip").classes("w-full")
-        with ui.row().classes("w-full justify-end"):
-            ui.button("关闭", on_click=import_dlg.close).props("outline")
+        # 短弹窗：右上角 X 与底部「关闭」同动作同作用域，删掉底部这个
 
     signer_block = SignerBlock(SIGNER_TEMPLATE)
     refreshers.append(signer_block)
@@ -369,7 +370,7 @@ def build_configs_panel(
     signer_block()
 
     if on_close is not None:
-        with ui.row().classes("w-full justify-end"):
+        with ui.row().classes("w-full justify-end tgs-dialog-footer"):
             ui.button("关闭", on_click=on_close).props("outline")
 
     return signer_block.refresh_options
@@ -448,7 +449,7 @@ def _build_dashboard(container) -> None:
                 refreshers.append(users_refresh)
                 # 块本身只创建空容器并返回 refresh，需立即调用一次填充内容
                 users_refresh()
-                with ui.row().classes("w-full justify-end"):
+                with ui.row().classes("w-full justify-end tgs-dialog-footer"):
                     ui.button("关闭", on_click=users_dialog.close).props("outline")
 
         def _ensure_logs() -> None:
@@ -462,7 +463,7 @@ def _build_dashboard(container) -> None:
                 logs_refresh = log_block(logs_card)
                 refreshers.append(logs_refresh)
                 logs_refresh()
-                with ui.row().classes("w-full justify-end"):
+                with ui.row().classes("w-full justify-end tgs-dialog-footer"):
                     ui.button("关闭", on_click=logs_dialog.close).props("outline")
 
         def _ensure_stats() -> None:
@@ -474,7 +475,7 @@ def _build_dashboard(container) -> None:
             with stats_card:
                 ui.label("频道 / 群组统计").classes("text-lg font-semibold")
                 channel_stats_block(state.workdir)
-                with ui.row().classes("w-full justify-end"):
+                with ui.row().classes("w-full justify-end tgs-dialog-footer"):
                     ui.button("关闭", on_click=stats_dialog.close).props("outline")
 
         async def open_settings() -> None:

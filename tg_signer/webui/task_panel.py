@@ -626,8 +626,8 @@ class TaskRunnerBlock:
             ui.label("账号来自 .session；多选时每账号一个进程。").classes(
                 "text-xs text-gray-500"
             )
-            with ui.row().classes("gap-2 justify-end w-full"):
-                ui.button("取消", on_click=self.dialog.close).props("outline")
+            # 只保留主操作：关闭走右上角 X，底部不再重复「取消」
+            with ui.row().classes("gap-2 justify-end w-full tgs-dialog-footer"):
                 ui.button("执行", color="primary", on_click=self.start_task)
 
     def _get_task_names(self, task_type: str | None = None) -> list[str]:
@@ -2041,7 +2041,7 @@ class TaskRunnerBlock:
                 list_container.clear()
                 with list_container:
                     if not filtered:
-                        ui.label("无匹配的子任务").classes("text-sm text-gray-500 p-2")
+                        ui.label("无匹配的子任务").classes("tgs-empty w-full")
                     for i, d in filtered:
                         status = d.get("status", "")
                         color = {

@@ -99,8 +99,8 @@ class InteractiveSignerConfig:
             self.refresh_chats_list()
 
             # Footer Actions
+            # 只保留主操作：关闭走右上角 X，底部不再重复「取消」
             with ui.row().classes("w-full justify-end mt-6 gap-2"):
-                ui.button("取消", on_click=self.dialog.close).props("flat")
                 ui.button("保存配置", icon="save", on_click=self.save_all)
 
     def refresh_chats_list(self):

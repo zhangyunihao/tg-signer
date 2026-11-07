@@ -1507,8 +1507,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         scope_sel.on_value_change(lambda _e: _sync_auto_cb())
         days_input.on_value_change(lambda _e: _sync_auto_cb())
         _sync_auto_cb()
-        with ui.row().classes("w-full justify-end"):
-            ui.button("取消", on_click=create_dialog.close).props("flat")
+        # 只保留主操作：关闭走右上角 X，底部不再重复「取消」；底栏吸底保证长内容可见
+        with ui.row().classes("w-full justify-end tgs-dialog-footer"):
             ui.button("启动执行", on_click=_do_create).props("color=primary")
 
     with (
@@ -1584,7 +1584,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             .classes("w-full")
             .props("outlined autogrow")
         )
-        with ui.row().classes("w-full justify-end"):
+        with ui.row().classes("w-full justify-end tgs-dialog-footer"):
             ui.button("取消", on_click=settings_dialog.close).props("flat")
             ui.button("保存", on_click=_save_settings).props("color=primary")
 

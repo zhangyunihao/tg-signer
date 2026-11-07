@@ -2699,12 +2699,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     with ui.row().classes("w-full items-center justify-between"):
         ui.label("共用日志（所有任务）").classes("font-semibold")
         with ui.row().classes("gap-1 items-center"):
-            ui.button("复制调试日志", icon="bug_report", on_click=copy_debug_log).props(
+            ui.button("复制调试信息", icon="bug_report", on_click=copy_debug_log).props(
                 "flat dense"
             ).tooltip("复制环境信息+任务配置+任务历史+日志文件，粘贴到电脑排查复现")
             ui.button(icon="content_copy", on_click=copy_log).props(
                 "flat round dense"
-            ).tooltip("一键复制日志")
+            ).tooltip("复制运行日志")
             ui.button(icon="delete_outline", on_click=clear_log).props(
                 "flat round dense"
             ).tooltip("清空日志")

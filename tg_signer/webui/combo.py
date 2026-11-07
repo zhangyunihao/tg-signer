@@ -2540,8 +2540,8 @@ class ComboTaskBlock:
                     step=1,
                     precision=0,
                 ).classes("flex-1")
+            # 只保留主操作：关闭走右上角 X，底部不再重复「取消」
             with ui.row().classes("gap-2 justify-end w-full"):
-                ui.button("取消", on_click=self.new_task_dialog.close).props("outline")
                 self.new_task_start_btn = ui.button(
                     "启动", color="primary", on_click=self._start_new_task
                 )

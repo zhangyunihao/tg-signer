@@ -110,7 +110,7 @@ class BaseConfigBlock:
                 label="保存为/新建名称",
                 placeholder="my_task",
             ).classes("min-w-[200px]")
-            ui.button("使用示例", on_click=self.fill_template)
+            ui.button("使用示例", on_click=self.fill_template).props("outline")
             self.setup_toolbar()
 
         schema = TypeAdapter(self.cfg_cls | None).json_schema()
@@ -122,14 +122,17 @@ class BaseConfigBlock:
             {"content": {"json": None}},
             schema=schema,
             on_change=on_change,
-        )
+        ).classes("w-full")
         self.selected_name: dict[str, str] = {"value": ""}
 
+        # 工具行只有「保存」是主操作，其余用描边/危险描边，避免一排实心按钮
         with ui.row().classes("gap-2 items-center"):
-            ui.button("刷新列表", on_click=self.refresh_options)
-            ui.button("加载", on_click=self.load_current)
+            ui.button("刷新列表", on_click=self.refresh_options).props("outline")
+            ui.button("加载", on_click=self.load_current).props("outline")
             ui.button("保存", color="primary", on_click=self.save_current)
-            ui.button("删除", color="negative", on_click=self.delete_current)
+            ui.button("删除", on_click=self.delete_current).props(
+                "outline color=negative"
+            )
         self.setup_footer()
 
     def clear_selection(self) -> None:

@@ -7,10 +7,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 233,
-    "htmlBytes": 94565,
-    "textLength": 226,
-    "bodyTextLength": 226
+    "nodeCount": 216,
+    "htmlBytes": 97777,
+    "textLength": 190,
+    "bodyTextLength": 190
   },
   "360x740::main-combo": {
     "docScrollWidth": 360,
@@ -20,10 +20,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 142,
-    "htmlBytes": 87337,
-    "textLength": 92,
-    "bodyTextLength": 92
+    "nodeCount": 139,
+    "htmlBytes": 91812,
+    "textLength": 82,
+    "bodyTextLength": 82
   },
   "360x740::main-random": {
     "docScrollWidth": 360,
@@ -33,10 +33,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 145,
-    "htmlBytes": 87758,
-    "textLength": 125,
-    "bodyTextLength": 125
+    "nodeCount": 143,
+    "htmlBytes": 92334,
+    "textLength": 115,
+    "bodyTextLength": 115
   },
   "360x740::main-leave": {
     "docScrollWidth": 360,
@@ -46,10 +46,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 161,
-    "htmlBytes": 89043,
-    "textLength": 120,
-    "bodyTextLength": 120
+    "nodeCount": 160,
+    "htmlBytes": 93633,
+    "textLength": 98,
+    "bodyTextLength": 98
   },
   "360x740::main-giveaway": {
     "docScrollWidth": 360,
@@ -60,9 +60,9 @@
     "bodyOverflow": 0,
     "offenders": [],
     "nodeCount": 158,
-    "htmlBytes": 89484,
-    "textLength": 163,
-    "bodyTextLength": 163
+    "htmlBytes": 94448,
+    "textLength": 182,
+    "bodyTextLength": 182
   },
   "360x740::messages": {
     "docScrollWidth": 360,
@@ -73,7 +73,7 @@
     "bodyOverflow": 0,
     "offenders": [],
     "nodeCount": 104,
-    "htmlBytes": 48262,
+    "htmlBytes": 53913,
     "textLength": 101,
     "bodyTextLength": 101
   },
@@ -86,7 +86,7 @@
     "bodyOverflow": 0,
     "offenders": [],
     "nodeCount": 63,
-    "htmlBytes": 42724,
+    "htmlBytes": 48407,
     "textLength": 36,
     "bodyTextLength": 36
   },
@@ -98,10 +98,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 515,
-    "htmlBytes": 278947,
-    "textLength": 593,
-    "bodyTextLength": 593
+    "nodeCount": 522,
+    "htmlBytes": 285300,
+    "textLength": 794,
+    "bodyTextLength": 794
   },
   "360x740::menu-settings": {
     "docScrollWidth": 360,
@@ -111,10 +111,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 269,
-    "htmlBytes": 101042,
-    "textLength": 587,
-    "bodyTextLength": 587
+    "nodeCount": 276,
+    "htmlBytes": 107452,
+    "textLength": 788,
+    "bodyTextLength": 788
   },
   "360x740::menu-users": {
     "docScrollWidth": 360,
@@ -124,10 +124,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 195,
-    "htmlBytes": 94515,
-    "textLength": 287,
-    "bodyTextLength": 287
+    "nodeCount": 202,
+    "htmlBytes": 101026,
+    "textLength": 488,
+    "bodyTextLength": 488
   },
   "360x740::menu-stats": {
     "docScrollWidth": 360,
@@ -137,10 +137,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 224,
-    "htmlBytes": 96857,
-    "textLength": 347,
-    "bodyTextLength": 347
+    "nodeCount": 231,
+    "htmlBytes": 103252,
+    "textLength": 548,
+    "bodyTextLength": 548
   },
   "360x740::menu-logs": {
     "docScrollWidth": 360,
@@ -150,10 +150,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 250,
-    "htmlBytes": 101146,
-    "textLength": 415,
-    "bodyTextLength": 415
+    "nodeCount": 276,
+    "htmlBytes": 110308,
+    "textLength": 2625,
+    "bodyTextLength": 2625
   },
   "360x740::add-leave": {
     "docScrollWidth": 360,
@@ -163,10 +163,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 240,
-    "htmlBytes": 97425,
-    "textLength": 332,
-    "bodyTextLength": 332
+    "nodeCount": 242,
+    "htmlBytes": 102998,
+    "textLength": 489,
+    "bodyTextLength": 489
   },
   "360x740::add-signin": {
     "docScrollWidth": 360,
@@ -176,10 +176,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 290,
-    "htmlBytes": 100873,
-    "textLength": 351,
-    "bodyTextLength": 351
+    "nodeCount": 276,
+    "htmlBytes": 105105,
+    "textLength": 494,
+    "bodyTextLength": 494
   },
   "360x740::add-giveaway": {
     "docScrollWidth": 360,
@@ -189,10 +189,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 405,
-    "htmlBytes": 115769,
-    "textLength": 562,
-    "bodyTextLength": 562
+    "nodeCount": 412,
+    "htmlBytes": 121981,
+    "textLength": 763,
+    "bodyTextLength": 763
   },
   "360x740::add-random": {
     "docScrollWidth": 360,
@@ -202,10 +202,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 237,
-    "htmlBytes": 98822,
-    "textLength": 369,
-    "bodyTextLength": 369
+    "nodeCount": 242,
+    "htmlBytes": 104873,
+    "textLength": 541,
+    "bodyTextLength": 541
   },
   "360x740::add-combo-template": {
     "docScrollWidth": 360,
@@ -215,10 +215,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 228,
-    "htmlBytes": 96092,
-    "textLength": 346,
-    "bodyTextLength": 346
+    "nodeCount": 232,
+    "htmlBytes": 101912,
+    "textLength": 518,
+    "bodyTextLength": 518
   },
   "1280x800::main-run": {
     "docScrollWidth": 1280,
@@ -228,10 +228,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 233,
-    "htmlBytes": 94559,
-    "textLength": 332,
-    "bodyTextLength": 332
+    "nodeCount": 216,
+    "htmlBytes": 97771,
+    "textLength": 283,
+    "bodyTextLength": 283
   },
   "1280x800::main-combo": {
     "docScrollWidth": 1280,
@@ -241,10 +241,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 142,
-    "htmlBytes": 87330,
-    "textLength": 164,
-    "bodyTextLength": 164
+    "nodeCount": 139,
+    "htmlBytes": 91805,
+    "textLength": 154,
+    "bodyTextLength": 154
   },
   "1280x800::main-random": {
     "docScrollWidth": 1280,
@@ -254,10 +254,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 145,
-    "htmlBytes": 87759,
-    "textLength": 168,
-    "bodyTextLength": 168
+    "nodeCount": 143,
+    "htmlBytes": 92328,
+    "textLength": 158,
+    "bodyTextLength": 158
   },
   "1280x800::main-leave": {
     "docScrollWidth": 1280,
@@ -267,10 +267,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 161,
-    "htmlBytes": 89044,
-    "textLength": 188,
-    "bodyTextLength": 188
+    "nodeCount": 160,
+    "htmlBytes": 93627,
+    "textLength": 166,
+    "bodyTextLength": 166
   },
   "1280x800::main-giveaway": {
     "docScrollWidth": 1280,
@@ -281,9 +281,9 @@
     "bodyOverflow": 0,
     "offenders": [],
     "nodeCount": 158,
-    "htmlBytes": 89485,
-    "textLength": 201,
-    "bodyTextLength": 201
+    "htmlBytes": 94441,
+    "textLength": 220,
+    "bodyTextLength": 220
   },
   "1280x800::messages": {
     "docScrollWidth": 1280,
@@ -294,7 +294,7 @@
     "bodyOverflow": 0,
     "offenders": [],
     "nodeCount": 104,
-    "htmlBytes": 48249,
+    "htmlBytes": 53900,
     "textLength": 101,
     "bodyTextLength": 101
   },
@@ -307,7 +307,7 @@
     "bodyOverflow": 0,
     "offenders": [],
     "nodeCount": 63,
-    "htmlBytes": 42711,
+    "htmlBytes": 48394,
     "textLength": 36,
     "bodyTextLength": 36
   },
@@ -319,10 +319,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 515,
-    "htmlBytes": 278896,
-    "textLength": 631,
-    "bodyTextLength": 631
+    "nodeCount": 522,
+    "htmlBytes": 285274,
+    "textLength": 832,
+    "bodyTextLength": 832
   },
   "1280x800::menu-settings": {
     "docScrollWidth": 1280,
@@ -332,10 +332,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 269,
-    "htmlBytes": 100991,
-    "textLength": 625,
-    "bodyTextLength": 625
+    "nodeCount": 276,
+    "htmlBytes": 107426,
+    "textLength": 826,
+    "bodyTextLength": 826
   },
   "1280x800::menu-users": {
     "docScrollWidth": 1280,
@@ -345,10 +345,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 195,
-    "htmlBytes": 94489,
-    "textLength": 325,
-    "bodyTextLength": 325
+    "nodeCount": 202,
+    "htmlBytes": 101018,
+    "textLength": 526,
+    "bodyTextLength": 526
   },
   "1280x800::menu-stats": {
     "docScrollWidth": 1280,
@@ -358,10 +358,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 224,
-    "htmlBytes": 96812,
-    "textLength": 385,
-    "bodyTextLength": 385
+    "nodeCount": 231,
+    "htmlBytes": 103225,
+    "textLength": 586,
+    "bodyTextLength": 586
   },
   "1280x800::menu-logs": {
     "docScrollWidth": 1280,
@@ -371,10 +371,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 250,
-    "htmlBytes": 101120,
-    "textLength": 453,
-    "bodyTextLength": 453
+    "nodeCount": 372,
+    "htmlBytes": 123981,
+    "textLength": 13032,
+    "bodyTextLength": 13032
   },
   "1280x800::detail-history": {
     "docScrollWidth": 1280,
@@ -384,10 +384,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 315,
-    "htmlBytes": 103382,
-    "textLength": 526,
-    "bodyTextLength": 526
+    "nodeCount": 305,
+    "htmlBytes": 108075,
+    "textLength": 659,
+    "bodyTextLength": 659
   },
   "1280x800::add-signin": {
     "docScrollWidth": 1280,
@@ -397,10 +397,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 290,
-    "htmlBytes": 100848,
-    "textLength": 457,
-    "bodyTextLength": 457
+    "nodeCount": 276,
+    "htmlBytes": 105080,
+    "textLength": 587,
+    "bodyTextLength": 587
   },
   "1280x800::add-giveaway": {
     "docScrollWidth": 1280,
@@ -410,10 +410,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 405,
-    "htmlBytes": 115725,
-    "textLength": 600,
-    "bodyTextLength": 600
+    "nodeCount": 412,
+    "htmlBytes": 121955,
+    "textLength": 801,
+    "bodyTextLength": 801
   },
   "1280x800::add-random": {
     "docScrollWidth": 1280,
@@ -423,10 +423,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 237,
-    "htmlBytes": 98804,
-    "textLength": 412,
-    "bodyTextLength": 412
+    "nodeCount": 242,
+    "htmlBytes": 104848,
+    "textLength": 584,
+    "bodyTextLength": 584
   },
   "1280x800::add-leave": {
     "docScrollWidth": 1280,
@@ -436,10 +436,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 240,
-    "htmlBytes": 97381,
-    "textLength": 400,
-    "bodyTextLength": 400
+    "nodeCount": 242,
+    "htmlBytes": 102973,
+    "textLength": 557,
+    "bodyTextLength": 557
   },
   "1280x800::add-combo-template": {
     "docScrollWidth": 1280,
@@ -449,10 +449,10 @@
     "bodyClientWidth": 1280,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 228,
-    "htmlBytes": 96066,
-    "textLength": 418,
-    "bodyTextLength": 418
+    "nodeCount": 232,
+    "htmlBytes": 101886,
+    "textLength": 590,
+    "bodyTextLength": 590
   },
   "360x740::detail-history": {
     "docScrollWidth": 360,
@@ -462,10 +462,10 @@
     "bodyClientWidth": 360,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 315,
-    "htmlBytes": 103389,
-    "textLength": 420,
-    "bodyTextLength": 420
+    "nodeCount": 305,
+    "htmlBytes": 108082,
+    "textLength": 566,
+    "bodyTextLength": 566
   },
   "407x830::main-run": {
     "docScrollWidth": 407,
@@ -475,10 +475,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 233,
-    "htmlBytes": 94565,
-    "textLength": 226,
-    "bodyTextLength": 226
+    "nodeCount": 216,
+    "htmlBytes": 97777,
+    "textLength": 190,
+    "bodyTextLength": 190
   },
   "407x830::main-combo": {
     "docScrollWidth": 407,
@@ -488,10 +488,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 142,
-    "htmlBytes": 87337,
-    "textLength": 92,
-    "bodyTextLength": 92
+    "nodeCount": 139,
+    "htmlBytes": 91812,
+    "textLength": 82,
+    "bodyTextLength": 82
   },
   "407x830::main-random": {
     "docScrollWidth": 407,
@@ -501,10 +501,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 145,
-    "htmlBytes": 87765,
-    "textLength": 125,
-    "bodyTextLength": 125
+    "nodeCount": 150,
+    "htmlBytes": 93532,
+    "textLength": 297,
+    "bodyTextLength": 297
   },
   "407x830::main-leave": {
     "docScrollWidth": 407,
@@ -514,10 +514,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 161,
-    "htmlBytes": 89050,
-    "textLength": 120,
-    "bodyTextLength": 120
+    "nodeCount": 160,
+    "htmlBytes": 93633,
+    "textLength": 98,
+    "bodyTextLength": 98
   },
   "407x830::main-giveaway": {
     "docScrollWidth": 407,
@@ -528,9 +528,9 @@
     "bodyOverflow": 0,
     "offenders": [],
     "nodeCount": 158,
-    "htmlBytes": 89491,
-    "textLength": 163,
-    "bodyTextLength": 163
+    "htmlBytes": 94448,
+    "textLength": 182,
+    "bodyTextLength": 182
   },
   "430x740::main-run": {
     "docScrollWidth": 430,
@@ -540,10 +540,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 233,
-    "htmlBytes": 94565,
-    "textLength": 226,
-    "bodyTextLength": 226
+    "nodeCount": 216,
+    "htmlBytes": 97777,
+    "textLength": 190,
+    "bodyTextLength": 372
   },
   "430x740::main-combo": {
     "docScrollWidth": 430,
@@ -553,10 +553,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 142,
-    "htmlBytes": 87337,
-    "textLength": 92,
-    "bodyTextLength": 92
+    "nodeCount": 139,
+    "htmlBytes": 91812,
+    "textLength": 82,
+    "bodyTextLength": 82
   },
   "430x740::main-random": {
     "docScrollWidth": 430,
@@ -566,10 +566,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 145,
-    "htmlBytes": 87765,
-    "textLength": 125,
-    "bodyTextLength": 125
+    "nodeCount": 143,
+    "htmlBytes": 92334,
+    "textLength": 115,
+    "bodyTextLength": 115
   },
   "430x740::main-leave": {
     "docScrollWidth": 430,
@@ -579,10 +579,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 161,
-    "htmlBytes": 89050,
-    "textLength": 120,
-    "bodyTextLength": 120
+    "nodeCount": 160,
+    "htmlBytes": 93633,
+    "textLength": 98,
+    "bodyTextLength": 98
   },
   "430x740::main-giveaway": {
     "docScrollWidth": 430,
@@ -593,9 +593,9 @@
     "bodyOverflow": 0,
     "offenders": [],
     "nodeCount": 158,
-    "htmlBytes": 89491,
-    "textLength": 163,
-    "bodyTextLength": 163
+    "htmlBytes": 94448,
+    "textLength": 182,
+    "bodyTextLength": 182
   },
   "407x830::messages": {
     "docScrollWidth": 407,
@@ -606,7 +606,7 @@
     "bodyOverflow": 0,
     "offenders": [],
     "nodeCount": 104,
-    "htmlBytes": 48262,
+    "htmlBytes": 53913,
     "textLength": 101,
     "bodyTextLength": 101
   },
@@ -619,7 +619,7 @@
     "bodyOverflow": 0,
     "offenders": [],
     "nodeCount": 63,
-    "htmlBytes": 42724,
+    "htmlBytes": 48407,
     "textLength": 36,
     "bodyTextLength": 36
   },
@@ -631,10 +631,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 515,
-    "htmlBytes": 278921,
-    "textLength": 593,
-    "bodyTextLength": 593
+    "nodeCount": 522,
+    "htmlBytes": 285300,
+    "textLength": 794,
+    "bodyTextLength": 794
   },
   "407x830::menu-settings": {
     "docScrollWidth": 407,
@@ -644,10 +644,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 269,
-    "htmlBytes": 101016,
-    "textLength": 587,
-    "bodyTextLength": 587
+    "nodeCount": 276,
+    "htmlBytes": 107452,
+    "textLength": 788,
+    "bodyTextLength": 788
   },
   "407x830::menu-users": {
     "docScrollWidth": 407,
@@ -657,10 +657,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 195,
-    "htmlBytes": 94496,
-    "textLength": 287,
-    "bodyTextLength": 287
+    "nodeCount": 202,
+    "htmlBytes": 101026,
+    "textLength": 488,
+    "bodyTextLength": 488
   },
   "407x830::menu-stats": {
     "docScrollWidth": 407,
@@ -670,10 +670,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 224,
-    "htmlBytes": 96839,
-    "textLength": 347,
-    "bodyTextLength": 347
+    "nodeCount": 231,
+    "htmlBytes": 103253,
+    "textLength": 548,
+    "bodyTextLength": 548
   },
   "407x830::menu-logs": {
     "docScrollWidth": 407,
@@ -683,10 +683,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 250,
-    "htmlBytes": 101127,
-    "textLength": 415,
-    "bodyTextLength": 415
+    "nodeCount": 308,
+    "htmlBytes": 114868,
+    "textLength": 6081,
+    "bodyTextLength": 6081
   },
   "407x830::detail-history": {
     "docScrollWidth": 407,
@@ -696,10 +696,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 315,
-    "htmlBytes": 103389,
-    "textLength": 420,
-    "bodyTextLength": 420
+    "nodeCount": 305,
+    "htmlBytes": 108082,
+    "textLength": 566,
+    "bodyTextLength": 566
   },
   "407x830::add-signin": {
     "docScrollWidth": 407,
@@ -709,10 +709,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 290,
-    "htmlBytes": 100873,
-    "textLength": 351,
-    "bodyTextLength": 351
+    "nodeCount": 276,
+    "htmlBytes": 105105,
+    "textLength": 494,
+    "bodyTextLength": 494
   },
   "407x830::add-giveaway": {
     "docScrollWidth": 407,
@@ -722,10 +722,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 405,
-    "htmlBytes": 115750,
-    "textLength": 562,
-    "bodyTextLength": 562
+    "nodeCount": 412,
+    "htmlBytes": 121981,
+    "textLength": 763,
+    "bodyTextLength": 763
   },
   "407x830::add-random": {
     "docScrollWidth": 407,
@@ -735,10 +735,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 237,
-    "htmlBytes": 98829,
-    "textLength": 369,
-    "bodyTextLength": 369
+    "nodeCount": 242,
+    "htmlBytes": 104873,
+    "textLength": 541,
+    "bodyTextLength": 541
   },
   "407x830::add-leave": {
     "docScrollWidth": 407,
@@ -748,10 +748,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 240,
-    "htmlBytes": 97406,
-    "textLength": 332,
-    "bodyTextLength": 332
+    "nodeCount": 242,
+    "htmlBytes": 102998,
+    "textLength": 489,
+    "bodyTextLength": 489
   },
   "407x830::add-combo-template": {
     "docScrollWidth": 407,
@@ -761,10 +761,10 @@
     "bodyClientWidth": 407,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 228,
-    "htmlBytes": 96092,
-    "textLength": 346,
-    "bodyTextLength": 346
+    "nodeCount": 232,
+    "htmlBytes": 101912,
+    "textLength": 518,
+    "bodyTextLength": 518
   },
   "430x740::messages": {
     "docScrollWidth": 430,
@@ -775,7 +775,7 @@
     "bodyOverflow": 0,
     "offenders": [],
     "nodeCount": 104,
-    "htmlBytes": 48262,
+    "htmlBytes": 53913,
     "textLength": 101,
     "bodyTextLength": 101
   },
@@ -788,7 +788,7 @@
     "bodyOverflow": 0,
     "offenders": [],
     "nodeCount": 63,
-    "htmlBytes": 42724,
+    "htmlBytes": 48407,
     "textLength": 36,
     "bodyTextLength": 36
   },
@@ -800,10 +800,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 515,
-    "htmlBytes": 278921,
-    "textLength": 593,
-    "bodyTextLength": 593
+    "nodeCount": 522,
+    "htmlBytes": 285300,
+    "textLength": 794,
+    "bodyTextLength": 794
   },
   "430x740::menu-settings": {
     "docScrollWidth": 430,
@@ -813,10 +813,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 269,
-    "htmlBytes": 101016,
-    "textLength": 587,
-    "bodyTextLength": 587
+    "nodeCount": 276,
+    "htmlBytes": 107452,
+    "textLength": 788,
+    "bodyTextLength": 788
   },
   "430x740::menu-users": {
     "docScrollWidth": 430,
@@ -826,10 +826,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 195,
-    "htmlBytes": 94496,
-    "textLength": 287,
-    "bodyTextLength": 287
+    "nodeCount": 202,
+    "htmlBytes": 101026,
+    "textLength": 488,
+    "bodyTextLength": 488
   },
   "430x740::menu-stats": {
     "docScrollWidth": 430,
@@ -839,10 +839,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 224,
-    "htmlBytes": 96839,
-    "textLength": 347,
-    "bodyTextLength": 347
+    "nodeCount": 231,
+    "htmlBytes": 103253,
+    "textLength": 548,
+    "bodyTextLength": 548
   },
   "430x740::menu-logs": {
     "docScrollWidth": 430,
@@ -852,10 +852,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 250,
-    "htmlBytes": 101127,
-    "textLength": 415,
-    "bodyTextLength": 415
+    "nodeCount": 340,
+    "htmlBytes": 119428,
+    "textLength": 9537,
+    "bodyTextLength": 9537
   },
   "430x740::detail-history": {
     "docScrollWidth": 430,
@@ -865,10 +865,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 315,
-    "htmlBytes": 103389,
-    "textLength": 420,
-    "bodyTextLength": 420
+    "nodeCount": 305,
+    "htmlBytes": 108082,
+    "textLength": 566,
+    "bodyTextLength": 566
   },
   "430x740::add-signin": {
     "docScrollWidth": 430,
@@ -878,10 +878,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 290,
-    "htmlBytes": 100873,
-    "textLength": 351,
-    "bodyTextLength": 351
+    "nodeCount": 276,
+    "htmlBytes": 105105,
+    "textLength": 494,
+    "bodyTextLength": 494
   },
   "430x740::add-giveaway": {
     "docScrollWidth": 430,
@@ -891,10 +891,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 405,
-    "htmlBytes": 115750,
-    "textLength": 562,
-    "bodyTextLength": 562
+    "nodeCount": 412,
+    "htmlBytes": 121981,
+    "textLength": 763,
+    "bodyTextLength": 763
   },
   "430x740::add-random": {
     "docScrollWidth": 430,
@@ -904,10 +904,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 237,
-    "htmlBytes": 98829,
-    "textLength": 369,
-    "bodyTextLength": 369
+    "nodeCount": 242,
+    "htmlBytes": 104873,
+    "textLength": 541,
+    "bodyTextLength": 541
   },
   "430x740::add-leave": {
     "docScrollWidth": 430,
@@ -917,10 +917,10 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 240,
-    "htmlBytes": 97432,
-    "textLength": 332,
-    "bodyTextLength": 332
+    "nodeCount": 242,
+    "htmlBytes": 102998,
+    "textLength": 489,
+    "bodyTextLength": 489
   },
   "430x740::add-combo-template": {
     "docScrollWidth": 430,
@@ -930,9 +930,9 @@
     "bodyClientWidth": 430,
     "bodyOverflow": 0,
     "offenders": [],
-    "nodeCount": 228,
-    "htmlBytes": 96092,
-    "textLength": 346,
-    "bodyTextLength": 346
+    "nodeCount": 232,
+    "htmlBytes": 101912,
+    "textLength": 518,
+    "bodyTextLength": 518
   }
 }
