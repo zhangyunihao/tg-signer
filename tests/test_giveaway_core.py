@@ -4816,6 +4816,7 @@ def test_check_win_message_forwards_emits_and_dedups(tmp_path):
     assert events[0]["type"] == "win"
     assert events[0]["account"] == "acc"
     assert events[0]["bot"] == "LotteryBestBot"
+    assert events[0]["mid"] == 7
     assert state.has("acc", "LotteryBestBot", "win:7")
     assert any("检测到中奖消息" in line for line in logs)
     assert any("已转发到 收藏夹" in line for line in logs)

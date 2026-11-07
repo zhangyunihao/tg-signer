@@ -705,18 +705,39 @@ def _handle_channels_full_event(client, workdir, ev: dict) -> None:
 
 
 def _handle_win_event(client, workdir, ev: dict) -> None:
-    """中奖提醒：持久化 + 顶部弹窗（好消息，绿色通知）。"""
+    """中奖提醒：持久化 + 顶部弹窗（好消息，绿色通知）。
+
+    同一条中奖消息可能被多个任务/多轮回扫重复识别（例如旧提醒产生时还没有
+    状态去重记录）。这里按原始消息 id（旧提醒按正文）去重，避免每次都按新的
+    检测时间插入一条未读提醒，表现为「已读的中奖消息又变回未读」。
+    """
     acct = str(ev.get("account") or "")
     bot = str(ev.get("bot") or "")
     if not acct or not bot:
         return
+    text = str(ev.get("text") or "")[:300]
+    mid = ev.get("mid")
     alerts = load_win_alerts(workdir)
+    for existing in alerts:
+        if str(existing.get("account") or "") != acct:
+            continue
+        if str(existing.get("bot") or "") != bot:
+            continue
+        old_mid = existing.get("mid")
+        same = (
+            str(old_mid) == str(mid)
+            if mid is not None and old_mid is not None
+            else str(existing.get("text") or "") == text
+        )
+        if same:
+            return
     alerts.insert(
         0,
         {
             "account": acct,
             "bot": bot,
-            "text": str(ev.get("text") or "")[:300],
+            "mid": mid,
+            "text": text,
             # 转发失败的目标与原因（引擎在 win 事件里带出），消息中心直接展示
             "fwd_failures": [
                 str(x)[:200] for x in (ev.get("fwd_failures") or []) if str(x).strip()

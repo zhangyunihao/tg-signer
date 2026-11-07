@@ -69,7 +69,7 @@ from tg_signer.webui.theme import MOBILE_DESIGN_CSS
 
 logger = logging.getLogger(__name__)
 
-# 已读状态文件与容量上限（防止长期运行膨胀）
+# 已读状态文件与清理阈值：超过阈值时清理已不存在消息的陈旧键（不再硬截断）
 READ_STATE_FILE = "webui_message_read.json"
 READ_STATE_MAX = 1000
 
@@ -118,9 +118,14 @@ def load_read_keys(workdir) -> Set[str]:
 
 def save_read_keys(workdir, keys: Set[str]) -> None:
     try:
-        atomic_write_json(
-            _read_state_path(workdir), {"read": sorted(keys)[:READ_STATE_MAX]}
-        )
+        kept = set(keys)
+        if len(kept) > READ_STATE_MAX:
+            # 超过上限时只清理「消息已不存在」的陈旧键，不按字母序硬截断：
+            # win| 开头的键排最后，硬截断会成批丢掉已读的中奖消息，
+            # 表现为标记已读后重新进入消息中心又变回未读
+            valid = {k for m in collect_messages(workdir) for k in message_keys(m)}
+            kept &= valid
+        atomic_write_json(_read_state_path(workdir), {"read": sorted(kept)})
     except OSError:
         logger.debug("写入消息已读状态失败", exc_info=True)
 
@@ -245,9 +250,13 @@ def collect_messages(workdir) -> List[dict]:
         acct = str(a.get("account") or "")
         bot = str(a.get("bot") or "")
         time_str = str(a.get("time") or "")
+        # 优先用原始消息 id 做键：回扫重复识别同一条中奖消息时键保持不变，
+        # 已读状态不会被检测时间变化冲掉；旧提醒没有 mid，继续按时间生成
+        mid = a.get("mid")
+        ident = str(mid) if mid is not None else time_str
         messages.append(
             {
-                "key": f"win|{acct}|{bot}|{time_str}",
+                "key": f"win|{acct}|{bot}|{ident}",
                 "tag": "中奖",
                 "color": "green",
                 "account": acct,

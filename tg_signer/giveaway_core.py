@@ -2172,6 +2172,8 @@ class GiveawayEngine:
             "type": "win",
             "account": account,
             "bot": bot_username,
+            # 原始消息 id：消息中心据此做去重与稳定的已读键，回扫重复识别不产生新未读
+            "mid": mid,
             "text": text[:300],
         }
         if failures:

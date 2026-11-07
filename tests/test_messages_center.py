@@ -4,8 +4,10 @@ from tg_signer.webui import giveaway
 from tg_signer.webui.messages import (
     collect_messages,
     is_message_unread,
+    load_read_keys,
     message_html,
     message_keys,
+    save_read_keys,
 )
 
 
@@ -146,6 +148,97 @@ def test_win_event_records_forward_failures(tmp_path):
         "转发失败：-1004324986564：CHAT_WRITE_FORBIDDEN"
         in giveaway.format_win_alert(alerts[0])
     )
+
+
+def test_win_event_dedups_repeated_detection(tmp_path):
+    """回扫重复识别同一条中奖消息：不再插入新的未读提醒。"""
+    ev = {
+        "type": "win",
+        "account": "alice",
+        "bot": "giveaway_bot",
+        "mid": 7,
+        "text": "恭喜您中奖了",
+    }
+    giveaway._handle_win_event(None, tmp_path, ev)
+    giveaway._handle_win_event(None, tmp_path, ev)
+    assert len(giveaway.load_win_alerts(tmp_path)) == 1
+
+
+def test_win_event_dedups_legacy_alert_without_mid(tmp_path):
+    """旧提醒没有 mid：按账号 + bot + 正文识别同一消息，不重复插入未读。"""
+    giveaway.save_win_alerts(
+        tmp_path,
+        [
+            {
+                "account": "alice",
+                "bot": "giveaway_bot",
+                "text": "恭喜您中奖了",
+                "time": "11-04 10:00:00",
+            }
+        ],
+    )
+    giveaway._handle_win_event(
+        None,
+        tmp_path,
+        {
+            "type": "win",
+            "account": "alice",
+            "bot": "giveaway_bot",
+            "mid": 7,
+            "text": "恭喜您中奖了",
+        },
+    )
+    assert len(giveaway.load_win_alerts(tmp_path)) == 1
+
+
+def test_win_message_key_prefers_message_id(tmp_path):
+    """新提醒用原始消息 id 做已读键，检测时间变化不再冲掉已读状态。"""
+    giveaway.save_win_alerts(
+        tmp_path,
+        [
+            {
+                "account": "alice",
+                "bot": "giveaway_bot",
+                "mid": 42,
+                "text": "恭喜您中奖了",
+                "time": "11-04 10:00:00",
+            },
+            {
+                "account": "bob",
+                "bot": "giveaway_bot",
+                "text": "恭喜您中奖了",
+                "time": "11-04 09:00:00",
+            },
+        ],
+    )
+    keys = {m["key"] for m in collect_messages(tmp_path) if m["tag"] == "中奖"}
+    assert "win|alice|giveaway_bot|42" in keys
+    # 旧提醒没有 mid，保持按时间生成，历史已读状态不失效
+    assert "win|bob|giveaway_bot|11-04 09:00:00" in keys
+
+
+def test_read_state_keeps_win_keys_above_limit(tmp_path):
+    """已读键超阈值时只清理陈旧键，不能按字母序把 win| 键成批丢掉。"""
+    giveaway.save_win_alerts(
+        tmp_path,
+        [
+            {
+                "account": "alice",
+                "bot": "giveaway_bot",
+                "mid": 42,
+                "text": "恭喜您中奖了",
+                "time": "11-04 10:00:00",
+            }
+        ],
+    )
+    (msg,) = [m for m in collect_messages(tmp_path) if m["tag"] == "中奖"]
+    stale = {f"speak_failed|x|y|口令|11-01 00:00:{i % 60:02d}|{i}" for i in range(1200)}
+    save_read_keys(tmp_path, stale | {msg["key"]})
+
+    keys = load_read_keys(tmp_path)
+    assert msg["key"] in keys
+    # 已不存在的陈旧键被清理，文件不会无限增长
+    assert not (stale & keys)
 
 
 def test_message_html_escapes_untrusted_text(tmp_path):
