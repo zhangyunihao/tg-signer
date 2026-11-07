@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -19,7 +20,8 @@ import uuid
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
-from tg_signer.webui.common import _assign_to_job
+from tg_signer.webui import account_queue
+from tg_signer.webui.common import _assign_to_job, load_account_parallel_limit
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +41,10 @@ class GiveawayProcess:
     状态卡在「运行中」、统计与结束信号丢失。
     """
 
-    def __init__(self, name: str, workdir) -> None:
+    def __init__(self, name: str, workdir, task_name: Optional[str] = None) -> None:
         self.name = name
+        # 事件文件用的展示名（可能含账号名），任务名保持原任务 ID 供状态库使用
+        self.task_name = task_name or name
         self.workdir = Path(workdir)
         self.proc: Optional[subprocess.Popen] = None
         # 运行统计：由子进程每秒回报一次，结束后保留最后值供「上次运行」展示
@@ -92,7 +96,8 @@ class GiveawayProcess:
 
         log_dir = self.workdir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        events_file = log_dir / f"giveaway-{self.name}-{uuid.uuid4().hex}.jsonl"
+        safe_name = re.sub(r"[^0-9A-Za-z_.-]+", "_", self.name)[:40]
+        events_file = log_dir / f"giveaway-{safe_name}-{uuid.uuid4().hex}.jsonl"
         self._events_file = events_file
 
         spec = self._build_spec(cfg)
@@ -155,7 +160,7 @@ class GiveawayProcess:
     def _build_spec(self, cfg: dict) -> dict:
         return {
             "accounts": [str(a) for a in (cfg.get("accounts") or [])],
-            "task": self.name,
+            "task": self.task_name,
             "workdir": str(self.workdir),
             "session_dir": str(cfg.get("session_dir") or "."),
             "chats": [str(c) for c in (cfg.get("chats") or [])],
@@ -337,3 +342,272 @@ class GiveawayProcess:
         path = self._events_file
         self._events_file = None
         self._unlink_events(path)
+
+
+class GiveawayTaskRunner:
+    """一个抽奖任务按账号拆分的子进程组，对外接口与单个 GiveawayProcess 一致。
+
+    每个账号独立启动一个 ``giveaway_runner`` 子进程，因此可以做到账号级排队：
+    账号被其它任务占用时只有该账号等待，空闲账号立即开始。
+    状态库（giveaway_state）使用 WAL + busy_timeout，支持多进程并发读写，
+    统计、日志、进度在这里聚合后交给界面，界面看到的仍是一个任务。
+    """
+
+    def __init__(self, name: str, workdir) -> None:
+        self.name = name
+        self.workdir = Path(workdir)
+        self.queue_id = f"giveaway|{self.workdir.resolve()}|{name}"
+        self._accounts: list[str] = []
+        self._cfg: dict = {}
+        self._engines: Dict[str, GiveawayProcess] = {}
+        self._pending: Dict[str, asyncio.Task] = {}
+        self._max_concurrent = 0
+        self._queue_cap = 0
+        self._stop_requested = False
+        self._finished = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._log: Optional[Callable[[str], None]] = None
+        self._on_event: Optional[Callable[[dict], None]] = None
+        self._on_finish: Optional[Callable[[], None]] = None
+        self._on_stats: Optional[Callable[[dict], None]] = None
+
+    @property
+    def running(self) -> bool:
+        if self._pending:
+            return True
+        return any(engine.running for engine in self._engines.values())
+
+    @property
+    def joined(self) -> int:
+        return sum(int(engine.joined) for engine in self._engines.values())
+
+    @property
+    def joined_by_account(self) -> Dict[str, int]:
+        merged: Dict[str, int] = {}
+        for engine in self._engines.values():
+            for account, count in engine.joined_by_account.items():
+                merged[str(account)] = merged.get(str(account), 0) + int(count)
+        return merged
+
+    @property
+    def joined_by_account_chat(self) -> Dict[str, Dict[str, int]]:
+        merged: Dict[str, Dict[str, int]] = {}
+        for engine in self._engines.values():
+            for account, chats in engine.joined_by_account_chat.items():
+                target = merged.setdefault(str(account), {})
+                for chat, count in chats.items():
+                    target[str(chat)] = target.get(str(chat), 0) + int(count)
+        return merged
+
+    @property
+    def win_sweep_text(self) -> str:
+        texts: list[str] = []
+        for engine in self._engines.values():
+            text = engine.win_sweep_text
+            if text and text not in texts:
+                texts.append(text)
+        return "；".join(texts[:3])
+
+    def progress_text(self) -> str:
+        active = [engine for engine in self._engines.values() if engine.running]
+        if not active:
+            if self._pending:
+                return f"排队中（{len(self._pending)} 个账号等待）"
+            return ""
+        text = f"运行中（{len(active)}/{len(self._accounts)} 个账号）"
+        detail = next(
+            (engine.progress_text() for engine in active if engine.progress_text()),
+            "",
+        )
+        return f"{text} {detail}" if detail else text
+
+    def _account_cfg(self, account: str) -> dict:
+        cfg = dict(self._cfg)
+        cfg["accounts"] = [account]
+        return cfg
+
+    def _emit_log(self, account: str, line: str) -> None:
+        if self._log is None:
+            return
+        # 子进程日志自带「[时间] [级别] [#任务 账号]」前缀，原样上送；
+        # 其它行（如 Python 异常栈）补上账号，便于多子进程时区分来源
+        if re.match(r"^\[[0-9:]{8}\] \[[A-Z]+\] ", line) or re.match(
+            r"^\[#[^\]]+\] \d{2}:\d{2}:\d{2} ", line
+        ):
+            self._log(line)
+        else:
+            self._log(f"[{account}] {line}")
+
+    def _aggregate_stats_payload(self) -> dict:
+        return {
+            "joined": self.joined,
+            "by_account": self.joined_by_account,
+            "by_chat": {
+                account: dict(chats)
+                for account, chats in self.joined_by_account_chat.items()
+            },
+            "progress": self.progress_text(),
+            "sweep": self.win_sweep_text,
+        }
+
+    def _account_stats(self, account: str, _payload: dict) -> None:
+        # 每个账号的统计先落到各自的 GiveawayProcess，这里统一聚合后回传界面
+        if self._on_stats is None:
+            return
+        try:
+            self._on_stats(self._aggregate_stats_payload())
+        except Exception:
+            logger.debug("聚合抽奖统计失败", exc_info=True)
+
+    def _launch_account(self, account: str) -> bool:
+        engine = GiveawayProcess(
+            f"{self.name}#{account}", self.workdir, task_name=self.name
+        )
+        # 先登记再启动：启动失败/立即结束时 running 判断与结束回调都只看 _engines
+        self._engines[account] = engine
+        started = engine.start(
+            self._account_cfg(account),
+            log=lambda line, a=account: self._emit_log(a, line),
+            on_event=self._on_event or (lambda _ev: None),
+            on_finish=lambda a=account: self._account_finished(a),
+            on_stats=lambda payload, a=account: self._account_stats(a, payload),
+        )
+        if not started:
+            self._engines.pop(account, None)
+            account_queue.release(self.queue_id, [account])
+            self._emit_log(account, "子进程启动失败，跳过该账号")
+            self._notify_finish_if_idle()
+            return False
+        if self._stop_requested:
+            # 停止请求恰好发生在启动前：立即停掉刚拉起的子进程
+            engine.stop()
+        return True
+
+    async def _wait_account(self, account: str) -> None:
+        """等本地并发槽位与跨任务账号租约，条件满足后启动该账号的子进程。"""
+        try:
+            while True:
+                if self._stop_requested:
+                    return
+                if (
+                    self._max_concurrent > 0
+                    and sum(1 for e in self._engines.values() if e.running)
+                    >= self._max_concurrent
+                ):
+                    await asyncio.sleep(1.0)
+                    continue
+                try:
+                    granted, _queued = account_queue.request(
+                        self.queue_id,
+                        self.name,
+                        "自动抽奖",
+                        [account],
+                        max_entries=self._queue_cap,
+                    )
+                except account_queue.QueueLimitError:
+                    await asyncio.sleep(1.0)
+                    continue
+                if not granted and not account_queue.poll(self.queue_id, account):
+                    await asyncio.sleep(1.0)
+                    continue
+                self._pending.pop(account, None)
+                if self._stop_requested:
+                    account_queue.release(self.queue_id, [account])
+                    return
+                self._launch_account(account)
+                return
+        except asyncio.CancelledError:
+            account_queue.release(self.queue_id, [account])
+            raise
+
+    def _account_finished(self, account: str) -> None:
+        account_queue.release(self.queue_id, [account])
+        if self._on_stats is not None:
+            try:
+                self._on_stats(self._aggregate_stats_payload())
+            except Exception:
+                logger.debug("聚合抽奖统计失败", exc_info=True)
+        self._notify_finish_if_idle()
+
+    def _notify_finish_if_idle(self) -> None:
+        if self._finished or self.running:
+            return
+        self._finished = True
+        if self._on_finish is not None:
+            self._on_finish()
+
+    def start(
+        self,
+        cfg: dict,
+        *,
+        log: Callable[[str], None],
+        on_event: Callable[[dict], None],
+        on_finish: Callable[[], None],
+        on_stats: Optional[Callable[[dict], None]] = None,
+    ) -> bool:
+        """启动任务：空闲账号立即开始，被占用账号进入跨任务队列等待。"""
+        if self.running:
+            return False
+        accounts = [str(a) for a in (cfg.get("accounts") or []) if str(a).strip()]
+        if not accounts:
+            return False
+        self._cfg = dict(cfg)
+        self._accounts = accounts
+        self._engines = {}
+        self._pending = {}
+        self._stop_requested = False
+        self._finished = False
+        self._log = log
+        self._on_event = on_event
+        self._on_finish = on_finish
+        self._on_stats = on_stats
+        self._loop = asyncio.get_running_loop()
+        self._max_concurrent = load_account_parallel_limit(self.workdir)
+        self._queue_cap = account_queue.queue_cap(self.workdir)
+
+        # 启动前检查排队上限：首批要启动的账号已把队列占满时直接拒绝
+        probe = accounts[: self._max_concurrent] if self._max_concurrent else accounts
+        busy_now = sum(
+            1 for account in probe if account_queue.blocked_by(account) is not None
+        )
+        if (
+            self._queue_cap > 0
+            and busy_now
+            and account_queue.waiting_count() + busy_now > self._queue_cap
+        ):
+            log("排队任务已满，请等待运行中的任务结束后再启动")
+            return False
+
+        for account in accounts:
+            self._pending[account] = self._loop.create_task(self._wait_account(account))
+        return True
+
+    def _cancel_pending(self) -> None:
+        """取消仍在排队/等槽位的账号（只能在事件循环线程调用）。"""
+        for task in list(self._pending.values()):
+            task.cancel()
+        self._pending.clear()
+
+    def stop(self) -> None:
+        """停止全部子进程并取消仍在排队的账号（可由任意线程调用）。"""
+        self._stop_requested = True
+        loop = self._loop
+        if loop is not None:
+            try:
+                # 取消 asyncio.Task 只能在事件循环线程执行
+                loop.call_soon_threadsafe(self._cancel_pending)
+            except RuntimeError:
+                logger.debug("提交抽奖排队取消失败", exc_info=True)
+        else:
+            self._cancel_pending()
+        account_queue.release_all(self.queue_id)
+        for engine in list(self._engines.values()):
+            if engine.running:
+                engine.stop()
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(self._notify_finish_if_idle)
+            except RuntimeError:
+                logger.debug("提交抽奖任务结束回调失败", exc_info=True)
+        else:
+            self._notify_finish_if_idle()

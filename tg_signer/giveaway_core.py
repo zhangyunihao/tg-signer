@@ -3326,8 +3326,10 @@ class GiveawayEngine:
             if wall - at <= window
         }
         self._transport_flood_hits = recent
+        # 用 -inf 作为「从未记录」的哨兵：monotonic 在 Windows 是开机时长，
+        # 开机未满节流窗口时 0.0 会被误当成「刚记录过」而吞掉首批告警
         if (
-            now - self._transport_flood_429_logged.get(account, 0.0)
+            now - self._transport_flood_429_logged.get(account, float("-inf"))
             < TRANSPORT_FLOOD_LOG_INTERVAL
         ):
             return
@@ -3349,7 +3351,10 @@ class GiveawayEngine:
             alert_key = f"single:{account}"
             alert_interval = TRANSPORT_FLOOD_ALERT_INTERVAL_SINGLE
         self.log(text)
-        if now - self._transport_flood_alerted.get(alert_key, 0.0) < alert_interval:
+        if (
+            now - self._transport_flood_alerted.get(alert_key, float("-inf"))
+            < alert_interval
+        ):
             return
         self._transport_flood_alerted[alert_key] = now
         self._spawn_flood_alert(text)
@@ -3404,7 +3409,7 @@ class GiveawayEngine:
             )
         now = time.monotonic()
         self._log_transport_flood_429(account)
-        if now - self._transport_flood_logged.get(account, 0.0) < 300:
+        if now - self._transport_flood_logged.get(account, float("-inf")) < 300:
             return
         self._transport_flood_logged[account] = now
         self.log(

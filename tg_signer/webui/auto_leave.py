@@ -23,6 +23,7 @@ from pyrogram.errors import FloodWait, RPCError
 from tg_signer.core import get_client, safe_disconnect, timeout_aiter
 from tg_signer.giveaway_state import record_account_limit
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui import account_queue
 from tg_signer.webui.activity import (
     create_poll_task,
     is_client_alive,
@@ -749,6 +750,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 f"其余 {len(accounts) - limit} 个账号排队"
             )
         state_lock = asyncio.Lock()
+        # 跨任务账号排队：同一账号被其它任务占用时等待，状态显示「排队中」
+        queue_id = f"auto_leave|{task_id}|{id(st)}"
+        max_entries = account_queue.queue_cap(workdir)
 
         async def run_account(account: str) -> None:
             if st["stop"]:
@@ -756,10 +760,31 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                 return
             if sem is not None:
                 await sem.acquire()
+            acquired = False
             try:
                 if st["stop"]:
                     log(f"[{task['name']}] 已停止，跳过账号 {account}")
                     return
+                ok = await account_queue.acquire_wait(
+                    queue_id,
+                    str(task.get("name") or task_id),
+                    "批量退频道",
+                    account,
+                    max_entries=max_entries,
+                    should_stop=lambda: bool(st["stop"]),
+                    on_wait=lambda text: (
+                        log(f"[{account}] {text}，等待账号空闲后扫描"),
+                        st.__setitem__("status", text),
+                        render_list(),
+                    ),
+                )
+                if not ok:
+                    log(f"[{task['name']}] 已停止，跳过账号 {account}")
+                    return
+                acquired = True
+                if st["status"] != "扫描中":
+                    st["status"] = "扫描中"
+                    render_list()
                 found = await scan_stale_chats(
                     account,
                     session_dir,
@@ -809,6 +834,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                         )
                 render_list()
             finally:
+                if acquired:
+                    account_queue.release(queue_id, [account])
                 if sem is not None:
                     sem.release()
 

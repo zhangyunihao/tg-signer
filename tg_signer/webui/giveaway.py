@@ -35,6 +35,7 @@ from tg_signer.giveaway_parsing import DEFAULT_KEYWORDS
 from tg_signer.giveaway_state import GiveawayState
 from tg_signer.locks import file_lock
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui import account_queue
 from tg_signer.webui.activity import (
     create_poll_task,
     is_client_alive,
@@ -59,7 +60,7 @@ from tg_signer.webui.components import (
     exit_fullscreen_button,
 )
 from tg_signer.webui.data import load_user_infos
-from tg_signer.webui.giveaway_process import GiveawayProcess
+from tg_signer.webui.giveaway_process import GiveawayTaskRunner
 from tg_signer.webui.random_chat import (
     build_account_options,
     list_session_names,
@@ -70,7 +71,7 @@ from tg_signer.webui.random_chat import (
 
 logger = logging.getLogger(__name__)
 
-_GLOBAL_ENGINES: Dict[str, GiveawayProcess] = {}
+_GLOBAL_ENGINES: Dict[str, GiveawayTaskRunner] = {}
 _GLOBAL_LOGS: Dict[str, List[str]] = {}
 _GLOBAL_STATUS_CBS: Dict[str, Callable[[bool], None]] = {}
 # 已删除的任务编号（按 workdir）：落盘合并时不再从磁盘捡回，
@@ -103,6 +104,7 @@ def stop_all_giveaway_tasks(workdir) -> int:
         if not key.startswith(prefix) or engine is None or not engine.running:
             continue
         try:
+            # 排队中的账号也计入 running，stop() 会一并取消
             engine.stop()
             count += 1
         except Exception:
@@ -1186,6 +1188,32 @@ def save_giveaway_max_concurrent(workdir, val) -> None:
     _update_win_settings(workdir, giveaway_max_concurrent=value)
 
 
+def load_max_queue_entries(workdir) -> int:
+    """跨任务排队等待条目上限（按账号条目计），0=不限。"""
+    path = Path(workdir) / WIN_SETTINGS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return account_queue.DEFAULT_MAX_QUEUE_ENTRIES
+    if not isinstance(data, dict):
+        return account_queue.DEFAULT_MAX_QUEUE_ENTRIES
+    try:
+        val = int(data.get("max_queue_entries"))
+    except (TypeError, ValueError):
+        return account_queue.DEFAULT_MAX_QUEUE_ENTRIES
+    return max(0, val)
+
+
+def save_max_queue_entries(workdir, val) -> None:
+    """保存跨任务排队等待条目上限，保留文件中其他键。"""
+    try:
+        value = max(0, int(val))
+    except (TypeError, ValueError):
+        logger.debug("最大排队账号条目非法，忽略写入: %r", val)
+        return
+    _update_win_settings(workdir, max_queue_entries=value)
+
+
 # 任务配置字段 -> 默认值，加载旧配置时补齐缺失字段
 _CFG_FIELDS = {
     "accounts": list,
@@ -1437,7 +1465,7 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     def engine_key(name: str) -> str:
         return f"{wd_key}|{name}"
 
-    def get_engine(name: str) -> Optional[GiveawayProcess]:
+    def get_engine(name: str) -> Optional[GiveawayTaskRunner]:
         return _GLOBAL_ENGINES.get(engine_key(name))
 
     def capture_engine_stats(name: str) -> bool:
@@ -1458,10 +1486,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         cfg["last_sweep"] = str(getattr(eng, "win_sweep_text", "") or "")
         return True
 
-    def ensure_engine(name: str) -> GiveawayProcess:
+    def ensure_engine(name: str) -> GiveawayTaskRunner:
         engine = get_engine(name)
         if engine is None:
-            engine = GiveawayProcess(name, workdir)
+            engine = GiveawayTaskRunner(name, workdir)
             _GLOBAL_ENGINES[engine_key(name)] = engine
         return engine
 
@@ -1548,9 +1576,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         return str(cfg.get("last_outcome") or "已完成")
 
     def _badge_color(running: bool, text: str) -> str:
-        """状态徽标配色：运行中=蓝，已完成=绿，其余（未运行/已停止）=灰。"""
+        """状态徽标配色：排队中=橙，运行中=蓝，已完成=绿，其余=灰。"""
         if running:
-            return "info"
+            return "warning" if text.startswith("排队中") else "info"
         return "positive" if text.startswith("已完成") else "grey-6"
 
     def _status_text(name: str) -> str:
@@ -1735,18 +1763,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 )
 
         cfg = tasks[name]
-        for other, ocfg in tasks.items():
-            if (
-                other != name
-                and task_running(other)
-                and set(cfg["accounts"]) & set(ocfg["accounts"])
-            ):
-                ui.notify(
-                    f"账号已被运行中的任务 #{other} 占用（同一账号不能并行建立连接），"
-                    "请先停止该任务",
-                    type="warning",
-                )
-                return
+        if task_running(name):
+            ui.notify(f"任务 #{name} 正在运行或排队中，请先停止", type="warning")
+            return
 
         # 运行中每次统计变化都写回配置并定期落盘，停止/重启后明细仍可查
         last_saved = {"joined": -1, "ts": 0.0}
@@ -1863,33 +1882,40 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             if ev.get("type") == "channels_full":
                 _start_channels_full_leave(ev)
 
-        engine = ensure_engine(name)
-        start_ts = time.time()
-        # 引擎在独立子进程运行：WebUI 不再承载长时间扫描/并发账号的 CPU 与内存
-        started = engine.start(
-            cfg,
-            log=log,
-            on_event=_on_event,
-            on_finish=_on_finish,
-            on_stats=_on_stats,
-        )
-        if started:
-            cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
-            cfg["last_duration"] = ""
-            cfg["_start_ts"] = start_ts
-            cfg.pop("last_outcome", None)  # 重新跑：清掉上一轮的结束结果
-            # 启动分隔线：子进程冷启动要数百毫秒，先落线再接它的首批日志
-            cfg["run_count"] = run_no
-            log(f"════ 第 {run_no} 次启动 ════")
-            _persist()
-            set_status(True)
-            ui.notify(f"任务 #{name} 已启动", type="positive")
-            # 超时自动停止：全局设置「抽奖任务超时」（分钟，0=不限）
-            runtime_min = load_giveaway_timeout_min(workdir)
-            if runtime_min > 0:
-                asyncio.create_task(_auto_stop_later(name, runtime_min, start_ts))
-        else:
-            ui.notify(f"任务 #{name} 正在运行或收尾中，请稍后再试", type="warning")
+        def _begin_engine_run() -> bool:
+            engine = ensure_engine(name)
+            start_ts = time.time()
+            # 引擎在独立子进程运行：WebUI 不再承载长时间扫描/并发账号的 CPU 与内存
+            started = engine.start(
+                cfg,
+                log=log,
+                on_event=_on_event,
+                on_finish=_on_finish,
+                on_stats=_on_stats,
+            )
+            if started:
+                cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+                cfg["last_duration"] = ""
+                cfg["_start_ts"] = start_ts
+                cfg.pop("last_outcome", None)  # 重新跑：清掉上一轮的结束结果
+                # 启动分隔线：子进程冷启动要数百毫秒，先落线再接它的首批日志
+                cfg["run_count"] = run_no
+                log(f"════ 第 {run_no} 次启动 ════")
+                _persist()
+                set_status(True)
+                ui.notify(f"任务 #{name} 已启动", type="positive")
+                # 超时自动停止：全局设置「抽奖任务超时」（分钟，0=不限）
+                runtime_min = load_giveaway_timeout_min(workdir)
+                if runtime_min > 0:
+                    asyncio.create_task(_auto_stop_later(name, runtime_min, start_ts))
+            else:
+                ui.notify(
+                    f"任务 #{name} 启动失败：排队任务已满或仍在收尾，请稍后再试",
+                    type="warning",
+                )
+            return started
+
+        _begin_engine_run()
 
     async def stop_task(name: str, set_status: Callable[[bool], None]) -> None:
         engine = get_engine(name)
@@ -1902,7 +1928,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             if capture_engine_stats(name):
                 _persist()
             # 停止内部会 terminate 子进程并最多等待 5 秒（失败再 kill 等 5 秒），
-            # 必须放线程执行，否则事件循环卡住期间所有面板轮询与 websocket 都停摆
+            # 必须放线程执行，否则事件循环卡住期间所有面板轮询与 websocket 都停摆。
+            # 排队中的账号由 Runner 一并取消并释放租约，结束回调由它补发
             await asyncio.to_thread(engine.stop)
         else:
             set_status(False)
@@ -2294,12 +2321,13 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             # 移动端卡片操作按钮：随状态变化切换「启动/停止」显隐
             card_start_btns: dict = {}
             card_stop_btns: dict = {}
-            # 「扫描中」也算运行态（info 蓝色）；「常驻待命中」是开启补漏后的待命态
+            # 「排队中」也算运行态（橙色）；「扫描中」/「常驻待命中」也是运行态
             running_expr = (
                 "props.row.status.startsWith('运行中')"
                 " || props.row.status.startsWith('扫描中')"
                 " || props.row.status.startsWith('常驻待命中')"
                 " || props.row.status.startsWith('停止中')"
+                " || props.row.status.startsWith('排队中')"
             )
             table.add_slot(
                 "body-cell-name",
@@ -2311,8 +2339,9 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             table.add_slot(
                 "body-cell-status",
                 '<q-td :props="props">'
-                f"<q-badge :color=\"({running_expr}) ? 'info' : "
-                "(props.row.status.startsWith('已完成') ? 'positive' : 'grey-6')\">"
+                f"<q-badge :color=\"props.row.status.startsWith('排队中') ? 'warning' : "
+                f"(({running_expr}) ? 'info' : "
+                "(props.row.status.startsWith('已完成') ? 'positive' : 'grey-6'))\">"
                 "{{ props.row.status }}</q-badge></q-td>",
             )
             table.add_slot(
@@ -2345,11 +2374,8 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                     if not running:
                         text = _ended_status(tasks.get(n))
                     else:
-                        engine = get_engine(n)
-                        # 刚启动时子进程尚未回报进度，回退「运行中」避免状态为空
-                        text = (
-                            (engine.progress_text() or "运行中") if engine else "运行中"
-                        )
+                        # 排队中 / 运行中 / 扫描中等状态统一由 _status_text 生成
+                        text = _status_text(n)
                     cfg_now = tasks.get(n) or {}
                     start_ts = cfg_now.get("_start_ts")
                     dur = (

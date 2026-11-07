@@ -19,6 +19,7 @@ from tg_signer.netcheck import (
     probe_telegram_connectivity,
 )
 from tg_signer.utils import atomic_write_text
+from tg_signer.webui import account_queue
 from tg_signer.webui.activity import install_activity_tracking, set_active_tab
 from tg_signer.webui.auto_leave import auto_leave_block
 from tg_signer.webui.channel_stats import channel_stats_block
@@ -52,6 +53,7 @@ from tg_signer.webui.giveaway import (
     load_giveaway_max_concurrent,
     load_giveaway_scan_cap,
     load_giveaway_timeout_min,
+    load_max_queue_entries,
     load_post_skip_keywords,
     load_win_extra_bots,
     load_win_forward_targets,
@@ -60,6 +62,7 @@ from tg_signer.webui.giveaway import (
     save_giveaway_max_concurrent,
     save_giveaway_scan_cap,
     save_giveaway_timeout_min,
+    save_max_queue_entries,
     save_post_skip_keywords,
     save_win_extra_bots,
     save_win_forward_targets,
@@ -497,6 +500,7 @@ def _build_dashboard(container) -> None:
             max_concurrent = await run.io_bound(
                 load_giveaway_max_concurrent, state.workdir
             )
+            max_queue = await run.io_bound(load_max_queue_entries, state.workdir)
             with (
                 ui.dialog() as dialog,
                 ui.card().classes("w-full max-w-xl tgs-dialog-card"),
@@ -596,6 +600,20 @@ def _build_dashboard(container) -> None:
                     max=100,
                     precision=0,
                 ).classes("w-full")
+                ui.label("最大排队账号条目（0=不限）").classes(
+                    "text-lg font-semibold mt-2"
+                )
+                ui.label(
+                    "不同任务选中同一账号时按账号排队；等待条目超过上限将"
+                    "拒绝新任务。默认 20，0=不限。"
+                ).classes("text-xs text-gray-500")
+                max_queue_input = ui.number(
+                    label="最大排队账号条目（0=不限）",
+                    value=max_queue,
+                    min=0,
+                    max=500,
+                    precision=0,
+                ).classes("w-full")
                 # 抽奖贴跳过关键字（全局）：扫描时命中的抽奖帖不参与
                 ui.label("抽奖贴跳过关键字").classes("text-lg font-semibold mt-2")
                 ui.label("命中任一关键字即跳过，留空不过滤。").classes(
@@ -668,6 +686,11 @@ def _build_dashboard(container) -> None:
                             max_concurrent_input.value,
                         )
                         await run.io_bound(
+                            save_max_queue_entries,
+                            state.workdir,
+                            max_queue_input.value,
+                        )
+                        await run.io_bound(
                             save_post_skip_keywords,
                             state.workdir,
                             skip_kw_input.value,
@@ -734,6 +757,72 @@ def _build_dashboard(container) -> None:
         tabs.value = "run"
         set_active_tab("run", tabs.client)
 
+        # 「运行/排队」面板：跨任务账号租约与等待队列（2 秒刷新一次）
+        queue_panel_ref: dict = {}
+
+        def open_queue_panel() -> None:
+            dlg = queue_panel_ref.get("dlg")
+            if dlg is None:
+                with (
+                    ui.dialog() as dlg,
+                    ui.card().classes("w-full max-w-3xl tgs-dialog-card"),
+                ):
+                    add_dialog_close_button(dlg)
+                    ui.label("运行 / 排队").classes("text-lg font-semibold")
+                    summary = ui.label("").classes("text-sm text-gray-600")
+                    columns = [
+                        {"name": "account", "label": "账号", "field": "account"},
+                        {"name": "task", "label": "任务", "field": "task"},
+                        {"name": "type", "label": "类型", "field": "type"},
+                        {"name": "state", "label": "状态", "field": "state"},
+                        {"name": "holder", "label": "占用者", "field": "holder"},
+                        {"name": "seconds", "label": "时长", "field": "seconds"},
+                    ]
+                    table = (
+                        ui.table(columns=columns, rows=[], row_key="key")
+                        .classes("w-full")
+                        .props("dense flat")
+                    )
+
+                    def refresh() -> None:
+                        snap = account_queue.snapshot()
+                        cap = account_queue.queue_cap(state.workdir)
+                        summary.text = (
+                            f"运行中账号 {snap['running']} 个 · "
+                            f"排队 {snap['waiting']} 个 · "
+                            f"涉及任务 {snap['tasks']} 个 · "
+                            f"排队上限 {cap if cap else '不限'}"
+                        )
+                        summary.update()
+                        rows = []
+                        for entry in snap["entries"]:
+                            queued = entry["kind"] == "queued"
+                            rows.append(
+                                {
+                                    "key": (
+                                        f"{entry['kind']}|{entry['task_id']}"
+                                        f"|{entry['account']}"
+                                    ),
+                                    "account": entry["account"],
+                                    "task": entry["task_name"],
+                                    "type": entry["task_type"],
+                                    "state": (
+                                        f"排队中（第 {entry['position']} 位）"
+                                        if queued
+                                        else "运行中"
+                                    ),
+                                    "holder": entry["holder"] or "—",
+                                    "seconds": f"{entry['seconds']} 秒",
+                                }
+                            )
+                        table.rows = rows
+                        table.update()
+
+                    ui.timer(2.0, refresh)
+                    refresh()
+                queue_panel_ref["dlg"] = dlg
+            dlg.open()
+
         # 「菜单」按钮的下拉项（点击按钮展开）
         with header_btn:
             with ui.menu():
@@ -751,6 +840,7 @@ def _build_dashboard(container) -> None:
                     "签到配置管理",
                     on_click=lambda: (_ensure_configs(), configs_dialog.open()),
                 )
+                ui.menu_item("运行 / 排队", on_click=open_queue_panel)
                 ui.menu_item("设置", on_click=open_settings)
                 ui.menu_item(
                     "用户信息", on_click=lambda: (_ensure_users(), users_dialog.open())

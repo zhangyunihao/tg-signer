@@ -285,7 +285,18 @@ class ResilientSQLiteStorage(SQLiteStorage):
                 await asyncio.sleep(delay)
 
     async def _open_once(self) -> None:
-        """打开 session 数据库一次；锁冲突以外的异常由调用方处理。"""
+        """打开 session 数据库一次；锁冲突以外的异常由调用方处理。
+
+        connect、PRAGMA 与 update()/create() 迁移写都是同步 sqlite I/O：
+        外部写锁（如组合任务子进程持有同一 session 文件）存在时，写语句
+        会等 busy_timeout（最长 30 秒）才返回；此前这些语句在事件循环上
+        执行，会把 WebUI 心跳一并挤断（页面卡死/断连）。这里整体改到
+        工作线程，锁等待只推迟该账号的 open，不再挂住整个页面。
+        """
+        await asyncio.to_thread(self._open_once_sync)
+
+    def _open_once_sync(self) -> None:
+        """在工作线程内完成一次 session 数据库打开（纯同步 sqlite I/O）。"""
         path = self.database
         file_exists = isinstance(path, pathlib.Path) and path.is_file()
         self.conn = sqlite3.connect(
@@ -303,10 +314,14 @@ class ResilientSQLiteStorage(SQLiteStorage):
                 raise
             # 只读介质等场景无法切换：保持原有日志模式即可
             logger.debug("session 数据库切换到 WAL 失败", exc_info=True)
+        # update()/create() 虽是协程，但体内只有同步 sqlite 调用（update
+        # 末尾还会无条件写一次 version——正是被外部写锁挤断的语句）；
+        # 当前已在工作线程（无运行中的事件循环），用独立循环就地驱动，
+        # 阻塞发生在本线程而不是主事件循环。
         if file_exists:
-            await self.update()
+            asyncio.run(self.update())
         else:
-            await self.create()
+            asyncio.run(self.create())
 
     def _discard_conn(self) -> None:
         """丢弃打开失败的连接，避免残留句柄继续持有数据库锁。"""

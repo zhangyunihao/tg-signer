@@ -17,6 +17,7 @@ from typing import Dict, Optional
 
 from nicegui import ui
 
+from tg_signer.webui import account_queue
 from tg_signer.webui.activity import (
     create_poll_task,
     is_client_alive,
@@ -360,6 +361,8 @@ def stop_run_core(record_id: str) -> tuple[str, Optional[dict]]:
                 logger.debug("任务进程 5 秒内未退出，强制结束", exc_info=True)
                 proc.kill()
     TaskRunnerBlock.runs.pop(record_id, None)
+    # 释放该任务占用的账号租约，并取消尚未轮到的排队条目
+    account_queue.release_all(record_id)
     close_pending_details(run, "中断")
     record = run["record"]
     record["status"] = "已停止"
@@ -517,7 +520,8 @@ class TaskRunnerBlock:
             '<q-badge :data-runstatus="props.row.id" '
             ":color=\"props.row.status === '已完成' ? 'positive' : "
             "props.row.status === '失败' ? 'negative' : "
-            "props.row.status === '运行中' ? 'info' : 'grey-6'\">"
+            "props.row.status === '运行中' || props.row.status === '排队中' "
+            "? 'info' : 'grey-6'\">"
             "{{ props.row.status }}</q-badge></q-td>",
         )
         # 执行时长列：运行中用 run_javascript 直接改写文本（data-rundur=<任务id>）
@@ -546,7 +550,8 @@ class TaskRunnerBlock:
             'label="复制" @click="$parent.$emit(\'duplicateTask\', props.row)" />'
             '<q-btn flat dense color="grey-8" '
             'label="明细" @click="$parent.$emit(\'detailTask\', props.row)" />'
-            '<q-btn v-if="props.row.status === \'运行中\'" flat dense color="negative" '
+            "<q-btn v-if=\"props.row.status === '运行中' || "
+            'props.row.status === \'排队中\'" flat dense color="negative" '
             'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
             "</q-td>",
         )
@@ -832,6 +837,8 @@ class TaskRunnerBlock:
             return "positive"
         if status == "失败":
             return "negative"
+        if status == "排队中":
+            return "warning"
         if status == "运行中":
             return "info"
         return "grey-6"
@@ -879,7 +886,7 @@ class TaskRunnerBlock:
                             "明细",
                             on_click=lambda r=row: self._detail_row(r),
                         ).props("flat dense color=grey-8")
-                        if row.get("status") == "运行中":
+                        if row.get("status") in ("运行中", "排队中"):
                             ui.button(
                                 "停止",
                                 on_click=functools.partial(
@@ -1197,26 +1204,29 @@ class TaskRunnerBlock:
                 ),
             }
 
-        # 全局设置「同时扫描账号数」：先启动上限内的账号，其余排队等槽位空出
+        # 全局设置「同时扫描账号数」：单任务内同时运行的账号上限
         limit = load_account_parallel_limit(state.workdir)
-        pending_accounts: list[str] = []
-        first_accounts = list(accounts)
-        if limit > 0 and len(first_accounts) > limit:
-            first_accounts = first_accounts[:limit]
-            pending_accounts = list(accounts[limit:])
-        for account in first_accounts:
-            item = start_account(account)
-            if item is not None:
-                procs.append(item)
-        if not procs:
-            ui.notify("未能启动任务", type="negative")
+        # 跨任务排队：同一账号被其它任务占用时登记等待条位（FIFO）
+        max_entries = account_queue.queue_cap(state.workdir)
+        probe_accounts = list(accounts[:limit]) if limit > 0 else list(accounts)
+        busy_now = sum(
+            1 for a in probe_accounts if account_queue.blocked_by(a) is not None
+        )
+        if (
+            max_entries > 0
+            and busy_now
+            and account_queue.waiting_count() + busy_now > max_entries
+        ):
+            ui.notify(
+                f"排队任务已满（{account_queue.waiting_count()}/{max_entries}），"
+                "请等待运行中的任务结束",
+                type="warning",
+            )
             return False
-        # 账号列展示本次任务的全部账号（已启动 + 排队待启动）
-        record["accounts"] = ", ".join([i["account"] for i in procs] + pending_accounts)
         total_units = (len(combo_subs) if is_combo else len(chats_labels)) * len(
             accounts
         )
-        self.runs[record["id"]] = {
+        run = {
             "record": record,
             "procs": procs,
             "queue": run_queue,
@@ -1226,24 +1236,36 @@ class TaskRunnerBlock:
             # 组合任务：本次实际执行的子任务列表（已按勾选过滤），
             # 「组合任务」tab 据此渲染子任务进度卡片
             "combo_subs": [dict(s) for s in combo_subs] if is_combo else [],
-            # 排队启动状态：pending 非空时轮询会继续拉起剩余账号
-            "pending": pending_accounts,
-            "limit": limit if pending_accounts else 0,
-            "launcher": start_account if pending_accounts else None,
+            # 排队状态：pending=未开始申请租约，waiting=已在跨任务队列等待
+            "pending": list(accounts),
+            "waiting": [],
+            "limit": limit,
+            "launcher": start_account,
+            "queue_cap": max_entries,
+            "ui_status": "运行中",
         }
+        self.runs[record["id"]] = run
+        self._start_pending_accounts(run)
+        if not procs and not run["pending"] and not run["waiting"]:
+            self.runs.pop(record["id"], None)
+            account_queue.release_all(record["id"])
+            ui.notify("未能启动任务", type="negative")
+            return False
+        # 账号列展示本次任务的全部账号（含排队中的账号）
+        record["accounts"] = ", ".join(accounts)
         append_task_history(record)
         self._refresh_history_table()
+        self._sync_queue_status(run)
         self._poll_enabled = True
         self._update_status()
+        queued = len(run["pending"]) + len(run["waiting"])
         tip = "服务重启后已自动恢复" if auto else "已启动"
-        queued = (
-            f"，同时 {limit} 个、排队 {len(pending_accounts)} 个"
-            if pending_accounts
-            else ""
+        tip_text = (
+            f"{tip}（{len(accounts)} 个账号，排队 {queued} 个）"
+            if queued
+            else f"{tip}（{len(accounts)} 个账号）"
         )
-        ui.notify(
-            f"{tip}: {task_name}（{len(accounts)} 个账号{queued}）", type="positive"
-        )
+        ui.notify(f"{tip_text}: {task_name}", type="positive")
         return True
 
     def _reader(
@@ -1429,6 +1451,26 @@ class TaskRunnerBlock:
         if not accounts:
             ui.notify("没有可重新加入的频道", type="warning")
             return False
+        run_id = f"{time.time_ns()}"
+        try:
+            _granted, busy = account_queue.request(
+                run_id,
+                task_name,
+                "加群 (重新加入)",
+                accounts,
+                max_entries=account_queue.queue_cap(state.workdir),
+            )
+        except account_queue.QueueLimitError:
+            ui.notify("排队任务已满，请等待运行中的任务结束", type="warning")
+            return False
+        if busy:
+            account_queue.release_all(run_id)
+            holder = account_queue.blocked_by(busy[0]) or "其它任务"
+            ui.notify(
+                f"账号 {busy[0]} 正被 {holder} 占用，请稍后重试",
+                type="warning",
+            )
+            return False
         random.shuffle(accounts)
         env = os.environ.copy()
         env["PYTHONPATH"] = str(SOURCE_ROOT)
@@ -1438,7 +1480,7 @@ class TaskRunnerBlock:
             for i, account in enumerate(accounts):
                 stagger_delays[account] = int(i * gap + random.uniform(0, gap * 0.5))
         record = {
-            "id": f"{time.time_ns()}",
+            "id": run_id,
             "start_time": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
             "task_type": "加群 (重新加入)",
             "task_name": task_name,
@@ -1499,6 +1541,7 @@ class TaskRunnerBlock:
                 for row in rows:
                     row["status"] = "失败"
                     row["note"] = "子进程启动失败"
+                account_queue.release(run_id, [account])
                 continue
             reader = threading.Thread(
                 target=self._join_reader,
@@ -1516,6 +1559,7 @@ class TaskRunnerBlock:
                 }
             )
         if not procs:
+            account_queue.release_all(run_id)
             ui.notify("未能启动加群任务", type="negative")
             return False
         record["accounts"] = ", ".join(i["account"] for i in procs)
@@ -1567,6 +1611,26 @@ class TaskRunnerBlock:
                 type="negative",
             )
             return False
+        run_id = f"{time.time_ns()}"
+        try:
+            _granted, busy = account_queue.request(
+                run_id,
+                task_name,
+                "签到 (失败重试)",
+                accounts,
+                max_entries=account_queue.queue_cap(state.workdir),
+            )
+        except account_queue.QueueLimitError:
+            ui.notify("排队任务已满，请等待运行中的任务结束", type="warning")
+            return False
+        if busy:
+            account_queue.release_all(run_id)
+            holder = account_queue.blocked_by(busy[0]) or "其它任务"
+            ui.notify(
+                f"账号 {busy[0]} 正被 {holder} 占用，请稍后重试",
+                type="warning",
+            )
+            return False
         random.shuffle(accounts)
         env = os.environ.copy()
         env["PYTHONPATH"] = str(SOURCE_ROOT)
@@ -1577,7 +1641,7 @@ class TaskRunnerBlock:
                 stagger_delays[account] = int(i * gap + random.uniform(0, gap * 0.5))
         total = sum(len(v) for v in matched.values())
         record = {
-            "id": f"{time.time_ns()}",
+            "id": run_id,
             "start_time": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
             "task_type": "签到 (失败重试)",
             "task_name": task_name,
@@ -1631,6 +1695,7 @@ class TaskRunnerBlock:
                             "note": "子进程启动失败",
                         }
                     )
+                account_queue.release(run_id, [account])
                 continue
             reader = threading.Thread(
                 target=self._reader,
@@ -1656,6 +1721,7 @@ class TaskRunnerBlock:
                 }
             )
         if not procs:
+            account_queue.release_all(run_id)
             ui.notify("未能启动重试签到任务", type="negative")
             return False
         record["accounts"] = ", ".join(i["account"] for i in procs)
@@ -2234,7 +2300,7 @@ class TaskRunnerBlock:
             ):
                 continue
             # 还有账号在排队等槽位：不能收尾，否则剩余账号永远不会启动
-            if run.get("pending"):
+            if run.get("pending") or run.get("waiting"):
                 continue
             procs = run.get("procs") or []
             if not all(i["proc"].poll() is not None for i in procs):
@@ -2251,6 +2317,7 @@ class TaskRunnerBlock:
         run = cls.runs.pop(record_id, None)
         if run is None:
             return False  # 已被其他浏览器标签页的轮询收尾
+        account_queue.release_all(record_id)
         rcs = ", ".join(str(i["proc"].returncode) for i in run["procs"])
         ok = all(i["proc"].returncode == 0 for i in run["procs"])
         close_pending_details(run, "自动")
@@ -2279,6 +2346,46 @@ class TaskRunnerBlock:
             return f"{seconds // 60}分{seconds % 60}秒"
         return f"{seconds}秒"
 
+    @staticmethod
+    def _queue_detail(run: dict) -> str:
+        """生成「排队中/等待任务X」文本，供结果列与顶部状态展示。"""
+        waiting = run.get("waiting") or []
+        pending = run.get("pending") or []
+        parts: list[str] = []
+        if waiting:
+            holders: list[str] = []
+            for account in waiting:
+                holder = account_queue.blocked_by(account)
+                if holder and holder not in holders:
+                    holders.append(holder)
+            text = f"排队中 {len(waiting)} 个账号"
+            if holders:
+                text += "，等待 " + "、".join(holders[:3])
+                if len(holders) > 3:
+                    text += " 等"
+            parts.append(text)
+        if pending:
+            parts.append(f"待启动 {len(pending)} 个账号")
+        return "；".join(parts)
+
+    def _sync_queue_status(self, run: dict) -> None:
+        """没有任何账号在跑时把任务状态显示为「排队中」。"""
+        record_id = str((run.get("record") or {}).get("id") or "")
+        alive = any(i["proc"].poll() is None for i in run.get("procs") or [])
+        queued = bool(run.get("pending") or run.get("waiting"))
+        status = "运行中" if alive or not queued else "排队中"
+        if run.get("ui_status") == status:
+            return
+        run["ui_status"] = status
+        for row in self.history_table.rows:
+            if str(row.get("id") or "") == record_id:
+                row["status"] = status
+                try:
+                    self.history_table.update()
+                except Exception:
+                    logger.debug("刷新任务排队状态失败", exc_info=True)
+                break
+
     def _update_status(self) -> None:
         if not self.runs:
             self.status_label.text = "空闲"
@@ -2286,10 +2393,16 @@ class TaskRunnerBlock:
             parts = []
             for run in self.runs.values():
                 rec = run["record"]
-                parts.append(
-                    f"{rec['task_name']}（{rec['accounts']}）已运行 "
-                    f"{self._format_duration_ts(run['start_ts'])}"
-                )
+                if run.get("ui_status") == "排队中":
+                    parts.append(
+                        f"{rec['task_name']}（排队中）已等 "
+                        f"{self._format_duration_ts(run['start_ts'])}"
+                    )
+                else:
+                    parts.append(
+                        f"{rec['task_name']}（{rec['accounts']}）已运行 "
+                        f"{self._format_duration_ts(run['start_ts'])}"
+                    )
             self.status_label.text = f"运行中 {len(self.runs)} 个任务: " + "; ".join(
                 parts
             )
@@ -2340,26 +2453,62 @@ class TaskRunnerBlock:
 
     @staticmethod
     def _start_pending_accounts(run: dict) -> None:
-        """按全局「同时扫描账号数」拉起排队中的账号，槽位满时等待下次轮询。"""
+        """按全局「同时扫描账号数」与跨任务账号队列拉起待启动账号。
+
+        - waiting 中的账号先轮询跨任务队列，队首放行后转入 pending；
+        - pending 按本地并发上限启动；账号被其它任务占用则登记等待条目，
+          状态显示为「排队中」。
+        """
         pending = run.get("pending")
-        launcher = run.get("launcher")
-        if not pending or launcher is None:
+        if not pending and not run.get("waiting"):
             return
-        limit = int(run.get("limit") or 0)
-        procs = run["procs"]
+        launcher = run.get("launcher")
+        if launcher is None:
+            return
+        record = run.get("record") or {}
+        task_id = str(record.get("id") or "")
+        task_name = str(record.get("task_name") or "")
+        task_type = str(record.get("task_type") or "")
+        cap = int(run.get("queue_cap") or 0)
+        # 1) 跨任务队列放行：按登记顺序转入本地待启动
+        granted_now: list[str] = []
+        still_waiting: list[str] = []
+        for account in run.get("waiting") or []:
+            if account_queue.poll(task_id, account):
+                granted_now.append(account)
+            else:
+                still_waiting.append(account)
+        run["waiting"] = still_waiting
+        if granted_now:
+            pending[:0] = granted_now
+        # 2) 按本地并发上限启动；账号忙则登记等待条目
         while pending:
+            limit = int(run.get("limit") or 0)
             if limit > 0:
-                alive = sum(1 for i in procs if i["proc"].poll() is None)
+                alive = sum(1 for i in run["procs"] if i["proc"].poll() is None)
                 if alive >= limit:
                     break
-            account = pending.pop(0)
+            account = pending[0]
+            try:
+                granted, _queued = account_queue.request(
+                    task_id, task_name, task_type, [account], max_entries=cap
+                )
+            except account_queue.QueueLimitError:
+                # 队列已满：保持 pending，等下次轮询（不丢弃账号）
+                break
+            pending.pop(0)
+            if not granted:
+                run["waiting"].append(account)
+                continue
             try:
                 item = launcher(account)
             except Exception as exc:
                 notify_error(exc)
                 item = None
             if item is not None:
-                procs.append(item)
+                run["procs"].append(item)
+            else:
+                account_queue.release(task_id, [account])
 
     @classmethod
     def start_pending_accounts_all(cls) -> None:
@@ -2383,11 +2532,15 @@ class TaskRunnerBlock:
                 progress = self._format_progress(run)
                 if progress:
                     parts.append(progress)
+                queue_detail = self._queue_detail(run)
+                if queue_detail:
+                    parts.append(queue_detail)
                 schedule = self._format_schedule(run)
                 if schedule:
                     parts.append(schedule)
                 # 每项独占一行（结果列 span 为 white-space: pre-line）
                 self._update_running_row(run_id, "\n".join(parts))
+            self._sync_queue_status(run)
         for run_id in finished_ids:
             self._finalize_run(run_id)
         self._update_status()

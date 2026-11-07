@@ -19,6 +19,7 @@ from nicegui import ui
 
 from tg_signer.core import get_client, safe_disconnect, timeout_aiter
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui import account_queue
 from tg_signer.webui.common import (
     attach_select_all,
     copy_text_to_clipboard,
@@ -192,6 +193,8 @@ async def refresh_stats_for_accounts(
 
     save_lock = asyncio.Lock()
     sem = asyncio.Semaphore(limit) if limit > 0 else None
+    queue_id = f"channel_stats|auto|{time.time_ns()}"
+    max_entries = account_queue.queue_cap(workdir)
 
     async def _refresh_one(idx: int, account: str) -> None:
         if idx:
@@ -202,11 +205,23 @@ async def refresh_stats_for_accounts(
             )
         if sem is not None:
             await sem.acquire()
+        acquired = False
 
         def _local_log(msg: str, _a=account) -> None:
             _log(f"[{_a}] {msg}")
 
         try:
+            ok = await account_queue.acquire_wait(
+                queue_id,
+                "更新统计（自动）",
+                "更新统计",
+                account,
+                max_entries=max_entries,
+                on_wait=lambda text: _local_log(f"{text}，等待账号空闲后刷新"),
+            )
+            if not ok:
+                return
+            acquired = True
             try:
                 rec = await scan_account(account, Path(session_dir), _local_log)
             except Exception as exc:
@@ -219,6 +234,8 @@ async def refresh_stats_for_accounts(
                 store["updated_at"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
                 save_stats(workdir, store)
         finally:
+            if acquired:
+                account_queue.release(queue_id, [account])
             if sem is not None:
                 sem.release()
 
@@ -399,6 +416,9 @@ def channel_stats_block(workdir) -> None:
         active: List[str] = []
         notes: Dict[str, str] = {}
         done = {"n": 0}
+        # 跨任务账号排队：账号被其它任务占用时显示「排队中」
+        queue_id = f"channel_stats|manual|{time.time_ns()}"
+        max_entries = account_queue.queue_cap(workdir)
 
         def render_progress() -> None:
             if active:
@@ -424,7 +444,22 @@ def channel_stats_block(workdir) -> None:
                 )
             if sem is not None:
                 await sem.acquire()
+            acquired = False
             try:
+                ok = await account_queue.acquire_wait(
+                    queue_id,
+                    "更新统计",
+                    "更新统计",
+                    account,
+                    max_entries=max_entries,
+                    on_wait=lambda text, name=account: (
+                        notes.__setitem__(name, text),
+                        render_progress(),
+                    ),
+                )
+                if not ok:
+                    return
+                acquired = True
                 active.append(account)
                 notes.pop(account, None)
                 render_progress()
@@ -463,6 +498,8 @@ def channel_stats_block(workdir) -> None:
                 notes.pop(account, None)
                 render_progress()
             finally:
+                if acquired:
+                    account_queue.release(queue_id, [account])
                 if sem is not None:
                     sem.release()
 

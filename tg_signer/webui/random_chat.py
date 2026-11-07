@@ -19,6 +19,7 @@ from nicegui import ui
 from tg_signer.core import get_client, safe_disconnect
 from tg_signer.phrases import PHRASES, parse_custom_phrases, phrase_pool_label
 from tg_signer.utils import atomic_write_json, atomic_write_text
+from tg_signer.webui import account_queue
 from tg_signer.webui.activity import (
     create_poll_task,
     is_client_alive,
@@ -331,6 +332,11 @@ class RandomChatEngine:
         self._recent_key: Optional[str] = None
         # 全局设置「同时扫描账号数」：同时发言的账号上限，0=不限
         self._max_concurrent_accounts: int = 0
+        # 跨任务账号队列（start() 时填充）
+        self._queue_task_id = ""
+        self._queue_task_name = "随机发言"
+        self._queue_cap = 0
+        self._queue_text = ""
 
     def _pick_text(self) -> str:
         """从语库中抽取一条，避开最近 RECENT_WINDOW 次已抽到的条目"""
@@ -382,15 +388,48 @@ class RandomChatEngine:
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    def _set_queue_text(self, text: str, log: Callable[[str], None]) -> None:
+        """记录排队状态；同一轮只提示一次，避免刷屏。"""
+        if text == self._queue_text:
+            return
+        self._queue_text = text
+        if text:
+            log(f"{datetime.now():%H:%M:%S} {text}，账号空闲后自动开始本轮发言")
+
+    async def _acquire_accounts(
+        self, accounts: List[str], log: Callable[[str], None]
+    ) -> bool:
+        """整轮持有全部账号：任一账号被其它任务占用则排队等待。"""
+        for account in accounts:
+            ok = await account_queue.acquire_wait(
+                self._queue_task_id,
+                self._queue_task_name,
+                "随机发言",
+                account,
+                max_entries=self._queue_cap,
+                should_stop=lambda: self._stop.is_set(),
+                on_wait=lambda text, a=account: self._set_queue_text(
+                    f"{text}（{a}）", log
+                ),
+            )
+            if not ok:
+                account_queue.release_all(self._queue_task_id)
+                return False
+        self._queue_text = ""
+        return True
+
     def progress_text(self) -> Optional[str]:
         """运行中返回带进度的状态文本（如 "运行中 (18/100)"），未运行返回 None
 
-        状态文本必须以「运行中」开头：任务表格据此判断显示「停止」还是「启动」。
+        状态文本必须以「运行中」或「排队中」开头：任务表格据此判断显示
+        「停止」还是「启动」。
         """
         if not self.running:
             return None
         if self._stopping:
             return "停止中"
+        if self._queue_text:
+            return f"排队中 ({self._queue_text})"
         if self._lock_wait_until is not None:
             remain = max(0, int(self._lock_wait_until - time.monotonic()))
             return f"运行中 (数据库占用 剩{remain}s后重试)"
@@ -420,6 +459,7 @@ class RandomChatEngine:
         recent_path: Optional[Path] = None,
         recent_key: Optional[str] = None,
         max_concurrent_accounts: int = 0,
+        max_queue_entries: int = 0,
     ) -> bool:
         if self.running:
             log("任务已在运行中")
@@ -443,6 +483,11 @@ class RandomChatEngine:
         self._deadline = time.monotonic() + self.MAX_RUNTIME_SECONDS
         self._stop = asyncio.Event()
         self._max_concurrent_accounts = max(0, int(max_concurrent_accounts))
+        # 跨任务账号队列：整轮持有全部账号，账号被占用时显示「排队中」
+        self._queue_task_id = f"random_chat|{recent_key or id(self)}"
+        self._queue_task_name = str(recent_key or "随机发言")
+        self._queue_cap = max(0, int(max_queue_entries))
+        self._queue_text = ""
         self._task = asyncio.create_task(
             self._loop(
                 accounts,
@@ -673,6 +718,8 @@ class RandomChatEngine:
     ) -> None:
         rounds = max(1, repeat_count + 1)
         self._rounds = rounds
+        if not self._queue_task_id:
+            self._queue_task_id = f"random_chat|{id(self)}"
         count_label = f"每账号 {total_count} 条" if total_count else "不限条数"
         pool_label = (
             f"任务自定义语库 {len(self.pool)} 条"
@@ -693,8 +740,14 @@ class RandomChatEngine:
             self.progress = {}
             # 每轮独立计算 20 分钟硬上限，轮次间隔的等待时间不计入其中
             self._deadline = time.monotonic() + self.MAX_RUNTIME_SECONDS
+            # 跨任务账号排队：本轮需要的账号全部空闲后才连接，避免与其它
+            # 任务同时占用同一 session
+            if not await self._acquire_accounts(accounts, log):
+                log("随机发言已停止")
+                return
             clients, locked = await self._connect_all(accounts, session_dir, log)
             if not clients:
+                account_queue.release_all(self._queue_task_id)
                 if locked:
                     # 到点执行时数据库仍被占用：本轮不结束，延后重试（有次数上限）
                     if lock_retries >= self.LOCK_MAX_RETRIES:
@@ -792,6 +845,8 @@ class RandomChatEngine:
                 for client in clients.values():
                     await safe_disconnect(client)
                 self._total_sent += sum(self.progress.values())
+                # 释放跨任务账号租约，让排队中的任务可以开始
+                account_queue.release_all(self._queue_task_id)
             if round_timed_out or self._stop.is_set():
                 break
             round_no += 1
@@ -933,9 +988,9 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
         return str(cfg.get("last_outcome") or "已完成")
 
     def _badge_color(running: bool, text: str) -> str:
-        """状态徽标配色：运行中=蓝，已完成=绿，其余（未运行/已停止）=灰。"""
+        """状态徽标配色：排队中=橙，运行中=蓝，已完成=绿，其余=灰。"""
         if running:
-            return "info"
+            return "warning" if text.startswith("排队中") else "info"
         return "positive" if text.startswith("已完成") else "grey-6"
 
     def _status_text(name: str) -> str:
@@ -1029,6 +1084,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             recent_path=Path(workdir) / "random_chat_recent.json",
             recent_key=str(name),
             max_concurrent_accounts=load_account_parallel_limit(workdir),
+            max_queue_entries=account_queue.queue_cap(workdir),
         )
         if started:
             cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
@@ -1236,21 +1292,25 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             table_ref["table"] = table
             # 移动端卡片上的状态徽章（按任务名），状态回调同时更新表格行与卡片徽章
             card_badges: dict[str, ui.badge] = {}
-            # 状态列渲染为彩色徽章：运行中=蓝、已完成=绿、其余=灰（状态文本可能带进度，用 startsWith 匹配）
+            # 状态列渲染为彩色徽章：排队中=橙、运行中=蓝、已完成=绿、其余=灰
+            # （状态文本可能带进度，用 startsWith 匹配）
             table.add_slot(
                 "body-cell-status",
                 '<q-td :props="props">'
-                "<q-badge :color=\"props.row.status.startsWith('运行中') ? 'info' : "
-                "(props.row.status.startsWith('已完成') ? 'positive' : 'grey-6')\">"
+                "<q-badge :color=\"props.row.status.startsWith('排队中') ? 'warning' : "
+                "(props.row.status.startsWith('运行中') ? 'info' : "
+                "(props.row.status.startsWith('已完成') ? 'positive' : 'grey-6'))\">"
                 "{{ props.row.status }}</q-badge></q-td>",
             )
-            # 操作列：结束态显示「启动」，运行中显示「停止」，另附「复制」「删除」
+            # 操作列：结束态显示「启动」，运行中/排队中显示「停止」，另附「复制」「删除」
             table.add_slot(
                 "body-cell-actions",
                 '<q-td :props="props" class="col-actions">'
-                '<q-btn v-if="!props.row.status.startsWith(\'运行中\')" flat dense color="primary" '
+                "<q-btn v-if=\"!props.row.status.startsWith('运行中') && "
+                '!props.row.status.startsWith(\'排队中\')" flat dense color="primary" '
                 'label="启动" @click="$parent.$emit(\'startTask\', props.row)" />'
-                '<q-btn v-if="props.row.status.startsWith(\'运行中\')" flat dense color="negative" '
+                "<q-btn v-if=\"props.row.status.startsWith('运行中') || "
+                'props.row.status.startsWith(\'排队中\')" flat dense color="negative" '
                 'label="停止" @click="$parent.$emit(\'stopTask\', props.row)" />'
                 '<q-btn flat dense color="primary" '
                 'label="复制" @click="$parent.$emit(\'copyTask\', props.row)" />'
