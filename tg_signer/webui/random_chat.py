@@ -82,7 +82,7 @@ def list_session_names(session_dir: Union[Path, str], workdir=None) -> List[str]
 def list_known_chats(workdir) -> Dict[str, str]:
     """汇总 users/*/latest_chats.json 中的群组聊天，返回 {显示名: chat_id}"""
     options: Dict[str, str] = {}
-    for info in load_user_infos(workdir):
+    for info in load_user_infos(workdir) or []:
         for chat in info.latest_chats or []:
             # type 可能是 "group"/"supergroup" 或枚举形式 "ChatType.GROUP" 等
             chat_type = str(chat.get("type") or "").lower()
@@ -99,7 +99,7 @@ def list_known_chats(workdir) -> Dict[str, str]:
 def chat_titles(workdir) -> Dict[str, str]:
     """汇总 users/*/latest_chats.json 中的群组聊天，返回 {chat_id: 群名}"""
     mapping: Dict[str, str] = {}
-    for info in load_user_infos(workdir):
+    for info in load_user_infos(workdir) or []:
         for chat in info.latest_chats or []:
             chat_type = str(chat.get("type") or "").lower()
             if not chat_type.endswith("group"):
@@ -1595,7 +1595,10 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
     create_poll_task(_poll_loop(), name="random-chat-poll", client=client)
 
     # —— 添加任务弹窗 ——
-    with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl tgs-dialog-card"):
+    with (
+        ui.dialog().props("transition-show=fade transition-hide=fade") as add_dlg,
+        ui.card().classes("w-full max-w-3xl tgs-dialog-card"),
+    ):
         add_dialog_close_button(add_dlg)
         ui.label("添加任务").classes("text-lg font-semibold")
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):

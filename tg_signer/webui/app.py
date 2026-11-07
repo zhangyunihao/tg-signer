@@ -189,20 +189,17 @@ def log_block(card: Optional[ui.card] = None) -> Callable[[], None]:
             log_list.clear()
             if not lines:
                 current_lines = []
+                empty_text = (
+                    "没有匹配过滤条件的日志行"
+                    if filtering
+                    else f"未找到日志文件: {path}"
+                )
                 with log_list:
-                    if filtering:
-                        ui.label("没有匹配过滤条件的日志行").classes(
-                            "text-gray-500 text-sm"
-                        )
-                    else:
-                        ui.label(f"未找到日志文件: {path}").classes(
-                            "text-gray-500 text-sm"
-                        )
+                    ui.label(empty_text).classes("w-full text-sm tgs-log-empty").style(
+                        "padding: 1rem"
+                    )
                 log_list.update()
-                if filtering:
-                    refresh_status("没有匹配过滤条件的日志行")
-                else:
-                    refresh_status(f"未找到日志文件: {path}")
+                refresh_status(empty_text)
                 return
 
             # 整段日志用一个 <pre> 渲染：几千行时元素数从「每行一个」降为 1，
@@ -347,7 +344,7 @@ def build_configs_panel(
         )
 
     with (
-        ui.dialog() as import_dlg,
+        ui.dialog().props("transition-show=fade transition-hide=fade") as import_dlg,
         ui.card().classes("w-[420px] max-w-full"),
     ):
         add_dialog_close_button(import_dlg)
@@ -407,28 +404,36 @@ def _build_dashboard(container) -> None:
 
         # ---- 预创建"数据查看"对话框（内容首次打开时才构建，减少首屏负载） ----
         with (
-            ui.dialog() as users_dialog,
+            ui.dialog().props(
+                "transition-show=fade transition-hide=fade"
+            ) as users_dialog,
             ui.card().classes("w-full max-w-4xl") as users_card,
         ):
             pass
         add_dialog_close_button(users_dialog)
 
         with (
-            ui.dialog() as logs_dialog,
+            ui.dialog().props(
+                "transition-show=fade transition-hide=fade"
+            ) as logs_dialog,
             ui.card().classes("w-full max-w-4xl") as logs_card,
         ):
             pass
         add_dialog_close_button(logs_dialog)
 
         with (
-            ui.dialog() as configs_dialog,
+            ui.dialog().props(
+                "transition-show=fade transition-hide=fade"
+            ) as configs_dialog,
             ui.card().classes("w-full max-w-4xl tgs-dialog-flex") as configs_card,
         ):
             pass
         add_dialog_close_button(configs_dialog)
 
         with (
-            ui.dialog() as stats_dialog,
+            ui.dialog().props(
+                "transition-show=fade transition-hide=fade"
+            ) as stats_dialog,
             ui.card().classes("w-full max-w-4xl") as stats_card,
         ):
             pass
@@ -502,153 +507,173 @@ def _build_dashboard(container) -> None:
             )
             max_queue = await run.io_bound(load_max_queue_entries, state.workdir)
             with (
-                ui.dialog() as dialog,
+                ui.dialog().props(
+                    "transition-show=fade transition-hide=fade"
+                ) as dialog,
                 ui.card().classes("w-full max-w-xl tgs-dialog-card"),
             ):
                 add_dialog_close_button(dialog)
                 ui.label("设置").classes("text-lg font-semibold")
-                workdir_input = ui.input(
-                    label="工作目录",
-                    value=str(state.workdir),
-                    placeholder=".signer",
-                ).classes("w-full")
-                # 中奖消息转发目标（全局设置，对所有抽奖任务生效）：
-                # 多选，选项 = 收藏夹 + 各账号最近会话中的群组/频道
-                ui.label("中奖消息转发目标").classes("text-lg font-semibold mt-2")
-                ui.label("转发到账号已加入的群组/频道，新启动任务生效。").classes(
-                    "text-xs text-gray-500"
-                )
-                for tid in current_targets:
-                    if tid not in target_options:
-                        target_options[tid] = tid
-                target_select = (
-                    ui.select(
-                        target_options,
-                        value=current_targets,
-                        label="转发目标（可多选）",
-                        multiple=True,
-                        with_input=True,
-                    )
-                    .classes("w-full")
-                    .props("use-chips clearable")
-                )
-                # 中奖回扫条数：首次记录某 bot 时的初始基线，之后增量扫描
-                ui.label("中奖回扫条数").classes("text-lg font-semibold mt-2")
-                ui.label("首次回扫条数（默认 50），之后按新消息增量扫描。").classes(
-                    "text-xs text-gray-500"
-                )
-                sweep_input = ui.number(
-                    label="回扫条数",
-                    value=sweep_limit,
-                    min=1,
-                    max=1000,
-                    precision=0,
-                ).classes("w-full")
-                # 中奖扫描额外机器人（全局）：除抽奖任务扫到的 bot 外也回扫这些 bot
-                ui.label("中奖扫描额外机器人").classes("text-lg font-semibold mt-2")
-                ui.label("额外回扫的机器人，逗号分隔，可带 @。").classes(
-                    "text-xs text-gray-500"
-                )
-                extra_bots_input = ui.input(
-                    label="额外机器人（逗号分隔）",
-                    value="，".join(extra_bots),
-                    placeholder="如：@yujie_lottery_bot, @LotteryBestBot",
-                ).classes("w-full")
-                # 抽奖任务超时（全局）：单独运行与组合子任务共用
-                ui.label("抽奖任务超时（分钟）").classes("text-lg font-semibold mt-2")
-                ui.label("到时自动停止；0=不限，默认 10 分钟。").classes(
-                    "text-xs text-gray-500"
-                )
-                timeout_input = ui.number(
-                    label="超时（分钟，0=不限）",
-                    value=timeout_min,
-                    min=0,
-                    max=10080,
-                    precision=0,
-                ).classes("w-full")
-                # 单频道扫描上限（全局）：关键词未命中时也按该条数截断
-                ui.label("单频道扫描上限（条）").classes("text-lg font-semibold mt-2")
-                ui.label("每轮最多回溯条数，默认 500。").classes(
-                    "text-xs text-gray-500"
-                )
-                scan_cap_input = ui.number(
-                    label="扫描上限（条）",
-                    value=scan_cap,
-                    min=1,
-                    max=10000,
-                    precision=0,
-                ).classes("w-full")
-                # 全局调用节奏（全局）：跨账号共享的 API 速率与并发账号数
-                ui.label("全局调用上限与同时扫描账号数").classes(
-                    "text-lg font-semibold mt-2"
-                )
-                ui.label(
-                    "合计限速，用于规避 429；同时账号数对签到、发言、"
-                    "更新统计、退频道、抽奖生效。0=不限，默认 8/秒、4 账号。"
-                ).classes("text-xs text-gray-500")
-                global_qps_input = ui.number(
-                    label="全局调用上限（次/秒，0=不限）",
-                    value=global_qps,
-                    min=0,
-                    max=100,
-                    precision=0,
-                ).classes("w-full")
-                max_concurrent_input = ui.number(
-                    label="同时扫描账号数（0=不限）",
-                    value=max_concurrent,
-                    min=0,
-                    max=100,
-                    precision=0,
-                ).classes("w-full")
-                ui.label("最大排队账号条目（0=不限）").classes(
-                    "text-lg font-semibold mt-2"
-                )
-                ui.label(
-                    "不同任务选中同一账号时按账号排队；等待条目超过上限将"
-                    "拒绝新任务。默认 20，0=不限。"
-                ).classes("text-xs text-gray-500")
-                max_queue_input = ui.number(
-                    label="最大排队账号条目（0=不限）",
-                    value=max_queue,
-                    min=0,
-                    max=500,
-                    precision=0,
-                ).classes("w-full")
-                # 抽奖贴跳过关键字（全局）：扫描时命中的抽奖帖不参与
-                ui.label("抽奖贴跳过关键字").classes("text-lg font-semibold mt-2")
-                ui.label("命中任一关键字即跳过，留空不过滤。").classes(
-                    "text-xs text-gray-500"
-                )
-                skip_kw_input = ui.input(
-                    label="跳过关键字（逗号分隔）",
-                    value="，".join(skip_keywords),
-                    placeholder="如：嫩妹币，仅限新用户",
-                ).classes("w-full")
-
-                # 参数细节统一收进折叠区：首屏只保留「做什么 + 关键限制」，
-                # 技术含义与风险说明仍可展开查看，不改变任何保存逻辑
-                with ui.expansion("参数说明与风险", icon="help_outline").classes(
+                # 分两组：通用（工作目录）+ 自动抽奖参数（9 项，默认折叠）。
+                # 抽奖参数原先平铺 9 个区块，移动端打开设置就要滚动约 1 屏；
+                # 收进折叠区后首屏只剩工作目录，找单项的路径不再经过长滚动
+                with ui.expansion("通用", icon="settings", value=True).classes(
                     "w-full"
                 ):
+                    workdir_input = ui.input(
+                        label="工作目录",
+                        value=str(state.workdir),
+                        placeholder=".signer",
+                    ).classes("w-full")
+                with ui.expansion(
+                    "自动抽奖参数",
+                    caption="9 项 · 转发目标、回扫、限流与跳过规则",
+                    icon="casino",
+                    value=False,
+                ).classes("w-full"):
+                    # 中奖消息转发目标（全局设置，对所有抽奖任务生效）：
+                    # 多选，选项 = 收藏夹 + 各账号最近会话中的群组/频道
+                    ui.label("中奖消息转发目标").classes("text-lg font-semibold mt-2")
+                    ui.label("转发到账号已加入的群组/频道，新启动任务生效。").classes(
+                        "text-xs text-gray-500"
+                    )
+                    for tid in current_targets:
+                        if tid not in target_options:
+                            target_options[tid] = tid
+                    target_select = (
+                        ui.select(
+                            target_options,
+                            value=current_targets,
+                            label="转发目标（可多选）",
+                            multiple=True,
+                            with_input=True,
+                        )
+                        .classes("w-full")
+                        .props("use-chips clearable")
+                    )
+                    # 中奖回扫条数：首次记录某 bot 时的初始基线，之后增量扫描
+                    ui.label("中奖回扫条数").classes("text-lg font-semibold mt-2")
+                    ui.label("首次回扫条数（默认 50），之后按新消息增量扫描。").classes(
+                        "text-xs text-gray-500"
+                    )
+                    sweep_input = ui.number(
+                        label="回扫条数",
+                        value=sweep_limit,
+                        min=1,
+                        max=1000,
+                        precision=0,
+                    ).classes("w-full")
+                    # 中奖扫描额外机器人（全局）：除抽奖任务扫到的 bot 外也回扫这些 bot
+                    ui.label("中奖扫描额外机器人").classes("text-lg font-semibold mt-2")
+                    ui.label("额外回扫的机器人，逗号分隔，可带 @。").classes(
+                        "text-xs text-gray-500"
+                    )
+                    extra_bots_input = ui.input(
+                        label="额外机器人（逗号分隔）",
+                        value="，".join(extra_bots),
+                        placeholder="如：@yujie_lottery_bot, @LotteryBestBot",
+                    ).classes("w-full")
+                    # 抽奖任务超时（全局）：单独运行与组合子任务共用
+                    ui.label("抽奖任务超时（分钟）").classes(
+                        "text-lg font-semibold mt-2"
+                    )
+                    ui.label("到时自动停止；0=不限，默认 10 分钟。").classes(
+                        "text-xs text-gray-500"
+                    )
+                    timeout_input = ui.number(
+                        label="超时（分钟，0=不限）",
+                        value=timeout_min,
+                        min=0,
+                        max=10080,
+                        precision=0,
+                    ).classes("w-full")
+                    # 单频道扫描上限（全局）：关键词未命中时也按该条数截断
+                    ui.label("单频道扫描上限（条）").classes(
+                        "text-lg font-semibold mt-2"
+                    )
+                    ui.label("每轮最多回溯条数，默认 500。").classes(
+                        "text-xs text-gray-500"
+                    )
+                    scan_cap_input = ui.number(
+                        label="扫描上限（条）",
+                        value=scan_cap,
+                        min=1,
+                        max=10000,
+                        precision=0,
+                    ).classes("w-full")
+                    # 全局调用节奏（全局）：跨账号共享的 API 速率与并发账号数
+                    ui.label("全局调用上限与同时扫描账号数").classes(
+                        "text-lg font-semibold mt-2"
+                    )
                     ui.label(
-                        "转发目标：各账号把中奖原消息转发到所选目标，目标需为该账号"
-                        "已加入的群组/频道；修改后对新启动的任务生效。\n"
-                        "回扫条数：首次记录某个 bot 时回扫最近 50 条；之后按水位线"
-                        "增量扫描，该值不再参与日常回扫。\n"
-                        "额外机器人：除抽奖任务扫到的 bot 外，也回扫这里填写的机器人"
-                        "私聊中奖通知（逗号分隔，可带 @）。\n"
-                        "超时：单独运行的抽奖任务与组合任务中的抽奖子任务共用；"
-                        "0=不限。\n"
-                        "扫描上限：每轮每频道最多回溯条数；达到上限会写入消息中心提醒。\n"
-                        "全局调用：按所有同时运行的抽奖任务与全部账号合计生效，同目录"
-                        "任务共用一个限速队列；用于规避 429 Transport flood（按出口 IP"
-                        "计数），0=不限。\n"
-                        "同时扫描账号数：签到、随机发言、更新统计、批量退频道（含组合"
-                        "任务里的退频道子任务）都按此上限同时处理账号，超出的账号排队"
-                        "等待空位；0=不限。\n"
-                        "跳过关键字：扫描到的帖子包含任一字符串时直接跳过、不参与"
-                        "（逗号分隔，留空不过滤）。"
-                    ).classes("text-xs text-gray-500").style("white-space: pre-line")
+                        "合计限速，用于规避 429；同时账号数对签到、发言、"
+                        "更新统计、退频道、抽奖生效。0=不限，默认 8/秒、4 账号。"
+                    ).classes("text-xs text-gray-500")
+                    global_qps_input = ui.number(
+                        label="全局调用上限（次/秒，0=不限）",
+                        value=global_qps,
+                        min=0,
+                        max=100,
+                        precision=0,
+                    ).classes("w-full")
+                    max_concurrent_input = ui.number(
+                        label="同时扫描账号数（0=不限）",
+                        value=max_concurrent,
+                        min=0,
+                        max=100,
+                        precision=0,
+                    ).classes("w-full")
+                    ui.label("最大排队账号条目（0=不限）").classes(
+                        "text-lg font-semibold mt-2"
+                    )
+                    ui.label(
+                        "不同任务选中同一账号时按账号排队；等待条目超过上限将"
+                        "拒绝新任务。默认 20，0=不限。"
+                    ).classes("text-xs text-gray-500")
+                    max_queue_input = ui.number(
+                        label="最大排队账号条目（0=不限）",
+                        value=max_queue,
+                        min=0,
+                        max=500,
+                        precision=0,
+                    ).classes("w-full")
+                    # 抽奖贴跳过关键字（全局）：扫描时命中的抽奖帖不参与
+                    ui.label("抽奖贴跳过关键字").classes("text-lg font-semibold mt-2")
+                    ui.label("命中任一关键字即跳过，留空不过滤。").classes(
+                        "text-xs text-gray-500"
+                    )
+                    skip_kw_input = ui.input(
+                        label="跳过关键字（逗号分隔）",
+                        value="，".join(skip_keywords),
+                        placeholder="如：嫩妹币，仅限新用户",
+                    ).classes("w-full")
+
+                    # 参数细节统一收进折叠区：首屏只保留「做什么 + 关键限制」，
+                    # 技术含义与风险说明仍可展开查看，不改变任何保存逻辑
+                    with ui.expansion("参数说明与风险", icon="help_outline").classes(
+                        "w-full"
+                    ):
+                        ui.label(
+                            "转发目标：各账号把中奖原消息转发到所选目标，目标需为该账号"
+                            "已加入的群组/频道；修改后对新启动的任务生效。\n"
+                            "回扫条数：首次记录某个 bot 时回扫最近 50 条；之后按水位线"
+                            "增量扫描，该值不再参与日常回扫。\n"
+                            "额外机器人：除抽奖任务扫到的 bot 外，也回扫这里填写的机器人"
+                            "私聊中奖通知（逗号分隔，可带 @）。\n"
+                            "超时：单独运行的抽奖任务与组合任务中的抽奖子任务共用；"
+                            "0=不限。\n"
+                            "扫描上限：每轮每频道最多回溯条数；达到上限会写入消息中心提醒。\n"
+                            "全局调用：按所有同时运行的抽奖任务与全部账号合计生效，同目录"
+                            "任务共用一个限速队列；用于规避 429 Transport flood（按出口 IP"
+                            "计数），0=不限。\n"
+                            "同时扫描账号数：签到、随机发言、更新统计、批量退频道（含组合"
+                            "任务里的退频道子任务）都按此上限同时处理账号，超出的账号排队"
+                            "等待空位；0=不限。\n"
+                            "跳过关键字：扫描到的帖子包含任一字符串时直接跳过、不参与"
+                            "（逗号分隔，留空不过滤）。"
+                        ).classes("text-xs text-gray-500").style(
+                            "white-space: pre-line"
+                        )
 
                 async def apply_settings() -> None:
                     # 先切换工作目录并刷新界面，再在后台线程落盘各项设置
@@ -764,7 +789,9 @@ def _build_dashboard(container) -> None:
             dlg = queue_panel_ref.get("dlg")
             if dlg is None:
                 with (
-                    ui.dialog() as dlg,
+                    ui.dialog().props(
+                        "transition-show=fade transition-hide=fade"
+                    ) as dlg,
                     ui.card().classes("w-full max-w-3xl tgs-dialog-card"),
                 ):
                     add_dialog_close_button(dlg)
@@ -783,6 +810,12 @@ def _build_dashboard(container) -> None:
                         .classes("w-full")
                         .props("dense flat")
                     )
+                    # 无运行/排队条目时隐藏空表，改用统一虚线空态（此前是英文
+                    # No data available），避免全站唯一一处英文占位
+                    queue_empty = ui.label("暂无运行中的账号").classes(
+                        "w-full text-sm tgs-empty"
+                    )
+                    queue_empty.set_visibility(False)
 
                     def refresh() -> None:
                         snap = account_queue.snapshot()
@@ -817,6 +850,8 @@ def _build_dashboard(container) -> None:
                             )
                         table.rows = rows
                         table.update()
+                        table.visible = bool(rows)
+                        queue_empty.visible = not rows
 
                     ui.timer(2.0, refresh)
                     refresh()

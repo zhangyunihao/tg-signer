@@ -747,12 +747,23 @@ def _build_center_page() -> None:
 
     # 重试日志弹窗：预创建卡片，打开时才填充内容（日志来自持久化文件，
     # 刷新页面后重新进入本函数会重建弹窗，日志按钮与内容仍按文件显示）
-    with ui.dialog() as retry_log_dialog, ui.card().classes("w-full max-w-2xl"):
+    with (
+        ui.dialog().props(
+            "transition-show=fade transition-hide=fade"
+        ) as retry_log_dialog,
+        ui.card().classes("w-full max-w-2xl"),
+    ):
         add_dialog_close_button(retry_log_dialog)
         retry_log_title = ui.label("重试日志").classes("text-lg font-semibold")
         retry_log_view = (
             ui.log(max_lines=500).classes(LOG_AREA_CLASS).style("height: 320px")
         )
+        retry_log_empty = (
+            ui.label("暂无重试日志")
+            .classes("w-full text-sm tgs-log-empty")
+            .style("padding: 1rem")
+        )
+        retry_log_empty.set_visibility(False)
 
     def open_retry_log(alert: dict) -> None:
         """弹窗展示该提醒的历次重试日志（无日志时提示空）。"""
@@ -762,11 +773,10 @@ def _build_center_page() -> None:
             f"「{alert.get('group') or ''}」"
         )
         retry_log_view.clear()
-        if lines:
-            for line in lines:
-                retry_log_view.push(line)
-        else:
-            retry_log_view.push("暂无日志")
+        retry_log_view.set_visibility(bool(lines))
+        retry_log_empty.set_visibility(not lines)
+        for line in lines:
+            retry_log_view.push(line)
         retry_log_dialog.open()
 
     with ui.column().classes("w-full gap-3"):

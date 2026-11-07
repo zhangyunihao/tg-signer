@@ -110,7 +110,11 @@ def build_combo_sub_spec(account: str, sub: dict, workdir) -> Optional[dict]:
         # 抽奖任务自带 session_dir 字段所以不受影响，退频道任务配置未存此字段，
         # 因此这里固定用 "." 与独立页面 auto_leave_block 保持一致。
         leave_task = next(
-            (t for t in _load_leave_tasks(workdir) if str(t.get("name")) == task_name),
+            (
+                t
+                for t in (_load_leave_tasks(workdir) or [])
+                if str(t.get("name")) == task_name
+            ),
             None,
         )
         if leave_task is not None:
@@ -219,7 +223,11 @@ def _combo_sub_accounts(sub: dict, workdir) -> list[str]:
         return [str(a) for a in (gcfg.get("accounts") or []) if a]
     if "退频道" in sub_type:
         leave_task = next(
-            (t for t in _load_leave_tasks(workdir) if str(t.get("name")) == task_name),
+            (
+                t
+                for t in (_load_leave_tasks(workdir) or [])
+                if str(t.get("name")) == task_name
+            ),
             None,
         )
         if leave_task is not None:
@@ -595,7 +603,12 @@ class TaskRunnerBlock:
         )
 
         # ---- 新增任务弹窗 ----
-        with ui.dialog() as self.dialog, ui.card().classes("w-full max-w-2xl"):
+        with (
+            ui.dialog().props(
+                "transition-show=fade transition-hide=fade"
+            ) as self.dialog,
+            ui.card().classes("w-full max-w-2xl"),
+        ):
             add_dialog_close_button(self.dialog)
             ui.label("新增任务").classes("text-lg font-semibold")
             with ui.row().classes("items-end w-full gap-3 flex-wrap"):
@@ -737,7 +750,7 @@ class TaskRunnerBlock:
         if "退频道" in task_type:
             # 批量退频道为任务列表模式：仅列出「自动退出」任务（排除仅扫描任务），
             # 按创建时间倒序；序号与「批量退频道」tab 一致（按创建顺序，最早为 1）
-            all_tasks = _load_leave_tasks(state.workdir)
+            all_tasks = _load_leave_tasks(state.workdir) or []
             total = len(all_tasks)
             opts = {}
             for j, t in enumerate(reversed(all_tasks)):
@@ -1009,7 +1022,7 @@ class TaskRunnerBlock:
             combo = next(
                 (
                     c
-                    for c in load_composite_tasks(state.workdir)
+                    for c in load_composite_tasks(state.workdir) or []
                     if c.get("name") == task_name
                 ),
                 None,
@@ -1953,7 +1966,10 @@ class TaskRunnerBlock:
         }
         # 勾选状态按明细行下标保存，切换筛选/重新渲染后仍保留
         selected: set[int] = set()
-        with ui.dialog() as dlg, ui.card().classes("w-full max-w-xl"):
+        with (
+            ui.dialog().props("transition-show=fade transition-hide=fade") as dlg,
+            ui.card().classes("w-full max-w-xl"),
+        ):
             add_dialog_close_button(dlg)
             ui.label(f"子任务明细 — {row.get('task', '')}").classes(
                 "text-lg font-semibold"

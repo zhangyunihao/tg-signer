@@ -24,6 +24,7 @@ from tg_signer.webui.data import (
     set_account_order,
     set_account_two_way,
 )
+from tg_signer.webui.health import reload_page
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +325,10 @@ def user_info_block() -> Callable[[], None]:
         send_btn.enable()
         login_btn.enable()
 
-    with ui.dialog() as add_dlg, ui.card().classes("w-[520px] max-w-full"):
+    with (
+        ui.dialog().props("transition-show=fade transition-hide=fade") as add_dlg,
+        ui.card().classes("w-[520px] max-w-full"),
+    ):
         add_dialog_close_button(add_dlg)
         ui.label("增加账户（TG 登录）").classes("text-lg font-semibold")
         add_name = ui.input("账户名", placeholder="例如 my_account").classes("w-full")
@@ -457,7 +461,10 @@ def user_info_block() -> Callable[[], None]:
             ui.notify("未发现账户（当前目录无 *.session）", type="warning")
             return
         _spamb_checking[0] = True
-        with ui.dialog() as dlg, ui.card().classes("w-[560px] max-w-full"):
+        with (
+            ui.dialog().props("transition-show=fade transition-hide=fade") as dlg,
+            ui.card().classes("w-[560px] max-w-full"),
+        ):
             add_dialog_close_button(dlg)
             ui.label("@spambot 账户限制状态").classes("text-lg font-semibold")
             ui.label("逐个连接 Telegram 查询，结果实时刷新").classes(
@@ -563,7 +570,12 @@ def user_info_block() -> Callable[[], None]:
                         ids_by_uid.setdefault(info["user_id"], []).append(n)
 
                     def delete_account(name: str) -> None:
-                        with ui.dialog() as dlg, ui.card():
+                        with (
+                            ui.dialog().props(
+                                "transition-show=fade transition-hide=fade"
+                            ) as dlg,
+                            ui.card(),
+                        ):
                             add_dialog_close_button(dlg)
                             ui.label(f"确认删除账户 {name}？").classes(
                                 "text-lg font-semibold"
@@ -603,7 +615,9 @@ def user_info_block() -> Callable[[], None]:
 
                     def rename_account(name: str) -> None:
                         with (
-                            ui.dialog() as dlg,
+                            ui.dialog().props(
+                                "transition-show=fade transition-hide=fade"
+                            ) as dlg,
                             ui.card().classes("w-[420px] max-w-full"),
                         ):
                             add_dialog_close_button(dlg)
@@ -769,6 +783,16 @@ def user_info_block() -> Callable[[], None]:
 
             # —— 用户信息 ——
             entries = load_user_infos(state.workdir)
+            if entries is None:
+                # 读盘失败与「没有账号」分开提示：磁盘异常时不再显示"未找到用户信息"
+                with ui.column().classes(
+                    "w-full items-center justify-center gap-3 tgs-empty"
+                ):
+                    ui.label("用户信息读取失败，请检查文件权限后重试").classes(
+                        "text-sm text-gray-500"
+                    )
+                    ui.button("重新加载", icon="refresh", on_click=reload_page)
+                return
             if not entries:
                 ui.label("未找到用户信息").classes("text-gray-500")
                 return

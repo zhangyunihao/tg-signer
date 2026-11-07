@@ -1252,7 +1252,7 @@ _CFG_FIELDS = {
 def list_known_channels(workdir) -> Dict[str, str]:
     """汇总 users/*/latest_chats.json 中的频道与群组，返回 {chat_id: "标题 (id)"}"""
     options: Dict[str, str] = {}
-    for info in load_user_infos(workdir):
+    for info in load_user_infos(workdir) or []:
         for chat in info.latest_chats or []:
             ctype = str(chat.get("type") or "").lower().replace("chattype.", "")
             if ctype != "channel" and not ctype.endswith("group"):
@@ -1268,7 +1268,7 @@ def list_known_channels(workdir) -> Dict[str, str]:
 def chat_kind_map(workdir) -> Dict[str, str]:
     """返回 {chat_id: "channel"|"group"}，供监控对象类型筛选"""
     mapping: Dict[str, str] = {}
-    for info in load_user_infos(workdir):
+    for info in load_user_infos(workdir) or []:
         for chat in info.latest_chats or []:
             ctype = str(chat.get("type") or "").lower().replace("chattype.", "")
             if ctype != "channel" and not ctype.endswith("group"):
@@ -1284,7 +1284,7 @@ def chat_kind_map(workdir) -> Dict[str, str]:
 def channel_title_map(workdir) -> Dict[str, str]:
     """返回 {chat_id: 频道名}，供任务表格展示"""
     mapping: Dict[str, str] = {}
-    for info in load_user_infos(workdir):
+    for info in load_user_infos(workdir) or []:
         for chat in info.latest_chats or []:
             cid = chat.get("id")
             if cid is None:
@@ -2642,7 +2642,12 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         else:
             ui.notify("当前没有已参与记录", type="info")
 
-    with ui.dialog() as clear_records_dlg, ui.card().classes("w-full max-w-md"):
+    with (
+        ui.dialog().props(
+            "transition-show=fade transition-hide=fade"
+        ) as clear_records_dlg,
+        ui.card().classes("w-full max-w-md"),
+    ):
         add_dialog_close_button(clear_records_dlg)
         ui.label("清除所有已参与抽奖记录").classes("text-lg font-semibold")
         clear_count_label = ui.label("").classes("text-sm text-gray-700")
@@ -2833,7 +2838,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
     create_poll_task(_poll_loop(), name="giveaway-poll", client=client)
 
     # —— 参与明细弹窗：按用户显示本次/上次新参加的抽奖数 ——
-    with ui.dialog() as detail_dlg, ui.card().classes("w-full max-w-md"):
+    with (
+        ui.dialog().props("transition-show=fade transition-hide=fade") as detail_dlg,
+        ui.card().classes("w-full max-w-md"),
+    ):
         add_dialog_close_button(detail_dlg)
         detail_title_label = ui.label("参与明细").classes("text-lg font-semibold")
         detail_total_label = ui.label("").classes("text-sm text-gray-700")
@@ -2881,7 +2889,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
         detail_dlg.open()
 
     # —— 添加任务弹窗 ——
-    with ui.dialog() as add_dlg, ui.card().classes("w-full max-w-3xl tgs-dialog-card"):
+    with (
+        ui.dialog().props("transition-show=fade transition-hide=fade") as add_dlg,
+        ui.card().classes("w-full max-w-3xl tgs-dialog-card"),
+    ):
         add_dialog_close_button(add_dlg)
         add_dlg_title = ui.label("添加任务").classes("text-lg font-semibold")
         with ui.row().classes("items-end w-full gap-3 flex-wrap"):
@@ -3022,30 +3033,32 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 )
             return low_input, high_input
 
-        with ui.row().classes("items-end w-full gap-3 flex-wrap") as delay_row:
-            delay_min_input, delay_max_input = _range_inputs(
-                "参与前随机延迟（秒）", low=3, high=10, max_value=600
-            )
-
-        with ui.row().classes("items-end w-full gap-3 flex-wrap"):
-            rescue_interval_input = ui.number(
-                label="补漏扫描间隔（分钟）",
-                value=30,
-                min=1,
-                max=1440,
-                format="%d",
-            ).classes("w-52")
-            rescue_limit_input = ui.number(
-                label="补漏重拉条数/频道",
-                value=10,
-                min=1,
-                max=100,
-                format="%d",
-            ).classes("w-44")
-
-        with ui.expansion("限流保护（加入/解析节奏与配额）", icon="shield").classes(
+        # 高级参数（参与延迟、补漏节奏、限流配额）统一收进折叠区：
+        # 添加任务默认只需填频道与关键词，首屏不再被这些调优项撑出一屏滚动
+        with ui.expansion("高级参数（延迟、补漏与限流）", icon="shield").classes(
             "w-full"
         ) as rate_limit_expansion:
+            with ui.row().classes("items-end w-full gap-3 flex-wrap") as delay_row:
+                delay_min_input, delay_max_input = _range_inputs(
+                    "参与前随机延迟（秒）", low=3, high=10, max_value=600
+                )
+
+            with ui.row().classes("items-end w-full gap-3 flex-wrap"):
+                rescue_interval_input = ui.number(
+                    label="补漏扫描间隔（分钟）",
+                    value=30,
+                    min=1,
+                    max=1440,
+                    format="%d",
+                ).classes("w-52")
+                rescue_limit_input = ui.number(
+                    label="补漏重拉条数/频道",
+                    value=10,
+                    min=1,
+                    max=100,
+                    format="%d",
+                ).classes("w-44")
+
             with ui.row().classes("items-end w-full gap-3 flex-wrap") as join_limit_row:
                 join_pace_min_input, join_pace_max_input = _range_inputs(
                     "加入间隔（秒）",
@@ -3098,6 +3111,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
             visible = bool(rescue_switch.value)
             rescue_interval_input.visible = visible
             rescue_limit_input.visible = visible and not is_win
+            # 中奖扫描只剩补漏间隔可调：未开补漏时整块高级参数区没有可调项，
+            # 隐藏折叠栏避免白占高度；其余任务类型始终保留入口
+            if is_win:
+                rate_limit_expansion.visible = visible
 
         def _apply_source_visibility() -> None:
             """按任务类型切换表单项：机器人任务只保留与回扫相关的配置。

@@ -58,6 +58,7 @@ from tg_signer.webui.giveaway import (
     load_giveaway_timeout_min,
     load_task_store,
 )
+from tg_signer.webui.health import reload_page
 from tg_signer.webui.theme import MOBILE_DESIGN_CSS
 
 logger = logging.getLogger(__name__)
@@ -79,16 +80,22 @@ def _composite_tasks_path(workdir: Path | str | None = None) -> Path:
     return get_workdir(workdir) / COMPOSITE_TASKS_FILE
 
 
-def load_composite_tasks(workdir: Path | str | None = None) -> list[dict]:
+def load_composite_tasks(workdir: Path | str | None = None) -> list[dict] | None:
+    """读取组合任务列表；文件缺失返回空列表，读取失败返回 None。
+
+    返回 None 用于区分「读盘失败」与「本来就没有任务」：调用侧据此显示
+    读取失败提示，而不是把损坏/不可读的文件当成空列表静默忽略。
+    """
     path = _composite_tasks_path(workdir)
     if not path.is_file():
         return []
     try:
         with open(path, "r", encoding="utf-8") as fp:
             data = json.load(fp)
-        return data if isinstance(data, list) else []
     except (json.JSONDecodeError, OSError):
-        return []
+        logger.warning("读取组合任务列表失败: %s", path, exc_info=True)
+        return None
+    return data if isinstance(data, list) else []
 
 
 def save_composite_tasks(items: list[dict], workdir: Path | str | None = None) -> None:
@@ -108,16 +115,18 @@ def _composite_progress_path(workdir: Path | str | None = None) -> Path:
     return get_workdir(workdir) / COMPOSITE_PROGRESS_FILE
 
 
-def load_combo_progress(workdir: Path | str | None = None) -> dict[str, dict]:
+def load_combo_progress(workdir: Path | str | None = None) -> dict[str, dict] | None:
+    """读取组合任务进度快照；文件缺失返回空字典，读取失败返回 None（同列表）。"""
     path = _composite_progress_path(workdir)
     if not path.is_file():
         return {}
     try:
         with open(path, "r", encoding="utf-8") as fp:
             data = json.load(fp)
-        return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError):
-        return {}
+        logger.warning("读取组合任务进度失败: %s", path, exc_info=True)
+        return None
+    return data if isinstance(data, dict) else {}
 
 
 def save_combo_progress(store: dict, workdir: Path | str | None = None) -> None:
@@ -429,7 +438,7 @@ def _merge_retry_updates(
                 combo_apply_retry_results(rec.get("details") or [], updates)
                 combo_refresh_record_status(rec)
                 update_task_history(rec)
-            store = load_combo_progress(state.workdir)
+            store = load_combo_progress(state.workdir) or {}
             snap = store.get(record_id)
             if snap is not None:
                 combo_apply_retry_results(snap.get("details") or [], updates)
@@ -908,7 +917,11 @@ def _giveaway_config_params(task_name: str, workdir) -> list[tuple[str, str]] | 
 def _leave_config_params(task_name: str, workdir) -> list[tuple[str, str]] | None:
     """批量退频道：webui_leave_tasks.json 里对应任务的全部参数。"""
     task = next(
-        (t for t in load_leave_tasks(workdir) if str(t.get("name")) == task_name),
+        (
+            t
+            for t in (load_leave_tasks(workdir) or [])
+            if str(t.get("name")) == task_name
+        ),
         None,
     )
     if task is None:
@@ -996,7 +1009,7 @@ def _leave_task_display(task_name: str, workdir) -> str:
     """
     if not task_name:
         return task_name
-    for i, t in enumerate(load_leave_tasks(workdir), 1):
+    for i, t in enumerate(load_leave_tasks(workdir) or [], 1):
         if str(t.get("name")) == task_name:
             return f"{i}｜{task_name}"
     return task_name
@@ -1006,7 +1019,8 @@ def _find_leave_task(task_name: str, workdir) -> dict | None:
     """按名称查找组合退频道子任务绑定的退频道任务配置。"""
     name = str(task_name or "")
     return next(
-        (t for t in load_leave_tasks(workdir) if str(t.get("name")) == name), None
+        (t for t in (load_leave_tasks(workdir) or []) if str(t.get("name")) == name),
+        None,
     )
 
 
@@ -1236,7 +1250,7 @@ class ComboTaskBlock:
 
     # ---- 数据 ----
 
-    def _load(self) -> list[dict]:
+    def _load(self) -> list[dict] | None:
         return load_composite_tasks(self.workdir)
 
     def _save(self, items: list[dict]) -> None:
@@ -1482,7 +1496,7 @@ class ComboTaskBlock:
         if subs is not None:
             return subs
         name = str(run["record"].get("task_name") or "")
-        combo = next((c for c in self._load() if c.get("name") == name), None)
+        combo = next((c for c in (self._load() or []) if c.get("name") == name), None)
         return (combo or {}).get("subs") or []
 
     def _sub_run_status(self, sub: dict, run: dict) -> str:
@@ -1961,6 +1975,18 @@ class ComboTaskBlock:
         except Exception:
             logger.debug("读取任务历史失败", exc_info=True)
         with self.template_container:
+            if items is None:
+                # 读取失败与「暂无模板」分开提示：损坏/不可读的文件不再被当成空列表
+                with ui.column().classes(
+                    "w-full items-center justify-center gap-3 tgs-empty"
+                ):
+                    ui.label("组合任务模板读取失败，请检查文件后重试").classes(
+                        "text-sm text-gray-500"
+                    )
+                    ui.button(
+                        "重新加载", icon="refresh", on_click=self._render_template_list
+                    )
+                return
             if not items:
                 ui.label("暂无模板，点「新增组合任务模板」创建。").classes(
                     "text-sm text-gray-400 tgs-empty"
@@ -2119,7 +2145,7 @@ class ComboTaskBlock:
         sig = self._snapshot_sig(snap)
         if not force and self._snap_sigs.get(rid) == sig:
             return
-        store = load_combo_progress(self.workdir)
+        store = load_combo_progress(self.workdir) or {}
         store[rid] = {**snap, "updated_at": time.time()}
         if len(store) > COMBO_PROGRESS_LIMIT:
             ordered = sorted(
@@ -2173,7 +2199,7 @@ class ComboTaskBlock:
         )
         if rec is None:
             return
-        store = load_combo_progress(self.workdir)
+        store = load_combo_progress(self.workdir) or {}
         snap = store.get(rid) or {}
         if not name:
             name = str(rec.get("task_name") or "")
@@ -2237,7 +2263,7 @@ class ComboTaskBlock:
     def _snapshot_run_view(self, rec: dict) -> dict | None:
         """把历史记录 + 进度快照拼成与运行中一致的展示结构；无快照时返回 None。"""
         rid = str(rec.get("id") or "")
-        snap = load_combo_progress(self.workdir).get(rid)
+        snap = (load_combo_progress(self.workdir) or {}).get(rid)
         if not snap:
             return None
         details = rec.get("details") or snap.get("details") or []
@@ -2260,7 +2286,10 @@ class ComboTaskBlock:
         }
 
     def _confirm_delete(self, name: str) -> None:
-        with ui.dialog() as dlg, ui.card():
+        with (
+            ui.dialog().props("transition-show=fade transition-hide=fade") as dlg,
+            ui.card(),
+        ):
             add_dialog_close_button(dlg)
             ui.label(f"确定删除组合任务模板「{name}」？").classes("text-base")
             with ui.row().classes("w-full justify-end gap-2"):
@@ -2273,7 +2302,7 @@ class ComboTaskBlock:
         dlg.open()
 
     def _delete(self, name: str, dlg) -> None:
-        items = [c for c in self._load() if c.get("name") != name]
+        items = [c for c in (self._load() or []) if c.get("name") != name]
         self._save(items)
         dlg.close()
         self._render_template_list()
@@ -2282,7 +2311,12 @@ class ComboTaskBlock:
     # ---- 创建/编辑弹窗 ----
 
     def _build_combo_dialog(self) -> None:
-        with ui.dialog() as self.combo_dialog, ui.card().classes("w-full max-w-2xl"):
+        with (
+            ui.dialog().props(
+                "transition-show=fade transition-hide=fade"
+            ) as self.combo_dialog,
+            ui.card().classes("w-full max-w-2xl"),
+        ):
             add_dialog_close_button(self.combo_dialog)
             self.combo_title = ui.label("新增组合任务").classes("text-lg font-semibold")
             ui.label("已有任务按顺序组合，账号之间并行。").classes(
@@ -2425,7 +2459,7 @@ class ComboTaskBlock:
                 type="warning",
             )
             return False
-        items = self._load()
+        items = self._load() or []
         updated = any(c.get("name") == name for c in items)
         items = [c for c in items if c.get("name") != name]
         items.append(
@@ -2449,7 +2483,9 @@ class ComboTaskBlock:
 
     def _build_config_dialog(self) -> None:
         with (
-            ui.dialog() as self.config_dialog,
+            ui.dialog().props(
+                "transition-show=fade transition-hide=fade"
+            ) as self.config_dialog,
             ui.card().classes("w-full max-w-2xl"),
         ):
             add_dialog_close_button(self.config_dialog)
@@ -2476,7 +2512,9 @@ class ComboTaskBlock:
 
     def _build_new_task_dialog(self) -> None:
         with (
-            ui.dialog() as self.new_task_dialog,
+            ui.dialog().props(
+                "transition-show=fade transition-hide=fade"
+            ) as self.new_task_dialog,
             ui.card().classes("w-full max-w-lg"),
         ):
             add_dialog_close_button(self.new_task_dialog)
@@ -2553,7 +2591,9 @@ class ComboTaskBlock:
         self.new_task_subs_container.clear()
         self._new_task_checks = {}
         name = str(self.new_task_template.value or "")
-        combo = next((c for c in self._load() if str(c.get("name")) == name), None)
+        combo = next(
+            (c for c in (self._load() or []) if str(c.get("name")) == name), None
+        )
         subs = (combo or {}).get("subs") or []
         with self.new_task_subs_container:
             if not subs:
@@ -2582,7 +2622,7 @@ class ComboTaskBlock:
         self, template: str | None = None, accounts: list[str] | None = None
     ) -> None:
         """打开新增组合任务弹窗；传入 template/accounts 时按历史行参数预填（复制）。"""
-        items = self._load()
+        items = self._load() or []
         if not items:
             ui.notify(
                 "还没有组合任务模板，请先在右上角「任务组合配置」中创建",
@@ -2888,9 +2928,27 @@ def _build_progress_page(record_id: str) -> None:
 
     if record is None:
         with content:
-            ui.label("未找到该组合任务记录（可能已被清理）").classes(
-                "text-sm text-gray-500 tgs-empty tgs-empty-page"
-            )
+            # 记录可能只是尚未落盘（任务刚结束）或被清理：给一个重试入口，
+            # 不再只有一行灰字让用户只能手动刷新整页
+            with ui.column().classes(
+                "w-full items-center justify-center gap-3 tgs-empty tgs-empty-page"
+            ):
+                ui.label("未找到该组合任务记录（可能已被清理）").classes(
+                    "text-sm text-gray-500"
+                )
+                ui.button("重新加载", icon="refresh", on_click=reload_page)
+        return
+
+    if load_combo_progress(state.workdir) is None:
+        with content:
+            # 进度文件存在但读不出来（损坏/权限），与「记录不存在」分开提示
+            with ui.column().classes(
+                "w-full items-center justify-center gap-3 tgs-empty tgs-empty-page"
+            ):
+                ui.label("组合任务进度读取失败（文件损坏或不可读）").classes(
+                    "text-sm text-gray-500"
+                )
+                ui.button("重新加载", icon="refresh", on_click=reload_page)
         return
 
     # 运行日志区常驻页面：轮询只就地更新文本，不随进度卡片重建，
@@ -2925,7 +2983,11 @@ def _build_progress_page(record_id: str) -> None:
     with log_box:
         # 整段日志用一个 <pre> 渲染，元素数始终为 1
         log_pre = (
-            ui.html("<pre>暂无日志输出</pre>").classes("w-full").style("margin: 0")
+            ui.html(
+                '<div class="tgs-log-empty" style="padding:1rem">暂无日志输出</div>'
+            )
+            .classes("w-full")
+            .style("margin: 0")
         )
     # 退出全屏悬浮按钮：默认隐藏，全屏时 fixed 显示在视口右上角
     log_exit = exit_fullscreen_button(lambda: fullscreen.toggle())
@@ -2935,7 +2997,7 @@ def _build_progress_page(record_id: str) -> None:
         """已结束任务的快照日志；只读一次快照文件，重试日志另行拼接。"""
         cached = log_state.get("snap_logs")
         if cached is None:
-            snap = load_combo_progress(view.workdir).get(record_id) or {}
+            snap = (load_combo_progress(view.workdir) or {}).get(record_id) or {}
             cached = [str(x) for x in (snap.get("logs") or [])][
                 -COMBO_PROGRESS_LOG_LINES:
             ]
@@ -2962,7 +3024,12 @@ def _build_progress_page(record_id: str) -> None:
         if body == log_state["body"]:
             return
         log_state["body"] = body
-        log_pre.set_content(f"<pre>{body or '暂无日志输出'}</pre>")
+        if body:
+            log_pre.set_content(f"<pre>{body}</pre>")
+        else:
+            log_pre.set_content(
+                '<div class="tgs-log-empty" style="padding:1rem">暂无日志输出</div>'
+            )
         log_pre.update()
 
     async def stop_task() -> None:
@@ -3126,7 +3193,9 @@ def _build_progress_page(record_id: str) -> None:
         leave_detail_dialog.open()
 
     with (
-        ui.dialog() as leave_detail_dialog,
+        ui.dialog().props(
+            "transition-show=fade transition-hide=fade"
+        ) as leave_detail_dialog,
         ui.card().classes("w-[560px] max-w-[96vw] max-h-[88vh] overflow-auto"),
     ):
         add_dialog_close_button(leave_detail_dialog)
@@ -3185,7 +3254,7 @@ def _build_progress_page(record_id: str) -> None:
             ),
             record,
         )
-        snap = load_combo_progress(view.workdir).get(record_id) or {}
+        snap = (load_combo_progress(view.workdir) or {}).get(record_id) or {}
         return (
             "done",
             str((fresh or {}).get("status") or ""),

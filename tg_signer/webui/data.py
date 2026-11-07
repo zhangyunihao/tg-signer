@@ -188,18 +188,31 @@ def _read_user_infos(users_dir: Path) -> List[UserInfo]:
     return entries
 
 
-def load_user_infos(workdir: Optional[Path | str] = None) -> List[UserInfo]:
+def load_user_infos(workdir: Optional[Path | str] = None) -> Optional[List[UserInfo]]:
+    """读取用户信息；users 目录不存在返回空列表，读盘失败返回 None。
+
+    返回 None 用于区分「读取失败」与「没有账号」：消息中心、账号面板据此
+    显示读取失败提示，避免磁盘异常被当成空列表静默吞掉。
+    """
     global _user_infos_cache
     base = get_workdir(workdir)
     users_dir = base / "users"
     if not users_dir.is_dir():
         return []
-    fingerprint = _user_infos_fingerprint(users_dir)
-    with _user_infos_lock:
-        cached = _user_infos_cache
-        if cached is not None and cached[0] == users_dir and cached[1] == fingerprint:
-            return list(cached[2])
-    entries = _read_user_infos(users_dir)
+    try:
+        fingerprint = _user_infos_fingerprint(users_dir)
+        with _user_infos_lock:
+            cached = _user_infos_cache
+            if (
+                cached is not None
+                and cached[0] == users_dir
+                and cached[1] == fingerprint
+            ):
+                return list(cached[2])
+        entries = _read_user_infos(users_dir)
+    except OSError:
+        logger.warning("读取用户信息失败: %s", users_dir, exc_info=True)
+        return None
     with _user_infos_lock:
         _user_infos_cache = (users_dir, fingerprint, entries)
     return list(entries)
@@ -212,7 +225,7 @@ def chat_username_map(workdir: Optional[Path | str] = None) -> Dict[str, str]:
     （数字 chat_id 对未加入账号不可解析，无法直接 join）。
     """
     mapping: Dict[str, str] = {}
-    for info in load_user_infos(workdir):
+    for info in load_user_infos(workdir) or []:
         for chat in info.latest_chats or []:
             cid = chat.get("id")
             username = chat.get("username")

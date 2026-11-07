@@ -39,7 +39,10 @@ def _ensure_dialog(state: dict) -> tuple[ui.dialog, ui.label]:
     dialog = state.get("dialog")
     if dialog is not None:
         return dialog, state["detail"]
-    with ui.dialog() as dialog, ui.card().classes("w-full max-w-md"):
+    with (
+        ui.dialog().props("transition-show=fade transition-hide=fade") as dialog,
+        ui.card().classes("w-full max-w-md"),
+    ):
         ui.label("页面出现异常").classes("text-base font-semibold text-negative")
         ui.label("这次操作没有完成，可重新加载页面后再试。").classes(
             "text-xs text-gray-500"

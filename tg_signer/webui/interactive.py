@@ -30,7 +30,7 @@ class InteractiveSignerConfig:
     ):
         self.workdir = workdir
         self.on_complete = on_complete
-        self.dialog = ui.dialog()
+        self.dialog = ui.dialog().props("transition-show=fade transition-hide=fade")
         with self.dialog, ui.card().classes("w-full max-w-4xl h-[90vh] flex flex-col"):
             with ui.row().classes("w-full items-center justify-between"):
                 ui.label("交互式配置向导").classes("text-xl font-bold")
@@ -155,7 +155,7 @@ class InteractiveSignerConfig:
         d_delete_after = chat.delete_after if chat else None
         d_actions: List[ActionT] = list(chat.actions) if chat else []
 
-        dialog = ui.dialog()
+        dialog = ui.dialog().props("transition-show=fade transition-hide=fade")
         with dialog, ui.card().classes("w-full max-w-2xl"):
             add_dialog_close_button(dialog)
             ui.label("编辑任务" if chat else "添加任务").classes(
@@ -165,7 +165,7 @@ class InteractiveSignerConfig:
             # Quick Import: 仿照随机发言，聚合全部账户的最近群组，内嵌下拉直接选择（无弹窗）
             def build_group_options():
                 options = {}
-                for u in load_user_infos(self.workdir):
+                for u in load_user_infos(self.workdir) or []:
                     for c in u.latest_chats or []:
                         # 签到目标是群组，私聊/机器人等非群组聊天不列出
                         chat_type = str(c.get("type") or "").lower()
@@ -282,7 +282,12 @@ class InteractiveSignerConfig:
                 refresh_actions()
 
             def add_action_ui():
-                with ui.dialog() as act_dialog, ui.card():
+                with (
+                    ui.dialog().props(
+                        "transition-show=fade transition-hide=fade"
+                    ) as act_dialog,
+                    ui.card(),
+                ):
                     add_dialog_close_button(act_dialog)
                     ui.label("添加动作").classes("font-bold")
                     act_type = ui.select(

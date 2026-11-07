@@ -47,6 +47,7 @@ from tg_signer.webui.components import (
     LogFullscreen,
     exit_fullscreen_button,
 )
+from tg_signer.webui.health import reload_page
 from tg_signer.webui.random_chat import (
     build_account_options,
     list_session_names,
@@ -215,8 +216,12 @@ def _scan_types_of(obj: Dict) -> str:
     return "both" if obj.get("include_groups") else "channel"
 
 
-def load_leave_tasks(workdir) -> List[Dict]:
-    """读取退频道任务列表；缺失时尝试从旧版单配置迁移出一条默认任务"""
+def load_leave_tasks(workdir) -> List[Dict] | None:
+    """读取退频道任务列表；缺失时尝试从旧版单配置迁移出一条默认任务。
+
+    文件不存在 → 走旧版迁移（正常路径）；存在但不可读/解析失败 → 返回 None，
+    让调用侧提示「读取失败」而不是误认为没有任务。
+    """
     try:
         data = json.loads(_tasks_path(workdir).read_text(encoding="utf-8"))
         if isinstance(data, list):
@@ -225,8 +230,11 @@ def load_leave_tasks(workdir) -> List[Dict]:
                 t.setdefault("scan_types", _scan_types_of(t))
                 t.setdefault("include_keywords", [])
             return tasks
+    except FileNotFoundError:
+        pass
     except Exception:
-        logger.debug("读取退频道任务列表失败，视为空", exc_info=True)
+        logger.warning("读取退频道任务列表失败", exc_info=True)
+        return None
     cfg = load_config(workdir)
     if cfg.get("accounts"):
         return [
@@ -268,7 +276,7 @@ def tasks_mtime_ns(workdir) -> int:
 
 def _patch_leave_task(workdir, task_id: str, **fields) -> Dict | None:
     """重新读取后更新单个任务，避免覆盖其他进程刚写入的字段。"""
-    tasks = load_leave_tasks(workdir)
+    tasks = load_leave_tasks(workdir) or []
     task = next((t for t in tasks if t.get("id") == task_id), None)
     if task is None:
         return None
@@ -292,7 +300,7 @@ def create_auto_leave_task(
     account = str(account or "").strip()
     if not account:
         return None
-    tasks = load_leave_tasks(workdir)
+    tasks = load_leave_tasks(workdir) or []
     for t in tasks:
         if t.get("trigger") != "channels_full":
             continue
@@ -639,6 +647,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     session_dir = Path(default_session_dir or ".")
     wd_key = str(Path(workdir).resolve())
     tasks = load_leave_tasks(workdir)
+    # 读取失败（None）与「没有任务」（[]）要区分：前者在列表位置提示并给重试
+    load_failed = tasks is None
+    tasks = tasks or []
     if tasks:
         save_leave_tasks(workdir, tasks)  # 旧配置迁移后立即落盘
 
@@ -1246,6 +1257,15 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     def render_mobile_cards(rows: List[Dict]) -> None:
         cards_container.clear()
         with cards_container:
+            if load_failed:
+                with ui.column().classes(
+                    "w-full items-center justify-center gap-3 tgs-empty"
+                ):
+                    ui.label("退频道任务读取失败，请检查文件后重试").classes(
+                        "text-sm text-gray-500"
+                    )
+                    ui.button("重新加载", icon="refresh", on_click=reload_page)
+                return
             shown = rows[: cards_limit["n"]]
             if not shown:
                 ui.label("暂无执行记录，点击「新建任务」开始").classes(
@@ -1358,6 +1378,8 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             )
         leave_table.rows = rows
         leave_table.update()
+        # 读取失败时隐藏空表，避免 Quasar 默认英文占位与错误提示并存
+        leave_table.set_visibility(not load_failed)
         render_mobile_cards(rows)
 
     def _on_leave_dup(e) -> None:
@@ -1505,7 +1527,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
     # 避免在表格单元格等事件槽位里动态创建弹窗导致 Quasar 渲染异常）----
 
     with (
-        ui.dialog() as create_dialog,
+        ui.dialog().props("transition-show=fade transition-hide=fade") as create_dialog,
         ui.card().classes("w-[520px] max-w-[96vw] max-h-[88vh] overflow-auto"),
     ):
         add_dialog_close_button(create_dialog)
@@ -1565,7 +1587,7 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             ui.button("启动执行", on_click=_do_create).props("color=primary")
 
     with (
-        ui.dialog() as detail_dialog,
+        ui.dialog().props("transition-show=fade transition-hide=fade") as detail_dialog,
         ui.card().classes("w-[560px] max-w-[96vw] max-h-[88vh] overflow-auto"),
     ):
         add_dialog_close_button(detail_dialog)
@@ -1580,7 +1602,10 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             ).classes("text-xs text-gray-500")
         detail_body = ui.column().classes("w-full gap-2")
 
-    with ui.dialog() as delete_dialog, ui.card():
+    with (
+        ui.dialog().props("transition-show=fade transition-hide=fade") as delete_dialog,
+        ui.card(),
+    ):
         add_dialog_close_button(delete_dialog)
         delete_label = ui.label("确认删除任务？").classes("text-lg font-semibold")
         with ui.row().classes("w-full justify-end"):
@@ -1616,7 +1641,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         )
 
     with (
-        ui.dialog() as settings_dialog,
+        ui.dialog().props(
+            "transition-show=fade transition-hide=fade"
+        ) as settings_dialog,
         ui.card().classes("w-[520px] max-w-[96vw]"),
     ):
         add_dialog_close_button(settings_dialog)
@@ -1681,6 +1708,9 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
 
     def _sync_from_disk() -> None:
         disk = load_leave_tasks(workdir)
+        if disk is None:
+            # 读盘失败时保留当前内存列表，等下一轮轮询再试
+            return
         known = {t["id"]: t for t in tasks}
         changed = False
         for item in disk:
