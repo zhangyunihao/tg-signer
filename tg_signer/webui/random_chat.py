@@ -1692,7 +1692,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
 
         phrases_input = (
             ui.textarea(
-                label="本任务语库（每行一条，留空则使用内置 200 条语库）",
+                label=f"本任务语库（每行一条，留空则使用内置 {len(PHRASES)} 条语库）",
                 placeholder="例如：\n今天天气不错\n群里挺热闹啊\n学到了学到了",
             )
             .classes("w-full")
