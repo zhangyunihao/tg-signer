@@ -36,6 +36,7 @@ from tg_signer.webui.common import (
     copy_text_to_clipboard,
     format_duration,
     list_field_summary,
+    load_account_parallel_limit,
     mobile_card_fields,
     mobile_card_result,
     with_select_all,
@@ -739,11 +740,26 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
             # 扫描范围包含群组时不允许自动退出（仅频道可自动退出）
             log(f"[{task['name']}] 扫描范围包含群组，自动退出不可用，仅扫描记录")
             auto_leave_on = False
-        try:
-            for account in accounts:
+        # 全局设置「同时扫描账号数」：限制同时扫描/退出的账号数，0=不限
+        limit = load_account_parallel_limit(workdir)
+        sem = asyncio.Semaphore(limit) if limit > 0 else None
+        if sem is not None and len(accounts) > limit:
+            log(
+                f"[{task['name']}] 同时扫描账号上限 {limit}（全局设置），"
+                f"其余 {len(accounts) - limit} 个账号排队"
+            )
+        state_lock = asyncio.Lock()
+
+        async def run_account(account: str) -> None:
+            if st["stop"]:
+                log(f"[{task['name']}] 已停止，跳过账号 {account}")
+                return
+            if sem is not None:
+                await sem.acquire()
+            try:
                 if st["stop"]:
                     log(f"[{task['name']}] 已停止，跳过账号 {account}")
-                    break
+                    return
                 found = await scan_stale_chats(
                     account,
                     session_dir,
@@ -772,22 +788,32 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
                             should_stop=lambda: st["stop"],
                             workdir=workdir,
                         )
-                        st["auto_left"] += len(done)
+                        async with state_lock:
+                            st["auto_left"] += len(done)
                     kept = [r for r in found if _kw_hit(task, r["title"])]
                     log(
                         f"[{account}] 命中保护关键字 {len(kept)} 个（待手动确认），"
                         f"未命中 {len(auto_rows)} 个自动退出"
                     )
-                    st["rows"].extend(kept)
+                    async with state_lock:
+                        st["rows"].extend(kept)
                 else:
-                    st["rows"].extend(found)
-                    # 不自动退出时，未命中保护关键字的对话默认勾选，命中关键字的不勾
-                    st["selected"].update(
-                        r["key"]
-                        for r in found
-                        if not _kw_hit(task, str(r.get("title") or ""))
-                    )
+                    async with state_lock:
+                        st["rows"].extend(found)
+                        # 不自动退出时，未命中保护关键字的对话默认勾选，
+                        # 命中关键字的不勾
+                        st["selected"].update(
+                            r["key"]
+                            for r in found
+                            if not _kw_hit(task, str(r.get("title") or ""))
+                        )
                 render_list()
+            finally:
+                if sem is not None:
+                    sem.release()
+
+        try:
+            await asyncio.gather(*(run_account(account) for account in accounts))
             if st["stop"]:
                 st["status"] = "已停止"
             else:

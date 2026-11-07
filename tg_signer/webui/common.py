@@ -113,6 +113,22 @@ class UIState:
 state = UIState()
 
 
+def load_account_parallel_limit(workdir) -> int:
+    """全局设置「同时扫描账号数」：0 表示不限。
+
+    签到 / 随机发言 / 更新统计 / 批量退频道 / 自动抽奖共用同一上限，
+    读写位置仍是设置弹窗里的 ``webui_win_settings.json``。这里延迟导入
+    giveaway 的读取函数，避免 common 与 giveaway 的循环依赖。
+    """
+    try:
+        from tg_signer.webui.giveaway import load_giveaway_max_concurrent
+
+        return max(0, int(load_giveaway_max_concurrent(workdir)))
+    except Exception:
+        logger.debug("读取同时扫描账号数失败，按不限处理", exc_info=True)
+        return 0
+
+
 def pretty_json(data: Dict[str, object]) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 

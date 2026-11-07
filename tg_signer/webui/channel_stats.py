@@ -23,6 +23,7 @@ from tg_signer.webui.common import (
     attach_select_all,
     copy_text_to_clipboard,
     format_duration,
+    load_account_parallel_limit,
     with_select_all,
 )
 from tg_signer.webui.components import (
@@ -38,8 +39,8 @@ STATS_FILE = "channel_stats.json"
 STATS_LOG_FILE = "channel_stats.log"
 # 单次网络调用超时（秒）：代理僵死时明确失败而不是永久挂起
 _NET_CALL_TIMEOUT = 90
-# 账号全并行，但按序号错峰启动（秒）：与抽奖一致，避免所有账号
-# 同一时刻一起连接并翻页、把代理和 Telegram 限流同时打满
+# 账号按全局「同时扫描账号数」并发，并按序号错峰启动（秒）：与抽奖一致，
+# 避免所有账号同一时刻一起连接并翻页、把代理和 Telegram 限流同时打满
 _SCAN_STAGGER_SECONDS = 3.0
 _FREE_LIMIT = 500
 _PREMIUM_LIMIT = 1000
@@ -183,32 +184,43 @@ async def refresh_stats_for_accounts(
         return load_stats(workdir)
     store = load_stats(workdir)
     _log = log or (lambda msg: append_stats_log(workdir, msg))
-    _log(f"[频道统计] 自动刷新 {len(accounts)} 个账号：{'、'.join(accounts)}")
+    limit = load_account_parallel_limit(workdir)
+    scope = f"同时最多 {limit} 个账号" if limit else "不限账号数"
+    _log(
+        f"[频道统计] 自动刷新 {len(accounts)} 个账号（{scope}）：{'、'.join(accounts)}"
+    )
 
     save_lock = asyncio.Lock()
+    sem = asyncio.Semaphore(limit) if limit > 0 else None
 
     async def _refresh_one(idx: int, account: str) -> None:
         if idx:
-            # 账号全并行，但错峰启动：避免所有账号同时连接、同时翻页
+            # 账号按上限并发，但错峰启动：避免所有账号同时连接、同时翻页
             await asyncio.sleep(
                 idx * _SCAN_STAGGER_SECONDS
                 + random.uniform(0, _SCAN_STAGGER_SECONDS / 2)
             )
+        if sem is not None:
+            await sem.acquire()
 
         def _local_log(msg: str, _a=account) -> None:
             _log(f"[{_a}] {msg}")
 
         try:
-            rec = await scan_account(account, Path(session_dir), _local_log)
-        except Exception as exc:
-            old = dict(store["accounts"].get(account) or {})
-            old.update({"account": account, "error": str(exc)})
-            rec = old
-            _log(f"[{account}] 自动刷新失败：{exc}")
-        async with save_lock:
-            store["accounts"][account] = rec
-            store["updated_at"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
-            save_stats(workdir, store)
+            try:
+                rec = await scan_account(account, Path(session_dir), _local_log)
+            except Exception as exc:
+                old = dict(store["accounts"].get(account) or {})
+                old.update({"account": account, "error": str(exc)})
+                rec = old
+                _log(f"[{account}] 自动刷新失败：{exc}")
+            async with save_lock:
+                store["accounts"][account] = rec
+                store["updated_at"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+                save_stats(workdir, store)
+        finally:
+            if sem is not None:
+                sem.release()
 
     await asyncio.gather(*(_refresh_one(idx, acc) for idx, acc in enumerate(accounts)))
     store["updated_at"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
@@ -379,8 +391,11 @@ def channel_stats_block(workdir) -> None:
         progress_status.text = f"准备统计 {total} 个账号..."
         progress_status.update()
         started = time.time()
-        log(f"开始更新统计：{'、'.join(accounts)}（全部账号并行，按账号错峰启动）")
+        limit = load_account_parallel_limit(workdir)
+        scope = f"同时最多 {limit} 个账号" if limit else "不限账号数"
+        log(f"开始更新统计：{'、'.join(accounts)}（{scope}，按账号错峰启动）")
         save_lock = asyncio.Lock()
+        sem = asyncio.Semaphore(limit) if limit > 0 else None
         active: List[str] = []
         notes: Dict[str, str] = {}
         done = {"n": 0}
@@ -402,48 +417,54 @@ def channel_stats_block(workdir) -> None:
 
         async def run_account(idx: int, account: str) -> None:
             if idx:
-                # 账号全并行，但错峰启动：避免所有账号同时连接、同时翻页
+                # 账号按上限并发，但错峰启动：避免所有账号同时连接、同时翻页
                 await asyncio.sleep(
                     idx * _SCAN_STAGGER_SECONDS
                     + random.uniform(0, _SCAN_STAGGER_SECONDS / 2)
                 )
-            active.append(account)
-            notes.pop(account, None)
-            render_progress()
-
-            def on_scan(message: str, name: str = account) -> None:
-                notes[name] = message
+            if sem is not None:
+                await sem.acquire()
+            try:
+                active.append(account)
+                notes.pop(account, None)
                 render_progress()
 
-            try:
-                rec = await scan_account(account, session_dir, log, on_scan)
-            except Exception as exc:
-                # 本次失败时保留上次的计数，只标记错误，避免图表数据被清零
-                record = dict(store["accounts"].get(account) or {})
-                record.update({"account": account, "error": str(exc)})
-                log(f"[{account}] 统计失败：{exc}")
-                logger.debug("统计账号 %s 失败", account, exc_info=True)
-            else:
-                record = rec
-                log(f"[{account}] 完成：{rec['joined']} / {rec['limit']}")
+                def on_scan(message: str, name: str = account) -> None:
+                    notes[name] = message
+                    render_progress()
 
-            async with save_lock:
-                store["accounts"][account] = record
-                store["updated_at"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
-                save_stats(workdir, store)
-                update_time.text = f"上次更新：{store['updated_at']}"
-                update_time.update()
-                render_chart()
-                render_summary()
-                done["n"] += 1
-                progress_bar.set_value(done["n"] / total)
+                try:
+                    rec = await scan_account(account, session_dir, log, on_scan)
+                except Exception as exc:
+                    # 本次失败时保留上次的计数，只标记错误，避免图表数据被清零
+                    record = dict(store["accounts"].get(account) or {})
+                    record.update({"account": account, "error": str(exc)})
+                    log(f"[{account}] 统计失败：{exc}")
+                    logger.debug("统计账号 %s 失败", account, exc_info=True)
+                else:
+                    record = rec
+                    log(f"[{account}] 完成：{rec['joined']} / {rec['limit']}")
 
-            try:
-                active.remove(account)
-            except ValueError:
-                pass
-            notes.pop(account, None)
-            render_progress()
+                async with save_lock:
+                    store["accounts"][account] = record
+                    store["updated_at"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+                    save_stats(workdir, store)
+                    update_time.text = f"上次更新：{store['updated_at']}"
+                    update_time.update()
+                    render_chart()
+                    render_summary()
+                    done["n"] += 1
+                    progress_bar.set_value(done["n"] / total)
+
+                try:
+                    active.remove(account)
+                except ValueError:
+                    pass
+                notes.pop(account, None)
+                render_progress()
+            finally:
+                if sem is not None:
+                    sem.release()
 
         try:
             await asyncio.gather(

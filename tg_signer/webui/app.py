@@ -578,9 +578,10 @@ def _build_dashboard(container) -> None:
                 ui.label("全局调用上限与同时扫描账号数").classes(
                     "text-lg font-semibold mt-2"
                 )
-                ui.label("合计限速，用于规避 429；0=不限，默认 8/秒、4 账号。").classes(
-                    "text-xs text-gray-500"
-                )
+                ui.label(
+                    "合计限速，用于规避 429；同时账号数对签到、发言、"
+                    "更新统计、退频道、抽奖生效。0=不限，默认 8/秒、4 账号。"
+                ).classes("text-xs text-gray-500")
                 global_qps_input = ui.number(
                     label="全局调用上限（次/秒，0=不限）",
                     value=global_qps,
@@ -624,6 +625,9 @@ def _build_dashboard(container) -> None:
                         "全局调用：按所有同时运行的抽奖任务与全部账号合计生效，同目录"
                         "任务共用一个限速队列；用于规避 429 Transport flood（按出口 IP"
                         "计数），0=不限。\n"
+                        "同时扫描账号数：签到、随机发言、更新统计、批量退频道（含组合"
+                        "任务里的退频道子任务）都按此上限同时处理账号，超出的账号排队"
+                        "等待空位；0=不限。\n"
                         "跳过关键字：扫描到的帖子包含任一字符串时直接跳过、不参与"
                         "（逗号分隔，留空不过滤）。"
                     ).classes("text-xs text-gray-500").style("white-space: pre-line")

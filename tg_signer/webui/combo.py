@@ -187,6 +187,8 @@ class _SharedRunner:
         """
         from tg_signer.webui.task_panel import TaskRunnerBlock
 
+        # 进度页同样负责补位排队账号：主控台关闭后，剩余账号不能停在上限之外
+        TaskRunnerBlock.start_pending_accounts_all()
         return TaskRunnerBlock.finalize_finished_runs(combo_only=combo_only)
 
     @staticmethod
@@ -2452,9 +2454,9 @@ class ComboTaskBlock:
         ):
             add_dialog_close_button(self.config_dialog)
             ui.label("任务组合配置").classes("text-lg font-semibold")
-            ui.label("把已有任务按顺序组合，执行时按绑定账号并行。").classes(
-                "text-xs text-gray-500"
-            )
+            ui.label(
+                "把已有任务按顺序组合，执行时按绑定账号并行（受全局「同时扫描账号数」限制）。"
+            ).classes("text-xs text-gray-500")
             with ui.row().classes("w-full gap-2"):
                 ui.button(
                     "新增组合任务模板",

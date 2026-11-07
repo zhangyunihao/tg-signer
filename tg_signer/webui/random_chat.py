@@ -31,6 +31,7 @@ from tg_signer.webui.common import (
     copy_text_to_clipboard,
     format_duration,
     list_field_summary,
+    load_account_parallel_limit,
     mobile_card_fields,
     with_select_all,
 )
@@ -328,6 +329,8 @@ class RandomChatEngine:
         # 落盘位置与键：同一任务跨运行共享最近窗口；为空表示不落盘
         self._recent_path: Optional[Path] = None
         self._recent_key: Optional[str] = None
+        # 全局设置「同时扫描账号数」：同时发言的账号上限，0=不限
+        self._max_concurrent_accounts: int = 0
 
     def _pick_text(self) -> str:
         """从语库中抽取一条，避开最近 RECENT_WINDOW 次已抽到的条目"""
@@ -416,6 +419,7 @@ class RandomChatEngine:
         repeat_interval: int = 0,
         recent_path: Optional[Path] = None,
         recent_key: Optional[str] = None,
+        max_concurrent_accounts: int = 0,
     ) -> bool:
         if self.running:
             log("任务已在运行中")
@@ -438,6 +442,7 @@ class RandomChatEngine:
         # 截止时间按轮次在 _loop 内重设；这里先给首轮一个上限
         self._deadline = time.monotonic() + self.MAX_RUNTIME_SECONDS
         self._stop = asyncio.Event()
+        self._max_concurrent_accounts = max(0, int(max_concurrent_accounts))
         self._task = asyncio.create_task(
             self._loop(
                 accounts,
@@ -715,6 +720,38 @@ class RandomChatEngine:
                 f"使用{pool_label}"
             )
             round_timed_out = False
+            # 全局设置「同时扫描账号数」：限制本轮同时发言的账号数，0=不限
+            limit = self._max_concurrent_accounts
+            sem = asyncio.Semaphore(limit) if limit > 0 else None
+            if sem is not None and len(clients) > limit:
+                log(
+                    f"同时发言账号上限 {limit}（全局设置），"
+                    f"其余 {len(clients) - limit} 个账号排队等待空闲槽位"
+                )
+
+            async def _run_account(account, client, _sem=sem) -> None:
+                if _sem is None:
+                    await self._account_loop(
+                        client,
+                        account,
+                        chat_id,
+                        interval,
+                        log,
+                        delete_after,
+                        total_count,
+                    )
+                else:
+                    async with _sem:
+                        await self._account_loop(
+                            client,
+                            account,
+                            chat_id,
+                            interval,
+                            log,
+                            delete_after,
+                            total_count,
+                        )
+
             try:
                 # 硬性兜底：即使账号循环因网络异常卡住，到期也强制取消，保证任务不超过上限
                 # 额外放宽 delete_after + 65，给停止后的延迟撤回收尾留足时间
@@ -729,15 +766,7 @@ class RandomChatEngine:
                     await asyncio.wait_for(
                         asyncio.gather(
                             *[
-                                self._account_loop(
-                                    client,
-                                    account,
-                                    chat_id,
-                                    interval,
-                                    log,
-                                    delete_after,
-                                    total_count,
-                                )
+                                _run_account(account, client)
                                 for account, client in clients.items()
                             ]
                         ),
@@ -999,6 +1028,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             repeat_interval=int(cfg.get("repeat_interval") or 0),
             recent_path=Path(workdir) / "random_chat_recent.json",
             recent_key=str(name),
+            max_concurrent_accounts=load_account_parallel_limit(workdir),
         )
         if started:
             cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"

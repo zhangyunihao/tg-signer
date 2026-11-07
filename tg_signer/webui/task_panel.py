@@ -37,6 +37,7 @@ from tg_signer.webui.common import (
     build_debug_report,
     copy_text_to_clipboard,
     list_field_summary,
+    load_account_parallel_limit,
     mobile_card_fields,
     mobile_card_result,
     notify_error,
@@ -1078,11 +1079,16 @@ class TaskRunnerBlock:
                 combo_event_loop = asyncio.get_running_loop()
             except RuntimeError:
                 combo_event_loop = None
-        for account in accounts:
+
+        def start_account(account: str) -> dict | None:
+            """启动单个账号的子进程；失败返回 None。
+
+            独立成函数是为了按全局「同时扫描账号数」排队：槽位空出后再调用它。
+            """
             combo_events: list[Path] = []
+            spec_subs: list[dict] = []
             if is_combo:
                 # 组合任务：每账号一个进程，进程内按顺序执行该账号参与的全部子任务
-                spec_subs = []
                 for sub, sub_accs in zip(combo_subs, sub_account_sets, strict=True):
                     if account not in sub_accs:
                         continue
@@ -1102,7 +1108,7 @@ class TaskRunnerBlock:
                         spec_subs.append(built)
                 if not spec_subs:
                     ui.notify(f"无法构建命令: {account}", type="warning")
-                    continue
+                    return None
                 spec_payload = {"subs": spec_subs}
                 if start_at:
                     spec_payload["start_at"] = start_at
@@ -1120,7 +1126,7 @@ class TaskRunnerBlock:
                 args = self._build_args(account, task_type, task_name)
                 if not args:
                     ui.notify(f"无法构建命令: {account}", type="warning")
-                    continue
+                    return None
                 cmd = [sys.executable, "-m", "tg_signer.task_runner"] + args
             # 每账号进程独立统计聊天级进度：started=已开始的聊天数，failed=签到失败数
             # last_sign/next_run 从子进程日志解析，用于结果列展示上次/预计下次执行时间
@@ -1151,7 +1157,7 @@ class TaskRunnerBlock:
                 _assign_to_job(proc)
             except Exception as exc:
                 notify_error(exc)
-                continue
+                return None
             reader = threading.Thread(
                 target=self._reader,
                 args=(
@@ -1179,26 +1185,37 @@ class TaskRunnerBlock:
                     ),
                     daemon=True,
                 ).start()
-            procs.append(
-                {
-                    "proc": proc,
-                    "reader": reader,
-                    "account": account,
-                    "stats": stats,
-                    # 组合任务：该账号进程将执行的子任务标签（与明细行 chat 对应），
-                    # 用于判断每个子任务涉及几个账号，从而聚合出整体状态
-                    "sub_labels": (
-                        [str(s.get("label") or "") for s in spec_subs]
-                        if is_combo
-                        else []
-                    ),
-                }
-            )
+            return {
+                "proc": proc,
+                "reader": reader,
+                "account": account,
+                "stats": stats,
+                # 组合任务：该账号进程将执行的子任务标签（与明细行 chat 对应），
+                # 用于判断每个子任务涉及几个账号，从而聚合出整体状态
+                "sub_labels": (
+                    [str(s.get("label") or "") for s in spec_subs] if is_combo else []
+                ),
+            }
+
+        # 全局设置「同时扫描账号数」：先启动上限内的账号，其余排队等槽位空出
+        limit = load_account_parallel_limit(state.workdir)
+        pending_accounts: list[str] = []
+        first_accounts = list(accounts)
+        if limit > 0 and len(first_accounts) > limit:
+            first_accounts = first_accounts[:limit]
+            pending_accounts = list(accounts[limit:])
+        for account in first_accounts:
+            item = start_account(account)
+            if item is not None:
+                procs.append(item)
         if not procs:
             ui.notify("未能启动任务", type="negative")
             return False
-        record["accounts"] = ", ".join(i["account"] for i in procs)
-        total_units = (len(combo_subs) if is_combo else len(chats_labels)) * len(procs)
+        # 账号列展示本次任务的全部账号（已启动 + 排队待启动）
+        record["accounts"] = ", ".join([i["account"] for i in procs] + pending_accounts)
+        total_units = (len(combo_subs) if is_combo else len(chats_labels)) * len(
+            accounts
+        )
         self.runs[record["id"]] = {
             "record": record,
             "procs": procs,
@@ -1209,13 +1226,24 @@ class TaskRunnerBlock:
             # 组合任务：本次实际执行的子任务列表（已按勾选过滤），
             # 「组合任务」tab 据此渲染子任务进度卡片
             "combo_subs": [dict(s) for s in combo_subs] if is_combo else [],
+            # 排队启动状态：pending 非空时轮询会继续拉起剩余账号
+            "pending": pending_accounts,
+            "limit": limit if pending_accounts else 0,
+            "launcher": start_account if pending_accounts else None,
         }
         append_task_history(record)
         self._refresh_history_table()
         self._poll_enabled = True
         self._update_status()
         tip = "服务重启后已自动恢复" if auto else "已启动"
-        ui.notify(f"{tip}: {task_name}（{len(procs)} 个账号）", type="positive")
+        queued = (
+            f"，同时 {limit} 个、排队 {len(pending_accounts)} 个"
+            if pending_accounts
+            else ""
+        )
+        ui.notify(
+            f"{tip}: {task_name}（{len(accounts)} 个账号{queued}）", type="positive"
+        )
         return True
 
     def _reader(
@@ -2205,6 +2233,9 @@ class TaskRunnerBlock:
                 (run.get("record") or {}).get("task_type") or ""
             ):
                 continue
+            # 还有账号在排队等槽位：不能收尾，否则剩余账号永远不会启动
+            if run.get("pending"):
+                continue
             procs = run.get("procs") or []
             if not all(i["proc"].poll() is not None for i in procs):
                 continue
@@ -2307,9 +2338,42 @@ class TaskRunnerBlock:
                 self._rendered_labels.popleft().delete()
             self.log_list.update()
 
+    @staticmethod
+    def _start_pending_accounts(run: dict) -> None:
+        """按全局「同时扫描账号数」拉起排队中的账号，槽位满时等待下次轮询。"""
+        pending = run.get("pending")
+        launcher = run.get("launcher")
+        if not pending or launcher is None:
+            return
+        limit = int(run.get("limit") or 0)
+        procs = run["procs"]
+        while pending:
+            if limit > 0:
+                alive = sum(1 for i in procs if i["proc"].poll() is None)
+                if alive >= limit:
+                    break
+            account = pending.pop(0)
+            try:
+                item = launcher(account)
+            except Exception as exc:
+                notify_error(exc)
+                item = None
+            if item is not None:
+                procs.append(item)
+
+    @classmethod
+    def start_pending_accounts_all(cls) -> None:
+        """为所有运行中的任务补位排队账号（与主控台页面是否打开无关）。"""
+        for run in list(cls.runs.values()):
+            cls._start_pending_accounts(run)
+
     def _check_finished_runs(self) -> None:
         finished_ids: list[str] = []
         for run_id, run in list(self.runs.items()):
+            # 有账号在排队时先补位；排队期间不能判定整个任务完成
+            self._start_pending_accounts(run)
+            if run.get("pending"):
+                continue
             if all(i["proc"].poll() is not None for i in run["procs"]):
                 if any(i["reader"].is_alive() for i in run["procs"]):
                     continue
@@ -2350,6 +2414,11 @@ class TaskRunnerBlock:
                     with self._poll_client:
                         self._refresh_history_table()
                         self._update_status()
+                # 排队账号的补位同样与 tab / 可见性无关：否则切到其他页面后
+                # 剩余账号会一直停在排队状态
+                with self._poll_client:
+                    for run in list(self.runs.values()):
+                        self._start_pending_accounts(run)
                 if not self._poll_enabled:
                     continue
                 # 页面不可见或已切到其他 tab 时跳过刷新，切回后自动恢复
