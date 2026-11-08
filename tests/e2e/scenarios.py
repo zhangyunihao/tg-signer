@@ -77,6 +77,7 @@ MENU_ENTRIES = (
     Scenario("menu-users", "菜单·用户信息", kind="menu", steps=("用户信息",)),
     Scenario("menu-stats", "菜单·频道统计", kind="menu", steps=("频道统计",)),
     Scenario("menu-logs", "菜单·日志", kind="menu", steps=("日志",)),
+    Scenario("menu-changelog", "菜单·更新日志", kind="menu", steps=("更新日志",)),
 )
 
 DIALOG_ENTRIES = (

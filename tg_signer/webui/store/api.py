@@ -249,6 +249,32 @@ class Store:
             lambda conn: int(conn.execute("PRAGMA data_version").fetchone()[0])
         )
 
+    def load_settings_blocking(self) -> Dict[str, Any]:
+        """仅限 ``ui.run`` 之前的启动窗口或专用后台线程调用。"""
+        return self._run_sync(repositories.load_settings)
+
+    def set_settings_blocking(self, values: Dict[str, Any]) -> int:
+        """仅限专用后台写线程调用（设置防抖落库）。"""
+        return self._write_many(repositories.set_settings, dict(values))
+
+    def load_account_state_blocking(self) -> Dict[str, List[str]]:
+        """仅限 ``ui.run`` 之前的启动窗口或专用后台线程调用。"""
+        return self._run_sync(repositories.load_account_state)
+
+    def save_account_state_blocking(
+        self,
+        disabled: Iterable[str],
+        two_way: Iterable[str],
+        order: Iterable[str],
+    ) -> int:
+        """仅限专用后台写线程调用（账号状态防抖落库）。"""
+        return self._write_many(
+            repositories.save_account_state,
+            list(disabled),
+            list(two_way),
+            list(order),
+        )
+
 
 def open_store(workdir: Path | str, *, import_legacy: bool = True) -> Store:
     """在 ``ui.run`` 之前打开存储层；失败只返回降级状态，不抛异常。"""

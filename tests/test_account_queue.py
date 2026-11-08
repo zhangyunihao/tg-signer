@@ -56,6 +56,59 @@ def test_cancel_and_release_clear_all_task_entries():
     assert aq.blocked_by("b") is None
 
 
+def _write_settings(tmp_path, **fields) -> None:
+    import json
+
+    (tmp_path / "webui_win_settings.json").write_text(
+        json.dumps(fields), encoding="utf-8"
+    )
+
+
+def test_ensure_available_ignores_overlap_when_setting_off(tmp_path):
+    """默认关闭：账号被占用时保持排队语义，不主动报错。"""
+    aq.request("t1", "任务A", "签到", ["a"])
+    aq.ensure_available(tmp_path, ["a"])
+
+
+def test_ensure_available_raises_when_setting_on(tmp_path):
+    """开启后：选中账号与运行中任务重叠时直接报错，且不登记排队条目。"""
+    _write_settings(tmp_path, reject_account_overlap=True)
+    aq.request("t1", "任务A", "签到", ["a"])
+
+    with pytest.raises(aq.AccountBusyError) as exc:
+        aq.ensure_available(tmp_path, ["a", "b"])
+    message = str(exc.value)
+    assert "账号 a" in message and "任务A（签到）" in message
+    assert aq.waiting_count() == 0
+
+    # 未重叠的账号照常可用
+    aq.ensure_available(tmp_path, ["b"])
+
+
+def test_giveaway_runner_rejects_overlap_when_setting_on(tmp_path, monkeypatch):
+    """抽奖任务开启该设置后，账号重叠直接启动失败而不是排队。"""
+    import tg_signer.webui.giveaway_process as gp
+
+    _install_fake_runner_engine(monkeypatch)
+    _write_settings(tmp_path, reject_account_overlap=True)
+    aq.request("other", "其它任务", "签到", ["a"])
+
+    async def _run():
+        runner = gp.GiveawayTaskRunner("抽奖3", tmp_path)
+        started = runner.start(
+            {"accounts": ["a", "b"]},
+            log=lambda _line: None,
+            on_event=lambda _ev: None,
+            on_finish=lambda: None,
+        )
+        assert started is False
+        assert "账号 a" in runner.last_error
+        assert aq.blocked_by("a") == "其它任务（签到）"
+        assert aq.task_state(runner.queue_id)["queued"] == []
+
+    asyncio.run(_run())
+
+
 def test_snapshot_reports_holder_and_position():
     aq.request("t1", "任务A", "签到", ["a"])
     aq.request("t2", "任务B", "抽奖", ["a"])

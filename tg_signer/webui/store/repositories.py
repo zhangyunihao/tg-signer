@@ -270,6 +270,12 @@ def save_account_state(
     names.update(str(name) for name in two_way)
     disabled_set = {str(name) for name in disabled}
     two_way_set = {str(name) for name in two_way}
+    # 整体替换语义：旧状态里被移出所有集合/排序的账号必须删除，
+    # 否则重新启用后下次启动又会从库里读回 disabled=1
+    for row in conn.execute("SELECT name FROM account_state").fetchall():
+        existing = str(row["name"])
+        if existing not in names:
+            conn.execute("DELETE FROM account_state WHERE name = ?", (existing,))
     for name in names:
         conn.execute(
             "INSERT OR REPLACE INTO account_state (name, disabled, two_way, position)"

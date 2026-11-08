@@ -715,6 +715,12 @@ def auto_leave_block(workdir, default_session_dir: str = ".") -> Callable[[], No
         if not accounts:
             ui.notify("请先为该任务选择账号（删除后新建）", type="warning")
             return
+        # 全局设置「账号被占用时直接报错」：账号与运行中任务重叠则拒绝启动
+        try:
+            account_queue.ensure_available(workdir, accounts)
+        except account_queue.AccountBusyError as exc:
+            ui.notify(str(exc), type="warning")
+            return
         st["running"] = True
         st["stop"] = False
         st["rows"].clear()

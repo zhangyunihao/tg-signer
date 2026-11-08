@@ -29,6 +29,10 @@ ALL_DOMAINS = "*"
 DOMAIN_ALERTS = "alerts"
 # 消息已读/置顶状态变更域
 DOMAIN_MESSAGES = "messages"
+# 全局设置（webui_win_settings）变更域
+DOMAIN_SETTINGS = "settings"
+# 账号状态（停用/双向/排序）变更域
+DOMAIN_ACCOUNTS = "accounts"
 
 _lock = threading.Lock()
 _store: Optional[Store] = None

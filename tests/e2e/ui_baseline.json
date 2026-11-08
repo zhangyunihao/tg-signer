@@ -934,5 +934,31 @@
     "htmlBytes": 101912,
     "textLength": 518,
     "bodyTextLength": 518
+  },
+  "360x740::menu-changelog": {
+    "docScrollWidth": 360,
+    "docClientWidth": 360,
+    "docOverflow": 0,
+    "bodyScrollWidth": 360,
+    "bodyClientWidth": 360,
+    "bodyOverflow": 0,
+    "offenders": [],
+    "nodeCount": 461,
+    "htmlBytes": 108841,
+    "textLength": 3506,
+    "bodyTextLength": 3506
+  },
+  "1280x800::menu-changelog": {
+    "docScrollWidth": 1280,
+    "docClientWidth": 1280,
+    "docOverflow": 0,
+    "bodyScrollWidth": 1280,
+    "bodyClientWidth": 1280,
+    "bodyOverflow": 0,
+    "offenders": [],
+    "nodeCount": 461,
+    "htmlBytes": 108834,
+    "textLength": 3599,
+    "bodyTextLength": 3599
   }
 }

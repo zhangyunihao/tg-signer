@@ -35,7 +35,7 @@ from tg_signer.giveaway_parsing import DEFAULT_KEYWORDS
 from tg_signer.giveaway_state import GiveawayState
 from tg_signer.locks import file_lock
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui import account_queue
+from tg_signer.webui import account_queue, state_cache
 from tg_signer.webui.activity import (
     create_poll_task,
     is_client_alive,
@@ -942,15 +942,7 @@ def load_win_forward_targets(workdir) -> List[str]:
 
     兼容旧配置：单目标字符串（或逗号分隔）自动转为列表。
     """
-    path = Path(workdir) / WIN_SETTINGS_FILE
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return ["me"]
-    except (OSError, ValueError):
-        logger.debug("读取中奖消息转发目标失败", exc_info=True)
-        return ["me"]
-    raw = data.get("win_forward_target") if isinstance(data, dict) else None
+    raw = state_cache.get_setting(workdir, "win_forward_target")
     if raw is None:
         return ["me"]
     if isinstance(raw, str):
@@ -964,24 +956,8 @@ def load_win_forward_targets(workdir) -> List[str]:
 
 
 def _update_win_settings(workdir, **fields) -> None:
-    """更新全局设置文件里的若干键（一次读盘、一次写盘）。
-
-    多个设置项共用一个文件，若各自「整文件读 → 改一个键 → 整文件写」，
-    两次保存交错就会丢掉其中一项，因此统一走这里并在文件锁内完成。
-    """
-    path = Path(workdir) / WIN_SETTINGS_FILE
-    try:
-        with file_lock(path):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (FileNotFoundError, OSError, ValueError):
-                data = {}
-            if not isinstance(data, dict):
-                data = {}
-            data.update(fields)
-            atomic_write_json(path, data)
-    except (OSError, ValueError, TimeoutError):
-        logger.debug("写入中奖提醒全局设置失败", exc_info=True)
+    """更新全局设置里的若干键（内存优先，Store 模式防抖落库）。"""
+    state_cache.update_settings(workdir, **fields)
 
 
 def save_win_forward_targets(workdir, targets) -> None:
@@ -996,14 +972,8 @@ def save_win_forward_targets(workdir, targets) -> None:
 
 def load_win_sweep_limit(workdir) -> int:
     """中奖回扫条数（全局设置），无配置/非法值回退默认 WIN_SWEEP_LIMIT。"""
-    path = Path(workdir) / WIN_SETTINGS_FILE
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
-        logger.debug("读取中奖回扫条数失败", exc_info=True)
-        return WIN_SWEEP_LIMIT
-    try:
-        limit = int(data.get("win_sweep_limit"))  # type: ignore[union-attr]
+        limit = int(state_cache.get_setting(workdir, "win_sweep_limit"))
     except (TypeError, ValueError):
         return WIN_SWEEP_LIMIT
     return limit if limit > 0 else WIN_SWEEP_LIMIT
@@ -1038,13 +1008,7 @@ def _split_bot_names(raw) -> List[str]:
 
 def load_win_extra_bots(workdir) -> List[str]:
     """中奖扫描额外机器人（全局设置）：除任务扫到的 bot 外也回扫这些 bot。"""
-    path = Path(workdir) / WIN_SETTINGS_FILE
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
-        return []
-    raw = data.get("win_extra_bots") if isinstance(data, dict) else None
-    return _split_bot_names(raw)
+    return _split_bot_names(state_cache.get_setting(workdir, "win_extra_bots"))
 
 
 def save_win_extra_bots(workdir, bots) -> None:
@@ -1068,18 +1032,10 @@ def _split_keywords(raw) -> List[str]:
 
 def load_post_skip_keywords(workdir) -> List[str]:
     """抽奖贴跳过关键字（全局设置）：扫描时命中任一即不参与，默认空。"""
-    path = Path(workdir) / WIN_SETTINGS_FILE
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError):
-        logger.debug("读取抽奖贴跳过关键字失败", exc_info=True)
-        return []
     # 兼容 1.0.82 误命名为 win_skip_keywords 的旧配置
-    raw = None
-    if isinstance(data, dict):
-        raw = data.get("skip_keywords") or data.get("win_skip_keywords")
+    raw = state_cache.get_setting(workdir, "skip_keywords") or state_cache.get_setting(
+        workdir, "win_skip_keywords"
+    )
     return _split_keywords(raw)
 
 
@@ -1094,13 +1050,8 @@ GIVEAWAY_TIMEOUT_MIN = 10
 
 def load_giveaway_timeout_min(workdir) -> int:
     """抽奖任务超时（分钟，全局设置）：单独运行与组合子任务共用，0=不限。"""
-    path = Path(workdir) / WIN_SETTINGS_FILE
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
-        return GIVEAWAY_TIMEOUT_MIN
-    try:
-        val = int(data.get("giveaway_timeout_min"))  # type: ignore[union-attr]
+        val = int(state_cache.get_setting(workdir, "giveaway_timeout_min"))
     except (TypeError, ValueError):
         return GIVEAWAY_TIMEOUT_MIN
     return max(0, val)
@@ -1118,13 +1069,8 @@ def save_giveaway_timeout_min(workdir, val) -> None:
 
 def load_giveaway_scan_cap(workdir) -> int:
     """频道/群组单轮单频道扫描上限（全局设置），默认 DEFAULT_SCAN_CAP。"""
-    path = Path(workdir) / WIN_SETTINGS_FILE
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
-        return DEFAULT_SCAN_CAP
-    try:
-        val = int(data.get("giveaway_scan_cap"))  # type: ignore[union-attr]
+        val = int(state_cache.get_setting(workdir, "giveaway_scan_cap"))
     except (TypeError, ValueError):
         return DEFAULT_SCAN_CAP
     return val if val > 0 else DEFAULT_SCAN_CAP
@@ -1145,13 +1091,8 @@ def load_giveaway_global_qps(workdir) -> float:
 
     0 表示不限制；非法值回落默认，避免限流保护被配置错误关掉。
     """
-    path = Path(workdir) / WIN_SETTINGS_FILE
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
-        return DEFAULT_GLOBAL_QPS
-    try:
-        val = float(data.get("giveaway_global_qps"))  # type: ignore[union-attr]
+        val = float(state_cache.get_setting(workdir, "giveaway_global_qps"))
     except (TypeError, ValueError):
         return DEFAULT_GLOBAL_QPS
     return max(0.0, val)
@@ -1169,13 +1110,8 @@ def save_giveaway_global_qps(workdir, val) -> None:
 
 def load_giveaway_max_concurrent(workdir) -> int:
     """同时进行扫描的账号数上限（全局设置），默认 DEFAULT_MAX_CONCURRENT_ACCOUNTS。"""
-    path = Path(workdir) / WIN_SETTINGS_FILE
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
-        return DEFAULT_MAX_CONCURRENT_ACCOUNTS
-    try:
-        val = int(data.get("giveaway_max_concurrent"))  # type: ignore[union-attr]
+        val = int(state_cache.get_setting(workdir, "giveaway_max_concurrent"))
     except (TypeError, ValueError):
         return DEFAULT_MAX_CONCURRENT_ACCOUNTS
     return max(0, val)
@@ -1193,15 +1129,8 @@ def save_giveaway_max_concurrent(workdir, val) -> None:
 
 def load_max_queue_entries(workdir) -> int:
     """跨任务排队等待条目上限（按账号条目计），0=不限。"""
-    path = Path(workdir) / WIN_SETTINGS_FILE
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
-        return account_queue.DEFAULT_MAX_QUEUE_ENTRIES
-    if not isinstance(data, dict):
-        return account_queue.DEFAULT_MAX_QUEUE_ENTRIES
-    try:
-        val = int(data.get("max_queue_entries"))
+        val = int(state_cache.get_setting(workdir, "max_queue_entries"))
     except (TypeError, ValueError):
         return account_queue.DEFAULT_MAX_QUEUE_ENTRIES
     return max(0, val)
@@ -1215,6 +1144,16 @@ def save_max_queue_entries(workdir, val) -> None:
         logger.debug("最大排队账号条目非法，忽略写入: %r", val)
         return
     _update_win_settings(workdir, max_queue_entries=value)
+
+
+def load_reject_account_overlap(workdir) -> bool:
+    """账号被其它任务占用时是否直接拒绝启动（不排队），默认关闭。"""
+    return bool(state_cache.get_setting(workdir, "reject_account_overlap", False))
+
+
+def save_reject_account_overlap(workdir, val) -> None:
+    """保存「账号被占用直接拒绝启动」开关，保留文件中其他键。"""
+    _update_win_settings(workdir, reject_account_overlap=bool(val))
 
 
 # 任务配置字段 -> 默认值，加载旧配置时补齐缺失字段
@@ -1912,10 +1851,10 @@ def giveaway_block(workdir, default_session_dir: str = ".") -> Callable[[], None
                 if runtime_min > 0:
                     asyncio.create_task(_auto_stop_later(name, runtime_min, start_ts))
             else:
-                ui.notify(
-                    f"任务 #{name} 启动失败：排队任务已满或仍在收尾，请稍后再试",
-                    type="warning",
+                reason = getattr(engine, "last_error", "") or (
+                    "排队任务已满或仍在收尾，请稍后再试"
                 )
+                ui.notify(f"任务 #{name} 启动失败：{reason}", type="warning")
             return started
 
         _begin_engine_run()

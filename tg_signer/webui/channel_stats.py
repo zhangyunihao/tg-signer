@@ -401,6 +401,12 @@ def channel_stats_block(workdir) -> None:
             return
         if running["flag"]:
             return
+        # 全局设置「账号被占用时直接报错」：账号与运行中任务重叠则拒绝启动
+        try:
+            account_queue.ensure_available(workdir, accounts)
+        except account_queue.AccountBusyError as exc:
+            ui.notify(str(exc), type="warning")
+            return
         running["flag"] = True
         update_btn.disable()
         total = len(accounts)

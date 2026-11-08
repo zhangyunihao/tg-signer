@@ -31,6 +31,18 @@ class QueueLimitError(RuntimeError):
         super().__init__(f"排队条目已达上限（{waiting}/{limit}），请稍后再启动任务")
 
 
+class AccountBusyError(RuntimeError):
+    """开启「账号重叠直接报错」时，选中账号正被其它任务占用。"""
+
+    def __init__(self, busy: List[Tuple[str, str]]) -> None:
+        self.busy = busy
+        account, holder = busy[0]
+        extra = f" 等 {len(busy)} 个账号" if len(busy) > 1 else ""
+        super().__init__(
+            f"账号 {account} 正被 {holder} 占用{extra}，已拒绝启动（未排队）"
+        )
+
+
 @dataclass
 class _Lease:
     task_id: str
@@ -85,6 +97,32 @@ def queue_cap(workdir) -> int:
         return max(0, int(load_max_queue_entries(workdir)))
     except Exception:
         return DEFAULT_MAX_QUEUE_ENTRIES
+
+
+def reject_on_overlap(workdir) -> bool:
+    """是否已开启「账号被占用时直接报错（不排队）」。"""
+    try:
+        from tg_signer.webui.giveaway import load_reject_account_overlap
+
+        return bool(load_reject_account_overlap(workdir))
+    except Exception:
+        return False
+
+
+def ensure_available(workdir, accounts: Iterable[str]) -> None:
+    """开启「账号重叠直接报错」时，任一账号被占用即抛 :class:`AccountBusyError`。
+
+    关闭该项时不检查，保持原有「排队等待」语义。
+    """
+    if not reject_on_overlap(workdir):
+        return
+    busy: List[Tuple[str, str]] = []
+    for account in _normalize(accounts):
+        holder = blocked_by(account)
+        if holder is not None:
+            busy.append((account, holder))
+    if busy:
+        raise AccountBusyError(busy)
 
 
 def request(

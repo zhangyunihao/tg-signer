@@ -66,6 +66,7 @@ from tg_signer.webui.giveaway import (
 )
 from tg_signer.webui.health import reload_page
 from tg_signer.webui.store import runtime as store_runtime
+from tg_signer.webui.task_history import subscribe_task_history
 from tg_signer.webui.theme import MOBILE_DESIGN_CSS
 
 logger = logging.getLogger(__name__)
@@ -259,6 +260,8 @@ def save_combo_progress(store: dict, workdir: Path | str | None = None) -> None:
         return
     # 旧路径：单写者假设（只由 WebUI 主进程轮询写入），不加文件锁
     atomic_write_json(_composite_progress_path(workdir), store)
+    # 降级路径也广播变更，进度页与列表统一走订阅刷新
+    _notify_combo_progress()
 
 
 # 组合任务进度独立页面路由（替代原「查看进度」弹窗），?record_id=任务记录ID
@@ -1358,8 +1361,13 @@ class ComboTaskBlock:
         self._snap_sigs: dict[str, tuple] = {}
         self._render_history()
         self._poll_client = ui.context.client
-        # 轮询刷新：历史状态变化时刷新列表，同时落盘运行中任务的进度快照
+        # 轮询只负责采集输出与落盘进度快照；列表刷新改由 Store 变更订阅驱动，
+        # 不再每 2 秒全量解析任务历史
         ui.timer(2.0, self._tick)
+        unsub_history = subscribe_task_history(self._on_state_change)
+        unsub_progress = subscribe_combo_progress(self._on_state_change)
+        self._poll_client.on_delete(unsub_history)
+        self._poll_client.on_delete(unsub_progress)
 
     @classmethod
     def headless(cls, workdir) -> "ComboTaskBlock":
@@ -2072,13 +2080,17 @@ class ComboTaskBlock:
             logger.debug("更新重试按钮状态失败", exc_info=True)
 
     def _tick(self) -> None:
-        """每 2 秒轮询：落盘进度快照；历史状态或运行中任务进度变化时刷新列表。"""
+        """每 2 秒轮询：采集子进程输出并落盘进度快照（列表刷新走订阅）。"""
         # 页面不可见或已切到其他 tab 时跳过，切回后自动恢复
         if not should_poll(self._poll_client, "combo"):
             return
         # 进度快照落盘：运行中每 2 秒更新，停止/结束后保留最终状态
         self._sync_progress_snapshots()
-        # 历史列表：状态变化或运行中任务进度（done/total/计数）变化时重渲染
+
+    def _on_state_change(self) -> None:
+        """Store 变更订阅回调：任务历史/组合进度变化时按签名决定是否重渲染。"""
+        if not should_poll(self._poll_client, "combo"):
+            return
         hist_sig = self._hist_signature()
         if hist_sig != self._last_hist_sig:
             self._last_hist_sig = hist_sig

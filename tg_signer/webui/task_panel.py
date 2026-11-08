@@ -1076,6 +1076,12 @@ class TaskRunnerBlock:
                 if not accounts:
                     ui.notify("组合任务的子任务都没有绑定可用账号", type="warning")
                     return False
+        # 全局设置「账号被占用时直接报错」：选中账号与运行中任务重叠则拒绝启动
+        try:
+            account_queue.ensure_available(state.workdir, accounts)
+        except account_queue.AccountBusyError as exc:
+            ui.notify(str(exc), type="warning")
+            return False
         # 多账号时打乱启动顺序，避免每次都按相同顺序发言
         accounts = [a for a in accounts if a]
         random.shuffle(accounts)

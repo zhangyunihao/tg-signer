@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from tg_signer.config import BaseJSONConfig, SignConfigV3
-from tg_signer.locks import file_lock
 from tg_signer.utils import atomic_write_json
+from tg_signer.webui import state_cache
 
 logger = logging.getLogger(__name__)
 
@@ -272,106 +272,45 @@ def chat_username_map(workdir: Optional[Path | str] = None) -> Dict[str, str]:
     return mapping
 
 
-def _accounts_state_path(workdir: Optional[Path | str] = None) -> Path:
-    return get_workdir(workdir) / "webui_accounts.json"
-
-
-def _read_accounts_state(path: Path) -> Dict:
-    try:
-        with open(path, "r", encoding="utf-8") as fp:
-            data = json.load(fp)
-        return data if isinstance(data, dict) else {}
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _update_accounts_state(path: Path, mutate) -> None:
-    """在文件锁内完成「读 → 改 → 写」。
-
-    同一个文件承载停用名单/排序/双向标记等多个字段，各 setter 若独立
-    整文件覆盖写，两次并发保存会互相覆盖其他字段。
-    """
-    try:
-        with file_lock(path):
-            state = _read_accounts_state(path)
-            mutate(state)
-            atomic_write_json(path, state)
-    except TimeoutError:
-        logger.warning("更新账户状态超时，本次修改未保存: %s", path)
-
-
 def load_disabled_accounts(workdir: Optional[Path | str] = None) -> set:
-    """读取被停用的账户名集合（webui_accounts.json）。"""
-    disabled = _read_accounts_state(_accounts_state_path(workdir)).get("disabled")
-    return set(disabled) if isinstance(disabled, list) else set()
+    """读取被停用的账户名集合（内存快照，Store 模式零 IO）。"""
+    return state_cache.load_disabled_accounts(get_workdir(workdir))
 
 
 def set_account_enabled(
     name: str, enabled: bool, workdir: Optional[Path | str] = None
 ) -> None:
-    """启用/停用账户，停用名单持久化到 webui_accounts.json（保留其他字段）。"""
-
-    def _mutate(state: Dict) -> None:
-        disabled = set(state.get("disabled") or [])
-        if enabled:
-            disabled.discard(name)
-        else:
-            disabled.add(name)
-        state["disabled"] = sorted(disabled)
-
-    _update_accounts_state(_accounts_state_path(workdir), _mutate)
+    """启用/停用账户，变更同步到内存并持久化（保留其他字段）。"""
+    state_cache.set_account_enabled(get_workdir(workdir), name, enabled)
 
 
 def load_two_way_accounts(workdir: Optional[Path | str] = None) -> set:
-    """读取标记为「双向」的账户名集合（webui_accounts.json，默认空集 = 都不是双向）。"""
-    two_way = _read_accounts_state(_accounts_state_path(workdir)).get("two_way")
-    return set(two_way) if isinstance(two_way, list) else set()
+    """读取标记为「双向」的账户名集合（默认空集 = 都不是双向）。"""
+    return state_cache.load_two_way_accounts(get_workdir(workdir))
 
 
 def set_account_two_way(
     name: str, two_way: bool, workdir: Optional[Path | str] = None
 ) -> None:
-    """标记/取消账户「双向」，持久化到 webui_accounts.json（保留其他字段）。"""
-
-    def _mutate(state: Dict) -> None:
-        values = set(state.get("two_way") or [])
-        if two_way:
-            values.add(name)
-        else:
-            values.discard(name)
-        state["two_way"] = sorted(values)
-
-    _update_accounts_state(_accounts_state_path(workdir), _mutate)
+    """标记/取消账户「双向」，变更同步到内存并持久化（保留其他字段）。"""
+    state_cache.set_account_two_way(get_workdir(workdir), name, two_way)
 
 
 def rename_account_state(
     old: str, new: str, workdir: Optional[Path | str] = None
 ) -> None:
-    """账户重命名后，同步更新 webui_accounts.json 中的 disabled/order/two_way 记录。"""
-
-    def _mutate(state: Dict) -> None:
-        for field in ("disabled", "order", "two_way"):
-            values = state.get(field)
-            if isinstance(values, list) and old in values:
-                values[values.index(old)] = new
-                state[field] = values
-
-    _update_accounts_state(_accounts_state_path(workdir), _mutate)
+    """账户重命名后，同步更新 disabled/order/two_way 记录。"""
+    state_cache.rename_account_state(get_workdir(workdir), old, new)
 
 
 def load_account_order(workdir: Optional[Path | str] = None) -> List[str]:
-    """读取账户展示顺序（webui_accounts.json 的 order 字段）。"""
-    order = _read_accounts_state(_accounts_state_path(workdir)).get("order")
-    return list(order) if isinstance(order, list) else []
+    """读取账户展示顺序（order 字段）。"""
+    return state_cache.load_account_order(get_workdir(workdir))
 
 
 def set_account_order(order: List[str], workdir: Optional[Path | str] = None) -> None:
     """保存账户展示顺序。"""
-
-    def _mutate(state: Dict) -> None:
-        state["order"] = list(order)
-
-    _update_accounts_state(_accounts_state_path(workdir), _mutate)
+    state_cache.set_account_order(get_workdir(workdir), list(order))
 
 
 def apply_account_order(
@@ -482,16 +421,13 @@ def export_all_configs(workdir: Optional[Path | str] = None) -> bytes:
 
     # 任务历史（随机发言任务列表）不导出：绑定具体设备，无需迁移
 
-    # 账户状态（停用名单 + 顺序 + 双向标记）
-    state = _read_accounts_state(_accounts_state_path(base))
-    account_state = {}
-    if isinstance(state.get("disabled"), list):
-        account_state["disabled"] = state["disabled"]
-    if isinstance(state.get("order"), list):
-        account_state["order"] = state["order"]
-    if isinstance(state.get("two_way"), list):
-        account_state["two_way"] = state["two_way"]
-    if account_state:
+    # 账户状态（停用名单 + 顺序 + 双向标记）：以内存快照为准，避免导出旧文件
+    account_state = {
+        "disabled": list(state_cache.load_disabled_accounts(base)),
+        "order": state_cache.load_account_order(base),
+        "two_way": list(state_cache.load_two_way_accounts(base)),
+    }
+    if any(account_state.values()):
         payload["account_state"] = account_state
 
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -522,16 +458,7 @@ def import_all_configs(
 
     account_state = data.get("account_state")
     if isinstance(account_state, dict):
-
-        def _mutate(state: Dict) -> None:
-            if isinstance(account_state.get("disabled"), list):
-                state["disabled"] = account_state["disabled"]
-            if isinstance(account_state.get("order"), list):
-                state["order"] = account_state["order"]
-            if isinstance(account_state.get("two_way"), list):
-                state["two_way"] = account_state["two_way"]
-
-        _update_accounts_state(_accounts_state_path(base), _mutate)
+        state_cache.replace_accounts(base, account_state)
 
     return counts
 

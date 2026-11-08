@@ -19,9 +19,10 @@ from tg_signer.netcheck import (
     probe_telegram_connectivity,
 )
 from tg_signer.utils import atomic_write_text
-from tg_signer.webui import account_queue, io_guard
+from tg_signer.webui import account_queue, io_guard, state_cache
 from tg_signer.webui.activity import install_activity_tracking, set_active_tab
 from tg_signer.webui.auto_leave import auto_leave_block
+from tg_signer.webui.changelog import changelog_block
 from tg_signer.webui.channel_stats import channel_stats_block
 from tg_signer.webui.combo import (
     attach_combo_store,
@@ -61,6 +62,7 @@ from tg_signer.webui.giveaway import (
     load_giveaway_timeout_min,
     load_max_queue_entries,
     load_post_skip_keywords,
+    load_reject_account_overlap,
     load_win_extra_bots,
     load_win_forward_targets,
     load_win_sweep_limit,
@@ -70,6 +72,7 @@ from tg_signer.webui.giveaway import (
     save_giveaway_timeout_min,
     save_max_queue_entries,
     save_post_skip_keywords,
+    save_reject_account_overlap,
     save_win_extra_bots,
     save_win_forward_targets,
     save_win_sweep_limit,
@@ -391,9 +394,11 @@ async def _apply_paths(workdir_input, on_refresh: Callable[[], None]) -> None:
     # 先把旧目录的防抖写落盘再切库，避免记录写到已关闭的连接
     await asyncio.to_thread(flush_task_history)
     await asyncio.to_thread(flush_combo_progress)
+    await asyncio.to_thread(state_cache.flush_state)
     store = await store_runtime.rebind(state.workdir)
     await hydrate_from_store(store)
     await hydrate_combo_progress(store)
+    await state_cache.hydrate_from_store(store)
     # 新工作目录的用户信息缓存是冷的：在线程里预热，切目录后首屏不冻结
     await asyncio.to_thread(preload_user_infos, state.workdir)
     on_refresh()
@@ -452,10 +457,20 @@ def _build_dashboard(container) -> None:
             pass
         add_dialog_close_button(stats_dialog)
 
+        with (
+            ui.dialog().props(
+                "transition-show=fade transition-hide=fade"
+            ) as changelog_dialog,
+            ui.card().classes("w-full max-w-2xl tgs-dialog-card") as changelog_card,
+        ):
+            pass
+        add_dialog_close_button(changelog_dialog)
+
         _users_built = False
         _logs_built = False
         _configs_built = False
         _stats_built = False
+        _changelog_built = False
 
         def _ensure_users() -> None:
             """用户信息对话框内容懒构建（仅首次）。"""
@@ -499,6 +514,17 @@ def _build_dashboard(container) -> None:
                 with ui.row().classes("w-full justify-end tgs-dialog-footer"):
                     ui.button("关闭", on_click=stats_dialog.close).props("outline")
 
+        def _ensure_changelog() -> None:
+            """更新日志对话框内容懒构建（仅首次）。"""
+            nonlocal _changelog_built
+            if _changelog_built:
+                return
+            _changelog_built = True
+            with changelog_card:
+                changelog_block(__version__)
+                with ui.row().classes("w-full justify-end tgs-dialog-footer"):
+                    ui.button("关闭", on_click=changelog_dialog.close).props("outline")
+
         async def open_settings() -> None:
             # 扫描各账号最近会话（list_known_channels）与读取多个状态文件都是磁盘
             # 密集操作，放到线程池执行，避免卡住事件循环里的其他轮询/请求
@@ -519,6 +545,9 @@ def _build_dashboard(container) -> None:
                 load_giveaway_max_concurrent, state.workdir
             )
             max_queue = await run.io_bound(load_max_queue_entries, state.workdir)
+            reject_overlap = await run.io_bound(
+                load_reject_account_overlap, state.workdir
+            )
             with (
                 ui.dialog().props(
                     "transition-show=fade transition-hide=fade"
@@ -537,6 +566,17 @@ def _build_dashboard(container) -> None:
                         label="工作目录",
                         value=str(state.workdir),
                         placeholder=".signer",
+                    ).classes("w-full")
+                    # 账号冲突处理：默认排队等待；开启后新任务与运行中任务
+                    # 账号重叠时直接报错，不再进入排队
+                    ui.label("账号冲突处理").classes("text-lg font-semibold mt-2")
+                    ui.label(
+                        "关闭=账号被占用时排队等待（默认）；开启=新任务选中账号"
+                        "与运行中任务重叠时直接报错、不启动"
+                    ).classes("text-xs text-gray-500")
+                    reject_overlap_switch = ui.switch(
+                        "账号被占用时直接报错（不排队）",
+                        value=reject_overlap,
                     ).classes("w-full")
                 with ui.expansion(
                     "自动抽奖参数",
@@ -729,6 +769,11 @@ def _build_dashboard(container) -> None:
                             max_queue_input.value,
                         )
                         await run.io_bound(
+                            save_reject_account_overlap,
+                            state.workdir,
+                            reject_overlap_switch.value,
+                        )
+                        await run.io_bound(
                             save_post_skip_keywords,
                             state.workdir,
                             skip_kw_input.value,
@@ -903,6 +948,13 @@ def _build_dashboard(container) -> None:
                 )
                 ui.menu_item(
                     "日志", on_click=lambda: (_ensure_logs(), logs_dialog.open())
+                )
+                ui.menu_item(
+                    "更新日志",
+                    on_click=lambda: (
+                        _ensure_changelog(),
+                        changelog_dialog.open(),
+                    ),
                 )
                 ui.separator()
                 ui.menu_item("停止所有任务并解锁数据库", on_click=_stop_all_tasks)
@@ -1412,6 +1464,23 @@ def build_ui(auth_code: str = None) -> None:
                 margin-top: 4px;
                 margin-bottom: 8px;
             }
+            /* 更新日志弹窗：Markdown 的 h3/列表默认字号偏大，压到正文层级，
+               移动端一屏能看到更多版本 */
+            .tgs-changelog h3 {
+                font-size: 0.95rem;
+                font-weight: 600;
+                line-height: 1.4;
+                margin: 10px 0 4px;
+            }
+            .tgs-changelog ul {
+                margin: 0 0 4px;
+                padding-left: 1.25rem;
+            }
+            .tgs-changelog li {
+                font-size: 0.85rem;
+                line-height: 1.5;
+                margin: 2px 0;
+            }
             /* 该 tab 有任务正在执行：主色加粗 + 底部高亮条。
                与选中态的胶囊底色区分，即使没停在这个 tab 也能一眼看出 */
             .main-tabs .q-tab.tgs-tab-running {
@@ -1796,6 +1865,8 @@ def main(host: str = None, port: int = None, storage_secret: str = None) -> None
     store = store_runtime.open_at_startup(state.workdir)
     attach_store(store)
     attach_combo_store(store)
+    # 设置与账号状态同样在启动窗口读入内存，运行/排队面板不再逐次读文件
+    state_cache.attach_store(store)
     # 用户信息（账号 me.json / latest_chats.json）也在启动窗口预热一次：
     # 首个页面请求的未读徽标与抽奖 tab 频道名映射都要读它，冷解析 200 个账号
     # 约 1.5-2.4 秒，落在事件循环上会表现为首屏冻结
@@ -1812,6 +1883,7 @@ def main(host: str = None, port: int = None, storage_secret: str = None) -> None
         # 任务历史/组合进度为防抖写盘，退出前强制落盘，避免最后一条记录丢失
         await asyncio.to_thread(flush_task_history)
         await asyncio.to_thread(flush_combo_progress)
+        await asyncio.to_thread(state_cache.flush_state)
         await asyncio.to_thread(store_runtime.shutdown)
         await asyncio.to_thread(io_guard.dump_stats_from_env)
 

@@ -338,6 +338,7 @@ class RandomChatEngine:
         self._queue_task_id = ""
         self._queue_task_name = "随机发言"
         self._queue_cap = 0
+        self._reject_overlap = False
         self._queue_text = ""
 
     def _pick_text(self) -> str:
@@ -403,6 +404,13 @@ class RandomChatEngine:
     ) -> bool:
         """整轮持有全部账号：任一账号被其它任务占用则排队等待。"""
         for account in accounts:
+            if self._reject_overlap:
+                # 开启「账号被占用时直接报错」：任一账号被占即取消本轮，不排队
+                holder = account_queue.blocked_by(account)
+                if holder is not None:
+                    log(f"账号 {account} 正被 {holder} 占用，已取消本轮（未排队）")
+                    account_queue.release_all(self._queue_task_id)
+                    return False
             ok = await account_queue.acquire_wait(
                 self._queue_task_id,
                 self._queue_task_name,
@@ -462,6 +470,7 @@ class RandomChatEngine:
         recent_key: Optional[str] = None,
         max_concurrent_accounts: int = 0,
         max_queue_entries: int = 0,
+        reject_account_overlap: bool = False,
     ) -> bool:
         if self.running:
             log("任务已在运行中")
@@ -489,6 +498,7 @@ class RandomChatEngine:
         self._queue_task_id = f"random_chat|{recent_key or id(self)}"
         self._queue_task_name = str(recent_key or "随机发言")
         self._queue_cap = max(0, int(max_queue_entries))
+        self._reject_overlap = bool(reject_account_overlap)
         self._queue_text = ""
         self._task = asyncio.create_task(
             self._loop(
@@ -1038,6 +1048,12 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
 
     async def start_task(name: str, set_status: Callable[[bool], None]) -> None:
         cfg = tasks[name]
+        # 全局设置「账号被占用时直接报错」：账号与运行中任务重叠则拒绝启动
+        try:
+            account_queue.ensure_available(workdir, cfg["accounts"])
+        except account_queue.AccountBusyError as exc:
+            ui.notify(str(exc), type="warning")
+            return
         for other, ocfg in tasks.items():
             if (
                 other != name
@@ -1087,6 +1103,7 @@ def random_chat_block(workdir, default_session_dir: str = ".") -> Callable[[], N
             recent_key=str(name),
             max_concurrent_accounts=load_account_parallel_limit(workdir),
             max_queue_entries=account_queue.queue_cap(workdir),
+            reject_account_overlap=account_queue.reject_on_overlap(workdir),
         )
         if started:
             cfg["last_start_time"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"

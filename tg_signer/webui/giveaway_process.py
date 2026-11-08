@@ -363,6 +363,8 @@ class GiveawayTaskRunner:
         self._pending: Dict[str, asyncio.Task] = {}
         self._max_concurrent = 0
         self._queue_cap = 0
+        self._reject_overlap = False
+        self._last_error = ""
         self._stop_requested = False
         self._finished = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -376,6 +378,11 @@ class GiveawayTaskRunner:
         if self._pending:
             return True
         return any(engine.running for engine in self._engines.values())
+
+    @property
+    def last_error(self) -> str:
+        """最近一次启动被拒绝的原因（为空表示未被拒绝）。"""
+        return self._last_error
 
     @property
     def joined(self) -> int:
@@ -489,6 +496,16 @@ class GiveawayTaskRunner:
             while True:
                 if self._stop_requested:
                     return
+                if self._reject_overlap:
+                    # 启动时检查后账号才被别的任务抢到：直接跳过该账号，不排队
+                    holder = account_queue.blocked_by(account)
+                    if holder is not None:
+                        self._pending.pop(account, None)
+                        self._emit_log(
+                            account, f"账号被 {holder} 占用，已跳过（未排队）"
+                        )
+                        self._notify_finish_if_idle()
+                        return
                 if (
                     self._max_concurrent > 0
                     and sum(1 for e in self._engines.values() if e.running)
@@ -564,6 +581,15 @@ class GiveawayTaskRunner:
         self._loop = asyncio.get_running_loop()
         self._max_concurrent = load_account_parallel_limit(self.workdir)
         self._queue_cap = account_queue.queue_cap(self.workdir)
+        self._reject_overlap = account_queue.reject_on_overlap(self.workdir)
+        self._last_error = ""
+        # 全局设置「账号被占用时直接报错」：任一账号与运行中任务重叠即拒绝启动
+        try:
+            account_queue.ensure_available(self.workdir, accounts)
+        except account_queue.AccountBusyError as exc:
+            self._last_error = str(exc)
+            log(self._last_error)
+            return False
 
         # 启动前检查排队上限：首批要启动的账号已把队列占满时直接拒绝
         probe = accounts[: self._max_concurrent] if self._max_concurrent else accounts
