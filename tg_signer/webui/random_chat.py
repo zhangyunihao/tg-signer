@@ -38,6 +38,7 @@ from tg_signer.webui.common import (
 )
 from tg_signer.webui.data import (
     apply_account_order,
+    invalidate_user_infos,
     load_disabled_accounts,
     load_user_infos,
 )
@@ -147,6 +148,7 @@ async def update_account_chats(
         me_file = user_dir / "me.json"
         if not me_file.is_file():
             atomic_write_text(me_file, str(me))
+        invalidate_user_infos(workdir)
         log(f"[{account}] 已更新 {len(latest)} 个对话")
         return len(latest)
     except asyncio.TimeoutError:

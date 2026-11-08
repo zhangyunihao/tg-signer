@@ -4650,7 +4650,15 @@ def test_win_regex_matches_real_bot_samples():
     )
     assert WIN_MESSAGE_RE.search(lottery8)
     assert WIN_PERSONAL_RE.search(lottery8)
+    # @yujie_lottery_bot：用「恭喜…获得了」而非「中奖/赢得」的中奖私信
+    yujie = (
+        "🎉 恭喜您在御姐群中获得了 @yiyi7180 伊伊 半价p（500p） 🎉\n\n"
+        "请在规定时间范围内预约使用，转让通知 如果你也听说 完事需要写报告 谢谢~"
+    )
+    assert WIN_MESSAGE_RE.search(yujie)
+    assert WIN_PERSONAL_RE.search(yujie)
     # 参与清单/规则说明类消息不误报
+    assert not WIN_MESSAGE_RE.search("恭喜您获得参与资格")
     assert not WIN_MESSAGE_RE.search("🎫 加入-某频道 ❌\n└  🔑 发送口令﹝出击宝宝﹞")
     assert not WIN_MESSAGE_RE.search("📜 抽奖说明：中奖者联系老师兑奖")
     # 规则里的假设句式「如果你中奖了」不误判

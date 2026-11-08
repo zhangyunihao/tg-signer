@@ -134,6 +134,8 @@ class UiServer:
         run_dir: Optional[Path] = None,
         keep_run_dir: bool = False,
         startup_timeout: float = 60.0,
+        extra_env: Optional[dict[str, str]] = None,
+        seed: bool = True,
     ) -> None:
         self.server_python = server_python or _default_server_python()
         self.port = port or _pick_free_port()
@@ -143,6 +145,8 @@ class UiServer:
         )
         self.keep_run_dir = keep_run_dir
         self.startup_timeout = startup_timeout
+        self.extra_env = dict(extra_env or {})
+        self.seed = seed
         self.proc: Optional[subprocess.Popen] = None
         self._stdout = None
         self._stderr = None
@@ -156,9 +160,15 @@ class UiServer:
 
     def __enter__(self) -> "UiServer":
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        workdir = seed_dataset(self.run_dir)
+        if self.seed:
+            workdir = seed_dataset(self.run_dir)
+        else:
+            # 调用方已在启动前自行播种（Store 模式下必须发生在 ui.run 之前）
+            workdir = self.run_dir / ".signer"
+            workdir.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
         env["TG_SIGNER_WORKDIR"] = str(workdir)
+        env.update(self.extra_env)
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         # 不使用授权码，避免每个视口都要先过验证页

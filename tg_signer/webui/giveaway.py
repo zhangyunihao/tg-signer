@@ -68,6 +68,7 @@ from tg_signer.webui.random_chat import (
     schedule_auth_checks,
     update_account_chats,
 )
+from tg_signer.webui.store import runtime as store_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +223,8 @@ class _AlertStore:
             logger.debug("写入%s文件失败", self.label, exc_info=True)
             return
         self._cache = (path, self._fingerprint(path), kept)
+        # 提醒变更：订阅该域的徽标/消息中心立即刷新（不依赖 10 秒轮询）
+        store_runtime.notify(store_runtime.DOMAIN_ALERTS)
 
 
 _JOIN_ALERTS = _AlertStore(JOIN_ALERTS_FILE, JOIN_ALERTS_MAX, "加入失败提醒")

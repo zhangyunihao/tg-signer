@@ -82,6 +82,7 @@ from tg_signer.webui.task_history import (
     load_task_history,
     save_task_binding,
     save_task_history,
+    subscribe_task_history,
     update_task_history,
 )
 
@@ -601,6 +602,10 @@ class TaskRunnerBlock:
         self._poll_task = create_poll_task(
             self._poll_forever(), name="run-poll", client=self._poll_client
         )
+        # 任务历史走 Store 内存快照：变更（含其他实例写入）时主动刷新表格，
+        # 不再依赖 2 秒轮询把 JSON 文件整份读回解析。页面关闭时自动退订。
+        self._unsubscribe_history = subscribe_task_history(self._on_history_changed)
+        self._poll_client.on_delete(self._unsubscribe_history)
 
         # ---- 新增任务弹窗 ----
         with (
@@ -804,6 +809,16 @@ class TaskRunnerBlock:
         if changed:
             save_task_history(items)
         return changed
+
+    def _on_history_changed(self) -> None:
+        """任务历史变更回调（在事件循环线程执行）。"""
+        if not is_client_alive(self._poll_client):
+            return
+        try:
+            with self._poll_client:
+                self._refresh_history_table()
+        except Exception:  # noqa: BLE001 - 页面重建竞态，不打断订阅分发
+            logger.debug("任务历史变更刷新失败", exc_info=True)
 
     def _refresh_history_table(self) -> None:
         items = load_task_history()
@@ -2612,14 +2627,13 @@ class TaskRunnerBlock:
         self._log_fullscreen.toggle()
 
     def _load_task_history_tail(self, limit: int) -> str:
-        """读取任务历史文件尾部记录（读取失败返回空串，不打扰用户）。"""
-        path = Path(state.workdir) / "webui_task_history.json"
+        """取任务历史尾部记录（Store 模式下为内存快照，不读文件）。"""
         try:
-            data = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError):
-            logger.debug("读取任务历史失败: %s", path, exc_info=True)
+            data = load_task_history()
+        except Exception:  # noqa: BLE001 - 复制调试信息不应因历史读取失败而中断
+            logger.debug("读取任务历史失败", exc_info=True)
             return ""
-        if isinstance(data, list) and data:
+        if data:
             return pretty_json(data[-limit:])
         return ""
 

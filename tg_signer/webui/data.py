@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -129,10 +130,32 @@ _user_infos_lock = threading.Lock()
 # 缓存 (users_dir, 内容指纹, 条目)：未读徽标/消息中心等轮询路径高频调用，
 # 避免每次轮询都重读全部 me.json / latest_chats.json
 _user_infos_cache: Optional[Tuple[Path, tuple, List[UserInfo]]] = None
+# 指纹缓存 (users_dir, 计算时间, 指纹)：一次页面构建会多次调用 load_user_infos，
+# 每次重算是 2N 次 stat；短 TTL 内复用，进程内写入点显式失效
+_FINGERPRINT_TTL_SEC = 1.0
+_fingerprint_cache: Dict[Path, Tuple[float, tuple]] = {}
+
+
+def invalidate_user_infos(workdir: Optional[Path | str] = None) -> None:
+    """在进程内写入 me.json / latest_chats.json 后调用，立即作废缓存。"""
+
+    global _user_infos_cache
+    with _user_infos_lock:
+        if workdir is None:
+            _fingerprint_cache.clear()
+            _user_infos_cache = None
+            return
+        users_dir = get_workdir(workdir) / "users"
+        _fingerprint_cache.pop(users_dir, None)
+        if _user_infos_cache is not None and _user_infos_cache[0] == users_dir:
+            _user_infos_cache = None
 
 
 def _user_infos_fingerprint(users_dir: Path) -> tuple:
     """users 目录内容指纹：用户目录列表 + 各 me.json/latest_chats.json 的 mtime+size。"""
+    cached = _fingerprint_cache.get(users_dir)
+    if cached is not None and time.monotonic() - cached[0] < _FINGERPRINT_TTL_SEC:
+        return cached[1]
     try:
         user_dirs = sorted(p.name for p in users_dir.iterdir() if p.is_dir())
     except OSError:
@@ -148,7 +171,9 @@ def _user_infos_fingerprint(users_dir: Path) -> tuple:
             else:
                 file_stats.append((st.st_mtime_ns, st.st_size))
         parts.append((name, tuple(file_stats)))
-    return tuple(parts)
+    fingerprint = tuple(parts)
+    _fingerprint_cache[users_dir] = (time.monotonic(), fingerprint)
+    return fingerprint
 
 
 def _read_user_infos(users_dir: Path) -> List[UserInfo]:
@@ -216,6 +241,18 @@ def load_user_infos(workdir: Optional[Path | str] = None) -> Optional[List[UserI
     with _user_infos_lock:
         _user_infos_cache = (users_dir, fingerprint, entries)
     return list(entries)
+
+
+def preload_user_infos(workdir: Optional[Path | str] = None) -> None:
+    """启动窗口预热用户信息缓存（只允许在 ``ui.run`` 之前调用）。
+
+    ``load_user_infos`` 冷解析要逐个读取全部 ``me.json`` / ``latest_chats.json``，
+    200 个账号约 1.5-2.4 秒；首个页面请求（消息中心铃铛、抽奖 tab 的频道名映射）
+    会同步走这条路，直接把事件循环冻结。放到启动窗口先解析一次，之后页面请求
+    只做一次 mtime 指纹比对即可命中缓存。
+    """
+
+    load_user_infos(workdir)
 
 
 def chat_username_map(workdir: Optional[Path | str] = None) -> Dict[str, str]:
@@ -568,6 +605,7 @@ def import_backup(raw: bytes, workdir: Optional[Path | str] = None) -> Dict[str,
             curated = import_all_configs(zf.read("configs.json"), workdir)
             counts.update({k: v for k, v in curated.items() if k in counts})
         # 兼容旧备份：忽略 sessions/ 目录（不再还原 session 凭据）
+        invalidate_user_infos(workdir)
     return counts
 
 

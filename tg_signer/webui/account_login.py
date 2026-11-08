@@ -15,6 +15,7 @@ from tg_signer.webui.data import (
     account_identities,
     apply_account_order,
     get_workdir,
+    invalidate_user_infos,
     load_account_limits,
     load_disabled_accounts,
     load_two_way_accounts,
@@ -61,6 +62,7 @@ class AccountLoginSession:
         user_dir = get_workdir(state.workdir) / "users" / str(me.id)
         user_dir.mkdir(parents=True, exist_ok=True)
         atomic_write_json(user_dir / "me.json", data)
+        invalidate_user_infos(state.workdir)
 
     async def start(self) -> str:
         """连接并发送验证码；若会话已授权则直接完成登录。"""

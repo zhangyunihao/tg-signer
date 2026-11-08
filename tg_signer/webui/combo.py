@@ -5,6 +5,7 @@
 TaskRunnerBlock 的 _launch（task_type="组合任务"），历史统一记录在任务历史里。
 """
 
+import asyncio
 import functools
 import json
 import logging
@@ -16,11 +17,16 @@ import time
 from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
+from typing import Callable
 
 from nicegui import app, ui
 
 from tg_signer.utils import atomic_write_json
-from tg_signer.webui.activity import install_activity_tracking, should_poll
+from tg_signer.webui.activity import (
+    install_activity_tracking,
+    is_client_alive,
+    should_poll,
+)
 from tg_signer.webui.auto_leave import (
     _fire_refresh_stats,
     _leave_rows,
@@ -59,6 +65,7 @@ from tg_signer.webui.giveaway import (
     load_task_store,
 )
 from tg_signer.webui.health import reload_page
+from tg_signer.webui.store import runtime as store_runtime
 from tg_signer.webui.theme import MOBILE_DESIGN_CSS
 
 logger = logging.getLogger(__name__)
@@ -104,19 +111,119 @@ def save_composite_tasks(items: list[dict], workdir: Path | str | None = None) -
 
 # 组合任务进度快照：运行中每 2 秒落盘一次，任务停止/结束后仍可查看
 # 子任务明细与运行日志（内存 runs 已清理、甚至服务重启后也不丢）
-COMPOSITE_PROGRESS_FILE = "webui_combo_progress.json"
+COMBO_PROGRESS_FILE = "webui_combo_progress.json"
 COMBO_PROGRESS_LIMIT = 30
 COMBO_PROGRESS_LOG_LINES = 200
 # 「一键复制」上限：运行中直接读共享输出缓冲，可比页面展示多取一些行
 COMBO_COPY_LOG_LINES = 1000
 
+# Store 接入：快照在内存里是唯一事实来源，落盘由防抖线程整表替换写回
+COMBO_PROGRESS_DOMAIN = "combo_progress"
+COMBO_PROGRESS_DEBOUNCE_SEC = 0.5
+
+_progress_lock = threading.Lock()
+_progress_store = None  # Store | None：非 None 时不再读写进度文件
+_progress_memory: dict[str, dict] | None = None
+_progress_timer: threading.Timer | None = None
+
 
 def _composite_progress_path(workdir: Path | str | None = None) -> Path:
-    return get_workdir(workdir) / COMPOSITE_PROGRESS_FILE
+    return get_workdir(workdir) / COMBO_PROGRESS_FILE
+
+
+# ---- Store 接入 / 订阅 ----
+
+
+def attach_combo_store(store) -> None:
+    """启动窗口（``ui.run`` 之前）调用：把进度快照读入内存。
+
+    之后轮询只读内存；持久化由防抖写线程走 Store。该来源导入失败或读取
+    出错时保持旧文件路径，避免丢数据。
+    """
+    global _progress_store, _progress_memory
+    if store is None or not getattr(store, "available", False):
+        detach_combo_store()
+        return
+    if COMBO_PROGRESS_FILE in (store.status.failed_sources or []):
+        logger.warning("组合任务进度导入失败，继续使用旧文件路径")
+        detach_combo_store()
+        return
+    try:
+        data = store.list_combo_progress_blocking(COMBO_PROGRESS_LIMIT)
+    except Exception:  # noqa: BLE001 - 读取失败只降级
+        logger.warning("读取组合任务进度失败，继续使用旧文件路径", exc_info=True)
+        detach_combo_store()
+        return
+    entries = {
+        str(rid): snap for rid, snap in (data or {}).items() if isinstance(snap, dict)
+    }
+    with _progress_lock:
+        _progress_store = store
+        _progress_memory = entries
+
+
+async def hydrate_combo_progress(store) -> None:
+    """运行期切换工作目录：在线程里读库后替换内存快照。"""
+    await asyncio.to_thread(attach_combo_store, store)
+
+
+def detach_combo_store() -> None:
+    """回到旧文件路径（切目录失败 / Store 降级时）。"""
+    global _progress_store, _progress_memory, _progress_timer
+    with _progress_lock:
+        _progress_store = None
+        _progress_memory = None
+        timer = _progress_timer
+        _progress_timer = None
+    if timer is not None:
+        timer.cancel()
+
+
+def subscribe_combo_progress(callback: Callable[[], None]) -> Callable[[], None]:
+    """订阅组合进度变更（回调在事件循环线程执行），返回退订函数。"""
+    return store_runtime.subscribe(COMBO_PROGRESS_DOMAIN, callback)
+
+
+def _notify_combo_progress() -> None:
+    store_runtime.notify(COMBO_PROGRESS_DOMAIN)
+
+
+def _persist_combo_progress(snapshot: dict[str, dict]) -> None:
+    """防抖定时器回调（独立线程）：整表写回 Store，旧快照不覆盖新快照。"""
+    global _progress_timer
+    with _progress_lock:
+        store = _progress_store
+        if store is None or snapshot is not _progress_memory:
+            return
+        _progress_timer = None
+    try:
+        store.replace_combo_progress_blocking(snapshot)
+    except Exception:  # noqa: BLE001 - 写失败不能影响 UI
+        logger.warning("写入组合任务进度失败", exc_info=True)
+
+
+def flush_combo_progress() -> None:
+    """立即把内存中的进度快照落盘（退出/切目录前在线程里调用）。"""
+    global _progress_timer
+    with _progress_lock:
+        timer = _progress_timer
+        _progress_timer = None
+        snapshot = _progress_memory
+    if timer is not None:
+        timer.cancel()
+    if snapshot is not None:
+        _persist_combo_progress(snapshot)
 
 
 def load_combo_progress(workdir: Path | str | None = None) -> dict[str, dict] | None:
-    """读取组合任务进度快照；文件缺失返回空字典，读取失败返回 None（同列表）。"""
+    """读取组合任务进度快照；文件缺失返回空字典，读取失败返回 None（同列表）。
+
+    Store 可用时直接返回内存快照（零 IO、零解析）。
+    """
+    with _progress_lock:
+        memory = _progress_memory
+    if memory is not None:
+        return dict(memory)
     path = _composite_progress_path(workdir)
     if not path.is_file():
         return {}
@@ -130,8 +237,27 @@ def load_combo_progress(workdir: Path | str | None = None) -> dict[str, dict] | 
 
 
 def save_combo_progress(store: dict, workdir: Path | str | None = None) -> None:
-    # 单写者假设：只由 WebUI 主进程的轮询逻辑写入（子进程不落盘快照），
-    # 因此这里不加文件锁；若将来改由子进程写入，需要补 file_lock。
+    global _progress_memory, _progress_timer
+    timer = None
+    with _progress_lock:
+        if _progress_memory is not None and _progress_store is not None:
+            _progress_memory = dict(store)
+            snapshot = _progress_memory
+            old_timer = _progress_timer
+            timer = threading.Timer(
+                COMBO_PROGRESS_DEBOUNCE_SEC, _persist_combo_progress, args=(snapshot,)
+            )
+            timer.daemon = True
+            _progress_timer = timer
+        else:
+            old_timer = None
+    if timer is not None:
+        if old_timer is not None:
+            old_timer.cancel()
+        timer.start()
+        _notify_combo_progress()
+        return
+    # 旧路径：单写者假设（只由 WebUI 主进程轮询写入），不加文件锁
     atomic_write_json(_composite_progress_path(workdir), store)
 
 
@@ -3303,25 +3429,54 @@ def _build_progress_page(record_id: str) -> None:
         render_content()
         ui.run_javascript(_SCROLL_RESTORE_JS % (win_top, el_top))
 
+    refresh_state = {"busy": False, "pending": False}
+
+    async def refresh_if_changed() -> None:
+        """签名变化才重绘；Store 变更通知与 2 秒兜底轮询共用同一入口。"""
+        if refresh_state["busy"]:
+            refresh_state["pending"] = True
+            return
+        refresh_state["busy"] = True
+        try:
+            while True:
+                refresh_state["pending"] = False
+                # 页面隐藏（手机锁屏/切后台）时跳过重绘；切回后自动补上
+                if not should_poll(page_client):
+                    return
+                sig = live_sig()
+                if sig != last_sig["value"]:
+                    last_sig["value"] = sig
+                    await render_content_preserving_scroll()
+                else:
+                    update_elapsed()
+                    update_log()
+                if not refresh_state["pending"]:
+                    return
+        finally:
+            refresh_state["busy"] = False
+
     async def tick() -> None:
         try:
             # 页面独立打开时也持续落盘快照，不依赖主控台是否开着
             view._sync_progress_snapshots()
-            # 页面隐藏（手机锁屏/切后台）时跳过重绘；快照落盘不受影响，切回后自动补上
-            if not should_poll(page_client):
-                return
-            sig = live_sig()
-            if sig != last_sig["value"]:
-                last_sig["value"] = sig
-                await render_content_preserving_scroll()
-            else:
-                update_elapsed()
-                update_log()
+            await refresh_if_changed()
         except Exception:
             logger.debug("刷新任务进度页面失败", exc_info=True)
 
+    def on_progress_changed() -> None:
+        """Store 订阅回调（事件循环线程）：其他页面/实例写入后立即刷新。"""
+        if not is_client_alive(page_client):
+            return
+        try:
+            asyncio.get_running_loop().create_task(refresh_if_changed())
+        except RuntimeError:
+            logger.debug("进度页订阅刷新失败", exc_info=True)
+
     last_sig["value"] = live_sig()
     render_content()
+    # 订阅表只持弱引用：把回调挂在页面存活期内的 view 上，避免被 GC 后收不到通知
+    view._combo_progress_listener = on_progress_changed
+    page_client.on_delete(subscribe_combo_progress(on_progress_changed))
     ui.timer(2.0, tick)
 
 

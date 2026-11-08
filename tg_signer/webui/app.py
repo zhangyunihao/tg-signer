@@ -19,11 +19,16 @@ from tg_signer.netcheck import (
     probe_telegram_connectivity,
 )
 from tg_signer.utils import atomic_write_text
-from tg_signer.webui import account_queue
+from tg_signer.webui import account_queue, io_guard
 from tg_signer.webui.activity import install_activity_tracking, set_active_tab
 from tg_signer.webui.auto_leave import auto_leave_block
 from tg_signer.webui.channel_stats import channel_stats_block
-from tg_signer.webui.combo import combo_block
+from tg_signer.webui.combo import (
+    attach_combo_store,
+    combo_block,
+    flush_combo_progress,
+    hydrate_combo_progress,
+)
 from tg_signer.webui.common import (
     add_dialog_close_button,
     build_debug_report,
@@ -45,6 +50,7 @@ from tg_signer.webui.data import (
     import_backup,
     list_log_files,
     load_logs,
+    preload_user_infos,
 )
 from tg_signer.webui.giveaway import (
     giveaway_block,
@@ -83,6 +89,12 @@ from tg_signer.webui.sign import (
     user_info_block,
 )
 from tg_signer.webui.stop_all import running_tabs, stop_all_tasks
+from tg_signer.webui.store import runtime as store_runtime
+from tg_signer.webui.task_history import (
+    attach_store,
+    hydrate_from_store,
+    load_task_history,
+)
 from tg_signer.webui.theme import MOBILE_DESIGN_CSS
 
 logger = logging.getLogger(__name__)
@@ -233,16 +245,9 @@ def log_block(card: Optional[ui.card] = None) -> Callable[[], None]:
             ]
             if current_lines:
                 sections.append(("当前显示日志行", "\n".join(current_lines)))
-            try:
-                hist = json.loads(
-                    (Path(state.workdir) / "webui_task_history.json").read_text(
-                        encoding="utf-8-sig"
-                    )
-                )
-                if isinstance(hist, list) and hist:
-                    sections.append(("任务历史（最近10条）", pretty_json(hist[-10:])))
-            except (OSError, json.JSONDecodeError):
-                logger.debug("读取任务历史失败", exc_info=True)
+            hist = load_task_history()
+            if hist:
+                sections.append(("任务历史（最近10条）", pretty_json(hist[-10:])))
             copy_text_to_clipboard(build_debug_report(state.workdir, sections))
             ui.notify(
                 "已复制调试信息（含环境信息），粘贴给电脑即可排查", type="positive"
@@ -376,13 +381,21 @@ def build_configs_panel(
     return signer_block.refresh_options
 
 
-def _apply_paths(workdir_input, on_refresh: Callable[[], None]) -> None:
+async def _apply_paths(workdir_input, on_refresh: Callable[[], None]) -> None:
     try:
         state.set_workdir(workdir_input.value or str(DEFAULT_WORKDIR))
         ui.notify(f"已切换工作目录: {state.workdir}", type="positive")
     except Exception as exc:  # noqa: BLE001
         notify_error(exc)
         return
+    # 先把旧目录的防抖写落盘再切库，避免记录写到已关闭的连接
+    await asyncio.to_thread(flush_task_history)
+    await asyncio.to_thread(flush_combo_progress)
+    store = await store_runtime.rebind(state.workdir)
+    await hydrate_from_store(store)
+    await hydrate_combo_progress(store)
+    # 新工作目录的用户信息缓存是冷的：在线程里预热，切目录后首屏不冻结
+    await asyncio.to_thread(preload_user_infos, state.workdir)
     on_refresh()
 
 
@@ -677,7 +690,7 @@ def _build_dashboard(container) -> None:
 
                 async def apply_settings() -> None:
                     # 先切换工作目录并刷新界面，再在后台线程落盘各项设置
-                    _apply_paths(workdir_input, refresh_all)
+                    await _apply_paths(workdir_input, refresh_all)
                     try:
                         await run.io_bound(
                             save_win_forward_targets,
@@ -770,6 +783,11 @@ def _build_dashboard(container) -> None:
         # 网络自检提示条挂在 header 之后：普通块级元素，不遮挡导航也不拦截
         # tab 点击（此前常驻 ui.notify 会盖住整个 header，自动化点 tab 直接超时）
         net_banner = ui.column().classes("w-full gap-0")
+
+        # 存储层降级横幅：与网络提示条同位置，仅降级时出现，可关闭
+        store_banner = ui.column().classes("w-full gap-0")
+        refreshers.append(lambda: _render_store_banner(store_banner))
+        _render_store_banner(store_banner)
 
         async def _run_net_probe() -> None:
             await _probe_telegram_connectivity(net_banner)
@@ -1162,6 +1180,38 @@ def _check_auth_code(input_code: str, auth_code: str) -> tuple[bool, str]:
 # 所有任务功能（签到/自动化/监控/抽奖等）都依赖能连上 Telegram，
 # 页面初始化时通过 TG_PROXY（未配置则直连）对 Telegram DC 做一次 TCP 握手验证。
 _NETWORK_CHECK_TIMEOUT = 8.0
+
+
+def _render_store_banner(slot: ui.element) -> None:
+    """存储层降级横幅：不可用或部分迁移失败时提示，可关闭。"""
+    slot.clear()
+    status = store_runtime.status()
+    if status is not None and status.available and not status.degraded:
+        return
+    if status is None:
+        message = "存储层未初始化，任务历史/提醒等继续使用旧文件路径，数据不会丢失。"
+        background, border_color, icon_name = "#fdecea", "#f5c2c0", "error_outline"
+    else:
+        detail = status.detail or "无详情"
+        message = (
+            f"存储层已降级（{status.reason or '未知原因'}）：{detail}。"
+            "相关数据继续使用旧文件路径，功能不受影响。"
+        )
+        background, border_color, icon_name = "#fff8e6", "#f0d9a8", "warning_amber"
+    with slot:
+        with (
+            ui.row()
+            .classes("w-full items-start no-wrap gap-2 px-3 py-2 tgs-net-banner")
+            .style(
+                f"background: {background}; border: 1px solid {border_color};"
+                " border-radius: 12px;"
+            )
+        ):
+            ui.icon(icon_name).classes("text-amber-600 mt-1")
+            ui.label(message).classes("text-sm flex-1")
+            ui.button(icon="close", on_click=lambda: slot.clear()).props(
+                'flat round dense aria-label="关闭提示"'
+            ).classes("tgs-banner-close").tooltip("关闭提示")
 
 
 async def _probe_telegram_connectivity(slot: ui.element) -> None:
@@ -1734,6 +1784,7 @@ def main(host: str = None, port: int = None, storage_secret: str = None) -> None
         log_dir=LOG_DIR,
         log_file=DEFAULT_LOG_FILE,
     )
+    io_guard.install_from_env()
 
     removed = cleanup_stale_sessions()
     if removed:
@@ -1741,14 +1792,28 @@ def main(host: str = None, port: int = None, storage_secret: str = None) -> None
             f"已清理 {removed} 个过期会话缓存文件（保留 {_SESSION_CLEANUP_DAYS} 天内）"
         )
 
+    # 存储层只在 ui.run 之前打开/迁移一次；失败降级为旧文件路径，UI 继续可用
+    store = store_runtime.open_at_startup(state.workdir)
+    attach_store(store)
+    attach_combo_store(store)
+    # 用户信息（账号 me.json / latest_chats.json）也在启动窗口预热一次：
+    # 首个页面请求的未读徽标与抽奖 tab 频道名映射都要读它，冷解析 200 个账号
+    # 约 1.5-2.4 秒，落在事件循环上会表现为首屏冻结
+    preload_user_infos(state.workdir)
+
     @app.on_startup
     async def _setup_loop_handler() -> None:
         _install_loop_exception_handler()
+        io_guard.start_lag_monitor_from_env()
+        store_runtime.bind_loop()
 
     @app.on_shutdown
     async def _flush_pending_writes() -> None:
-        # 任务历史为防抖写盘，退出前强制落盘，避免最后一条记录丢失
-        flush_task_history()
+        # 任务历史/组合进度为防抖写盘，退出前强制落盘，避免最后一条记录丢失
+        await asyncio.to_thread(flush_task_history)
+        await asyncio.to_thread(flush_combo_progress)
+        await asyncio.to_thread(store_runtime.shutdown)
+        await asyncio.to_thread(io_guard.dump_stats_from_env)
 
     # 页面构建失败时展示可读错误页 + 「重新加载」按钮，替换 NiceGUI 默认 500
     app.on_page_exception(page_error_page)

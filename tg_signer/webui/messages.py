@@ -25,7 +25,7 @@ import logging
 import re
 from html import escape
 from pathlib import Path
-from typing import Callable, List, Set
+from typing import Callable, List, Optional, Set
 
 from nicegui import app, ui
 
@@ -65,6 +65,7 @@ from tg_signer.webui.giveaway import (
     retry_speak_alert,
     speak_retry_log_key,
 )
+from tg_signer.webui.store import runtime as store_runtime
 from tg_signer.webui.theme import MOBILE_DESIGN_CSS
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,8 @@ def save_read_keys(workdir, keys: Set[str]) -> None:
             valid = {k for m in collect_messages(workdir) for k in message_keys(m)}
             kept &= valid
         atomic_write_json(_read_state_path(workdir), {"read": sorted(kept)})
+        # 已读状态变化：铃铛徽标订阅该域，标记已读后立即刷新
+        store_runtime.notify(store_runtime.DOMAIN_MESSAGES)
     except OSError:
         logger.debug("写入消息已读状态失败", exc_info=True)
 
@@ -152,6 +155,8 @@ def save_pin_keys(workdir, keys: Set[str]) -> None:
         atomic_write_json(
             _pin_state_path(workdir), {"pinned": sorted(keys)[:PIN_STATE_MAX]}
         )
+        # 置顶状态变化同样属于消息状态变更，订阅方按指纹刷新即可
+        store_runtime.notify(store_runtime.DOMAIN_MESSAGES)
     except OSError:
         logger.debug("写入消息置顶状态失败", exc_info=True)
 
@@ -421,6 +426,10 @@ def message_center_button() -> Callable[[], None]:
 
     msg_btn.on_click(lambda: ui.navigate.to(MESSAGES_PAGE_PATH, new_tab=True))
     refresh_badge()
+    # 提醒/已读变更即时刷新徽标（跨进程写入的提醒仍由 10 秒轮询兜底）。
+    # 订阅表只保存弱引用：refresh_badge 被下面的轮询协程引用，随页面存活
+    for domain in (store_runtime.DOMAIN_ALERTS, store_runtime.DOMAIN_MESSAGES):
+        client.on_delete(store_runtime.subscribe(domain, refresh_badge))
 
     async def _poll() -> None:
         failures = 0
@@ -442,14 +451,14 @@ def message_center_button() -> Callable[[], None]:
     return refresh_badge
 
 
-def _filter_options(read_keys: Set[str]) -> dict:
+def _filter_options(read_keys: Set[str], messages: List[dict]) -> dict:
     """构建用户过滤下拉选项：全部用户 + 消息中出现过的全部账号。
 
     有未读消息的账号排前面，每个账号标注当前未读条数（如 alice（3 未读））。
     """
     accounts: Set[str] = set()
     unread_counts: dict[str, int] = {}
-    for m in collect_messages(state.workdir):
+    for m in messages:
         acct = str(m.get("account") or "")
         if not acct:
             continue
@@ -463,10 +472,10 @@ def _filter_options(read_keys: Set[str]) -> dict:
     }
 
 
-def _type_filter_options() -> dict:
+def _type_filter_options(messages: List[dict]) -> dict:
     """构建消息类型过滤下拉选项：全部类型 + 当前消息中出现过的类型（按列表顺序）。"""
     tags: List[str] = []
-    for m in collect_messages(state.workdir):
+    for m in messages:
         tag = str(m.get("tag") or "")
         if tag and tag not in tags:
             tags.append(tag)
@@ -493,9 +502,8 @@ def _build_center_page() -> None:
     # 未读全量展示；已读默认 5 条，按「展开更多」每次追加 5 条
     shown = {"n": READ_PAGE_SIZE}
 
-    def visible_messages() -> List[dict]:
+    def visible_messages(messages: List[dict]) -> List[dict]:
         """按当前用户/类型过滤条件取可见消息（未排序）。"""
-        messages = collect_messages(state.workdir)
         sel = str(filter_sel.value or "")
         if sel:
             messages = [m for m in messages if m.get("account") == sel]
@@ -526,7 +534,7 @@ def _build_center_page() -> None:
         refresh_unread_badge()
 
     def mark_all_read() -> None:
-        for m in visible_messages():
+        for m in visible_messages(collect_messages(state.workdir)):
             read_keys.update(message_keys(m))
         save_read_keys(state.workdir, read_keys)
         render_list()
@@ -597,9 +605,11 @@ def _build_center_page() -> None:
         shown["n"] += READ_PAGE_SIZE
         render_list()
 
-    def render_list() -> None:
+    def render_list(messages: Optional[List[dict]] = None) -> None:
         list_container.clear()
-        messages = visible_messages()
+        if messages is None:
+            messages = collect_messages(state.workdir)
+        messages = visible_messages(messages)
         pin_keys = load_pin_keys(state.workdir)
         # 重试日志（持久化）：有日志的发言任务才显示「日志」按钮，刷新后仍在
         retry_logs = load_speak_retry_logs(state.workdir)
@@ -703,35 +713,38 @@ def _build_center_page() -> None:
                     ).props("flat dense full-width").classes("text-sm")
 
     def refresh_all() -> None:
+        # 一次汇总供筛选选项、列表与未读计数共用：collect_messages 要读全部提醒
+        # 文件并按条格式化，重复调用会把页面构建的耗时成倍放大
+        messages = collect_messages(state.workdir)
         # 重建过滤选项（未读账号置前并刷新未读数标注），选中项失效时回落「全部用户」
-        filter_sel.options = _filter_options(read_keys)
+        filter_sel.options = _filter_options(read_keys, messages)
         if str(filter_sel.value or "") not in filter_sel.options:
             filter_sel.value = ALL_ACCOUNTS
             app.storage.user[FILTER_STORAGE_KEY] = ALL_ACCOUNTS
         filter_sel.update()
         # 消息类型选项随当前消息集合变化，失效时回落「全部类型」
-        type_sel.options = _type_filter_options()
+        type_sel.options = _type_filter_options(messages)
         if str(type_sel.value or "") not in type_sel.options:
             type_sel.value = ALL_TYPES
             app.storage.user[TYPE_FILTER_STORAGE_KEY] = ALL_TYPES
         type_sel.update()
         # 只要还有口令提醒就显示「重发口令」（重发成功后随提醒消除自动隐藏）
         retry_all_btn.set_visibility(bool(load_speak_alerts(state.workdir)))
-        render_list()
-        refresh_unread_badge()
+        render_list(messages)
+        refresh_unread_badge(messages)
 
-    def refresh_unread_badge() -> None:
-        count = sum(
-            1
-            for m in collect_messages(state.workdir)
-            if is_message_unread(m, read_keys)
-        )
+    def refresh_unread_badge(messages: Optional[List[dict]] = None) -> None:
+        if messages is None:
+            messages = collect_messages(state.workdir)
+        count = sum(1 for m in messages if is_message_unread(m, read_keys))
         unread_badge.set_text(str(count))
         unread_badge.set_visibility(count > 0)
 
-    def _fingerprint() -> str:
+    def _fingerprint(messages: Optional[List[dict]] = None) -> str:
         """列表内容指纹：消息集合 + 已读/置顶状态变化时才重渲染，避免轮询打断滚动位置。"""
         pin_keys = load_pin_keys(state.workdir)
+        if messages is None:
+            messages = collect_messages(state.workdir)
         return json.dumps(
             [
                 [
@@ -741,7 +754,7 @@ def _build_center_page() -> None:
                     is_message_unread(m, read_keys),
                     m["key"] in pin_keys,
                 ]
-                for m in collect_messages(state.workdir)
+                for m in messages
             ]
         )
 
@@ -797,9 +810,10 @@ def _build_center_page() -> None:
                     refresh_all
                 )
         # 恢复上次选择的过滤用户/消息类型（刷新页面、重开标签页后仍保留）
-        options = _filter_options(read_keys)
+        messages = collect_messages(state.workdir)
+        options = _filter_options(read_keys, messages)
         saved = str(app.storage.user.get(FILTER_STORAGE_KEY) or "")
-        type_options = _type_filter_options()
+        type_options = _type_filter_options(messages)
         saved_type = str(app.storage.user.get(TYPE_FILTER_STORAGE_KEY) or "")
         with ui.row().classes("w-full items-center gap-2 no-wrap"):
             filter_sel = (
@@ -828,6 +842,13 @@ def _build_center_page() -> None:
 
     client = ui.context.client
 
+    def refresh_if_changed() -> None:
+        """消息集合或已读/置顶状态变化时才重渲染（订阅与轮询共用同一判断）。"""
+        fp = _fingerprint()
+        if fp != last_fp["value"]:
+            last_fp["value"] = fp
+            refresh_all()
+
     async def _poll() -> None:
         failures = 0
         while True:
@@ -839,15 +860,17 @@ def _build_center_page() -> None:
                 # 页面隐藏（手机锁屏/切后台）时跳过汇总，切回后自动恢复
                 if not should_poll(client):
                     continue
-                fp = _fingerprint()
-                if fp != last_fp["value"]:
-                    last_fp["value"] = fp
-                    refresh_all()
+                refresh_if_changed()
             except Exception:
                 failures += 1
                 logger.exception("轮询刷新消息中心列表失败（连续 %s 次）", failures)
 
     create_poll_task(_poll(), name="messages-page-poll", client=client)
+    # 提醒变更即时刷新列表；跨进程写入的提醒仍由上面的轮询兜底。
+    # 订阅表只保存弱引用：refresh_if_changed 被轮询协程引用，随页面存活
+    client.on_delete(
+        store_runtime.subscribe(store_runtime.DOMAIN_ALERTS, refresh_if_changed)
+    )
 
 
 @ui.page(MESSAGES_PAGE_PATH)

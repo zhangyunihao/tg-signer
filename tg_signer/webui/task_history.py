@@ -1,13 +1,15 @@
+import asyncio
 import json
 import logging
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from tg_signer.locks import file_lock
 from tg_signer.utils import atomic_write_json
 from tg_signer.webui.common import state
 from tg_signer.webui.data import get_workdir
+from tg_signer.webui.store import runtime as store_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +18,17 @@ TASK_HISTORY_FILE = "webui_task_history.json"
 TASK_HISTORY_LIMIT = 100
 # 落盘防抖：组合任务结束时可能连续追加多条记录，先在内存合并再写盘
 TASK_HISTORY_DEBOUNCE_SEC = 0.5
+TASK_HISTORY_DOMAIN = "task_history"
 
 # 缓存结构：(文件路径, 文件指纹(mtime_ns, size), 记录列表)。
 # 指纹用于发现其他 WebUI 实例（如 8080/8081 共用工作目录）对同一文件的写入。
 _task_history_cache: Optional[tuple[Path, Optional[tuple[int, int]], list[dict]]] = None
 _task_history_timer: Optional[threading.Timer] = None
 _task_history_lock = threading.Lock()
+
+# Store 模式：内存快照即唯一事实来源；文件路径只在降级时使用
+_store = None
+_memory: Optional[list[dict]] = None
 
 
 def _task_history_path() -> Path:
@@ -61,7 +68,68 @@ def _write_task_history(path: Path, items: list[dict]) -> None:
             _task_history_cache = (path, _task_history_fingerprint(path), items)
 
 
+# ---- Store 接入 / 订阅 ----
+
+
+def attach_store(store) -> None:
+    """启动窗口（``ui.run`` 之前）调用：把任务历史读入内存。
+
+    之后 ``load_task_history`` 不再碰文件；持久化由防抖写线程走 Store。
+    读取失败或该来源导入失败时保持旧文件路径，避免丢数据。
+    """
+    global _store, _memory
+    if store is None or not store.available:
+        detach_store()
+        return
+    if TASK_HISTORY_FILE in (store.status.failed_sources or []):
+        logger.warning("任务历史导入失败，继续使用旧文件路径")
+        detach_store()
+        return
+    try:
+        records = store.list_task_runs_blocking(TASK_HISTORY_LIMIT)
+    except Exception:  # noqa: BLE001 - 读取失败只降级
+        logger.warning("读取任务历史失败，继续使用旧文件路径", exc_info=True)
+        detach_store()
+        return
+    with _task_history_lock:
+        _store = store
+        _memory = list(reversed(records))[-TASK_HISTORY_LIMIT:]
+
+
+async def hydrate_from_store(store) -> None:
+    """运行期切换工作目录：在线程里读库后替换内存快照。"""
+    await asyncio.to_thread(attach_store, store)
+
+
+def detach_store() -> None:
+    """回到旧文件路径（切目录失败 / Store 降级时）。"""
+    global _store, _memory
+    with _task_history_lock:
+        _store = None
+        _memory = None
+
+
+def subscribe_task_history(callback: Callable[[], None]) -> Callable[[], None]:
+    """订阅任务历史变更（回调在事件循环线程执行）。"""
+    return store_runtime.subscribe(TASK_HISTORY_DOMAIN, callback)
+
+
+def _notify_task_history() -> None:
+    store_runtime.notify(TASK_HISTORY_DOMAIN)
+
+
+def _persist_store(store, snapshot: list[dict]) -> None:
+    """防抖定时器回调：把内存快照整表写回 Store（在独立线程执行）。"""
+    try:
+        store.replace_task_runs_blocking(snapshot)
+    except Exception:  # noqa: BLE001 - 写失败不能影响 UI
+        logger.warning("写入任务历史失败", exc_info=True)
+
+
 def load_task_history() -> list[dict]:
+    with _task_history_lock:
+        if _store is not None and _memory is not None:
+            return list(_memory)
     global _task_history_cache
     path = _task_history_path()
     fingerprint = _task_history_fingerprint(path)
@@ -75,14 +143,19 @@ def load_task_history() -> list[dict]:
 
 
 def flush_task_history() -> None:
-    """立即把内存中的任务历史落盘（退出前调用，避免防抖窗口内丢数据）。"""
+    """立即把内存中的任务历史落盘（退出前在线程里调用，避免防抖窗口丢数据）。"""
     global _task_history_timer
     with _task_history_lock:
         timer = _task_history_timer
         _task_history_timer = None
+        store = _store
+        snapshot = _memory
         cache = _task_history_cache
     if timer is not None:
         timer.cancel()
+    if store is not None and snapshot is not None:
+        _persist_store(store, snapshot)
+        return
     if cache is not None:
         _write_task_history(cache[0], cache[2])
 
@@ -99,20 +172,36 @@ def _persist_task_history(path: Path, snapshot: list[dict]) -> None:
 
 
 def save_task_history(items: list[dict]) -> None:
-    global _task_history_cache, _task_history_timer
-    path = _task_history_path()
+    global _task_history_cache, _task_history_timer, _memory
     snapshot = list(items[-TASK_HISTORY_LIMIT:])
+    path = _task_history_path()
     with _task_history_lock:
+        store = _store
+        if store is not None:
+            _memory = snapshot
+        else:
+            _task_history_cache = (
+                path,
+                _task_history_fingerprint(path),
+                snapshot,
+            )
         old_timer = _task_history_timer
-        _task_history_cache = (path, _task_history_fingerprint(path), snapshot)
-        timer = threading.Timer(
-            TASK_HISTORY_DEBOUNCE_SEC, _persist_task_history, args=(path, snapshot)
-        )
+        if store is not None:
+            timer = threading.Timer(
+                TASK_HISTORY_DEBOUNCE_SEC, _persist_store, args=(store, snapshot)
+            )
+        else:
+            timer = threading.Timer(
+                TASK_HISTORY_DEBOUNCE_SEC,
+                _persist_task_history,
+                args=(path, snapshot),
+            )
         timer.daemon = True
         _task_history_timer = timer
     if old_timer is not None:
         old_timer.cancel()
     timer.start()
+    _notify_task_history()
 
 
 def append_task_history(record: dict) -> None:
